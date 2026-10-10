@@ -713,7 +713,7 @@ fn resident_ctx(b: &BackendStatus, name: &str) -> Option<u64> {
 /// would silently take model control away from any backend that gained a
 /// second family. A SystemOne-only backend has no model-control API at all
 /// (load is implicit there), so it stays `false`.
-fn supports_control(b: &BackendStatus) -> bool {
+pub(crate) fn supports_control(b: &BackendStatus) -> bool {
     b.lmstudio || b.api_type.contains(ApiFamily::Ollama)
 }
 

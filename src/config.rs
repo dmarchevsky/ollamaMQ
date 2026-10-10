@@ -88,6 +88,26 @@ pub struct Settings {
     /// one oversized body can never deadlock the proxy against itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_queued_bytes: Option<u64>,
+    /// Where clients and their API keys are stored (default "clients.json"
+    /// in the working directory). Managed from the web UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients_file: Option<String>,
+    /// Web UI at `/ui`, behind HTTP basic auth. Disabled unless a password is
+    /// set here or in `OLLAMA_MQ_UI_PASSWORD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_ui: Option<WebUiSettings>,
+}
+
+/// `settings.web_ui`. The environment variables `OLLAMA_MQ_UI_USER` and
+/// `OLLAMA_MQ_UI_PASSWORD` override these values.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WebUiSettings {
+    /// Basic-auth user name (default "admin").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Basic-auth password. No password = the web UI is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 /// One backend entry from the `backends:` list.

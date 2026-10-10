@@ -1008,10 +1008,12 @@ name = "ollamaMQ"
 version = "0.5.0"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
  "clap",
  "crossterm",
  "futures-util",
+ "getrandom 0.3.4",
  "ratatui",
  "reqwest",
  "serde",

@@ -10,13 +10,12 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::control::{self, ControlAction, LoadOptions, RESULT_VISIBLE};
-use crate::dispatcher::{AppState, BackendApiType, BackendStatus, LogEvent};
-use crate::lock::LockExt;
+use crate::control::{self, ControlAction, LoadOptions};
+use crate::dispatcher::{AppState, BackendApiType, LogEvent};
+use crate::snapshot::{self, StateSnapshot};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Panel {
@@ -83,64 +82,6 @@ struct LogDetail {
 /// Lines scrolled per PageUp/PageDown in the log detail view.
 const DETAIL_PAGE: usize = 10;
 
-#[derive(PartialEq, Eq)]
-struct ActiveOpView {
-    backend_idx: usize,
-    verb: String,
-    model: String,
-    identifier: Option<String>,
-    elapsed_secs: u64,
-}
-
-#[derive(PartialEq, Eq)]
-struct RecentResultView {
-    backend_idx: usize,
-    ok: bool,
-    verb: String,
-    model: String,
-    identifier: Option<String>,
-    error: Option<String>,
-}
-
-/// One row of the users table.
-///
-/// The snapshot used to carry five whole `HashMap<String, _>` clones of the
-/// per-user bookkeeping and a sixth `Vec` of the ids — six allocations per
-/// tracked user, rebuilt ten times a second. Everything the dashboard shows
-/// about a user now lives in one row, built in a single pass.
-#[derive(PartialEq, Eq)]
-struct UserRow {
-    id: String,
-    queued: usize,
-    processing: usize,
-    processed: usize,
-    dropped: usize,
-    ip: Option<IpAddr>,
-}
-
-impl UserRow {
-    /// Requests of this user's that are queued or in flight.
-    fn outstanding(&self) -> usize {
-        self.queued + self.processing
-    }
-}
-
-#[derive(PartialEq, Eq)]
-struct StateSnapshot {
-    /// Users in display order.
-    users: Vec<UserRow>,
-    /// Request-log records dropped because the log channel was full.
-    reqlog_dropped: u64,
-    blocked_ips: HashSet<IpAddr>,
-    blocked_users: HashSet<String>,
-    vip_user: Option<String>,
-    boost_user: Option<String>,
-    backends: Vec<BackendStatus>,
-    /// Recent request/control events (newest first) for the Logs panel.
-    logs: Vec<LogEvent>,
-    active_ops: Vec<ActiveOpView>,
-    recent_results: Vec<RecentResultView>,
-}
 
 pub struct TuiDashboard {
     table_state: TableState,
@@ -179,88 +120,6 @@ impl TuiDashboard {
         }
     }
 
-    fn capture_snapshot(&self, state: &Arc<AppState>) -> StateSnapshot {
-        let mut users: Vec<UserRow> = {
-            let queues = state.queues.lock_or_recover();
-            let processing = state.processing_counts.lock_or_recover();
-            let processed = state.processed_counts.lock_or_recover();
-            let dropped = state.dropped_counts.lock_or_recover();
-            let ips = state.user_ips.lock_or_recover();
-            queues
-                .iter()
-                .map(|(id, q)| UserRow {
-                    queued: q.len(),
-                    processing: processing.get(id).copied().unwrap_or(0),
-                    processed: processed.get(id).copied().unwrap_or(0),
-                    dropped: dropped.get(id).copied().unwrap_or(0),
-                    ip: ips.get(id).copied(),
-                    id: id.clone(),
-                })
-                .collect()
-        };
-        let reqlog_dropped = state.reqlog.dropped_count();
-        let blocked_ips = state.blocked_ips.lock_or_recover().clone();
-        let blocked_users = state.blocked_users.lock_or_recover().clone();
-        let vip_user = state.vip_user.lock_or_recover().clone();
-        let boost_user = state.boost_user.lock_or_recover().clone();
-        let backends = state.backends.lock_or_recover().clone();
-        let logs: Vec<LogEvent> = state
-            .logs
-            .lock_or_recover()
-            .iter()
-            .rev()
-            .take(50)
-            .cloned()
-            .collect();
-        let active_ops: Vec<ActiveOpView> = state
-            .control_ops
-            .lock_or_recover()
-            .values()
-            .map(|op| ActiveOpView {
-                backend_idx: op.backend_idx,
-                verb: op.action.verb().to_string(),
-                model: op.canonical.clone(),
-                identifier: op.identifier.clone(),
-                elapsed_secs: op.started.elapsed().as_secs(),
-            })
-            .collect();
-        let recent_results: Vec<RecentResultView> = state
-            .control_history
-            .lock_or_recover()
-            .iter()
-            .filter(|r| r.finished_at.elapsed() < RESULT_VISIBLE)
-            .map(|r| RecentResultView {
-                backend_idx: r.backend_idx,
-                ok: r.ok,
-                verb: r.action.verb().to_string(),
-                model: r.model.clone(),
-                identifier: r.identifier.clone(),
-                error: r.error.clone(),
-            })
-            .collect();
-
-        // Busiest first, then most-served, then by id for a stable order.
-        users.sort_by(|a, b| {
-            b.outstanding()
-                .cmp(&a.outstanding())
-                .then_with(|| (b.processed + b.dropped).cmp(&(a.processed + a.dropped)))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-
-        StateSnapshot {
-            users,
-            reqlog_dropped,
-            blocked_ips,
-            blocked_users,
-            vip_user,
-            boost_user,
-            backends,
-            logs,
-            active_ops,
-            recent_results,
-        }
-    }
-
     pub fn run(&mut self, state: &Arc<AppState>) -> io::Result<bool> {
         enable_raw_mode()?;
         io::stdout().execute(EnterAlternateScreen)?;
@@ -275,7 +134,7 @@ impl TuiDashboard {
         let mut force_redraw = true;
 
         loop {
-            let fresh = self.capture_snapshot(state);
+            let fresh = snapshot::capture(state, 50);
             // The flash message hides itself after a timeout with no event to
             // announce it, so its visibility is part of "has anything changed".
             let flash_visible = self
@@ -538,25 +397,7 @@ impl TuiDashboard {
                                 && let Some(i) = self.table_state.selected()
                                 && i < snapshot.users.len()
                             {
-                                let user_id = snapshot.users[i].id.clone();
-
-                                // 1. Handle VIP
-                                {
-                                    let mut vip = state.vip_user.lock_or_recover();
-                                    if vip.as_ref() == Some(&user_id) {
-                                        *vip = None;
-                                    } else {
-                                        *vip = Some(user_id.clone());
-                                    }
-                                }
-
-                                // 2. Clear Boost if we just set VIP
-                                {
-                                    let mut boost = state.boost_user.lock_or_recover();
-                                    if boost.as_ref() == Some(&user_id) {
-                                        *boost = None;
-                                    }
-                                }
+                                state.toggle_vip(&snapshot.users[i].id);
                             }
                         }
                         KeyCode::Char('b') => {
@@ -564,25 +405,7 @@ impl TuiDashboard {
                                 && let Some(i) = self.table_state.selected()
                                 && i < snapshot.users.len()
                             {
-                                let user_id = snapshot.users[i].id.clone();
-
-                                // 1. Handle Boost
-                                {
-                                    let mut boost = state.boost_user.lock_or_recover();
-                                    if boost.as_ref() == Some(&user_id) {
-                                        *boost = None;
-                                    } else {
-                                        *boost = Some(user_id.clone());
-                                    }
-                                }
-
-                                // 2. Clear VIP if we just set Boost
-                                {
-                                    let mut vip = state.vip_user.lock_or_recover();
-                                    if vip.as_ref() == Some(&user_id) {
-                                        *vip = None;
-                                    }
-                                }
+                                state.toggle_boost(&snapshot.users[i].id);
                             }
                         }
                         KeyCode::Char('x') => {
@@ -1656,6 +1479,7 @@ impl TuiDashboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::UserRow;
     use ratatui::{Terminal, backend::TestBackend};
 
     /// Everything the dashboard painted, as plain text.

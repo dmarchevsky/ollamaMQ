@@ -57,6 +57,10 @@ settings:
   request_log_max_bytes: 10485760             # rotate when file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
   log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
+  clients_file: clients.json                  # clients and their API keys, managed from the web UI (default shown)
+  # web_ui:                    # web UI at /ui behind basic auth; off unless a password is set here
+  #   username: admin          # or in OLLAMA_MQ_UI_PASSWORD (env vars OLLAMA_MQ_UI_USER /
+  #   password: change-me      # OLLAMA_MQ_UI_PASSWORD override these)
 
 # --- Models to load onto backends -------------------------------------------
 # Fields per model:

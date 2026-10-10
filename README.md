@@ -18,12 +18,14 @@
 - **Fail-Fast for Unsatisfiable Requests**: If no online backend can ever serve a queued request (wrong API family or model absent everywhere), it is answered with `503` after `stuck_timeout` seconds instead of hanging forever. Requests merely waiting for a busy or loading backend are unaffected.
 - **Per-Model Concurrency Limits**: Each model entry's `max_concurrent_requests` caps how many in-flight requests one backend may serve for that model, bounded globally by `settings.max_concurrent_per_backend` (default 1 — the historical one-request-per-backend behavior; raise it to let a single backend handle several requests at once). The limit is keyed on the model's base name, so it applies no matter how the client spells it — `qwen3.8-27b`, `qwen/qwen3.8-27b` and `unsloth/qwen3.8-27b@q8_0` all draw on the same budget as the configured entry.
 - **Metadata Reads Never Queue**: `/`, `/api/tags`, `/api/ps`, `/api/version`, `/api/show`, `/v1/models` and `/v1/models/{model}` don't run inference, so they neither wait for a free backend slot nor occupy one — a chat UI polling `/api/tags` on a timer is answered immediately instead of queueing behind a multi-minute generation (or a model load) with the default `max_concurrent_per_backend: 1`.
-- **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue, capped at 100 waiting requests — beyond that the proxy answers `429` rather than growing the queue.
+- **Per-User Queuing**: Each user (identified by a client API key, else by the `X-User-ID` header) has their own FIFO queue, capped at 100 waiting requests — beyond that the proxy answers `429` rather than growing the queue.
 - **Bounded Memory**: A queued request holds its whole body until a backend takes it, so bodies are capped two ways: `settings.max_body_bytes` per request (default 64 MiB, `413` beyond it) and `settings.max_queued_bytes` across all queues at once (default 512 MiB, `503` beyond it). A request is always admitted when the queues are empty, so an oversized body can never lock the proxy out of making progress. `/api/blobs/{digest}` keeps a separate 1 GiB allowance for model-layer uploads.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
+- **Web UI**: Everything the TUI does, in a browser at `/ui` behind basic auth — plus management of clients and their API keys.
+- **Clients & API Keys**: Give each client one or more keys (generated or any string you choose). A request with a client key queues under the client's name, so a key holder can't hop queues by changing `X-User-ID`.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
 - **Async Architecture**: Built on `tokio` and `axum` for high concurrency.
 
@@ -313,6 +315,10 @@ settings:
   request_log_max_bytes: 10485760             # rotate when the file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
   log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
+  clients_file: clients.json   # clients and their API keys, managed from the web UI (default shown)
+  web_ui:                      # web UI at /ui; off unless a password is set (here or in OLLAMA_MQ_UI_PASSWORD)
+    username: admin            # basic-auth user (default admin)
+    password: change-me        # basic-auth password
 
 # --- Models to load on startup / reload, via the model-control logic
 models:
@@ -421,6 +427,8 @@ The Dockerfile uses a multi-stage build:
 | `HOST`        | Host/interface to bind to      | `0.0.0.0`                |
 | `TIMEOUT`     | Request timeout in seconds     | `300`                    |
 | `OLLAMA_MQ_API_KEY` | Optional API key; enables auth when set | *(unset — auth disabled)* |
+| `OLLAMA_MQ_UI_USER` | Web UI basic-auth user (overrides `settings.web_ui.username`) | `admin` |
+| `OLLAMA_MQ_UI_PASSWORD` | Web UI basic-auth password (overrides `settings.web_ui.password`); enables the web UI | *(unset — web UI off)* |
 
 ### 🔒 Security (Optional API-Key Auth)
 
@@ -431,7 +439,7 @@ When a key is set, every request **except `/health`** must present it via one of
 - `Authorization: Bearer <key>`
 - `X-API-Key: <key>`
 
-Requests with a missing or wrong key get `401 Unauthorized` (`{"error":"unauthorized"}`). The `/health` endpoint always stays unauthenticated so health checks and Docker healthchecks keep working.
+The key of any enabled client (see *Web UI, Clients & API Keys* below) is accepted too. Requests with a missing or wrong key get `401 Unauthorized` (`{"error":"unauthorized"}`). The `/health` endpoint always stays unauthenticated so health checks and Docker healthchecks keep working.
 
 ```bash
 # Enable auth
@@ -457,6 +465,31 @@ docker run -d --name ollamamq -p 11435:11435 \
   -e OLLAMA_MQ_API_KEY=supersecret \
   chlebon/ollamamq
 ```
+
+### 🖥️ Web UI, Clients & API Keys
+
+Set a password and open `http://<host>:11435/ui/`:
+
+```bash
+OLLAMA_MQ_UI_PASSWORD=change-me ollamaMQ --no-tui     # user defaults to "admin"
+```
+
+The web UI is **off** unless a password is configured (`OLLAMA_MQ_UI_PASSWORD`, or `settings.web_ui.password` in `appconf.yaml`). It sits behind HTTP basic auth, independent of `OLLAMA_MQ_API_KEY`. Basic auth sends the password with every request, so put the UI behind TLS (a reverse proxy) when it is reachable from beyond a trusted network.
+
+It covers everything the TUI does:
+
+- **Overview / Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload** (TUI `L` / `U`)
+- **Users** — queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock** (TUI `p` `b` `x` `X` `u`)
+- **Blocked** — blocked users and IPs
+- **Logs** — recent requests with a filter; click a row for the full captured content
+- **Reload config** — re-read `appconf.yaml` (TUI `r`)
+
+It also manages **clients and their API keys**:
+
+- Create a client (its name becomes its queue id), then add keys — **generated** (`omq-…`) or **any string you choose** (8–256 printable characters, unique across clients). A key can be relabelled, moved to another client, or revoked; a client can be renamed, disabled (its keys get `403`) or deleted.
+- A request carrying a client key (`Authorization: Bearer <key>` or `X-Api-Key: <key>`) queues under that client's name, **whatever `X-User-ID` it sends**. The key is removed before the request is forwarded, so it never reaches a backend (the backend's own `token` applies instead).
+- Requests with no key, or a key no client owns, behave as before: `X-User-ID` decides the queue.
+- Keys are stored in plaintext in `settings.clients_file` (default `clients.json` in the working directory) so they can be looked up again; the file is written owner-only (`0600`). Changes are saved immediately (atomic replace). A clients file that exists but cannot be parsed stops the proxy at startup rather than being overwritten.
 
 ### Port Configuration
 

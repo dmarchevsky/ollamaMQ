@@ -709,6 +709,13 @@ pub struct AppState {
     /// gigabytes to pile up; this bounds it in bytes. Read and updated only
     /// under the `queues` lock, so the checks are atomic with the push/pop.
     pub queued_bytes: std::sync::atomic::AtomicU64,
+    /// Clients and their API keys (see [`crate::clients`]). Starts empty and
+    /// in memory; `main` swaps in the store loaded from `clients_file`.
+    pub clients: Mutex<crate::clients::ClientStore>,
+    /// Events evicted from the front of `logs` so far. The event at index `i`
+    /// of the ring has the stable sequence number `logs_evicted + i`, which
+    /// the web UI uses to fetch one event's full content.
+    pub logs_evicted: std::sync::atomic::AtomicU64,
 }
 
 /// One line of the TUI Logs panel: a request entering ("IN") or leaving
@@ -891,6 +898,8 @@ impl AppState {
             log_content_limit,
             max_queued_bytes,
             queued_bytes: std::sync::atomic::AtomicU64::new(0),
+            clients: Mutex::new(crate::clients::ClientStore::in_memory()),
+            logs_evicted: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -982,6 +991,39 @@ impl AppState {
         info!("User unblocked: {}", user_id);
     }
 
+    /// Toggle `user_id` as the VIP user. A user is never VIP and boost at
+    /// once, so becoming VIP clears their boost.
+    pub fn toggle_vip(&self, user_id: &str) {
+        {
+            let mut vip = self.vip_user.lock_or_recover();
+            if vip.as_deref() == Some(user_id) {
+                *vip = None;
+            } else {
+                *vip = Some(user_id.to_string());
+            }
+        }
+        let mut boost = self.boost_user.lock_or_recover();
+        if boost.as_deref() == Some(user_id) {
+            *boost = None;
+        }
+    }
+
+    /// Toggle `user_id` as the boost user; the mirror of [`Self::toggle_vip`].
+    pub fn toggle_boost(&self, user_id: &str) {
+        {
+            let mut boost = self.boost_user.lock_or_recover();
+            if boost.as_deref() == Some(user_id) {
+                *boost = None;
+            } else {
+                *boost = Some(user_id.to_string());
+            }
+        }
+        let mut vip = self.vip_user.lock_or_recover();
+        if vip.as_deref() == Some(user_id) {
+            *vip = None;
+        }
+    }
+
     pub fn is_ip_blocked(&self, ip: &IpAddr) -> bool {
         self.blocked_ips.lock_or_recover().contains(ip)
     }
@@ -996,6 +1038,10 @@ impl AppState {
         logs.push_back(ev);
         while logs.len() > MAX_LOG_EVENTS {
             logs.pop_front();
+            // Only ever changed under the `logs` lock, so it is consistent
+            // with the ring whenever the ring is read.
+            self.logs_evicted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // Bound memory: only the newest MAX_LOG_CONTENT_EVENTS may keep
         // their (potentially large) content — strip it from older events,
@@ -2234,17 +2280,35 @@ pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     method: Method,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     body: Bytes,
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
     let ip = addr.ip();
-    let user_id = headers
-        .get("X-User-ID")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("anonymous")
-        .to_string();
+    // A client key decides the queue identity and beats `X-User-ID`, so a key
+    // holder cannot hop queues. No key, or one no client owns, falls back to
+    // `X-User-ID` as before.
+    let client = crate::auth::extract_api_key(&headers)
+        .and_then(|key| state.clients.lock_or_recover().resolve(&key));
+    let user_id = match &client {
+        Some(c) => c.client.clone(),
+        None => headers
+            .get("X-User-ID")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("anonymous")
+            .to_string(),
+    };
+    if let Some(c) = &client {
+        if c.disabled {
+            warn!("Request with a key of disabled client: {} (IP: {})", user_id, ip);
+            return (StatusCode::FORBIDDEN, "Client disabled").into_response();
+        }
+        // The key is a credential for ollamaMQ, not for the backend: drop it
+        // so it never leaves the proxy and the backend's own token applies.
+        headers.remove(axum::http::header::AUTHORIZATION);
+        headers.remove("x-api-key");
+    }
 
     if state.is_ip_blocked(&ip) {
         warn!("Blocked request from IP: {} for user: {}", ip, user_id);
@@ -3308,6 +3372,120 @@ mod tests {
         let chat: Vec<_> = calls.into_iter().filter(|(p, _)| p == "/api/chat").collect();
         assert_eq!(chat.len(), 1);
         assert_eq!(chat[0].1.as_deref(), Some("Bearer client-key"));
+    }
+
+    fn add_test_client(state: &Arc<AppState>, name: &str, key: &str) {
+        let mut clients = state.clients.lock_or_recover();
+        clients.create_client(name, "").expect("create client");
+        clients.add_key(name, Some(key), "").expect("add key");
+    }
+
+    /// A client key picks the queue (over the client's own `X-User-ID`) and
+    /// is stripped before forwarding, so the backend token applies instead.
+    #[tokio::test]
+    async fn client_key_sets_queue_user_and_is_not_forwarded() {
+        let (url, calls) = spawn_recording_backend().await;
+        let state = new_test_state(vec![url]);
+        arm_ollama_backend(&state, Some("sekrit".to_string()));
+        add_test_client(&state, "alice", "alice-key-123");
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer alice-key-123".parse().expect("header value"),
+        );
+        headers.insert("X-User-ID", "mallory".parse().expect("header value"));
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proxy_handler(
+                State(state.clone()),
+                ConnectInfo("127.0.0.1:41010".parse().expect("addr")),
+                Method::POST,
+                headers,
+                axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+                Bytes::from_static(br#"{"model":"llama3","messages":[]}"#),
+            ),
+        )
+        .await
+        .expect("request not answered within 10s")
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(res.into_body(), usize::MAX).await;
+        worker.abort();
+
+        let ips = state.user_ips.lock_or_recover();
+        assert!(ips.contains_key("alice"), "queued under {:?}", ips.keys());
+        assert!(!ips.contains_key("mallory"));
+        drop(ips);
+        let calls = calls.lock_or_recover().clone();
+        let chat: Vec<_> = calls.into_iter().filter(|(p, _)| p == "/api/chat").collect();
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].1.as_deref(), Some("Bearer sekrit"));
+    }
+
+    #[tokio::test]
+    async fn disabled_client_key_is_rejected() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        add_test_client(&state, "bob", "bob-key-0001");
+        state
+            .clients
+            .lock_or_recover()
+            .update_client(
+                "bob",
+                crate::clients::ClientPatch {
+                    disabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect("disable");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "bob-key-0001".parse().expect("header value"));
+        let res = proxy_handler(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:41011".parse().expect("addr")),
+            Method::POST,
+            headers,
+            axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+            Bytes::from_static(br#"{"model":"llama3"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(state.queues.lock_or_recover().is_empty());
+    }
+
+    /// A key no client owns changes nothing: `X-User-ID` still decides.
+    /// (Observed through a block on that user, so no backend is needed.)
+    #[tokio::test]
+    async fn unknown_key_falls_back_to_user_header() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        add_test_client(&state, "alice", "alice-key-123");
+        // Set directly: `block_user` would persist to the working directory.
+        state.blocked_users.lock_or_recover().insert("carol".to_string());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer not-a-client-key".parse().expect("header value"),
+        );
+        headers.insert("X-User-ID", "carol".parse().expect("header value"));
+        let res = proxy_handler(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:41012".parse().expect("addr")),
+            Method::POST,
+            headers,
+            axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+            Bytes::from_static(br#"{"model":"llama3"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], b"User blocked");
     }
 
     // -- Scheduler-tier integration tests ------------------------------------

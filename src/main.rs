@@ -13,12 +13,16 @@ use tokio::sync::Notify;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod auth;
+mod clients;
 mod config;
 mod control;
 mod dispatcher;
 mod lock;
 mod reqlog;
+mod snapshot;
 mod tui;
+mod web;
 
 use crate::control::{admin_model_load, admin_model_unload, admin_models_state};
 use crate::dispatcher::{AppState, proxy_handler, run_worker};
@@ -78,19 +82,6 @@ struct TuiState {
     toggle_notify: Arc<Notify>,
 }
 
-/// Constant-time string comparison to avoid timing side-channels when checking API keys.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// Build the 401 response with JSON content type and a Bearer challenge hint.
 fn unauthorized_response() -> Response {
     Response::builder()
@@ -101,10 +92,11 @@ fn unauthorized_response() -> Response {
         .unwrap()
 }
 
-/// Optional API-key auth middleware. If no key is configured (state is None),
-/// all requests pass through untouched.
+/// Optional API-key auth middleware. If no key is configured (`api_key` is
+/// None), all requests pass through untouched. When one is, the request must
+/// present it or the key of an enabled client.
 async fn auth_middleware(
-    State(api_key): State<Option<String>>,
+    State((api_key, state)): State<(Option<String>, Arc<AppState>)>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -112,31 +104,18 @@ async fn auth_middleware(
         return next.run(request).await;
     };
 
-    let headers = request.headers();
-    let provided = headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                // Auth-scheme is case-insensitive per RFC 7235; "Bearer " is 7 ASCII bytes.
-                .and_then(|v| {
-                    if v.len() > 7 && v.get(..7)?.eq_ignore_ascii_case("Bearer ") {
-                        Some(v[7..].to_string())
-                    } else {
-                        None
-                    }
-                })
-        });
-
-    let provided = match provided {
-        Some(p) => p,
-        None => return unauthorized_response(),
+    let Some(provided) = auth::extract_api_key(request.headers()) else {
+        return unauthorized_response();
     };
 
-    if constant_time_eq(&provided, &expected) {
+    let client_ok = || {
+        state
+            .clients
+            .lock_or_recover()
+            .resolve(&provided)
+            .is_some_and(|c| !c.disabled)
+    };
+    if auth::constant_time_eq(&provided, &expected) || client_ok() {
         next.run(request).await
     } else {
         unauthorized_response()
@@ -218,6 +197,22 @@ async fn main() {
         .unwrap_or(512 * 1024 * 1024);
     let allow_all_routes =
         args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
+    let clients_file = file_cfg
+        .settings
+        .clients_file
+        .clone()
+        .unwrap_or_else(|| clients::DEFAULT_CLIENTS_FILE.to_string());
+    // Web UI credentials: env vars win over appconf.yaml; no password = off.
+    let web_cfg = file_cfg.settings.web_ui.clone().unwrap_or_default();
+    let env_nonempty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let web_auth = env_nonempty("OLLAMA_MQ_UI_PASSWORD")
+        .or(web_cfg.password.filter(|p| !p.is_empty()))
+        .map(|password| web::WebAuth {
+            username: env_nonempty("OLLAMA_MQ_UI_USER")
+                .or(web_cfg.username.filter(|u| !u.is_empty()))
+                .unwrap_or_else(|| "admin".to_string()),
+            password,
+        });
 
     // `kind:` per backend, in config order, collected before `file_cfg.backends`
     // is consumed below. Only the config file can carry one: `--backend-urls`
@@ -305,6 +300,20 @@ async fn main() {
         log_content_limit,
         max_queued_bytes,
     ));
+
+    // A clients file that exists but cannot be read is fatal: running with an
+    // empty store would answer every keyed client as a stranger, and the
+    // first change made in the web UI would overwrite the file.
+    match clients::ClientStore::load(&clients_file) {
+        Ok(store) => {
+            info!("Loaded {} client(s) from {}", store.len(), clients_file);
+            *state.clients.lock_or_recover() = store;
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
 
     // Pin the `kind:`-configured API families now, BEFORE the health loop
     // starts: a Laya-style backend answers nothing that identifies it, so a
@@ -403,14 +412,25 @@ async fn main() {
     // Protect all proxy routes (including the fallback) with optional API-key auth.
     // /health is registered separately below and stays unauthenticated.
     let app = app
-        .layer(middleware::from_fn_with_state(api_key, auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            (api_key, state.clone()),
+            auth_middleware,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .with_state(state.clone());
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(|| async { "OK" }))
-        .merge(app)
-        .with_state(state.clone());
+        .merge(app);
+    // The web UI has its own (basic) auth, so it sits outside the API-key layer.
+    match web_auth {
+        Some(auth) => {
+            info!("Web UI enabled at /ui (user '{}')", auth.username);
+            app = app.merge(web::router(auth));
+        }
+        None => info!("Web UI disabled (set OLLAMA_MQ_UI_PASSWORD or settings.web_ui.password)"),
+    }
+    let app = app.with_state(state.clone());
 
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
