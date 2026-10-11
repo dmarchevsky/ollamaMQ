@@ -18,7 +18,7 @@
 - **Fail-Fast for Unsatisfiable Requests**: If no online backend can ever serve a queued request (wrong API family or model absent everywhere), it is answered with `503` after `stuck_timeout` seconds instead of hanging forever. Requests merely waiting for a busy or loading backend are unaffected.
 - **Per-Model Concurrency Limits**: Each model entry's `max_concurrent_requests` caps how many in-flight requests one backend may serve for that model, bounded globally by `settings.max_concurrent_per_backend` (default 1 — the historical one-request-per-backend behavior; raise it to let a single backend handle several requests at once). The limit is keyed on the model's base name, so it applies no matter how the client spells it — `qwen3.8-27b`, `qwen/qwen3.8-27b` and `unsloth/qwen3.8-27b@q8_0` all draw on the same budget as the configured entry.
 - **Metadata Reads Never Queue**: `/`, `/api/tags`, `/api/ps`, `/api/version`, `/api/show`, `/v1/models` and `/v1/models/{model}` don't run inference, so they neither wait for a free backend slot nor occupy one — a chat UI polling `/api/tags` on a timer is answered immediately instead of queueing behind a multi-minute generation (or a model load) with the default `max_concurrent_per_backend: 1`.
-- **Per-User Queuing**: Each user (identified by a client API key, else by the `X-User-ID` header) has their own FIFO queue, capped at 100 waiting requests — beyond that the proxy answers `429` rather than growing the queue.
+- **Per-User Queuing**: Each user (identified by a client API key, else by the `X-User-ID` header, else by address as `ip-<address>`) has their own FIFO queue, capped at 100 waiting requests — beyond that the proxy answers `429` rather than growing the queue.
 - **Bounded Memory**: A queued request holds its whole body until a backend takes it, so bodies are capped two ways: `settings.max_body_bytes` per request (default 64 MiB, `413` beyond it) and `settings.max_queued_bytes` across all queues at once (default 512 MiB, `503` beyond it). A request is always admitted when the queues are empty, so an oversized body can never lock the proxy out of making progress. `/api/blobs/{digest}` keeps a separate 1 GiB allowance for model-layer uploads.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
@@ -128,6 +128,10 @@ curl -X POST http://localhost:11435/api/chat \
     "stream": true
   }'
 ```
+
+#### Model aliases and Olla-style paths
+
+`settings.model_aliases` lets clients ask for a model under another name: a request whose `model` matches an alias (any case) is rewritten to the target before routing, so the model policy, logs and metrics all see the real name. Olla-style URLs (`/olla/openai/v1/...`, `/olla/proxy/api/...`) are accepted too and served as the plain routes, so a client set up for Olla only needs a new port. Only known routes are served behind those prefixes.
 
 #### Decision-model backends (System One)
 
@@ -310,6 +314,10 @@ settings:
                                  # neither wait for a slot nor take one.
   max_body_bytes: 67108864       # largest request body accepted, 413 beyond it (default 64 MiB).
                                  # /api/blobs/{digest} keeps its own 1 GiB allowance.
+  model_aliases:                 # serve a model under another name (case-insensitive), applied before routing,
+    codex-auto-review: Qwen3.8-Flash-Next   # the model policy and metrics; reloaded with the config (default none)
+  ip_identity: true              # requests with no client key and no X-User-ID queue as ip-<address>;
+                                 # false = they all share "anonymous" (default true)
   detect_backend_slots: true     # use the parallel slots a backend reports (llama.cpp /props total_slots,
                                  # halogen /health slots) as its capacity instead of max_concurrent_per_backend;
                                  # models without max_concurrent_requests may then use all of them (default true)

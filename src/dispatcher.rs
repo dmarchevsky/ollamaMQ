@@ -702,6 +702,11 @@ pub struct AppState {
     /// Use the slot count a backend reports as its capacity
     /// (`settings.detect_backend_slots`, default on).
     pub detect_slots: std::sync::atomic::AtomicBool,
+    /// Model aliases, keyed by lowercase alias (`settings.model_aliases`).
+    pub model_aliases: Mutex<HashMap<String, String>>,
+    /// Keyless requests without `X-User-ID` queue as `ip-<address>`
+    /// (`settings.ip_identity`, default on).
+    pub ip_identity: std::sync::atomic::AtomicBool,
     /// Per-model concurrency limits keyed by `model_concurrency_key`; rebuilt
     /// whenever the model config changes. Unlisted models default to 1.
     pub model_limits: Mutex<HashMap<String, u32>>,
@@ -914,6 +919,8 @@ impl AppState {
             load_keep_alive,
             max_concurrent_per_backend,
             detect_slots: std::sync::atomic::AtomicBool::new(true),
+            model_aliases: Mutex::new(HashMap::new()),
+            ip_identity: std::sync::atomic::AtomicBool::new(true),
             model_limits: Mutex::new(build_model_limits(&model_config)),
             model_config: Mutex::new(model_config),
             model_config_path,
@@ -1095,6 +1102,44 @@ impl AppState {
             Some(n) if self.detect_slots.load(std::sync::atomic::Ordering::Relaxed) => (n, true),
             _ => (self.max_concurrent_per_backend, false),
         }
+    }
+
+    /// Replace the model aliases (keys matched case-insensitively).
+    pub fn set_model_aliases(&self, aliases: Option<&std::collections::BTreeMap<String, String>>) {
+        *self.model_aliases.lock_or_recover() = aliases
+            .map(|a| {
+                a.iter()
+                    .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
+                    .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    /// The body with its `model` swapped for the alias target, when the
+    /// request names an alias; otherwise the body untouched (no re-encoding).
+    pub fn apply_model_alias(&self, body: Bytes) -> Bytes {
+        let target = {
+            let aliases = self.model_aliases.lock_or_recover();
+            if aliases.is_empty() {
+                return body;
+            }
+            match extract_requested_model(&body)
+                .and_then(|m| aliases.get(&m.trim().to_lowercase()).cloned())
+            {
+                Some(t) => t,
+                None => return body,
+            }
+        };
+        let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return body;
+        };
+        let Some(obj) = json.as_object_mut() else {
+            return body;
+        };
+        debug!("model alias: {:?} -> {}", obj.get("model"), target);
+        obj.insert("model".to_string(), serde_json::Value::String(target));
+        serde_json::to_vec(&json).map(Bytes::from).unwrap_or(body)
     }
 
     /// The `model` metric label for a request (see [`model_label_in`]).
@@ -1383,6 +1428,19 @@ fn name_matches_listed(requested: &str, listed: &str) -> bool {
 /// tag/quant normalization.
 fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
     available.iter().any(|m| name_matches_listed(requested, m))
+}
+
+/// The route behind an Olla-style path: `/olla/openai/...` and
+/// `/olla/proxy/...` map to `/...`; anything else is unchanged.
+pub fn strip_olla_prefix(path: &str) -> &str {
+    for prefix in ["/olla/openai", "/olla/proxy"] {
+        if let Some(rest) = path.strip_prefix(prefix)
+            && rest.starts_with('/')
+        {
+            return rest;
+        }
+    }
+    path
 }
 
 /// The `endpoint` metric label: the route template `path` belongs to, so
@@ -2726,8 +2784,16 @@ pub async fn proxy_handler(
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     body: Bytes,
 ) -> impl IntoResponse {
-    let path = uri.path().to_string();
+    // Olla-style paths (`/olla/openai/v1/...`, `/olla/proxy/api/...`) are the
+    // plain routes under a prefix, so clients set up for Olla only change port.
+    let path = strip_olla_prefix(uri.path()).to_string();
+    // Only known routes behind the prefix: the catch-all Olla routes must not
+    // open what the explicit route list (allow_all_routes off) keeps closed.
+    if path.len() != uri.path().len() && route_template(&path) == "other" {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
     let ip = addr.ip();
+    let body = state.apply_model_alias(body);
     // A client key decides the queue identity and beats `X-User-ID`, so a key
     // holder cannot hop queues. No key, or one no client owns, falls back to
     // `X-User-ID` as before.
@@ -2735,12 +2801,13 @@ pub async fn proxy_handler(
         .and_then(|key| state.clients.lock_or_recover().resolve(&key));
     let user_id = match &client {
         Some(c) => c.client.clone(),
-        None => state.unkeyed_identity(
-            headers
-                .get("X-User-ID")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("anonymous"),
-        ),
+        None => match headers.get("X-User-ID").and_then(|h| h.to_str().ok()) {
+            Some(claimed) => state.unkeyed_identity(claimed),
+            None if state.ip_identity.load(std::sync::atomic::Ordering::Relaxed) => {
+                format!("ip-{ip}")
+            }
+            None => state.unkeyed_identity("anonymous"),
+        },
     };
     // Metrics for requests refused before they are queued.
     let endpoint = route_template(&path);
@@ -4191,7 +4258,8 @@ mod tests {
         assert!(state.queues.lock_or_recover().is_empty(), "nothing was queued");
         let text = crate::metrics::render(&state);
         assert!(
-            text.contains(r#"ollamamq_requests_total{client="anonymous",model="llama3",endpoint="/v1/chat/completions",outcome="hidden_model"} 1"#),
+            // No key, no X-User-ID: identified by address (`ip_identity`).
+            text.contains(r#"ollamamq_requests_total{client="ip-127.0.0.1",model="llama3",endpoint="/v1/chat/completions",outcome="hidden_model"} 1"#),
             "{text}"
         );
         assert!(!state.model_blocked("phi4:14b"));
@@ -4395,6 +4463,85 @@ mod tests {
         }
         assert_eq!(run(true).await, 2, "both slots used");
         assert_eq!(run(false).await, 1, "configured cap of 1");
+    }
+
+    #[test]
+    fn olla_prefixes_are_stripped() {
+        assert_eq!(strip_olla_prefix("/olla/openai/v1/chat/completions"), "/v1/chat/completions");
+        assert_eq!(strip_olla_prefix("/olla/proxy/api/chat"), "/api/chat");
+        assert_eq!(strip_olla_prefix("/olla/openaix/v1/models"), "/olla/openaix/v1/models");
+        assert_eq!(strip_olla_prefix("/v1/models"), "/v1/models");
+    }
+
+    async fn call(state: &Arc<AppState>, path: &'static str, body: &'static [u8]) -> axum::response::Response {
+        proxy_handler(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:41040".parse().expect("addr")),
+            Method::POST,
+            HeaderMap::new(),
+            axum::extract::OriginalUri(path.parse().expect("uri")),
+            Bytes::from_static(body),
+        )
+        .await
+        .into_response()
+    }
+
+    /// Olla paths reach the same handling as the plain route (seen through
+    /// the immediate 404 for a hidden model), but unknown routes behind the
+    /// prefix stay closed.
+    #[tokio::test]
+    async fn olla_paths_route_like_plain_ones() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        state.backends.lock_or_recover()[0].available_models = Arc::new(set(&["llama3"]));
+        hide_models(&state, "llama3", vec![]);
+        let res = call(&state, "/olla/openai/v1/chat/completions", br#"{"model":"llama3"}"#).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let b = axum::body::to_bytes(res.into_body(), usize::MAX).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&b).expect("json");
+        assert_eq!(v["error"]["code"], "model_not_found", "routed as /v1/chat/completions");
+
+        let res = call(&state, "/olla/proxy/admin/models", b"").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(state.queues.lock_or_recover().is_empty());
+    }
+
+    /// An alias is resolved before routing: the backend receives the target
+    /// model name, and the rest of the body is untouched.
+    #[tokio::test]
+    async fn model_alias_rewrites_the_request() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        let aliases: std::collections::BTreeMap<String, String> =
+            [("Codex-Auto-Review".to_string(), "llama3".to_string())].into_iter().collect();
+        state.set_model_aliases(Some(&aliases));
+
+        let out = state.apply_model_alias(Bytes::from_static(
+            br#"{"model":"codex-auto-review","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        ));
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(v["model"], "llama3");
+        assert_eq!(v["messages"][0]["content"], "hi");
+        assert_eq!(v["stream"], true);
+
+        // Not an alias: the exact bytes pass through.
+        let body = Bytes::from_static(br#"{"model":"phi4",  "x":1}"#);
+        assert_eq!(state.apply_model_alias(body.clone()), body);
+    }
+
+    /// Without a key or X-User-ID a request is `ip-<address>`; with
+    /// `ip_identity` off it shares `anonymous`.
+    #[tokio::test]
+    async fn ip_identity_for_unidentified_requests() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        state.backends.lock_or_recover()[0].available_models = Arc::new(set(&["llama3"]));
+        hide_models(&state, "llama3", vec![]);
+        let _ = call(&state, "/api/chat", br#"{"model":"llama3"}"#).await;
+        state
+            .ip_identity
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = call(&state, "/api/chat", br#"{"model":"llama3"}"#).await;
+        let text = crate::metrics::render(&state);
+        assert!(text.contains(r#"client="ip-127.0.0.1",model="llama3",endpoint="/api/chat",outcome="hidden_model"} 1"#), "{text}");
+        assert!(text.contains(r#"client="anonymous",model="llama3",endpoint="/api/chat",outcome="hidden_model"} 1"#), "{text}");
     }
 
     // -- Scheduler-tier integration tests ------------------------------------

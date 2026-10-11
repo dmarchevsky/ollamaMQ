@@ -367,6 +367,14 @@ async fn main() {
         }
     }
 
+    state.set_model_aliases(file_cfg.settings.model_aliases.as_ref());
+    if !state.model_aliases.lock_or_recover().is_empty() {
+        info!("{} model alias(es) loaded", state.model_aliases.lock_or_recover().len());
+    }
+    state.ip_identity.store(
+        file_cfg.settings.ip_identity.unwrap_or(true),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let detect_slots = file_cfg.settings.detect_backend_slots.unwrap_or(true);
     state
         .detect_slots
@@ -458,6 +466,9 @@ async fn main() {
         // every other proxy route — the body is never parsed — and the route
         // table routes it to a System One backend and nowhere else.
         .route("/v1/systemone", any(proxy_handler))
+        // Olla-style prefixes (`proxy_handler` strips them).
+        .route("/olla/openai/{*rest}", any(proxy_handler))
+        .route("/olla/proxy/{*rest}", any(proxy_handler))
         // Local admin API (model load/unload control) — never proxied to
         // backends, protected by the same optional API-key auth.
         .route("/admin/models", get(admin_models_state))

@@ -1102,7 +1102,9 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
 /// Returns the number of model entries in the new config. (Backends and
 /// settings from the file are only read at startup.)
 pub fn reload_model_config(state: &Arc<AppState>) -> Result<usize, String> {
-    let configs = crate::config::load_config(&state.model_config_path)?.models;
+    let cfg = crate::config::load_config(&state.model_config_path)?;
+    state.set_model_aliases(cfg.settings.model_aliases.as_ref());
+    let configs = cfg.models;
     let n = configs.len();
     *state.model_limits.lock_or_recover() = crate::dispatcher::build_model_limits(&configs);
     *state.model_config.lock_or_recover() = configs;

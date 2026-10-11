@@ -67,6 +67,16 @@ pub struct Settings {
     /// `max_concurrent_requests` may then use all of those slots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect_backend_slots: Option<bool>,
+    /// Model name aliases: a request for the key (any case) is served as the
+    /// value, e.g. `codex-auto-review: Qwen3.8-Flash-Next`. Applied before
+    /// routing, the model policy and metrics; reloaded with the config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_aliases: Option<std::collections::BTreeMap<String, String>>,
+    /// Identify requests that carry neither a client key nor `X-User-ID` by
+    /// their address, as `ip-<address>` (default true). False: they all
+    /// share the `anonymous` queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_identity: Option<bool>,
     /// Path of the size-rotated request log file (default
     /// "ollamamq-requests.jsonl" in the working directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
