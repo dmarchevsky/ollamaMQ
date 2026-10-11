@@ -146,6 +146,11 @@ async function api(method, path, body) {
     opts.body = JSON.stringify(body);
   }
   const res = await fetch('api/' + path, opts);
+  if (res.status === 401) {
+    // Session expired or signed out elsewhere: sign in, then come back here.
+    location.href = 'login?next=' + encodeURIComponent(location.pathname + location.hash);
+    throw new Error('sign in required');
+  }
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
@@ -837,6 +842,11 @@ const actions = {
   },
   'add-rule': () => addRuleDialog(),
   'del-rule': el => act('DELETE', `models/rules/${encodeURIComponent(el.dataset.id)}`, undefined, 'Rule removed'),
+  'logout': async () => {
+    if (DEMO) return toast('Demo mode: nothing to sign out of');
+    try { await api('POST', 'logout', {}); } catch { /* signed out anyway */ }
+    location.href = 'login';
+  },
   'nav-open': () => setNav(true),
   'nav-close': () => setNav(false),
   'edit-client': el => clientDialog(S.clients.find(c => c.name === el.dataset.name)),
@@ -943,6 +953,9 @@ function route() {
 window.addEventListener('hashchange', route);
 
 function start() {
+  if (!DEMO) {
+    api('GET', 'me').then(d => { $('#whoami').textContent = d.user ? `Signed in as ${d.user}` : ''; }).catch(() => {});
+  }
   route();
   setInterval(poll, POLL_MS);
 }

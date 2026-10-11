@@ -1,10 +1,13 @@
 //! Web UI at `/ui`: the TUI's functions in a browser, plus client and API-key
-//! management. Behind HTTP basic auth; off unless a password is configured.
+//! management. Off unless a password is configured.
 //!
-//! The page is static (embedded from `src/web/`) and talks to the JSON API
-//! under `/ui/api/`. Every mutating call must carry `X-OllamaMQ-UI: 1`: a
-//! custom header forces a CORS preflight, so another site cannot ride the
-//! browser's cached basic-auth credentials to change anything.
+//! Browsers sign in on `/ui/login` and get a session cookie (see
+//! [`crate::session`]); scripts may instead send the same user and password
+//! as HTTP basic auth. The page is static (embedded from `src/web/`) and
+//! talks to the JSON API under `/ui/api/`. Every mutating call must carry
+//! `X-OllamaMQ-UI: 1`: a custom header forces a CORS preflight, so another
+//! site cannot ride the browser's credentials to change anything (the
+//! cookie is also `SameSite=Strict`).
 
 use axum::{
     Json, Router,
@@ -33,6 +36,18 @@ const INDEX_HTML: &str = include_str!("web/index.html");
 const APP_JS: &str = include_str!("web/app.js");
 const APP_CSS: &str = include_str!("web/app.css");
 const DEMO_JS: &str = include_str!("web/demo.js");
+const LOGIN_HTML: &str = include_str!("web/login.html");
+const LOGIN_JS: &str = include_str!("web/login.js");
+
+/// Reachable without signing in: the login page and what it needs.
+const PUBLIC_PATHS: &[&str] = &[
+    "/ui",
+    "/ui/login",
+    "/ui/login.js",
+    "/ui/app.css",
+    "/ui/api/login",
+    "/ui/api/logout",
+];
 
 /// Upper bound on the logs one `/ui/api/logs` call returns (the ring buffer
 /// itself holds fewer).
@@ -44,16 +59,40 @@ const CSRF_HEADER: &str = "x-ollamamq-ui";
 const CSP: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; \
                    img-src 'self' data:; frame-ancestors 'none'";
 
-/// Basic-auth credentials for the web UI.
+/// The web UI's credentials (one admin user).
 #[derive(Clone)]
 pub struct WebAuth {
     pub username: String,
     pub password: String,
 }
 
-/// Routes for `/ui` and `/ui/api/*`, all behind basic auth.
+impl WebAuth {
+    fn check(&self, user: &str, pass: &str) -> bool {
+        // Evaluate both so the response time does not reveal which one failed.
+        let user_ok = constant_time_eq(user, &self.username);
+        let pass_ok = constant_time_eq(pass, &self.password);
+        user_ok & pass_ok
+    }
+}
+
+struct AuthState {
+    creds: WebAuth,
+    sessions: crate::session::Sessions,
+    limiter: crate::session::LoginLimiter,
+}
+
+/// Routes for `/ui` and `/ui/api/*`; all but the login page need a session
+/// (or basic-auth credentials).
 pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
+    let auth = Arc::new(AuthState {
+        creds: auth,
+        sessions: Default::default(),
+        limiter: Default::default(),
+    });
     let api = Router::new()
+        .route("/login", post(login))
+        .route("/logout", post(logout))
+        .route("/me", get(me))
         .route("/state", get(get_state))
         .route("/logs", get(list_logs))
         .route("/logs/{seq}", get(get_log))
@@ -100,9 +139,19 @@ pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
             "/ui/demo.js",
             get(|| async { asset(DEMO_JS, "text/javascript; charset=utf-8") }),
         )
+        .route(
+            "/ui/login",
+            get(|| async { asset(LOGIN_HTML, "text/html; charset=utf-8") }),
+        )
+        .route(
+            "/ui/login.js",
+            get(|| async { asset(LOGIN_JS, "text/javascript; charset=utf-8") }),
+        )
         .nest("/ui/api", api)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
-        .layer(middleware::from_fn_with_state(Arc::new(auth), basic_auth))
+        .layer(middleware::from_fn_with_state(auth.clone(), require_auth))
+        .layer(axum::Extension(auth))
+        .layer(middleware::from_fn(security_headers))
 }
 
 fn asset(body: &'static str, content_type: &'static str) -> Response {
@@ -118,24 +167,53 @@ fn asset(body: &'static str, content_type: &'static str) -> Response {
 
 // ------------------------------------------------------------------ guards
 
-async fn basic_auth(State(auth): State<Arc<WebAuth>>, request: Request, next: Next) -> Response {
-    let ok = basic_credentials(request.headers()).is_some_and(|(user, pass)| {
-        // Evaluate both so the response time does not reveal which one failed.
-        let user_ok = constant_time_eq(&user, &auth.username);
-        let pass_ok = constant_time_eq(&pass, &auth.password);
-        user_ok & pass_ok
-    });
-    if !ok {
-        return Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header(
-                header::WWW_AUTHENTICATE,
-                "Basic realm=\"ollamaMQ\", charset=\"UTF-8\"",
-            )
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from("{\"error\":\"unauthorized\"}"))
-            .unwrap();
+/// The signed-in user: a live session cookie, or basic-auth credentials
+/// (for scripts).
+fn authenticated(auth: &AuthState, headers: &axum::http::HeaderMap) -> Option<String> {
+    let cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| crate::session::cookie_value(c, crate::session::COOKIE));
+    if let Some(user) = cookie.and_then(|t| auth.sessions.user(t)) {
+        return Some(user);
     }
+    basic_credentials(headers)
+        .filter(|(u, p)| auth.creds.check(u, p))
+        .map(|(u, _)| u)
+}
+
+async fn require_auth(
+    State(auth): State<Arc<AuthState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if PUBLIC_PATHS.contains(&path) || authenticated(&auth, request.headers()).is_some() {
+        return next.run(request).await;
+    }
+    // API callers get a plain 401 (no `WWW-Authenticate`, so browsers never
+    // pop their own credentials dialog); pages go to the sign-in form and
+    // come back afterwards.
+    if path.starts_with("/ui/api/") {
+        return ApiError::new(StatusCode::UNAUTHORIZED, "sign in required").into_response();
+    }
+    let back: String = url_escape(path);
+    Redirect::to(&format!("/ui/login?next={back}")).into_response()
+}
+
+/// Percent-encode a path for a query value (what `encodeURIComponent` does).
+fn url_escape(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+async fn security_headers(request: Request, next: Next) -> Response {
     let mut res = next.run(request).await;
     let h = res.headers_mut();
     h.insert(
@@ -708,6 +786,93 @@ async fn delete_key(
     ok()
 }
 
+// ------------------------------------------------------------- sign-in
+
+#[derive(Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+fn session_cookie(token: &str, max_age: u64, secure: bool) -> String {
+    format!(
+        "{}={token}; Path=/ui; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        crate::session::COOKIE,
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+/// Served over HTTPS (directly or behind a TLS-terminating proxy): only
+/// then may the cookie be marked `Secure`.
+fn is_https(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("https"))
+}
+
+async fn login(
+    axum::Extension(auth): axum::Extension<Arc<AuthState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<LoginBody>,
+) -> Response {
+    if let Some(secs) = auth.limiter.locked_for() {
+        warn!("web: sign-in refused, too many failed attempts");
+        return ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("too many failed sign-ins; try again in {secs}s"),
+        )
+        .into_response();
+    }
+    if !auth.creds.check(&body.username, &body.password) {
+        auth.limiter.fail();
+        warn!("web: failed sign-in for user '{}'", body.username);
+        return ApiError::new(StatusCode::UNAUTHORIZED, "wrong user name or password")
+            .into_response();
+    }
+    auth.limiter.succeed();
+    let token = auth.sessions.create(&body.username);
+    info!("web: '{}' signed in", body.username);
+    let cookie = session_cookie(
+        &token,
+        crate::session::SESSION_TTL.as_secs(),
+        is_https(&headers),
+    );
+    (
+        [(header::SET_COOKIE, cookie)],
+        Json(json!({ "user": body.username })),
+    )
+        .into_response()
+}
+
+async fn logout(
+    axum::Extension(auth): axum::Extension<Arc<AuthState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(token) = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| crate::session::cookie_value(c, crate::session::COOKIE))
+    {
+        auth.sessions.remove(token);
+    }
+    (
+        [(
+            header::SET_COOKIE,
+            session_cookie("", 0, is_https(&headers)),
+        )],
+        Json(json!({})),
+    )
+        .into_response()
+}
+
+async fn me(
+    axum::Extension(auth): axum::Extension<Arc<AuthState>>,
+    headers: axum::http::HeaderMap,
+) -> Json<serde_json::Value> {
+    Json(json!({ "user": authenticated(&auth, &headers) }))
+}
+
 // ------------------------------------------------------------ model policy
 
 #[derive(Serialize)]
@@ -885,48 +1050,105 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_auth_guards_everything() {
+    async fn sign_in_flow() {
         let base = serve(test_state()).await;
         let c = http();
+        let post_json = |path: &str, body: serde_json::Value, cookie: Option<&str>| {
+            let mut r = c
+                .post(format!("{base}/ui/api/{path}"))
+                .header("X-OllamaMQ-UI", "1")
+                .json(&body);
+            if let Some(ck) = cookie {
+                r = r.header(header::COOKIE, ck);
+            }
+            r.send()
+        };
 
+        // Pages redirect to the sign-in form; API calls get a bare 401 (no
+        // `WWW-Authenticate`, so browsers show no credentials dialog).
         let res = c.get(format!("{base}/ui/")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(res.headers()[header::LOCATION], "/ui/login?next=%2Fui%2F");
+        let res = c.get(format!("{base}/ui/api/state")).send().await.unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
+
+        // The sign-in page and its assets are public, with security headers.
+        let res = c.get(format!("{base}/ui/login")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get(header::CONTENT_SECURITY_POLICY).is_some());
+        assert!(res.text().await.unwrap().contains("Sign in"));
+        for asset in ["login.js", "app.css"] {
+            let res = c.get(format!("{base}/ui/{asset}")).send().await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{asset}");
+        }
+
+        // Wrong password, then the right one: a session cookie.
+        let res = post_json(
+            "login",
+            json!({"username": "admin", "password": "nope"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = post_json(
+            "login",
+            json!({"username": "admin", "password": "pw"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let set = res.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(
-            res.headers()[header::WWW_AUTHENTICATE]
-                .to_str()
-                .unwrap()
-                .starts_with("Basic ")
+            set.contains("HttpOnly") && set.contains("SameSite=Strict") && set.contains("Path=/ui")
         );
-        let res = c
-            .get(format!("{base}/ui/api/state"))
-            .basic_auth("admin", Some("wrong"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(!set.contains("Secure"), "plain http: no Secure flag");
+        let cookie = set.split(';').next().unwrap().to_string();
 
         let res = c
             .get(format!("{base}/ui/"))
-            .basic_auth("admin", Some("pw"))
+            .header(header::COOKIE, &cookie)
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        assert!(
-            res.headers()[header::CONTENT_SECURITY_POLICY]
-                .to_str()
-                .is_ok()
-        );
-        assert!(res.text().await.unwrap().contains("ollamaMQ"));
+        let me: serde_json::Value = c
+            .get(format!("{base}/ui/api/me"))
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(me["user"], "admin");
 
+        // Login also needs the UI header (no cross-site sign-in).
         let res = c
-            .get(format!("{base}/ui"))
-            .basic_auth("admin", Some("pw"))
+            .post(format!("{base}/ui/api/login"))
+            .json(&json!({"username": "admin", "password": "pw"}))
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
+        // Signing out ends the session.
+        let res = post_json("logout", json!({}), Some(&cookie)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = c
+            .get(format!("{base}/ui/api/state"))
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Scripts can still use basic auth with the same credentials.
         let res = c
             .get(format!("{base}/ui/api/state"))
             .basic_auth("admin", Some("pw"))
@@ -936,6 +1158,29 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let v: serde_json::Value = res.json().await.unwrap();
         assert_eq!(v["backends"][0]["url"], "http://127.0.0.1:9");
+    }
+
+    #[tokio::test]
+    async fn sign_in_is_rate_limited() {
+        let base = serve(test_state()).await;
+        let c = http();
+        let try_login = |pw: &'static str| {
+            c.post(format!("{base}/ui/api/login"))
+                .header("X-OllamaMQ-UI", "1")
+                .json(&json!({"username": "admin", "password": pw}))
+                .send()
+        };
+        for _ in 0..10 {
+            assert_eq!(
+                try_login("bad").await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        // Locked: even the right password is refused for now.
+        assert_eq!(
+            try_login("pw").await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[tokio::test]

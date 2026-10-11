@@ -432,3 +432,22 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 
 .rules-h { margin-top: 18px; }
 .rules-inactive { opacity: .55; }
+
+/* --- Sign-in --- */
+.whoami { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; color: var(--faint); font-size: 12px; }
+.whoami #whoami:empty { display: none; }
+.signout { color: var(--nav-text); font-size: 12px; text-align: left; }
+.signout:hover { color: #fff; text-decoration: underline; }
+.login-body { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--bg); padding: 16px; }
+.login-wrap { width: 100%; max-width: 380px; }
+.login-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: 0 10px 40px rgba(16, 24, 40, .10); padding: 28px 26px 22px;
+}
+.login-brand { font-weight: 700; font-size: 17px; margin-bottom: 18px; }
+.login-card h1 { font-size: 22px; margin: 0 0 18px; }
+.login-card label { display: block; font-size: 12.5px; font-weight: 600; color: var(--muted); margin-bottom: 14px; }
+.login-card input { display: block; width: 100%; margin-top: 6px; font-size: 15px; padding: 9px 12px; font-weight: 400; }
+.login-submit { width: 100%; padding: 10px; font-size: 15px; margin-top: 4px; }
+.login-error { background: var(--bad-soft); color: var(--bad); border-radius: 8px; padding: 9px 12px; font-size: 13px; margin-bottom: 12px; }
+.login-note { color: var(--faint); font-size: 12px; text-align: center; margin: 14px 0 0; }

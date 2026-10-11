@@ -25,7 +25,7 @@
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
 - **Prometheus Metrics**: `GET /metrics` reports requests, outcomes, tokens, bytes and latency **per client and per model**, plus live queue and backend state.
-- **Web UI**: Everything the TUI does, in a browser at `/ui` behind basic auth — plus management of clients and their API keys.
+- **Web UI**: Everything the TUI does, in a browser at `/ui` behind a sign-in page — plus management of clients and their API keys.
 - **Clients & API Keys**: Give each client one or more keys (generated or any string you choose). A request with a client key queues under the client's name, so a key holder can't hop queues by changing `X-User-ID`.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
 - **Async Architecture**: Built on `tokio` and `axum` for high concurrency.
@@ -320,8 +320,8 @@ settings:
   models_file: models.json     # model filter rules, managed from the web UI (default shown)
   metrics_token: ""            # bearer token for GET /metrics; empty = open (default)
   web_ui:                      # web UI at /ui; off unless a password is set (here or in OLLAMA_MQ_UI_PASSWORD)
-    username: admin            # basic-auth user (default admin)
-    password: change-me        # basic-auth password
+    username: admin            # sign-in user (default admin)
+    password: change-me        # sign-in password
 
 # --- Models to load on startup / reload, via the model-control logic
 models:
@@ -430,9 +430,9 @@ The Dockerfile uses a multi-stage build:
 | `HOST`        | Host/interface to bind to      | `0.0.0.0`                |
 | `TIMEOUT`     | Request timeout in seconds     | `300`                    |
 | `OLLAMA_MQ_API_KEY` | Optional API key; enables auth when set | *(unset — auth disabled)* |
-| `OLLAMA_MQ_UI_USER` | Web UI basic-auth user (overrides `settings.web_ui.username`) | `admin` |
+| `OLLAMA_MQ_UI_USER` | Web UI sign-in user (overrides `settings.web_ui.username`) | `admin` |
 | `OLLAMA_MQ_METRICS_TOKEN` | Bearer token required by `GET /metrics` (overrides `settings.metrics_token`) | *(unset — open)* |
-| `OLLAMA_MQ_UI_PASSWORD` | Web UI basic-auth password (overrides `settings.web_ui.password`); enables the web UI | *(unset — web UI off)* |
+| `OLLAMA_MQ_UI_PASSWORD` | Web UI sign-in password (overrides `settings.web_ui.password`); enables the web UI | *(unset — web UI off)* |
 
 ### 🔒 Security (Optional API-Key Auth)
 
@@ -478,7 +478,7 @@ Set a password and open `http://<host>:11435/ui/`:
 OLLAMA_MQ_UI_PASSWORD=change-me ollamaMQ --no-tui     # user defaults to "admin"
 ```
 
-The web UI is **off** unless a password is configured (`OLLAMA_MQ_UI_PASSWORD`, or `settings.web_ui.password` in `appconf.yaml`). It sits behind HTTP basic auth, independent of `OLLAMA_MQ_API_KEY`. Basic auth sends the password with every request, so put the UI behind TLS (a reverse proxy) when it is reachable from beyond a trusted network.
+The web UI is **off** unless a password is configured (`OLLAMA_MQ_UI_PASSWORD`, or `settings.web_ui.password` in `appconf.yaml`). Browsers sign in on `/ui/login`, which sets a session cookie (`HttpOnly`, `SameSite=Strict`, `Secure` when the proxy in front sends `X-Forwarded-Proto: https`) valid for 7 days; **Sign out** is in the sidebar. Sessions are kept in memory, so restarting ollamaMQ signs everyone out. After 10 failed sign-ins within 10 minutes further attempts get `429` until the window passes. Scripts can skip the page and send the same user and password as HTTP basic auth to `/ui/api/*`. This is all independent of `OLLAMA_MQ_API_KEY`. The password crosses the network at sign-in, so put the UI behind TLS (a reverse proxy) when it is reachable from beyond a trusted network.
 
 It covers everything the TUI does:
 

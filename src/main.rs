@@ -22,6 +22,7 @@ mod lock;
 mod metrics;
 mod model_policy;
 mod reqlog;
+mod session;
 mod snapshot;
 mod tui;
 mod web;
