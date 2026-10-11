@@ -86,6 +86,9 @@ pub struct ClientView {
 pub struct Resolved {
     pub client: String,
     pub disabled: bool,
+    /// The key that matched (id and label; for metrics, never the secret).
+    pub key_id: String,
+    pub key_label: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -216,13 +219,18 @@ impl ClientStore {
         for c in &self.clients {
             for k in &c.keys {
                 if constant_time_eq(&k.key, key) && found.is_none() {
-                    found = Some((k.id.clone(), c.name.clone(), c.disabled));
+                    found = Some((k.id.clone(), k.label.clone(), c.name.clone(), c.disabled));
                 }
             }
         }
-        let (id, client, disabled) = found?;
-        self.last_used.insert(id, now_ms());
-        Some(Resolved { client, disabled })
+        let (key_id, key_label, client, disabled) = found?;
+        self.last_used.insert(key_id.clone(), now_ms());
+        Some(Resolved {
+            client,
+            disabled,
+            key_id,
+            key_label,
+        })
     }
 
     pub fn list(&self) -> Vec<ClientView> {

@@ -96,6 +96,10 @@ pub struct Settings {
     /// working directory). Managed from the web UI's Models page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_file: Option<String>,
+    /// Bearer token required by `GET /metrics`. Unset (the default) leaves
+    /// the endpoint open, like `/health`. `OLLAMA_MQ_METRICS_TOKEN` overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_token: Option<String>,
     /// Web UI at `/ui`, behind HTTP basic auth. Disabled unless a password is
     /// set here or in `OLLAMA_MQ_UI_PASSWORD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

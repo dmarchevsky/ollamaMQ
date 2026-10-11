@@ -723,6 +723,8 @@ pub struct AppState {
     /// in memory; `main` swaps in the store loaded from `models_file`. A leaf
     /// lock: nothing is acquired while it is held.
     pub model_policy: Mutex<crate::model_policy::ModelPolicyStore>,
+    /// Prometheus counters and histograms (see [`crate::metrics`]).
+    pub metrics: crate::metrics::Metrics,
     /// Events evicted from the front of `logs` so far. The event at index `i`
     /// of the ring has the stable sequence number `logs_evicted + i`, which
     /// the web UI uses to fetch one event's full content.
@@ -778,7 +780,7 @@ impl FairShare {
     }
 
     /// The score as of `now`, after decay. Cheap and side-effect free.
-    fn value_at(&self, now: std::time::Instant) -> f64 {
+    pub(crate) fn value_at(&self, now: std::time::Instant) -> f64 {
         let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
         self.score * 0.5f64.powf(elapsed / FAIR_SHARE_HALF_LIFE.as_secs_f64())
     }
@@ -911,6 +913,7 @@ impl AppState {
             queued_bytes: std::sync::atomic::AtomicU64::new(0),
             clients: Mutex::new(crate::clients::ClientStore::in_memory()),
             model_policy: Mutex::new(crate::model_policy::ModelPolicyStore::in_memory()),
+            metrics: crate::metrics::Metrics::new(),
             logs_evicted: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1070,6 +1073,11 @@ impl AppState {
 
     pub fn is_ip_blocked(&self, ip: &IpAddr) -> bool {
         self.blocked_ips.lock_or_recover().contains(ip)
+    }
+
+    /// The `model` metric label for a request (see [`model_label_in`]).
+    pub fn model_label(&self, requested: Option<&str>) -> String {
+        model_label_in(&self.backends.lock_or_recover(), requested)
     }
 
     /// The current model policy, without holding its lock afterwards.
@@ -1353,6 +1361,54 @@ fn name_matches_listed(requested: &str, listed: &str) -> bool {
 /// tag/quant normalization.
 fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
     available.iter().any(|m| name_matches_listed(requested, m))
+}
+
+/// The `endpoint` metric label: the route template `path` belongs to, so
+/// path parameters (blob digests, model ids) never become label values.
+pub fn route_template(path: &str) -> &'static str {
+    const ROUTES: &[&str] = &[
+        "/",
+        "/api/generate",
+        "/api/chat",
+        "/api/embed",
+        "/api/embeddings",
+        "/api/tags",
+        "/api/show",
+        "/api/create",
+        "/api/copy",
+        "/api/delete",
+        "/api/pull",
+        "/api/push",
+        "/api/ps",
+        "/api/version",
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/embeddings",
+        "/v1/models",
+        "/v1/systemone",
+    ];
+    if let Some(r) = ROUTES.iter().find(|r| **r == path) {
+        return r;
+    }
+    if path.starts_with("/api/blobs/") {
+        return "/api/blobs/{digest}";
+    }
+    if path.starts_with("/v1/models/") {
+        return "/v1/models/{model}";
+    }
+    "other"
+}
+
+/// The `model` metric label: the requested name when some backend lists it,
+/// `unknown` for names none does (typos, probes — clients choose these, so
+/// they must not become label values), `none` for model-less requests.
+/// Takes the backend list so callers already holding its lock can use it.
+pub fn model_label_in(backends: &[BackendStatus], requested: Option<&str>) -> String {
+    match requested {
+        None => "none".to_string(),
+        Some(m) if backends.iter().any(|b| model_routable(m, &b.available_models)) => m.to_string(),
+        Some(_) => "unknown".to_string(),
+    }
 }
 
 /// `404` for a hidden model, in the error shape of the API family the path
@@ -2119,6 +2175,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 let mut dropped_counts = state.dropped_counts.lock_or_recover();
                                 *dropped_counts.entry(user_id.clone()).or_insert(0) += 1;
                                 drop(dropped_counts);
+                                state.metrics.inc(
+                                    &crate::metrics::REQUESTS,
+                                    &[
+                                        user_id,
+                                        &model_label_in(&backends, dropped.requested_model.as_deref()),
+                                        route_template(&dropped.path),
+                                        "timeout",
+                                    ],
+                                    1.0,
+                                );
                                 state.log_event(LogEvent {
                                     at: std::time::SystemTime::now(),
                                     dir: "OUT",
@@ -2272,6 +2338,23 @@ pub async fn run_worker(state: Arc<AppState>) {
                 tokio::spawn(async move {
                     let log_model = task.requested_model.clone();
                     let route_families = families_for_route(&task.method, &task.path);
+                    // Metric labels, fixed for the request's lifetime.
+                    let m_model = state_clone.model_label(task.requested_model.as_deref());
+                    let m_endpoint = route_template(&task.path);
+                    let m_backend = crate::metrics::backend_label(&backend_url);
+                    let metrics = &state_clone.metrics;
+                    let outcome = |o: &str| {
+                        metrics.inc(
+                            &crate::metrics::REQUESTS,
+                            &[&user_id, &m_model, m_endpoint, o],
+                            1.0,
+                        );
+                    };
+                    metrics.observe(
+                        &crate::metrics::QUEUE_WAIT,
+                        &[&user_id, &m_model],
+                        task.queued_at.elapsed().as_secs_f64(),
+                    );
                     let log_out = |info: String,
                                    backend: Option<String>,
                                    content: Option<Arc<String>>| {
@@ -2307,6 +2390,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                         let mut dropped = state_clone.dropped_counts.lock_or_recover();
                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
                         log_out("dropped (blocked)".into(), Some(backend_url.clone()), None);
+                        outcome("blocked");
                     } else {
                         {
                             let mut processing = state_clone.processing_counts.lock_or_recover();
@@ -2318,6 +2402,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                         // total_bytes keeps counting).
                         let mut total_bytes: u64 = 0;
                         let mut content_acc: Vec<u8> = Vec::new();
+                        // The end of the body, where token usage is reported.
+                        let mut tail: Vec<u8> = Vec::new();
+                        let started = std::time::Instant::now();
                         // `task.method`/`task.path` are moved into the request
                         // builder below; capture strings for log records.
                         let method_str = task.method.to_string();
@@ -2361,6 +2448,11 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         match chunk_res {
                                             Ok(chunk) => {
                                                 if first_prefix.is_none() {
+                                                    metrics.observe(
+                                                        &crate::metrics::TTFB,
+                                                        &[&m_model, &m_backend],
+                                                        started.elapsed().as_secs_f64(),
+                                                    );
                                                     let n = chunk.len().min(512);
                                                     first_prefix = Some(
                                                         String::from_utf8_lossy(&chunk[..n])
@@ -2369,6 +2461,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 }
                                                 let n = chunk.len();
                                                 total_bytes += n as u64;
+                                                crate::metrics::push_tail(&mut tail, &chunk);
                                                 if content_acc.len() < state_clone.log_content_limit
                                                 {
                                                     let room = state_clone.log_content_limit
@@ -2401,6 +2494,34 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         route_families,
                                         is_endpoint_rejection(status, &prefix),
                                     );
+
+                                    metrics.inc(
+                                        &crate::metrics::BACKEND_RESPONSES,
+                                        &[&user_id, &m_model, &m_backend, status.as_str()],
+                                        1.0,
+                                    );
+                                    metrics.inc(
+                                        &crate::metrics::RESPONSE_BYTES,
+                                        &[&user_id, &m_model, &m_backend],
+                                        total_bytes as f64,
+                                    );
+                                    metrics.observe(
+                                        &crate::metrics::DURATION,
+                                        &[&m_model, &m_backend],
+                                        started.elapsed().as_secs_f64(),
+                                    );
+                                    if let Some((prompt, completion)) =
+                                        crate::metrics::parse_usage(&tail)
+                                    {
+                                        for (kind, n) in [("prompt", prompt), ("completion", completion)] {
+                                            metrics.inc(
+                                                &crate::metrics::TOKENS,
+                                                &[&user_id, &m_model, &m_backend, kind],
+                                                n as f64,
+                                            );
+                                        }
+                                    }
+                                    outcome(if client_disconnected { "client_gone" } else { "ok" });
 
                                     if !client_disconnected {
                                         delivered = true;
@@ -2443,6 +2564,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             None,
                                         );
                                     }
+                                } else {
+                                    outcome("client_gone");
                                 }
                             }
                             Err(e) => {
@@ -2468,6 +2591,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     Some(backend_url.clone()),
                                     Some(err_msg),
                                 );
+                                outcome("backend_error");
                             }
                         }
 
@@ -2545,9 +2669,25 @@ pub async fn proxy_handler(
                 .unwrap_or("anonymous"),
         ),
     };
+    // Metrics for requests refused before they are queued.
+    let endpoint = route_template(&path);
+    let refused = |outcome: &str| {
+        let model = state.model_label(extract_requested_model(&body).as_deref());
+        state.metrics.inc(
+            &crate::metrics::REQUESTS,
+            &[&user_id, &model, endpoint, outcome],
+            1.0,
+        );
+    };
     if let Some(c) = &client {
+        state.metrics.inc(
+            &crate::metrics::KEY_REQUESTS,
+            &[&c.client, &c.key_id, &c.key_label],
+            1.0,
+        );
         if c.disabled {
             warn!("Request with a key of disabled client: {} (IP: {})", user_id, ip);
+            refused("blocked");
             return (StatusCode::FORBIDDEN, "Client disabled").into_response();
         }
         // The key is a credential for ollamaMQ, not for the backend: drop it
@@ -2558,11 +2698,13 @@ pub async fn proxy_handler(
 
     if state.is_ip_blocked(&ip) {
         warn!("Blocked request from IP: {} for user: {}", ip, user_id);
+        refused("blocked");
         return (StatusCode::FORBIDDEN, "IP blocked").into_response();
     }
 
     if state.is_user_blocked(&user_id) {
         warn!("Blocked request from user: {} (IP: {})", user_id, ip);
+        refused("blocked");
         return (StatusCode::FORBIDDEN, "User blocked").into_response();
     }
 
@@ -2618,6 +2760,11 @@ pub async fn proxy_handler(
                 content: None,
             });
         }
+        state.metrics.inc(
+            &crate::metrics::REQUESTS,
+            &[&user_id, "none", endpoint, "ok"],
+            1.0,
+        );
         return response;
     }
 
@@ -2648,10 +2795,18 @@ pub async fn proxy_handler(
             info: "404 model hidden".to_string(),
             content: None,
         });
+        let label = state.model_label(Some(model));
+        state.metrics.inc(
+            &crate::metrics::REQUESTS,
+            &[&user_id, &label, endpoint, "hidden_model"],
+            1.0,
+        );
         return model_not_found(&path, model);
     }
 
     let task_method = method.as_str().to_string();
+    // Before the queues lock below: this takes the backends lock.
+    let model_label = state.model_label(requested_model.as_deref());
     // Request-log content is captured before `body` moves into the Task.
     let body_len = body.len() as u64;
     let content = Arc::new(crate::reqlog::truncate_utf8(&body, state.log_content_limit));
@@ -2692,6 +2847,11 @@ pub async fn proxy_handler(
                 info: format!("429 queue full ({} waiting)", MAX_QUEUED_PER_USER),
                 content: None,
             });
+            state.metrics.inc(
+                &crate::metrics::REQUESTS,
+                &[&user_id, &model_label, endpoint, "queue_full"],
+                1.0,
+            );
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 axum::Json(serde_json::json!({
@@ -2728,6 +2888,11 @@ pub async fn proxy_handler(
                 info: format!("503 queue memory full ({} B waiting)", queued_now),
                 content: None,
             });
+            state.metrics.inc(
+                &crate::metrics::REQUESTS,
+                &[&user_id, &model_label, endpoint, "overloaded"],
+                1.0,
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 axum::Json(serde_json::json!({
@@ -2741,6 +2906,11 @@ pub async fn proxy_handler(
             .queued_bytes
             .fetch_add(body_len, std::sync::atomic::Ordering::Relaxed);
     }
+    state.metrics.inc(
+        &crate::metrics::REQUEST_BYTES,
+        &[&user_id, &model_label],
+        body_len as f64,
+    );
 
     state.reqlog.log(crate::reqlog::ReqRecord {
         ts: crate::reqlog::now_unix_millis(),
@@ -3927,6 +4097,11 @@ mod tests {
         assert_eq!(json(res).await["error"], "model 'llama3:latest' not found");
 
         assert!(state.queues.lock_or_recover().is_empty(), "nothing was queued");
+        let text = crate::metrics::render(&state);
+        assert!(
+            text.contains(r#"ollamamq_requests_total{client="anonymous",model="llama3",endpoint="/v1/chat/completions",outcome="hidden_model"} 1"#),
+            "{text}"
+        );
         assert!(!state.model_blocked("phi4:14b"));
         // Not listed anywhere and not named by a rule: the normal path decides.
         assert!(!state.model_blocked("mistral"));
@@ -3985,6 +4160,74 @@ mod tests {
         hide_models(&state, "LLAMA*", vec![]);
         let res = aggregate_model_list(&state, "/api/tags").await.expect("listing");
         assert!(names(res).await.is_empty());
+    }
+
+    /// One request end to end: per-client/model counters, latency
+    /// histograms and token usage parsed from the backend's answer.
+    #[tokio::test]
+    async fn metrics_record_a_served_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route(
+                    "/api/tags",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({ "models": [{ "name": "llama3" }] }))
+                    }),
+                )
+                .route(
+                    "/api/chat",
+                    axum::routing::post(|| async {
+                        axum::Json(serde_json::json!({
+                            "message": { "content": "hi" },
+                            "done": true,
+                            "prompt_eval_count": 7,
+                            "eval_count": 9,
+                        }))
+                    }),
+                );
+            let _ = axum::serve(listener, app).await;
+        });
+        let state = new_test_state(vec![url.clone()]);
+        arm_ollama_backend(&state, None);
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-User-ID", "alice".parse().expect("header value"));
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proxy_handler(
+                State(state.clone()),
+                ConnectInfo("127.0.0.1:41030".parse().expect("addr")),
+                Method::POST,
+                headers,
+                axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+                Bytes::from_static(br#"{"model":"llama3","messages":[]}"#),
+            ),
+        )
+        .await
+        .expect("answered")
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(res.into_body(), usize::MAX).await;
+        wait_for_completion(&state, 0).await;
+        worker.abort();
+
+        let backend = crate::metrics::backend_label(&url);
+        let text = crate::metrics::render(&state);
+        for line in [
+            r#"ollamamq_requests_total{client="alice",model="llama3",endpoint="/api/chat",outcome="ok"} 1"#.to_string(),
+            format!(r#"ollamamq_backend_responses_total{{client="alice",model="llama3",backend="{backend}",code="200"}} 1"#),
+            format!(r#"ollamamq_tokens_total{{client="alice",model="llama3",backend="{backend}",kind="prompt"}} 7"#),
+            format!(r#"ollamamq_tokens_total{{client="alice",model="llama3",backend="{backend}",kind="completion"}} 9"#),
+            r#"ollamamq_request_bytes_total{client="alice",model="llama3"} 32"#.to_string(),
+            r#"ollamamq_queue_wait_seconds_count{client="alice",model="llama3"} 1"#.to_string(),
+            format!(r#"ollamamq_request_duration_seconds_count{{model="llama3",backend="{backend}"}} 1"#),
+            format!(r#"ollamamq_backend_up{{backend="{backend}",api_type="Ollama"}} 1"#),
+        ] {
+            assert!(text.contains(&line), "missing: {line}\n{text}");
+        }
     }
 
     // -- Scheduler-tier integration tests ------------------------------------

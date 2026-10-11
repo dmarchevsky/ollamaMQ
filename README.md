@@ -24,6 +24,7 @@
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
+- **Prometheus Metrics**: `GET /metrics` reports requests, outcomes, tokens, bytes and latency **per client and per model**, plus live queue and backend state.
 - **Web UI**: Everything the TUI does, in a browser at `/ui` behind basic auth — plus management of clients and their API keys.
 - **Clients & API Keys**: Give each client one or more keys (generated or any string you choose). A request with a client key queues under the client's name, so a key holder can't hop queues by changing `X-User-ID`.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
@@ -317,6 +318,7 @@ settings:
   log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
   clients_file: clients.json   # clients and their API keys, managed from the web UI (default shown)
   models_file: models.json     # model filter rules, managed from the web UI (default shown)
+  metrics_token: ""            # bearer token for GET /metrics; empty = open (default)
   web_ui:                      # web UI at /ui; off unless a password is set (here or in OLLAMA_MQ_UI_PASSWORD)
     username: admin            # basic-auth user (default admin)
     password: change-me        # basic-auth password
@@ -429,6 +431,7 @@ The Dockerfile uses a multi-stage build:
 | `TIMEOUT`     | Request timeout in seconds     | `300`                    |
 | `OLLAMA_MQ_API_KEY` | Optional API key; enables auth when set | *(unset — auth disabled)* |
 | `OLLAMA_MQ_UI_USER` | Web UI basic-auth user (overrides `settings.web_ui.username`) | `admin` |
+| `OLLAMA_MQ_METRICS_TOKEN` | Bearer token required by `GET /metrics` (overrides `settings.metrics_token`) | *(unset — open)* |
 | `OLLAMA_MQ_UI_PASSWORD` | Web UI basic-auth password (overrides `settings.web_ui.password`); enables the web UI | *(unset — web UI off)* |
 
 ### 🔒 Security (Optional API-Key Auth)
@@ -509,6 +512,48 @@ The **Models** page decides which models the proxy serves. Rules are case-insens
 - A rule limited to some backends hides the model there only; requests route to the backends that still serve it.
 - Model load/unload from the TUI or web UI still works on hidden models (to warm one before serving it). `/api/ps` is not filtered.
 - Rules are stored in `settings.models_file` (default `models.json`), written atomically. A file that exists but cannot be parsed stops the proxy at startup rather than serving everything.
+
+### 📈 Prometheus Metrics
+
+`GET /metrics` serves Prometheus text format. Like `/health` it is open by default; set `settings.metrics_token` (or `OLLAMA_MQ_METRICS_TOKEN`) to require `Authorization: Bearer <token>`.
+
+```yaml
+scrape_configs:
+  - job_name: ollamamq
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["ollamamq-host:11435"]
+    # authorization: { credentials: "<token>" }   # when metrics_token is set
+```
+
+**Labels:** `client` (registered client name, unregistered `X-User-ID`/`ip-…`, or `unverified:<name>`), `model` (as requested; `unknown` for names no backend lists, `none` for model-less requests), `backend` (`host:port`), `endpoint` (route template). `client` and `model` keep at most 200 distinct values each; beyond that they read `other`.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `ollamamq_requests_total` | counter | client, model, endpoint, outcome (`ok` `client_gone` `backend_error` `timeout` `blocked` `hidden_model` `queue_full` `overloaded`) |
+| `ollamamq_backend_responses_total` | counter | client, model, backend, code |
+| `ollamamq_tokens_total` | counter | client, model, backend, kind (`prompt` / `completion`) |
+| `ollamamq_request_bytes_total` / `ollamamq_response_bytes_total` | counter | client, model (, backend) |
+| `ollamamq_client_key_requests_total` | counter | client, key_id, key_label |
+| `ollamamq_queue_wait_seconds` | histogram | client, model |
+| `ollamamq_time_to_first_byte_seconds` / `ollamamq_request_duration_seconds` | histogram | model, backend |
+| `ollamamq_queue_depth`, `ollamamq_requests_in_flight`, `ollamamq_client_fair_share_score` | gauge | client |
+| `ollamamq_client_info` | gauge (=1) | client, registered, disabled, vip, boost |
+| `ollamamq_backend_up`, `ollamamq_backend_requests_in_flight`, `ollamamq_backend_max_concurrency`, `ollamamq_backend_models`, `ollamamq_model_loaded`, `ollamamq_backend_model_requests_in_flight` | gauge | backend (, api_type / state / model) |
+| `ollamamq_model_control_operations_total` | counter | backend, model, action, result |
+| `ollamamq_clients`, `ollamamq_blocked`, `ollamamq_model_policy_rules`, `ollamamq_model_policy_mode`, `ollamamq_queued_bytes`, `ollamamq_request_log_dropped_total`, `ollamamq_build_info`, `ollamamq_start_time_seconds` | various | — |
+
+**Tokens** are read from the end of each response: OpenAI/llama.cpp `usage`, Ollama `prompt_eval_count`/`eval_count`. Streamed OpenAI-style responses only carry usage when the client asks for it (`"stream_options": {"include_usage": true}`) or the server always sends it (recent llama.cpp); otherwise nothing is counted for that request.
+
+Useful queries:
+
+```promql
+sum by (client) (rate(ollamamq_requests_total{outcome="ok"}[5m]))          # requests/s per client
+sum by (model) (rate(ollamamq_tokens_total{kind="completion"}[5m]))         # generated tokens/s per model
+sum by (client, model) (increase(ollamamq_tokens_total[24h]))               # daily usage matrix
+histogram_quantile(0.95, sum by (le, client) (rate(ollamamq_queue_wait_seconds_bucket[5m])))
+sum by (outcome) (rate(ollamamq_requests_total{outcome!="ok"}[5m]))         # failures by kind
+```
 
 ### Port Configuration
 

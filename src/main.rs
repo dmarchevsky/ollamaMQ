@@ -19,6 +19,7 @@ mod config;
 mod control;
 mod dispatcher;
 mod lock;
+mod metrics;
 mod model_policy;
 mod reqlog;
 mod snapshot;
@@ -123,6 +124,28 @@ async fn auth_middleware(
     }
 }
 
+/// `GET /metrics`: Prometheus text format, behind an optional bearer token.
+fn metrics_handler(
+    state: Arc<AppState>,
+    headers: axum::http::HeaderMap,
+    token: Option<&str>,
+) -> Response {
+    if let Some(expected) = token {
+        let ok = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|t| auth::constant_time_eq(t.trim(), expected));
+        if !ok {
+            return unauthorized_response();
+        }
+    }
+    Response::builder()
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(axum::body::Body::from(metrics::render(&state)))
+        .unwrap()
+}
+
 /// Normalize a backend URL from the CLI or config: strip trailing slashes
 /// and add `http://` when no scheme is given.
 fn normalize_backend_url(url: String) -> String {
@@ -211,6 +234,8 @@ async fn main() {
     // Web UI credentials: env vars win over appconf.yaml; no password = off.
     let web_cfg = file_cfg.settings.web_ui.clone().unwrap_or_default();
     let env_nonempty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let metrics_token = env_nonempty("OLLAMA_MQ_METRICS_TOKEN")
+        .or(file_cfg.settings.metrics_token.clone().filter(|t| !t.is_empty()));
     let web_auth = env_nonempty("OLLAMA_MQ_UI_PASSWORD")
         .or(web_cfg.password.filter(|p| !p.is_empty()))
         .map(|password| web::WebAuth {
@@ -445,8 +470,22 @@ async fn main() {
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .with_state(state.clone());
 
+    if metrics_token.is_some() {
+        info!("/metrics requires a bearer token");
+    }
     let mut app = Router::new()
         .route("/health", get(|| async { "OK" }))
+        // Outside the API-key layer, like /health: Prometheus scrapes it
+        // with its own (optional) token.
+        .route(
+            "/metrics",
+            get(
+                move |State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap| {
+                    let token = metrics_token.clone();
+                    async move { metrics_handler(state, headers, token.as_deref()) }
+                },
+            ),
+        )
         .merge(app);
     // The web UI has its own (basic) auth, so it sits outside the API-key layer.
     match web_auth {
@@ -515,5 +554,46 @@ async fn tui_loop(tui_state: Arc<Mutex<TuiState>>, state: Arc<AppState>) {
         } else {
             toggle_notify.notified().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> Arc<AppState> {
+        Arc::new(AppState::new(
+            vec![("http://127.0.0.1:9".to_string(), None)],
+            5,
+            86400,
+            1,
+            1,
+            "appconf.yaml".into(),
+            Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        ))
+    }
+
+    #[test]
+    fn metrics_token_is_optional() {
+        let st = state();
+        let open = metrics_handler(st.clone(), axum::http::HeaderMap::new(), None);
+        assert_eq!(open.status(), StatusCode::OK);
+
+        let denied = metrics_handler(st.clone(), axum::http::HeaderMap::new(), Some("s3cret"));
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("authorization", "Bearer s3cret".parse().unwrap());
+        let ok = metrics_handler(st, h, Some("s3cret"));
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert!(
+            ok.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain; version=0.0.4")
+        );
     }
 }

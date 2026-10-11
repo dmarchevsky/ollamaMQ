@@ -1456,6 +1456,16 @@ pub fn start_model_control(
         {
             let mut ops = state.control_ops.lock_or_recover();
             ops.remove(&backend_idx);
+            state.metrics.inc(
+                &crate::metrics::CONTROL_OPS,
+                &[
+                    &crate::metrics::backend_label(&backend_url),
+                    &canonical,
+                    action.label(),
+                    if result.is_ok() { "ok" } else { "error" },
+                ],
+                1.0,
+            );
             let mut hist = state.control_history.lock_or_recover();
             hist.push_back(ControlResult {
                 backend_idx,
