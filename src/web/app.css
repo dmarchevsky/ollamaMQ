@@ -388,3 +388,47 @@ pre.content {
 }
 .detail-h h2 .mono { font-size: inherit; }
 .client-name .mono { font-size: 13px; }
+
+/* --- Models page --- */
+.models-split { grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr); }
+.panel-toolbar { display: flex; gap: 10px; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.panel-toolbar input { flex: 1; min-width: 160px; }
+.panel-toolbar .seg { margin: 0; }
+.chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.chip { font: 11.5px var(--mono); padding: 1px 7px; border-radius: 9px; background: var(--surface-2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+.chip.off { text-decoration: line-through; color: var(--bad); background: var(--bad-soft); border-color: transparent; }
+tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
+.model-hidden { opacity: .6; border-style: dashed; }
+.model-hidden .name { text-decoration: line-through; }
+.switch { position: relative; display: inline-block; width: 34px; height: 20px; cursor: pointer; vertical-align: middle; }
+.switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+.switch span { position: absolute; inset: 0; background: var(--border); border-radius: 10px; transition: background .15s; }
+.switch span::after { content: ''; position: absolute; left: 3px; top: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+.switch input:checked + span { background: var(--ok); }
+.switch input:checked + span::after { transform: translateX(14px); }
+.rule-preview { font-size: 12.5px; color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.rule-preview code { font-size: 12px; }
+@media (max-width: 1100px) { .models-split { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 720px) {
+  .panel-toolbar input { flex-basis: 100%; }
+  #page-models .page-tools .seg span { padding: 5px 8px; font-size: 12px; }
+}
+
+.rules { list-style: none; margin: 0; padding: 0; }
+.rules li { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.rules li:last-child { border-bottom: none; }
+.rule-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.rule-top .keyval { word-break: break-all; }
+.rule-meta { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; font-size: 12.5px; }
+@media (max-width: 720px) {
+  #model-list table tr:not(:has(> th)) { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+  #model-list table td { width: auto; }
+  #model-list table td:first-child { flex: 1 1 calc(100% - 60px); }
+  #model-list table td:nth-child(2) { order: 3; flex-basis: 100%; text-align: left; }
+  #model-list table td:nth-child(3) { order: 4; }
+  #model-list table td:last-child { order: 2; }
+  #model-list table td[data-label]::before { content: none; }
+}
+
+.rules-h { margin-top: 18px; }
+.rules-inactive { opacity: .55; }

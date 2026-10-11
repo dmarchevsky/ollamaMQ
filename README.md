@@ -316,6 +316,7 @@ settings:
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
   log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
   clients_file: clients.json   # clients and their API keys, managed from the web UI (default shown)
+  models_file: models.json     # model filter rules, managed from the web UI (default shown)
   web_ui:                      # web UI at /ui; off unless a password is set (here or in OLLAMA_MQ_UI_PASSWORD)
     username: admin            # basic-auth user (default admin)
     password: change-me        # basic-auth password
@@ -480,6 +481,7 @@ It covers everything the TUI does:
 
 - **Overview / Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload** (TUI `L` / `U`)
 - **Clients** — every queue identity with its queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock** (TUI `p` `b` `x` `X` `u`)
+- **Models** — every model the backends list, with a switch per model and filter rules (below)
 - **Blocked** — disabled clients, blocked ids and blocked IPs
 - **Logs** — recent requests with a filter; click a row for the full captured content
 - **Reload config** — re-read `appconf.yaml` (TUI `r`)
@@ -496,6 +498,17 @@ It also manages **clients and their API keys**. The Clients page lists two kinds
 - **VIP and boost on a registered client are saved** with it and restored at startup; on an unregistered id they last until restart.
 - **Renaming a client moves its live state** — queued requests, counters, last IP, fair-share position, VIP/boost — to the new name. Requests already being served finish under the old name. Deleting a client turns its name back into an ordinary id and clears its VIP/boost.
 - Keys are stored in plaintext in `settings.clients_file` (default `clients.json` in the working directory) so they can be looked up again; the file is written owner-only (`0600`). Changes are saved immediately (atomic replace). A clients file that exists but cannot be parsed stops the proxy at startup rather than being overwritten.
+
+#### Model filtering
+
+The **Models** page decides which models the proxy serves. Rules are case-insensitive globs (`*` any run of characters, `?` one character) matched against the model names backends list, for every backend or only some:
+
+- **Hide** rules always win. **Allow** rules matter only in *Serve only allowed* mode; the default mode, *Serve all except hidden*, serves every model no hide rule names. Switching modes is safe: rules of the other kind are kept and come back when you switch back.
+- A model's switch adds or removes an exact-name rule. A model still hidden by a pattern rule cannot be switched on from the list — remove or narrow the pattern.
+- Hidden models are left out of the merged `/v1/models` and `/api/tags`, and a request naming one (in the body, or the path of `/v1/models/{id}`) gets **`404 model not found`** at once, in OpenAI or Ollama error shape. Matching follows routing, so `llama3` cannot reach a hidden `llama3:latest`.
+- A rule limited to some backends hides the model there only; requests route to the backends that still serve it.
+- Model load/unload from the TUI or web UI still works on hidden models (to warm one before serving it). `/api/ps` is not filtered.
+- Rules are stored in `settings.models_file` (default `models.json`), written atomically. A file that exists but cannot be parsed stops the proxy at startup rather than serving everything.
 
 ### Port Configuration
 

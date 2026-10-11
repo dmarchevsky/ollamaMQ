@@ -74,6 +74,8 @@ pub struct StateSnapshot {
     pub logs: Vec<LogEvent>,
     pub active_ops: Vec<ActiveOpView>,
     pub recent_results: Vec<RecentResultView>,
+    /// Which models are served (to mark hidden ones).
+    pub model_policy: Arc<crate::model_policy::Policy>,
 }
 
 pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
@@ -169,5 +171,6 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
         logs,
         active_ops,
         recent_results,
+        model_policy: state.model_policy(),
     }
 }

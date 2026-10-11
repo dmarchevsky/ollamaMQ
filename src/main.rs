@@ -19,6 +19,7 @@ mod config;
 mod control;
 mod dispatcher;
 mod lock;
+mod model_policy;
 mod reqlog;
 mod snapshot;
 mod tui;
@@ -202,6 +203,11 @@ async fn main() {
         .clients_file
         .clone()
         .unwrap_or_else(|| clients::DEFAULT_CLIENTS_FILE.to_string());
+    let models_file = file_cfg
+        .settings
+        .models_file
+        .clone()
+        .unwrap_or_else(|| model_policy::DEFAULT_MODELS_FILE.to_string());
     // Web UI credentials: env vars win over appconf.yaml; no password = off.
     let web_cfg = file_cfg.settings.web_ui.clone().unwrap_or_default();
     let env_nonempty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
@@ -309,6 +315,25 @@ async fn main() {
             info!("Loaded {} client(s) from {}", store.len(), clients_file);
             *state.clients.lock_or_recover() = store;
             state.apply_client_store();
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // Same rule for the model policy: an unreadable file must not silently
+    // start serving every model the operator hid.
+    match model_policy::ModelPolicyStore::load(&models_file) {
+        Ok(store) => {
+            let p = store.snapshot();
+            info!(
+                "Loaded model policy from {} ({:?} mode, {} rule(s))",
+                models_file,
+                p.mode,
+                p.rules.len()
+            );
+            *state.model_policy.lock_or_recover() = store;
         }
         Err(e) => {
             eprintln!("Error: {e}");

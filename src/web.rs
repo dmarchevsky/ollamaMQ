@@ -26,6 +26,7 @@ use crate::clients::{ClientPatch, StoreError};
 use crate::control::{self, ControlAction, LoadOptions};
 use crate::dispatcher::AppState;
 use crate::lock::LockExt;
+use crate::model_policy::{Action, Mode, Rule};
 use crate::snapshot;
 
 const INDEX_HTML: &str = include_str!("web/index.html");
@@ -66,6 +67,14 @@ pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
             axum::routing::patch(update_client).delete(delete_client),
         )
         .route("/clients/{name}/keys", post(add_key))
+        .route("/models", get(get_models))
+        .route("/models/mode", axum::routing::put(set_model_mode))
+        .route("/models/rules", post(add_model_rule))
+        .route(
+            "/models/rules/{id}",
+            axum::routing::delete(delete_model_rule),
+        )
+        .route("/models/toggle", post(toggle_model))
         .route(
             "/keys/{id}",
             axum::routing::patch(move_key).delete(delete_key),
@@ -225,6 +234,8 @@ struct BackendView {
     current_model: Option<String>,
     models_available: Vec<String>,
     models_loaded: Vec<String>,
+    /// Listed models the model policy keeps this backend from serving.
+    models_hidden: Vec<String>,
     /// False when the backend cannot report what is resident (then every
     /// available model counts as ready).
     loaded_known: bool,
@@ -279,6 +290,7 @@ fn sorted(set: &HashSet<String>) -> Vec<String> {
 
 async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
     let snap = snapshot::capture(&state, 0);
+    let policy = state.model_policy();
 
     let backends = snap
         .backends
@@ -295,6 +307,16 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
             current_model: b.current_model.clone(),
             models_available: sorted(&b.available_models),
             models_loaded: sorted(&b.loaded_models),
+            models_hidden: {
+                let mut v: Vec<String> = b
+                    .available_models
+                    .iter()
+                    .filter(|m| !policy.served(m, &b.url))
+                    .cloned()
+                    .collect();
+                v.sort();
+                v
+            },
             loaded_known: b.loaded_state_known,
             loaded_ctx: b.loaded_ctx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             can_control: control::supports_control(b),
@@ -650,6 +672,141 @@ async fn delete_key(
     ok()
 }
 
+// ------------------------------------------------------------ model policy
+
+#[derive(Serialize)]
+struct RuleView {
+    #[serde(flatten)]
+    rule: Rule,
+    /// Distinct listed models the rule hits right now (within its scope).
+    matches: usize,
+}
+
+#[derive(Serialize)]
+struct ModelPolicyView {
+    mode: Mode,
+    rules: Vec<RuleView>,
+}
+
+async fn get_models(State(state): State<Arc<AppState>>) -> Json<ModelPolicyView> {
+    let policy = state.model_policy();
+    let listed: Vec<(String, Vec<String>)> = state
+        .backends
+        .lock_or_recover()
+        .iter()
+        .map(|b| (b.url.clone(), b.available_models.iter().cloned().collect()))
+        .collect();
+    let rules = policy
+        .rules
+        .iter()
+        .map(|r| {
+            let mut hit: HashSet<String> = HashSet::new();
+            for (url, models) in &listed {
+                if !r.backends.is_empty() && !r.backends.contains(url) {
+                    continue;
+                }
+                for m in models {
+                    if crate::model_policy::glob_match(&r.pattern, m) {
+                        hit.insert(m.to_lowercase());
+                    }
+                }
+            }
+            RuleView {
+                rule: r.clone(),
+                matches: hit.len(),
+            }
+        })
+        .collect();
+    Json(ModelPolicyView {
+        mode: policy.mode,
+        rules,
+    })
+}
+
+#[derive(Deserialize)]
+struct ModeBody {
+    mode: Mode,
+}
+
+async fn set_model_mode(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ModeBody>,
+) -> ApiResult<serde_json::Value> {
+    state.model_policy.lock_or_recover().set_mode(body.mode)?;
+    warn!("web: model policy mode set to {:?}", body.mode);
+    ok()
+}
+
+#[derive(Deserialize)]
+struct NewRule {
+    pattern: String,
+    action: Action,
+    #[serde(default)]
+    backends: Vec<String>,
+}
+
+async fn add_model_rule(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<NewRule>,
+) -> ApiResult<Rule> {
+    // Scope must name configured backends: a typo would make a rule that
+    // silently never applies.
+    {
+        let backends = state.backends.lock_or_recover();
+        if let Some(bad) = body
+            .backends
+            .iter()
+            .find(|u| !backends.iter().any(|b| &b.url == *u))
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("unknown backend '{bad}'"),
+            ));
+        }
+    }
+    let rule =
+        state
+            .model_policy
+            .lock_or_recover()
+            .add_rule(&body.pattern, body.action, body.backends)?;
+    info!(
+        "web: model rule {} added: {:?} '{}'",
+        rule.id, rule.action, rule.pattern
+    );
+    Ok(Json(rule))
+}
+
+async fn delete_model_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    state.model_policy.lock_or_recover().delete_rule(&id)?;
+    info!("web: model rule {} removed", id);
+    ok()
+}
+
+#[derive(Deserialize)]
+struct ToggleBody {
+    model: String,
+    served: bool,
+}
+
+async fn toggle_model(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ToggleBody>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .model_policy
+        .lock_or_recover()
+        .set_served(&body.model, body.served)?;
+    info!(
+        "web: model '{}' {}",
+        body.model,
+        if body.served { "served" } else { "hidden" }
+    );
+    ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,6 +1028,95 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(state.vip_user.lock_or_recover().as_deref(), Some("alice2"));
+    }
+
+    #[tokio::test]
+    async fn model_rules_api() {
+        let state = test_state();
+        state.backends.lock_or_recover()[0].available_models = Arc::new(
+            ["gemma3:27b", "llava:13b", "nomic-embed-text:latest"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let base = serve(state.clone()).await;
+        let c = http();
+        let send = |m: reqwest::Method, path: &str, body: serde_json::Value| {
+            c.request(m, format!("{base}/ui/api/{path}"))
+                .basic_auth("admin", Some("pw"))
+                .header("X-OllamaMQ-UI", "1")
+                .json(&body)
+                .send()
+        };
+        let get = |path: &str| {
+            c.get(format!("{base}/ui/api/{path}"))
+                .basic_auth("admin", Some("pw"))
+                .send()
+        };
+
+        let res = send(
+            reqwest::Method::POST,
+            "models/rules",
+            json!({"pattern": "*embed*", "action": "hide"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = send(
+            reqwest::Method::POST,
+            "models/rules",
+            json!({"pattern": "x", "action": "hide", "backends": ["http://nope:1"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let pol: serde_json::Value = get("models").await.unwrap().json().await.unwrap();
+        assert_eq!(pol["mode"], "deny");
+        assert_eq!(pol["rules"][0]["matches"], 1);
+
+        let res = send(
+            reqwest::Method::POST,
+            "models/toggle",
+            json!({"model": "llava:13b", "served": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let st: serde_json::Value = get("state").await.unwrap().json().await.unwrap();
+        assert_eq!(
+            st["backends"][0]["models_hidden"],
+            json!(["llava:13b", "nomic-embed-text:latest"])
+        );
+
+        // Allow mode with no allow rules: only the toggled-on model is served.
+        let res = send(
+            reqwest::Method::PUT,
+            "models/mode",
+            json!({"mode": "allow"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        send(
+            reqwest::Method::POST,
+            "models/toggle",
+            json!({"model": "gemma3:27b", "served": true}),
+        )
+        .await
+        .unwrap();
+        let p = state.model_policy();
+        assert!(p.served("gemma3:27b", "http://127.0.0.1:9"));
+        assert!(!p.served("llava:13b", "http://127.0.0.1:9"));
+        // A pattern hide rule cannot be switched off from one model.
+        let res = send(
+            reqwest::Method::POST,
+            "models/toggle",
+            json!({"model": "nomic-embed-text:latest", "served": true}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

@@ -22,6 +22,9 @@ const S = {
   revealed: new Set(),       // key ids shown unmasked
   selectedClient: null,
   clientFilter: 'all',       // all | registered | unregistered
+  modelPolicy: null,         // { mode, rules } from api/models
+  modelShow: 'all',          // all | served | hidden
+  modelQuery: "",
   online: true,
 };
 
@@ -164,14 +167,17 @@ async function poll() {
   try {
     const needLogs = S.page === 'logs' || S.page === 'overview';
     const needClients = S.page === 'clients' || !S.clients.length;
-    const [state, logs, clients] = await Promise.all([
+    const needModels = S.page === 'models' || !S.modelPolicy;
+    const [state, logs, clients, models] = await Promise.all([
       api('GET', 'state'),
       needLogs && !$('#log-pause').checked ? api('GET', `logs?limit=${LOG_LIMIT}`) : null,
       needClients ? api('GET', 'clients') : null,
+      needModels ? api('GET', 'models') : null,
     ]);
     S.state = state;
     if (logs) S.logs = logs;
     if (clients) S.clients = clients;
+    if (models) S.modelPolicy = models;
     S.online = true;
   } catch (e) {
     S.online = false;
@@ -193,6 +199,7 @@ function render() {
     overview: renderOverview,
     backends: renderBackends,
     clients: renderClients,
+    models: renderModels,
     blocked: renderBlocked,
     logs: renderLogs,
   })[S.page]?.(st);
@@ -214,6 +221,8 @@ function renderNav(st) {
   // Registered clients plus the unregistered ids currently tracked.
   const unregistered = st.users.filter(u => !u.registered).length;
   $('#nav-clients').textContent = (S.clients.length + unregistered) || '';
+  const hiddenModels = modelCatalog(st).filter(m => m.status !== 'served').length;
+  $('#nav-models').textContent = hiddenModels ? `${hiddenModels} hidden` : '';
   const nb = st.blocked.users.length + st.blocked.ips.length + st.blocked.clients.length;
   $('#nav-blocked').textContent = nb || '';
 }
@@ -279,6 +288,7 @@ function renderBackends(st) {
     const open = S.expanded.has(b.url);
     const pct = b.max ? Math.min(100, (b.active / b.max) * 100) : 0;
     const loaded = new Set(b.models_loaded);
+    const hiddenHere = new Set(b.models_hidden);
     let html = `<tr class="bk-row ${open ? 'open' : ''}" data-action="toggle-backend" data-url="${esc(b.url)}">
       <td><span class="caret">${open ? '▾' : '▸'}</span><span class="sdot ${b.online ? 'on' : 'off'}"></span><span class="bk-url">${esc(hostOf(b.url))}</span></td>
       <td>${typeBadge(b.api_type)}</td>
@@ -302,9 +312,11 @@ function renderBackends(st) {
         </div>
         ${shown.length ? `<div class="models">${shown.map(m => {
           const isLoaded = loaded.has(m);
+          const isHidden = hiddenHere.has(m);
           const ctx = b.loaded_ctx?.[m];
-          return `<div class="model ${isLoaded ? 'loaded' : ''}">
-            <span class="name" title="${esc(m)}">${esc(m)}</span>
+          return `<div class="model ${isLoaded ? 'loaded' : ''} ${isHidden ? 'model-hidden' : ''}">
+            <span class="name" title="${esc(m)}${isHidden ? ' — hidden by the model policy' : ''}">${esc(m)}</span>
+            ${isHidden ? '<span class="badge bad">hidden</span>' : ''}
             ${isLoaded ? `<span class="badge ok">loaded${ctx ? ` · ${Math.round(ctx / 1024)}k ctx` : ''}</span>` : ''}
             ${b.can_control ? (isLoaded
               ? `<button class="btn sm" data-action="model" data-op="unload" data-idx="${b.idx}" data-model="${esc(m)}" ${busy ? 'disabled' : ''}>Unload</button>`
@@ -500,6 +512,119 @@ function renderBlocked(st) {
   setHTML($('#blocked-ips'), tbl(st.blocked.ips, 'ip', 'Unblock', 'No blocked IP addresses'));
 }
 
+// --- Models: which models the proxy serves
+
+/** Case-insensitive glob (`*`, `?`) — the server's rule, used for previews. */
+function globRe(p) {
+  return new RegExp('^' + p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
+}
+
+/** Every model any backend lists, grouped case-insensitively, with where it is hidden. */
+function modelCatalog(st) {
+  const by = new Map();
+  for (const b of st.backends) {
+    const hidden = new Set(b.models_hidden);
+    for (const m of b.models_available) {
+      const k = m.toLowerCase();
+      if (!by.has(k)) by.set(k, { name: m, per: [] });
+      by.get(k).per.push({ b, ok: !hidden.has(m) });
+    }
+  }
+  return [...by.values()]
+    .map(m => {
+      const n = m.per.filter(p => p.ok).length;
+      return { ...m, status: n === m.per.length ? 'served' : n === 0 ? 'hidden' : 'partial' };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function renderModels(st) {
+  const pol = S.modelPolicy;
+  if (!pol) return;
+  const rows = modelCatalog(st);
+  $$('#model-mode input').forEach(i => { i.checked = i.value === pol.mode; });
+
+  const shown = rows.filter(r =>
+    (S.modelShow === 'all' || (S.modelShow === 'served' ? r.status !== 'hidden' : r.status !== 'served')) &&
+    (!S.modelQuery || r.name.toLowerCase().includes(S.modelQuery)));
+  const badge = r => r.status === 'served' ? '<span class="badge ok">served</span>'
+    : r.status === 'hidden' ? '<span class="badge bad">hidden</span>'
+    : `<span class="badge warn">hidden on ${r.per.filter(p => !p.ok).length} of ${r.per.length}</span>`;
+  setHTML($('#model-list'), shown.length ? `<table>
+    <tr><th>Model</th><th>Backends</th><th>Status</th><th class="num">Serve</th></tr>
+    ${shown.map(r => `<tr class="${r.status === 'hidden' ? 'is-hidden' : ''}">
+      <td><span class="mono">${esc(r.name)}</span></td>
+      <td><span class="chips">${r.per.map(p => `<span class="chip ${p.ok ? '' : 'off'}" title="${esc(p.b.url)}${p.ok ? '' : ' — hidden here'}">${esc(hostOf(p.b.url))}</span>`).join('')}</span></td>
+      <td>${badge(r)}</td>
+      <td class="num"><label class="switch" title="${r.status === 'hidden' ? 'Serve on every backend' : 'Hide on every backend'}">
+        <input type="checkbox" data-model="${esc(r.name)}" ${r.status !== 'hidden' ? 'checked' : ''}><span></span></label></td></tr>`).join('')}
+    </table>` : `<div class="empty">${rows.length ? 'No models match' : 'No backend lists any models yet'}</div>`);
+
+  const scope = r => r.backends.length
+    ? r.backends.map(u => `<span class="chip">${esc(hostOf(u))}</span>`).join('')
+    : '<span class="dim">all backends</span>';
+  const list = rules => `<ul class="rules">${rules.map(r => `<li>
+      <div class="rule-top"><span class="keyval">${esc(r.pattern)}</span>
+        <button class="btn sm danger" data-action="del-rule" data-id="${esc(r.id)}">Remove</button></div>
+      <div class="rule-meta"><span class="chips">${scope(r)}</span>
+        <span class="dim">· ${r.matches} match${r.matches === 1 ? '' : 'es'}</span>
+        ${r.from_toggle ? '<span class="dim" title="Created by a model\'s switch">· from switch</span>' : ''}</div>
+    </li>`).join('')}</ul>`;
+  const hide = pol.rules.filter(r => r.action === 'hide');
+  const allow = pol.rules.filter(r => r.action === 'allow');
+  const allowActive = pol.mode === 'allow';
+  setHTML($('#model-rules'), `
+    <div class="section-h"><h2>Hide rules</h2><span class="dim">${hide.length}</span></div>
+    ${hide.length ? list(hide) : '<div class="empty">No hide rules.</div>'}
+    ${allowActive || allow.length ? `
+      <div class="section-h rules-h"><h2>Allow rules</h2><span class="dim">${allowActive ? allow.length : 'inactive in this mode'}</span></div>
+      <div class="${allowActive ? '' : 'rules-inactive'}">${allow.length ? list(allow)
+        : '<div class="empty">No allow rules — nothing is served. Switch models on, or add an allow rule.</div>'}</div>` : ''}
+    <p class="field-hint" style="margin-top:14px !important">Hide rules always win. ${allowActive
+      ? 'Only models an allow rule matches are served.'
+      : 'Allow rules apply only in "Serve only allowed".'}
+      Patterns also catch models a backend adds later; a model's switch adds or removes an exact-name rule.</p>`);
+}
+
+async function addRuleDialog() {
+  const dlg = $('#dlg-rule');
+  const form = $('form', dlg);
+  form.reset();
+  form.action.value = S.modelPolicy?.mode === 'allow' ? 'allow' : 'hide';
+  form.scope.innerHTML = '<option value="">All backends</option>' +
+    S.state.backends.map(b => `<option value="${esc(b.url)}">${esc(hostOf(b.url))}</option>`).join('');
+  const catalog = modelCatalog(S.state);
+  form.oninput = () => {
+    const p = form.pattern.value.trim();
+    const scope = form.scope.value;
+    const re = p ? globRe(p) : null;
+    const hits = re ? catalog.filter(m => m.per.some(x => (!scope || x.b.url === scope) && re.test(m.name))) : [];
+    $('[data-preview]', dlg).innerHTML = p
+      ? `<b>${hits.length}</b> model${hits.length === 1 ? '' : 's'} match now${hits.length ? ': ' + hits.slice(0, 6).map(m => `<code>${esc(m.name)}</code>`).join(', ') + (hits.length > 6 ? ' …' : '') : ''}`
+      : 'Type a pattern to see which models it matches.';
+  };
+  form.oninput();
+  const fd = await ask(dlg);
+  if (!fd) return;
+  await act('POST', 'models/rules', {
+    pattern: fd.get('pattern').trim(),
+    action: fd.get('action'),
+    backends: fd.get('scope') ? [fd.get('scope')] : [],
+  }, 'Rule added');
+}
+
+async function setModelMode(mode) {
+  const pol = S.modelPolicy;
+  if (mode === 'allow' && !pol.rules.some(r => r.action === 'allow')) {
+    const ok = await confirmDlg('Serve only allowed models?',
+      'There are no allow rules yet, so <b>no model will be served</b> until you switch models on or add an allow rule. Hide rules keep applying.',
+      'Switch mode');
+    if (!ok) { render(); return; }
+  }
+  await act('PUT', 'models/mode', { mode },
+    mode === 'allow' ? 'Now serving only allowed models' : 'Now serving all models except hidden');
+}
+
 // --- Logs
 
 function infoClass(info) {
@@ -685,6 +810,8 @@ const actions = {
     // The detail panel sits below the list on phones: bring it into view.
     if (isPhone()) $('#client-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
   },
+  'add-rule': () => addRuleDialog(),
+  'del-rule': el => act('DELETE', `models/rules/${encodeURIComponent(el.dataset.id)}`, undefined, 'Rule removed'),
   'nav-open': () => setNav(true),
   'nav-close': () => setNav(false),
   'edit-client': el => clientDialog(S.clients.find(c => c.name === el.dataset.name)),
@@ -761,6 +888,18 @@ $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d)
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
 $('#client-filter').addEventListener('change', e => { S.clientFilter = e.target.value; render(); });
+$('#model-search').addEventListener('input', e => { S.modelQuery = e.target.value.trim().toLowerCase(); render(); });
+$('#model-show').addEventListener('change', e => { S.modelShow = e.target.value; render(); });
+$('#model-mode').addEventListener('change', e => setModelMode(e.target.value));
+// A model's switch: serve or hide it on every backend. On failure (e.g. a
+// pattern rule still hides it) the re-render puts the switch back.
+$('#model-list').addEventListener('change', e => {
+  const cb = e.target.closest('input[data-model]');
+  if (!cb) return;
+  const model = cb.dataset.model;
+  act('POST', 'models/toggle', { model, served: cb.checked }, `${model} ${cb.checked ? 'served' : 'hidden'}`)
+    .then(r => { if (!r) { $('#model-list')._html = null; render(); } });
+});
 
 // ------------------------------------------------------------------- routing
 

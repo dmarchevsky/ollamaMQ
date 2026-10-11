@@ -383,7 +383,10 @@ async fn aggregate_model_list(
     // Backends that get asked for their own listing, and the names of those
     // that must not be asked but have models to advertise anyway (below).
     let mut probed: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
-    let mut state_only: Vec<Vec<String>> = Vec::new();
+    let mut state_only: Vec<(String, Vec<String>)> = Vec::new();
+    // Hidden models are dropped per backend, before de-duplication, so one
+    // hidden on one backend still lists when another serves it.
+    let policy = state.model_policy();
     {
         let backends = state.backends.lock_or_recover();
         for b in backends.iter() {
@@ -403,7 +406,7 @@ async fn aggregate_model_list(
                 // can route to. Names only, and only for this family: a backend
                 // of any other family that cannot serve this route contributes
                 // nothing here, exactly as before.
-                state_only.push(names);
+                state_only.push((b.url.clone(), names));
             }
         }
     }
@@ -429,7 +432,7 @@ async fn aggregate_model_list(
             .await;
             // The names travel with the answer so a backend that says
             // nothing still gets to contribute its own models.
-            (body, names)
+            (body, names, base)
         }
     }))
     .await;
@@ -445,7 +448,7 @@ async fn aggregate_model_list(
     // were never asked at all: they are contributed in a second pass below,
     // once every live entry is in, so a bare synthesised entry can never take a
     // rich one's place whatever the backend order is.
-    for (body, names) in bodies {
+    for (body, names, base) in bodies {
         // A backend that answers 200 with an error object (LM Studio does this
         // for foreign endpoints) has no listing to contribute. Likewise one
         // whose listing uses a shape this endpoint does not recognise, one that
@@ -459,7 +462,7 @@ async fn aggregate_model_list(
         });
         let (Some(body), Some((array_key, name_field))) = (body, shape) else {
             if !names.is_empty() {
-                state_only.push(names);
+                state_only.push((base, names));
             }
             continue;
         };
@@ -470,7 +473,11 @@ async fn aggregate_model_list(
         // The merged list is always written in the route's own envelope, so an
         // entry read through the other one is re-keyed on the way in.
         for entry in entries {
-            match entry.get(name_field).and_then(|v| v.as_str()) {
+            let name = entry.get(name_field).and_then(|v| v.as_str());
+            if name.is_some_and(|id| !policy.served(id, &base)) {
+                continue;
+            }
+            match name {
                 // Already listed by an earlier backend.
                 Some(id) if !seen.insert(id.to_string()) => continue,
                 Some(_) => merged.push(retitled_entry(entry, name_field, out_field)),
@@ -488,9 +495,9 @@ async fn aggregate_model_list(
     // per known name, written in this route's own envelope, skipping any name a
     // live entry already carried (first writer wins, and live writers went first).
     let mut from_state = 0usize;
-    for names in state_only {
+    for (base, names) in state_only {
         for name in names {
-            if !seen.insert(name.clone()) {
+            if !policy.served(&name, &base) || !seen.insert(name.clone()) {
                 continue;
             }
             from_state += 1;
@@ -712,6 +719,10 @@ pub struct AppState {
     /// Clients and their API keys (see [`crate::clients`]). Starts empty and
     /// in memory; `main` swaps in the store loaded from `clients_file`.
     pub clients: Mutex<crate::clients::ClientStore>,
+    /// Which models are served (see [`crate::model_policy`]). Starts open and
+    /// in memory; `main` swaps in the store loaded from `models_file`. A leaf
+    /// lock: nothing is acquired while it is held.
+    pub model_policy: Mutex<crate::model_policy::ModelPolicyStore>,
     /// Events evicted from the front of `logs` so far. The event at index `i`
     /// of the ring has the stable sequence number `logs_evicted + i`, which
     /// the web UI uses to fetch one event's full content.
@@ -899,6 +910,7 @@ impl AppState {
             max_queued_bytes,
             queued_bytes: std::sync::atomic::AtomicU64::new(0),
             clients: Mutex::new(crate::clients::ClientStore::in_memory()),
+            model_policy: Mutex::new(crate::model_policy::ModelPolicyStore::in_memory()),
             logs_evicted: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1058,6 +1070,41 @@ impl AppState {
 
     pub fn is_ip_blocked(&self, ip: &IpAddr) -> bool {
         self.blocked_ips.lock_or_recover().contains(ip)
+    }
+
+    /// The current model policy, without holding its lock afterwards.
+    pub fn model_policy(&self) -> Arc<crate::model_policy::Policy> {
+        self.model_policy.lock_or_recover().snapshot()
+    }
+
+    /// True when the policy keeps every backend from serving `requested`, so
+    /// the request can be answered `404` before it is queued. A model no
+    /// backend lists at all is left to the normal path unless a rule names
+    /// it directly.
+    pub fn model_blocked(&self, requested: &str) -> bool {
+        let policy = self.model_policy();
+        if policy.is_open() {
+            return false;
+        }
+        let backends: Vec<(String, Arc<HashSet<String>>)> = self
+            .backends
+            .lock_or_recover()
+            .iter()
+            .map(|b| (b.url.clone(), b.available_models.clone()))
+            .collect();
+        let mut listed = false;
+        for (url, available) in &backends {
+            if available.iter().any(|m| name_matches_listed(requested, m)) {
+                listed = true;
+                if policy_allows(&policy, requested, url, available) {
+                    return false;
+                }
+            }
+        }
+        if listed {
+            return true;
+        }
+        !backends.is_empty() && !backends.iter().any(|(url, _)| policy.served(requested, url))
     }
 
     /// Blocked user id, or disabled registered client.
@@ -1306,6 +1353,53 @@ fn name_matches_listed(requested: &str, listed: &str) -> bool {
 /// tag/quant normalization.
 fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
     available.iter().any(|m| name_matches_listed(requested, m))
+}
+
+/// `404` for a hidden model, in the error shape of the API family the path
+/// belongs to, so clients treat it like any model the server does not have.
+fn model_not_found(path: &str, model: &str) -> axum::response::Response {
+    let message = format!("model '{model}' not found");
+    let body = if path.starts_with("/v1/") {
+        serde_json::json!({ "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": "model_not_found",
+        }})
+    } else {
+        serde_json::json!({ "error": message })
+    };
+    (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
+}
+
+/// Whether the model policy lets the backend at `url` serve `requested`.
+///
+/// Rules are written against the names backends list, so the check runs on
+/// the listed names the request resolves to (with the same matching as
+/// routing): a request for `llama3` is refused when the listed
+/// `llama3:latest` is hidden. A hide rule naming the requested spelling
+/// itself also refuses it. A backend that lists nothing matching is judged
+/// on the requested name.
+fn policy_allows(
+    policy: &crate::model_policy::Policy,
+    requested: &str,
+    url: &str,
+    available: &HashSet<String>,
+) -> bool {
+    if policy.is_open() {
+        return true;
+    }
+    if policy.hidden(requested, url) {
+        return false;
+    }
+    let mut matched = false;
+    for m in available.iter().filter(|m| name_matches_listed(requested, m)) {
+        matched = true;
+        if policy.served(m, url) {
+            return true;
+        }
+    }
+    !matched && policy.served(requested, url)
 }
 
 /// True when the requested model is resident on this backend per its latest
@@ -1732,6 +1826,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                     })
                 })
                 .collect();
+            // Taken before the backends lock: the policy lock is a leaf.
+            let policy = state.model_policy();
             let mut backends = state.backends.lock_or_recover();
             let mut last_idx = state
                 .last_backend_idx
@@ -1884,7 +1980,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 // If a specific model is requested, backend MUST also have it.
                                 match &task_ref.requested_model {
                                     Some(model) => {
-                                        let has_model = model_routable(model, &b.available_models);
+                                        let has_model = model_routable(model, &b.available_models)
+                                            && policy_allows(&policy, model, &b.url, &b.available_models);
                                         if !has_model {
                                             debug!(
                                                 "Backend {} rejected: model '{}' not found. Available: {:?}",
@@ -1975,6 +2072,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         // fails with 503 instead of routing elsewhere.
                                         Some(model) => {
                                             model_routable(model, &b.available_models)
+                                                && policy_allows(&policy, model, &b.url, &b.available_models)
                                                 && pin.as_ref().is_none_or(|pins| {
                                                     pins.iter()
                                                         .any(|p| pin_url_matches(p, &b.url))
@@ -2528,6 +2626,30 @@ pub async fn proxy_handler(
     task_headers.remove(axum::http::header::HOST);
 
     let requested_model = extract_requested_model(&body);
+
+    // A hidden model (see `crate::model_policy`) is answered 404 at once
+    // instead of waiting out stuck_timeout. `/v1/models/{id}` names its model
+    // in the path rather than the body.
+    let policy_model = requested_model.clone().or_else(|| {
+        path.strip_prefix("/v1/models/")
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+    });
+    if let Some(model) = policy_model.as_deref()
+        && state.model_blocked(model)
+    {
+        info!("Request for hidden model '{}' from {} refused", model, user_id);
+        state.log_event(LogEvent {
+            at: std::time::SystemTime::now(),
+            dir: "OUT",
+            user: user_id.clone(),
+            model: Some(model.to_string()),
+            backend: None,
+            info: "404 model hidden".to_string(),
+            content: None,
+        });
+        return model_not_found(&path, model);
+    }
 
     let task_method = method.as_str().to_string();
     // Request-log content is captured before `body` moves into the Task.
@@ -3758,6 +3880,111 @@ mod tests {
         assert_eq!(state.processed_counts.lock_or_recover()["new"], 7);
         assert_eq!(state.boost_user.lock_or_recover().as_deref(), Some("new"));
         assert_eq!(state.clients.lock_or_recover().priority(), (None, Some("new".into())));
+    }
+
+    fn hide_models(state: &Arc<AppState>, pattern: &str, backends: Vec<String>) {
+        state
+            .model_policy
+            .lock_or_recover()
+            .add_rule(pattern, crate::model_policy::Action::Hide, backends)
+            .expect("add rule");
+    }
+
+    /// A hidden model is refused with 404 before queueing, in the error shape
+    /// of the route's family, and a short name cannot reach a hidden listing.
+    #[tokio::test]
+    async fn hidden_model_is_refused_at_once() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        state.backends.lock_or_recover()[0].available_models = Arc::new(set(&["llama3:latest", "phi4:14b"]));
+        hide_models(&state, "llama3:latest", vec![]);
+
+        let call = |path: &'static str, body: &'static [u8]| {
+            let state = state.clone();
+            async move {
+                proxy_handler(
+                    State(state),
+                    ConnectInfo("127.0.0.1:41020".parse().expect("addr")),
+                    Method::POST,
+                    HeaderMap::new(),
+                    axum::extract::OriginalUri(path.parse().expect("uri")),
+                    Bytes::from_static(body),
+                )
+                .await
+                .into_response()
+            }
+        };
+        let json = |res: axum::response::Response| async move {
+            let b = axum::body::to_bytes(res.into_body(), usize::MAX).await.expect("body");
+            serde_json::from_slice::<serde_json::Value>(&b).expect("json")
+        };
+
+        let res = call("/v1/chat/completions", br#"{"model":"llama3"}"#).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json(res).await["error"]["code"], "model_not_found");
+
+        let res = call("/api/chat", br#"{"model":"llama3:latest"}"#).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json(res).await["error"], "model 'llama3:latest' not found");
+
+        assert!(state.queues.lock_or_recover().is_empty(), "nothing was queued");
+        assert!(!state.model_blocked("phi4:14b"));
+        // Not listed anywhere and not named by a rule: the normal path decides.
+        assert!(!state.model_blocked("mistral"));
+    }
+
+    /// A rule scoped to one backend leaves the model routable on the other.
+    #[tokio::test]
+    async fn per_backend_hide_routes_to_the_other_backend() {
+        let (url0, calls0) = spawn_recording_backend().await;
+        let (url1, calls1) = spawn_recording_backend().await;
+        let state = new_test_state(vec![url0.clone(), url1.clone()]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            for b in backends.iter_mut() {
+                b.is_online = true;
+                b.api_type = BackendApiType::Ollama;
+                b.available_models = Arc::new(set(&["llama3"]));
+            }
+        }
+        hide_models(&state, "llama3", vec![url0.clone()]);
+        assert!(!state.model_blocked("llama3"));
+
+        let _rx = enqueue_llama_chat(&state, HeaderMap::new());
+        let worker = tokio::spawn(run_worker(state.clone()));
+        let picked = wait_for_picked_backend(&state)
+            .await
+            .expect("no backend picked up the request within 10s");
+        assert_eq!(picked, 1);
+        wait_for_completion(&state, picked).await;
+        worker.abort();
+
+        let chats0 = calls0.lock_or_recover().iter().filter(|(p, _)| p == "/api/chat").count();
+        let chats1 = calls1.lock_or_recover().iter().filter(|(p, _)| p == "/api/chat").count();
+        assert_eq!((chats0, chats1), (0, 1));
+    }
+
+    /// Hidden models are left out of the merged listing.
+    #[tokio::test]
+    async fn hidden_models_leave_the_merged_listing() {
+        let (url, _calls) = spawn_recording_backend().await;
+        let state = new_test_state(vec![url]);
+        arm_ollama_backend(&state, None);
+        let names = |res: axum::response::Response| async move {
+            let b = axum::body::to_bytes(res.into_body(), usize::MAX).await.expect("body");
+            let v: serde_json::Value = serde_json::from_slice(&b).expect("json");
+            v["models"]
+                .as_array()
+                .expect("models array")
+                .iter()
+                .map(|m| m["name"].as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        };
+        let res = aggregate_model_list(&state, "/api/tags").await.expect("listing");
+        assert_eq!(names(res).await, vec!["llama3".to_string()]);
+
+        hide_models(&state, "LLAMA*", vec![]);
+        let res = aggregate_model_list(&state, "/api/tags").await.expect("listing");
+        assert!(names(res).await.is_empty());
     }
 
     // -- Scheduler-tier integration tests ------------------------------------

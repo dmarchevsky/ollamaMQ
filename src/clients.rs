@@ -130,7 +130,7 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn random_hex(bytes: usize) -> String {
+pub(crate) fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     getrandom::fill(&mut buf).expect("OS random number generator unavailable");
     buf.iter().map(|b| format!("{b:02x}")).collect()
@@ -440,16 +440,25 @@ impl ClientStore {
 }
 
 fn write_atomic(path: &Path, clients: &[Client]) -> std::io::Result<()> {
-    let body = serde_json::to_string_pretty(&ClientsFile {
-        clients: clients.to_vec(),
-    })
-    .map_err(std::io::Error::other)?;
+    write_json_atomic(
+        path,
+        &ClientsFile {
+            clients: clients.to_vec(),
+        },
+    )
+}
+
+/// Write `value` as pretty JSON to `path`: a temporary file, synced, then
+/// renamed over the old one, so a crash never leaves a half-written file.
+/// Owner-only, since these stores hold credentials and policy.
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let body = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     {
-        // The file holds plaintext keys: owner-only. A leftover temp file is
-        // removed first so the mode applies (it is only set on creation).
+        // A leftover temp file is removed first so the mode applies (it is
+        // only set on creation).
         let _ = fs::remove_file(&tmp);
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true);

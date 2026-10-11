@@ -31,7 +31,7 @@
     {
       url: 'http://gpu-box.lan:11434', online: true, api_type: 'Ollama', active: 0, max: 2, processed: 4120,
       current_model: 'llama3.3:70b',
-      models_available: ['llama3.3:70b', 'qwen3:32b', 'gpt-oss:120b', 'gpt-oss:20b', 'mistral-small3.2:24b',
+      models_available: ['llama3.3:70b', 'Qwen3.8-27B', 'qwen3:32b', 'gpt-oss:120b', 'gpt-oss:20b', 'mistral-small3.2:24b',
         'nomic-embed-text:latest', 'deepseek-r1:32b', 'gemma3:27b', 'phi4:14b', 'qwen2.5-coder:32b',
         'llava:13b', 'codellama:34b', 'granite3.3:8b', 'smollm2:1.7b', 'mxbai-embed-large:latest'],
       models_loaded: ['llama3.3:70b', 'nomic-embed-text:latest'], loaded_known: true,
@@ -127,12 +127,36 @@
     users.forEach(u => { if (u.registered) u.blocked = clients.find(c => c.name === u.id)?.disabled ?? false; });
   };
 
+  // Model policy (mirrors src/model_policy.rs: hide rules win; allow rules
+  // only count in allow mode).
+  const policy = {
+    mode: 'deny',
+    rules: [
+      { id: 'm1', pattern: '*-Instruct-Q6', action: 'hide', backends: [], from_toggle: false },
+      { id: 'm2', pattern: 'codellama:34b', action: 'hide', backends: [], from_toggle: true },
+      { id: 'm3', pattern: 'smollm*', action: 'hide', backends: [], from_toggle: false },
+      { id: 'm4', pattern: 'Qwen3.8-27B', action: 'hide', backends: ['http://gpu-box.lan:11434'], from_toggle: false },
+    ],
+  };
+  let ruleSeq = 10;
+  const glob = p => new RegExp('^' + p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
+  const hits = (r, m, url) => (!r.backends.length || r.backends.includes(url)) && glob(r.pattern).test(m);
+  const served = (m, url) => !policy.rules.some(r => r.action === 'hide' && hits(r, m, url))
+    && (policy.mode === 'deny' || policy.rules.some(r => r.action === 'allow' && hits(r, m, url)));
+  const policyView = () => ({
+    mode: policy.mode,
+    rules: policy.rules.map(r => ({
+      ...r,
+      matches: new Set(backends.flatMap(b => b.models_available.filter(m => hits(r, m, b.url)).map(m => m.toLowerCase()))).size,
+    })),
+  });
+
   function snapshot() {
     const sum = (f) => users.reduce((a, u) => a + u[f], 0);
     return {
       ...state,
       stats: { queued: sum('queued'), processing: sum('processing'), done: sum('done'), dropped: sum('dropped'), log_dropped: 0 },
-      backends,
+      backends: backends.map(b => ({ ...b, models_hidden: b.models_available.filter(m => !served(m, b.url)) })),
       users,
     };
   }
@@ -156,6 +180,32 @@
         return delay({ ...ev, content });
       }
       if (method === 'POST' && p === 'config/reload') return delay({ models: 3 });
+      if (method === 'GET' && p === 'models') return delay(policyView());
+      if (method === 'PUT' && p === 'models/mode') { policy.mode = body.mode; return delay({}); }
+      if (method === 'POST' && p === 'models/rules') {
+        if (!body.pattern) err('pattern must be 1–200 characters');
+        const r = { id: 'm' + ruleSeq++, pattern: body.pattern, action: body.action, backends: body.backends || [], from_toggle: false };
+        policy.rules.push(r);
+        return delay(r);
+      }
+      if (method === 'DELETE' && seg[0] === 'models' && seg[1] === 'rules') {
+        policy.rules = policy.rules.filter(r => r.id !== seg[2]);
+        return delay({});
+      }
+      if (method === 'POST' && p === 'models/toggle') {
+        const exact = r => r.pattern.toLowerCase() === body.model.toLowerCase();
+        if (body.served) {
+          policy.rules = policy.rules.filter(r => !(r.action === 'hide' && exact(r)));
+          const blocker = policy.rules.find(r => r.action === 'hide' && !r.backends.length && glob(r.pattern).test(body.model));
+          if (blocker) err(`'${body.model}' is hidden by the rule '${blocker.pattern}' — remove or narrow that rule`);
+          if (policy.mode === 'allow' && !policy.rules.some(r => r.action === 'allow' && !r.backends.length && glob(r.pattern).test(body.model))) {
+            policy.rules.push({ id: 'm' + ruleSeq++, pattern: body.model, action: 'allow', backends: [], from_toggle: true });
+          }
+        } else if (!policy.rules.some(r => r.action === 'hide' && !r.backends.length && exact(r))) {
+          policy.rules.push({ id: 'm' + ruleSeq++, pattern: body.model, action: 'hide', backends: [], from_toggle: true });
+        }
+        return delay({});
+      }
 
       if (method === 'POST' && seg[0] === 'users') {
         const [, id, op] = seg;

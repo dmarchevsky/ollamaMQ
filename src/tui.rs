@@ -1023,8 +1023,13 @@ impl TuiDashboard {
                         for (mi, m) in models.into_iter().enumerate().take(limit) {
                             let is_cursor = cursor == Some(mi);
                             let is_loaded = b.loaded_models.contains(&m);
+                            let is_hidden = !snapshot.model_policy.served(&m, &b.url);
                             let m_style = if is_cursor {
                                 Style::default().fg(Color::Yellow).bold()
+                            } else if is_hidden {
+                                Style::default()
+                                    .fg(Color::Red)
+                                    .add_modifier(Modifier::CROSSED_OUT)
                             } else if is_loaded {
                                 Style::default().fg(Color::Green).bold()
                             } else {
@@ -1045,6 +1050,12 @@ impl TuiDashboard {
                                         " (In RAM)",
                                         Style::default().fg(Color::Green).italic(),
                                     )
+                                } else {
+                                    Span::raw("")
+                                },
+                                // Kept out of listings and refused by the model policy.
+                                if is_hidden {
+                                    Span::styled(" (hidden)", Style::default().fg(Color::Red).italic())
                                 } else {
                                     Span::raw("")
                                 },
@@ -1537,6 +1548,7 @@ mod tests {
             logs: Vec::new(),
             active_ops: Vec::new(),
             recent_results: Vec::new(),
+            model_policy: Default::default(),
         }
     }
 

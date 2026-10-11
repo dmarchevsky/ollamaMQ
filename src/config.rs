@@ -92,6 +92,10 @@ pub struct Settings {
     /// in the working directory). Managed from the web UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clients_file: Option<String>,
+    /// Where the model filter rules are stored (default "models.json" in the
+    /// working directory). Managed from the web UI's Models page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_file: Option<String>,
     /// Web UI at `/ui`, behind HTTP basic auth. Disabled unless a password is
     /// set here or in `OLLAMA_MQ_UI_PASSWORD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

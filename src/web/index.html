@@ -14,6 +14,7 @@
     <nav>
       <a href="#overview" data-page="overview"><span class="ico">▦</span>Overview</a>
       <a href="#backends" data-page="backends"><span class="ico">⛁</span>Backends</a>
+      <a href="#models" data-page="models"><span class="ico">◇</span>Models<span class="count" id="nav-models"></span></a>
       <a href="#clients" data-page="clients"><span class="ico">⚿</span>Clients<span class="count" id="nav-clients"></span></a>
       <a href="#blocked" data-page="blocked"><span class="ico">⊘</span>Blocked<span class="count" id="nav-blocked"></span></a>
       <a href="#logs" data-page="logs"><span class="ico">≡</span>Logs</a>
@@ -45,6 +46,35 @@
     <section class="page" id="page-backends">
       <h1>Backends</h1>
       <div class="panel flush" id="backends"></div>
+    </section>
+
+    <section class="page" id="page-models">
+      <div class="page-h">
+        <h1>Models</h1>
+        <div class="page-tools">
+          <div class="seg" id="model-mode" role="radiogroup" aria-label="Policy">
+            <label><input type="radio" name="model-mode" value="deny" checked><span>Serve all except hidden</span></label>
+            <label><input type="radio" name="model-mode" value="allow"><span>Serve only allowed</span></label>
+          </div>
+          <button class="btn primary" data-action="add-rule">+ Add rule</button>
+        </div>
+      </div>
+      <p class="hint">Hidden models are left out of <code>/v1/models</code> and <code>/api/tags</code>, and requests for them get <code>404 model not found</code> at once.
+        A rule can apply to every backend or only some — then the model is still served by the others.</p>
+      <div class="split models-split">
+        <div class="panel flush">
+          <div class="panel-toolbar">
+            <input type="search" id="model-search" placeholder="Search models…" autocomplete="off">
+            <div class="seg" id="model-show">
+              <label><input type="radio" name="model-show" value="all" checked><span>All</span></label>
+              <label><input type="radio" name="model-show" value="served"><span>Served</span></label>
+              <label><input type="radio" name="model-show" value="hidden"><span>Hidden</span></label>
+            </div>
+          </div>
+          <div id="model-list"></div>
+        </div>
+        <div class="panel" id="model-rules"></div>
+      </div>
     </section>
 
     <section class="page" id="page-clients">
@@ -143,6 +173,21 @@
     <label>Model <input name="model" list="dl-models" required autocomplete="off" spellcheck="false"></label>
     <datalist id="dl-models"></datalist>
     <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary" data-submit>Load</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-rule">
+  <form method="dialog" data-form="rule">
+    <h3>Add rule</h3>
+    <label>Pattern <input name="pattern" required placeholder="e.g. *-GGUF:Q4*  or  codellama:34b" autocomplete="off" spellcheck="false"></label>
+    <p class="field-hint"><code>*</code> matches anything, <code>?</code> one character; case-insensitive. Matched against the model names backends list.</p>
+    <label>Action <select name="action">
+      <option value="hide">Hide matching models</option>
+      <option value="allow">Allow matching models (used in "Serve only allowed")</option>
+    </select></label>
+    <label>Applies to <select name="scope"><option value="">All backends</option></select></label>
+    <div class="rule-preview" data-preview></div>
+    <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary" data-submit>Add rule</button></div>
   </form>
 </dialog>
 
