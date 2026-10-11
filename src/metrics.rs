@@ -396,6 +396,38 @@ pub fn render(state: &Arc<AppState>) -> String {
             .map(|u| (vec![u.id.clone()], u.processing as f64))
             .collect(),
     );
+    // Runs in progress, grouped so each label set is one series.
+    let mut active: BTreeMap<Vec<String>, (f64, f64, f64)> = BTreeMap::new();
+    for r in state.runs.list() {
+        let e = active
+            .entry(vec![r.client, r.model, r.backend])
+            .or_insert((0.0, 0.0, 0.0));
+        e.0 += 1.0;
+        e.1 = e.1.max(r.started.elapsed().as_secs_f64());
+        e.2 += r.tokens as f64;
+    }
+    let labels = ["client", "model", "backend"];
+    gauge(
+        &mut out,
+        "ollamamq_active_requests",
+        "Requests being served right now.",
+        &labels,
+        active.iter().map(|(k, v)| (k.clone(), v.0)).collect(),
+    );
+    gauge(
+        &mut out,
+        "ollamamq_active_oldest_seconds",
+        "How long the oldest request in progress has been running.",
+        &labels,
+        active.iter().map(|(k, v)| (k.clone(), v.1)).collect(),
+    );
+    gauge(
+        &mut out,
+        "ollamamq_active_generated_tokens",
+        "Tokens generated so far by requests in progress (estimated from the stream).",
+        &labels,
+        active.iter().map(|(k, v)| (k.clone(), v.2)).collect(),
+    );
     gauge(
         &mut out,
         "ollamamq_queued_bytes",
@@ -685,6 +717,95 @@ pub fn parse_usage(tail: &[u8]) -> Option<(u64, u64)> {
     None
 }
 
+// ------------------------------------------------------------- live runs
+
+/// One request being served right now.
+#[derive(Clone, Debug)]
+pub struct Run {
+    pub client: String,
+    pub model: String,
+    pub backend: String,
+    pub started: std::time::Instant,
+    pub first_byte: Option<std::time::Instant>,
+    /// Generated tokens so far, estimated from the stream (see
+    /// [`estimate_stream_tokens`]).
+    pub tokens: u64,
+}
+
+/// Requests in progress, for the live views (`/metrics` gauges, the web
+/// UI's "Running now"). A leaf lock.
+#[derive(Default)]
+pub struct Runs {
+    inner: Mutex<BTreeMap<u64, Run>>,
+    seq: std::sync::atomic::AtomicU64,
+}
+
+impl Runs {
+    /// Register a run; it is removed when the returned guard drops, so every
+    /// exit path (finished, client gone, backend error, panic) clears it.
+    pub fn start(&self, client: &str, model: &str, backend: &str) -> RunGuard<'_> {
+        let id = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.lock_or_recover().insert(
+            id,
+            Run {
+                client: client.to_string(),
+                model: model.to_string(),
+                backend: backend.to_string(),
+                started: std::time::Instant::now(),
+                first_byte: None,
+                tokens: 0,
+            },
+        );
+        RunGuard { runs: self, id }
+    }
+
+    /// Oldest first.
+    pub fn list(&self) -> Vec<Run> {
+        self.inner.lock_or_recover().values().cloned().collect()
+    }
+}
+
+pub struct RunGuard<'a> {
+    runs: &'a Runs,
+    id: u64,
+}
+
+impl RunGuard<'_> {
+    pub fn update(&self, f: impl FnOnce(&mut Run)) {
+        if let Some(r) = self.runs.inner.lock_or_recover().get_mut(&self.id) {
+            f(r);
+        }
+    }
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.runs.inner.lock_or_recover().remove(&self.id);
+    }
+}
+
+/// Generated tokens in a streamed chunk, estimated as the number of
+/// non-empty text fields it carries: OpenAI `content` / `reasoning_content`
+/// deltas and `text` (completions), Ollama `content` / `response`. Streaming
+/// servers send about one token per event, so this tracks a run while it is
+/// going; the exact count from the final usage tops it up when it ends.
+pub fn estimate_stream_tokens(chunk: &[u8]) -> u64 {
+    const FIELDS: &[&[u8]] = &[b"content\":\"", b"\"response\":\"", b"\"text\":\""];
+    let mut n = 0;
+    for f in FIELDS {
+        let mut from = 0;
+        while let Some(pos) = chunk[from..].windows(f.len()).position(|w| w == *f) {
+            let end = from + pos + f.len();
+            // `"content":""` is an empty delta, not a token.
+            if chunk.get(end) != Some(&b'"') {
+                n += 1;
+            }
+            from = end;
+        }
+    }
+    n
+}
+
 /// Keep the last [`USAGE_TAIL_BYTES`] of a streamed body. Trims in batches so
 /// a stream of small chunks does not shift the buffer on every chunk.
 pub fn push_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
@@ -743,6 +864,31 @@ mod tests {
         assert!(out.contains(
             r#"ollamamq_request_duration_seconds_bucket{model="qwen",backend="b:1",le="+Inf"} 0"#
         ));
+    }
+
+    #[test]
+    fn stream_token_estimate() {
+        let sse = b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        assert_eq!(
+            estimate_stream_tokens(sse),
+            2,
+            "empty role delta does not count"
+        );
+        let ollama = b"{\"message\":{\"role\":\"assistant\",\"content\":\"He\"},\"done\":false}\n{\"response\":\"llo\",\"done\":false}\n";
+        assert_eq!(estimate_stream_tokens(ollama), 2);
+        assert_eq!(estimate_stream_tokens(b"{\"error\":\"x\"}"), 0);
+    }
+
+    #[test]
+    fn runs_clear_on_drop_and_show_as_gauges() {
+        let runs = Runs::default();
+        {
+            let g = runs.start("dm", "qwen", "b:1");
+            g.update(|r| r.tokens += 5);
+            let l = runs.list();
+            assert_eq!((l.len(), l[0].tokens), (1, 5));
+        }
+        assert!(runs.list().is_empty());
     }
 
     #[test]

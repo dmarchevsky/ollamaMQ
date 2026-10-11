@@ -725,6 +725,8 @@ pub struct AppState {
     pub model_policy: Mutex<crate::model_policy::ModelPolicyStore>,
     /// Prometheus counters and histograms (see [`crate::metrics`]).
     pub metrics: crate::metrics::Metrics,
+    /// Requests being served right now (live views).
+    pub runs: crate::metrics::Runs,
     /// Events evicted from the front of `logs` so far. The event at index `i`
     /// of the ring has the stable sequence number `logs_evicted + i`, which
     /// the web UI uses to fetch one event's full content.
@@ -914,6 +916,7 @@ impl AppState {
             clients: Mutex::new(crate::clients::ClientStore::in_memory()),
             model_policy: Mutex::new(crate::model_policy::ModelPolicyStore::in_memory()),
             metrics: crate::metrics::Metrics::new(),
+            runs: crate::metrics::Runs::default(),
             logs_evicted: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -2418,6 +2421,11 @@ pub async fn run_worker(state: Arc<AppState>) {
                         let method_str = task.method.to_string();
                         let path_str = task.path.clone();
 
+                        // Shown as running until this block ends, on any path.
+                        let run = state_clone.runs.start(&user_id, &m_model, &m_backend);
+                        // Completion tokens already counted from the stream.
+                        let mut live_tokens: u64 = 0;
+
                         // Attach this backend's configured auth token unless the
                         // client already presented its own credentials.
                         let mut headers = task.headers.clone();
@@ -2461,6 +2469,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                         &[&m_model, &m_backend],
                                                         started.elapsed().as_secs_f64(),
                                                     );
+                                                    run.update(|r| {
+                                                        r.first_byte = Some(std::time::Instant::now())
+                                                    });
                                                     let n = chunk.len().min(512);
                                                     first_prefix = Some(
                                                         String::from_utf8_lossy(&chunk[..n])
@@ -2470,6 +2481,18 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 let n = chunk.len();
                                                 total_bytes += n as u64;
                                                 crate::metrics::push_tail(&mut tail, &chunk);
+                                                // Count generated tokens as they stream, so
+                                                // runs in progress show up live.
+                                                let est = crate::metrics::estimate_stream_tokens(&chunk);
+                                                if est > 0 {
+                                                    live_tokens += est;
+                                                    metrics.inc(
+                                                        &crate::metrics::TOKENS,
+                                                        &[&user_id, &m_model, &m_backend, "completion"],
+                                                        est as f64,
+                                                    );
+                                                    run.update(|r| r.tokens += est);
+                                                }
                                                 if content_acc.len() < state_clone.log_content_limit
                                                 {
                                                     let room = state_clone.log_content_limit
@@ -2518,9 +2541,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         &[&m_model, &m_backend],
                                         started.elapsed().as_secs_f64(),
                                     );
+                                    // The exact usage replaces the stream estimate: only
+                                    // the difference is added (a counter cannot go down).
                                     if let Some((prompt, completion)) =
                                         crate::metrics::parse_usage(&tail)
                                     {
+                                        let completion = completion.saturating_sub(live_tokens);
                                         for (kind, n) in [("prompt", prompt), ("completion", completion)] {
                                             metrics.inc(
                                                 &crate::metrics::TOKENS,

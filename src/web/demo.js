@@ -151,6 +151,19 @@
     })),
   });
 
+  // Runs in progress: tokens grow with time like a streaming backend.
+  const demoRuns = [
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', backend: '192.168.6.11:8731', started: now - 94_000, ttfb: 2.4, rate: 38.5 },
+    { client: 'openwebui', model: 'Qwen3.8-27B', backend: '192.168.255.224:8000', started: now - 21_000, ttfb: 6.8, rate: 11.2 },
+    { client: 'n8n-agents', model: 'llama3.3:70b', backend: 'gpu-box.lan:11434', started: now - 3_000, ttfb: null, rate: 0 },
+  ];
+  const runView = () => demoRuns.map(r => {
+    const elapsed = (Date.now() - r.started) / 1000;
+    const gen = r.ttfb == null ? 0 : Math.max(0, elapsed - r.ttfb);
+    return { client: r.client, model: r.model, backend: r.backend, elapsed_secs: elapsed,
+      ttfb_secs: r.ttfb, tokens: Math.floor(gen * r.rate), tokens_per_sec: gen >= 1 ? r.rate : null };
+  });
+
   function snapshot() {
     const sum = (f) => users.reduce((a, u) => a + u[f], 0);
     return {
@@ -158,6 +171,7 @@
       stats: { queued: sum('queued'), processing: sum('processing'), done: sum('done'), dropped: sum('dropped'), log_dropped: 0 },
       backends: backends.map(b => ({ ...b, models_hidden: b.models_available.filter(m => !served(m, b.url)) })),
       users,
+      runs: runView(),
     };
   }
 

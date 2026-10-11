@@ -52,6 +52,13 @@ function fmtAgo(ms) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+/** Seconds as `12.3s` or `4m 05s`. */
+function fmtDur(s) {
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${String(Math.floor(s % 60)).padStart(2, '0')}s`;
+}
+
 function fmtTime(ms) {
   const d = new Date(ms);
   const p = n => String(n).padStart(2, '0');
@@ -257,6 +264,24 @@ function renderOverview(st) {
     </table>` : '<div class="empty">No traffic yet</div>');
 
   setHTML($('#ov-logs'), logTable(S.logs.slice(0, OVERVIEW_LOGS), false));
+  renderRuns(st);
+}
+
+/** Requests being served right now; refreshed with every poll. */
+function renderRuns(st) {
+  const runs = st.runs || [];
+  $('#ov-runs-count').textContent = runs.length ? `${runs.length} in progress` : '';
+  setHTML($('#ov-runs'), runs.length ? `<table>
+    <tr><th>Client</th><th>Model</th><th>Backend</th><th class="num">Elapsed</th><th class="num">First byte</th><th class="num">Tokens</th><th class="num">tok/s</th></tr>
+    ${runs.map(r => `<tr>
+      <td><span class="mono">${esc(r.client)}</span></td>
+      <td class="trunc">${esc(r.model)}</td>
+      <td class="mono dim">${esc(r.backend)}</td>
+      <td class="num">${fmtDur(r.elapsed_secs)}</td>
+      <td class="num">${r.ttfb_secs == null ? '<span class="st-warn">waiting…</span>' : fmtDur(r.ttfb_secs)}</td>
+      <td class="num">${fmtNum(r.tokens)}</td>
+      <td class="num">${r.tokens_per_sec == null ? '<span class="dim">—</span>' : r.tokens_per_sec.toFixed(1)}</td></tr>`).join('')}
+    </table>` : '<div class="empty">Nothing running</div>');
 }
 
 // --- Backends

@@ -487,6 +487,7 @@ It covers everything the TUI does:
 - **Models** — every model the backends list, with a switch per model and filter rules (below)
 - **Blocked** — disabled clients, blocked ids and blocked IPs
 - **Logs** — recent requests with a filter; click a row for the full captured content
+- **Running now** (on Overview) — every request being served: client, model, backend, elapsed, time to first byte, tokens so far and tok/s, refreshed every second
 - **Reload config** — re-read `appconf.yaml` (TUI `r`)
 
 It also manages **clients and their API keys**. The Clients page lists two kinds of client together (filter with *All / Registered / Unregistered*):
@@ -538,12 +539,13 @@ scrape_configs:
 | `ollamamq_queue_wait_seconds` | histogram | client, model |
 | `ollamamq_time_to_first_byte_seconds` / `ollamamq_request_duration_seconds` | histogram | model, backend |
 | `ollamamq_queue_depth`, `ollamamq_requests_in_flight`, `ollamamq_client_fair_share_score` | gauge | client |
+| `ollamamq_active_requests`, `ollamamq_active_oldest_seconds`, `ollamamq_active_generated_tokens` | gauge | client, model, backend — requests in progress right now |
 | `ollamamq_client_info` | gauge (=1) | client, registered, disabled, vip, boost |
 | `ollamamq_backend_up`, `ollamamq_backend_requests_in_flight`, `ollamamq_backend_max_concurrency`, `ollamamq_backend_models`, `ollamamq_model_loaded`, `ollamamq_backend_model_requests_in_flight` | gauge | backend (, api_type / state / model) |
 | `ollamamq_model_control_operations_total` | counter | backend, model, action, result |
 | `ollamamq_clients`, `ollamamq_blocked`, `ollamamq_model_policy_rules`, `ollamamq_model_policy_mode`, `ollamamq_queued_bytes`, `ollamamq_request_log_dropped_total`, `ollamamq_build_info`, `ollamamq_start_time_seconds` | various | — |
 
-**Tokens** are read from the end of each response: OpenAI/llama.cpp `usage`, Ollama `prompt_eval_count`/`eval_count`, and for llama.cpp streams (which send no `usage` unless asked) the final chunk's `timings` (`cache_n + prompt_n` prompt, `predicted_n` completion). Other OpenAI-style streams only carry usage when the client asks for it (`"stream_options": {"include_usage": true}`); without it nothing is counted for that request.
+**Tokens** are counted live while a response streams (each chunk carrying generated text counts one, so runs in progress show up in `tokens_total` and the `active_*` gauges), then topped up to the exact figure when the response ends. The exact figure is read from the end of each response: OpenAI/llama.cpp `usage`, Ollama `prompt_eval_count`/`eval_count`, and for llama.cpp streams (which send no `usage` unless asked) the final chunk's `timings` (`cache_n + prompt_n` prompt, `predicted_n` completion). Other OpenAI-style streams only carry usage when the client asks for it (`"stream_options": {"include_usage": true}`); without it nothing is counted for that request.
 
 Useful queries:
 
