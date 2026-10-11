@@ -272,19 +272,27 @@ function renderOverview(st) {
   renderRuns(st);
 }
 
+/** Time to first token; until then the run is waiting for the backend or
+ *  evaluating the prompt. A non-streamed response never shows a first token. */
+function firstToken(r) {
+  if (r.ttft_secs != null) return fmtDur(r.ttft_secs);
+  if (r.ttfb_secs == null) return '<span class="st-warn">waiting…</span>';
+  return r.tokens ? '<span class="dim">—</span>' : '<span class="st-warn">prefill…</span>';
+}
+
 /** Requests being served right now; refreshed with every poll. */
 function renderRuns(st) {
   const runs = st.runs || [];
   $('#ov-runs-count').textContent = runs.length ? `${runs.length} in progress` : '';
   setHTML($('#ov-runs'), runs.length ? `<table>
-    <tr><th>Client</th><th>Key</th><th>Model</th><th>Backend</th><th class="num">Elapsed</th><th class="num">First byte</th><th class="num">Tokens</th><th class="num">tok/s</th></tr>
+    <tr><th>Client</th><th>Key</th><th>Model</th><th>Backend</th><th class="num">Elapsed</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">tok/s</th></tr>
     ${runs.map(r => `<tr>
       <td><span class="mono">${esc(r.client)}</span></td>
       <td class="dim">${r.key && r.key !== 'none' ? esc(r.key) : '—'}</td>
       <td class="trunc">${esc(r.model)}</td>
       <td class="mono dim">${esc(r.backend)}</td>
       <td class="num">${fmtDur(r.elapsed_secs)}</td>
-      <td class="num">${r.ttfb_secs == null ? '<span class="st-warn">waiting…</span>' : fmtDur(r.ttfb_secs)}</td>
+      <td class="num">${firstToken(r)}</td>
       <td class="num">${fmtNum(r.tokens)}</td>
       <td class="num">${r.tokens_per_sec == null ? '<span class="dim">—</span>' : r.tokens_per_sec.toFixed(1)}</td></tr>`).join('')}
     </table>` : '<div class="empty">Nothing running</div>');

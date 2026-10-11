@@ -161,7 +161,7 @@
     const elapsed = (Date.now() - r.started) / 1000;
     const gen = r.ttfb == null ? 0 : Math.max(0, elapsed - r.ttfb);
     return { client: r.client, key: r.key, model: r.model, backend: r.backend, elapsed_secs: elapsed,
-      ttfb_secs: r.ttfb, tokens: Math.floor(gen * r.rate), tokens_per_sec: gen >= 1 ? r.rate : null };
+      ttfb_secs: r.ttfb, ttft_secs: r.ttfb, tokens: Math.floor(gen * r.rate), tokens_per_sec: gen >= 1 ? r.rate : null };
   });
 
   function snapshot() {

@@ -327,9 +327,12 @@ struct RunView {
     elapsed_secs: f64,
     /// Time to first byte; `None` while the backend has not answered yet.
     ttfb_secs: Option<f64>,
+    /// Time to the first generated token; `None` while prefilling (or for a
+    /// response that is not streamed).
+    ttft_secs: Option<f64>,
     /// Generated tokens so far (estimated from the stream).
     tokens: u64,
-    /// Generation speed since the first byte.
+    /// Generation speed since the first token.
     tokens_per_sec: Option<f64>,
 }
 
@@ -504,10 +507,12 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
             .into_iter()
             .map(|r| {
                 let ttfb = r.first_byte.map(|f| (f - r.started).as_secs_f64());
-                let gen_secs = r.first_byte.map(|f| f.elapsed().as_secs_f64());
+                let ttft = r.first_token.map(|f| (f - r.started).as_secs_f64());
+                let gen_secs = r.first_token.map(|f| f.elapsed().as_secs_f64());
                 RunView {
                     elapsed_secs: r.started.elapsed().as_secs_f64(),
                     ttfb_secs: ttfb,
+                    ttft_secs: ttft,
                     tokens_per_sec: gen_secs
                         .filter(|s| *s >= 1.0 && r.tokens > 0)
                         .map(|s| r.tokens as f64 / s),

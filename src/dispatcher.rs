@@ -1443,6 +1443,44 @@ pub fn strip_olla_prefix(path: &str) -> &str {
     path
 }
 
+/// TTFT for non-streamed responses, and generation / prefill speed, once a
+/// response has finished. Backend timings win; for streams without them,
+/// generation time is measured from the first token to the end.
+fn record_speed(
+    metrics: &crate::metrics::Metrics,
+    [client, model, backend]: [&str; 3],
+    usage: Option<crate::metrics::Usage>,
+    first_token: Option<std::time::Instant>,
+    live_tokens: u64,
+) {
+    use crate::metrics::{GEN_SECONDS, GEN_SPEED, GEN_TOKENS, PROMPT_EVAL_TOKENS, PROMPT_SECONDS, TTFT};
+    let labels = [client, model, backend];
+    let u = usage.unwrap_or_default();
+    if first_token.is_none()
+        && let Some(p) = u.prompt_secs
+    {
+        metrics.observe(&TTFT, &labels, p);
+    }
+    if let (Some(secs), Some(n)) = (u.prompt_secs, u.prompt_eval)
+        && n > 0
+    {
+        metrics.inc(&PROMPT_SECONDS, &labels, secs);
+        metrics.inc(&PROMPT_EVAL_TOKENS, &labels, n as f64);
+    }
+    let tokens = if usage.is_some() { u.completion } else { live_tokens };
+    let secs = u
+        .gen_secs
+        .or_else(|| first_token.map(|t| t.elapsed().as_secs_f64()));
+    // One token has no measurable rate.
+    if let Some(secs) = secs.filter(|s| *s > 0.0)
+        && tokens >= 2
+    {
+        metrics.inc(&GEN_SECONDS, &labels, secs);
+        metrics.inc(&GEN_TOKENS, &labels, tokens as f64);
+        metrics.observe(&GEN_SPEED, &[model, backend], tokens as f64 / secs);
+    }
+}
+
 /// The `endpoint` metric label: the route template `path` belongs to, so
 /// path parameters (blob digests, model ids) never become label values.
 pub fn route_template(path: &str) -> &'static str {
@@ -2466,6 +2504,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                     }
                     metrics.touch(&crate::metrics::RESPONSE_BYTES, &[&user_id, &m_model, &m_backend]);
                     metrics.touch_histogram(&crate::metrics::TTFB, &[&m_model, &m_backend]);
+                    metrics.touch_histogram(&crate::metrics::TTFT, &[&user_id, &m_model, &m_backend]);
+                    metrics.touch_histogram(&crate::metrics::GEN_SPEED, &[&m_model, &m_backend]);
+                    for def in [
+                        &crate::metrics::GEN_SECONDS,
+                        &crate::metrics::GEN_TOKENS,
+                        &crate::metrics::PROMPT_SECONDS,
+                        &crate::metrics::PROMPT_EVAL_TOKENS,
+                    ] {
+                        metrics.touch(def, &[&user_id, &m_model, &m_backend]);
+                    }
                     metrics.touch_histogram(&crate::metrics::DURATION, &[&m_model, &m_backend]);
                     let log_out = |info: String,
                                    backend: Option<String>,
@@ -2566,6 +2614,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     // tell "endpoint rejected" error bodies apart from normal
                                     // application errors (learning hook below).
                                     let mut first_prefix: Option<String> = None;
+                                    // Streams (SSE / NDJSON) show their first token as it
+                                    // is generated; a plain JSON body arrives all at once.
+                                    let streaming = resp_content_type.as_deref().is_some_and(|c| {
+                                        c.starts_with("text/event-stream") || c.contains("ndjson")
+                                    });
+                                    let mut first_token: Option<std::time::Instant> = None;
                                     while let Some(chunk_res) = stream.next().await {
                                         match chunk_res {
                                             Ok(chunk) => {
@@ -2590,6 +2644,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 // Count generated tokens as they stream, so
                                                 // runs in progress show up live.
                                                 let est = crate::metrics::estimate_stream_tokens(&chunk);
+                                                if est > 0 && streaming && first_token.is_none() {
+                                                    let now = std::time::Instant::now();
+                                                    first_token = Some(now);
+                                                    metrics.observe(
+                                                        &crate::metrics::TTFT,
+                                                        &[&user_id, &m_model, &m_backend],
+                                                        (now - started).as_secs_f64(),
+                                                    );
+                                                    run.update(|r| r.first_token = Some(now));
+                                                }
                                                 if est > 0 {
                                                     live_tokens += est;
                                                     count_tokens("completion", est);
@@ -2645,12 +2709,22 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     );
                                     // The exact usage replaces the stream estimate: only
                                     // the difference is added (a counter cannot go down).
-                                    if let Some((prompt, completion)) =
-                                        crate::metrics::parse_usage(&tail)
-                                    {
-                                        let completion = completion.saturating_sub(live_tokens);
-                                        count_tokens("prompt", prompt);
-                                        count_tokens("completion", completion);
+                                    let usage = crate::metrics::parse_usage(&tail);
+                                    if let Some(u) = usage {
+                                        count_tokens("prompt", u.prompt);
+                                        count_tokens(
+                                            "completion",
+                                            u.completion.saturating_sub(live_tokens),
+                                        );
+                                    }
+                                    if status.is_success() && !client_disconnected {
+                                        record_speed(
+                                            metrics,
+                                            [&user_id, &m_model, &m_backend],
+                                            usage,
+                                            first_token,
+                                            live_tokens,
+                                        );
                                     }
                                     outcome(if client_disconnected { "client_gone" } else { "ok" });
 
@@ -2911,6 +2985,10 @@ pub async fn proxy_handler(
     let (tx, rx) = mpsc::channel(32);
     let mut task_headers = headers.clone();
     task_headers.remove(axum::http::header::HOST);
+    // The body may have been rewritten (model alias); the HTTP client sets
+    // the length of the body actually sent.
+    task_headers.remove(axum::http::header::CONTENT_LENGTH);
+    task_headers.remove(axum::http::header::TRANSFER_ENCODING);
 
     let requested_model = extract_requested_model(&body);
 
@@ -4344,6 +4422,8 @@ mod tests {
                             "done": true,
                             "prompt_eval_count": 7,
                             "eval_count": 9,
+                            "prompt_eval_duration": 250_000_000u64,
+                            "eval_duration": 300_000_000u64,
                         }))
                     }),
                 );
@@ -4398,6 +4478,15 @@ mod tests {
             r#"ollamamq_client_key_tokens_total{client="alice",key="laptop",kind="completion"} 9"#.to_string(),
             r#"ollamamq_client_key_tokens_total{client="alice",key="laptop",kind="prompt"} 7"#.to_string(),
             format!(r#"ollamamq_backend_free_slots{{backend="{backend}"}} 1"#),
+            // Speed from Ollama's durations: 9 tokens in 0.3 s = 30 tok/s.
+            format!(r#"ollamamq_generation_seconds_total{{client="alice",model="llama3",backend="{backend}"}} 0.3"#),
+            format!(r#"ollamamq_generation_tokens_total{{client="alice",model="llama3",backend="{backend}"}} 9"#),
+            format!(r#"ollamamq_prompt_seconds_total{{client="alice",model="llama3",backend="{backend}"}} 0.25"#),
+            format!(r#"ollamamq_prompt_eval_tokens_total{{client="alice",model="llama3",backend="{backend}"}} 7"#),
+            format!(r#"ollamamq_generation_speed_tokens_per_second_bucket{{model="llama3",backend="{backend}",le="30"}} 1"#),
+            format!(r#"ollamamq_generation_speed_tokens_per_second_bucket{{model="llama3",backend="{backend}",le="20"}} 0"#),
+            // Not streamed: TTFT is the backend's prompt time.
+            format!(r#"ollamamq_time_to_first_token_seconds_sum{{client="alice",model="llama3",backend="{backend}"}} 0.25"#),
         ] {
             assert!(text.contains(&line), "missing: {line}\n{text}");
         }
@@ -4525,6 +4614,63 @@ mod tests {
         // Not an alias: the exact bytes pass through.
         let body = Bytes::from_static(br#"{"model":"phi4",  "x":1}"#);
         assert_eq!(state.apply_model_alias(body.clone()), body);
+    }
+
+    /// An aliased request reaches the backend as valid JSON even though the
+    /// rewritten body is longer than the client's `Content-Length`.
+    #[tokio::test]
+    async fn aliased_request_is_forwarded_with_its_new_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route(
+                    "/api/tags",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({ "models": [{ "name": "a-longer-model-name" }] }))
+                    }),
+                )
+                .route(
+                    "/api/chat",
+                    axum::routing::post(|body: Bytes| async move {
+                        match serde_json::from_slice::<serde_json::Value>(&body) {
+                            Ok(v) => (StatusCode::OK, v["model"].to_string()),
+                            Err(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+                        }
+                    }),
+                );
+            let _ = axum::serve(listener, app).await;
+        });
+        let state = new_test_state(vec![url]);
+        arm_ollama_backend(&state, None);
+        let aliases: std::collections::BTreeMap<String, String> =
+            [("short".to_string(), "a-longer-model-name".to_string())].into_iter().collect();
+        state.set_model_aliases(Some(&aliases));
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let body = Bytes::from_static(br#"{"model":"short","messages":[]}"#);
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::CONTENT_LENGTH, body.len().into());
+        headers.insert("x-user-id", "alias-test".parse().expect("header value"));
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proxy_handler(
+                State(state.clone()),
+                ConnectInfo("127.0.0.1:41031".parse().expect("addr")),
+                Method::POST,
+                headers,
+                axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+                body,
+            ),
+        )
+        .await
+        .expect("answered")
+        .into_response();
+        let status = res.status();
+        let text = axum::body::to_bytes(res.into_body(), usize::MAX).await.expect("body");
+        worker.abort();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&text));
+        assert_eq!(&text[..], br#""a-longer-model-name""#);
     }
 
     /// Without a key or X-User-ID a request is `ip-<address>`; with

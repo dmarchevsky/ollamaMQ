@@ -68,6 +68,26 @@ pub const KEY_TOKENS: CounterDef = CounterDef {
     help: "Tokens used through each client API key (key label, or id when unlabelled).",
     labels: &["client", "key", "kind"],
 };
+pub const GEN_SECONDS: CounterDef = CounterDef {
+    name: "ollamamq_generation_seconds_total",
+    help: "Time spent generating (decoding), from backend timings or first token to end. Per-stream speed = rate(generation_tokens_total) / rate(this).",
+    labels: &["client", "model", "backend"],
+};
+pub const GEN_TOKENS: CounterDef = CounterDef {
+    name: "ollamamq_generation_tokens_total",
+    help: "Generated tokens of requests whose generation time was measured (pairs with generation_seconds_total).",
+    labels: &["client", "model", "backend"],
+};
+pub const PROMPT_SECONDS: CounterDef = CounterDef {
+    name: "ollamamq_prompt_seconds_total",
+    help: "Prompt evaluation (prefill) time reported by backends.",
+    labels: &["client", "model", "backend"],
+};
+pub const PROMPT_EVAL_TOKENS: CounterDef = CounterDef {
+    name: "ollamamq_prompt_eval_tokens_total",
+    help: "Prompt tokens evaluated (not served from cache), pairs with prompt_seconds_total.",
+    labels: &["client", "model", "backend"],
+};
 pub const CONTROL_OPS: CounterDef = CounterDef {
     name: "ollamamq_model_control_operations_total",
     help: "Model load/unload operations by result.",
@@ -97,6 +117,19 @@ pub const DURATION: HistogramDef = HistogramDef {
     ],
 };
 
+pub const TTFT: HistogramDef = HistogramDef {
+    name: "ollamamq_time_to_first_token_seconds",
+    help: "Time from dispatch to the first generated token (streams), or the backend's prompt time (non-streamed responses that report it).",
+    labels: &["client", "model", "backend"],
+    buckets: &[0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0, 120.0],
+};
+pub const GEN_SPEED: HistogramDef = HistogramDef {
+    name: "ollamamq_generation_speed_tokens_per_second",
+    help: "Generation speed of each finished request.",
+    labels: &["model", "backend"],
+    buckets: &[2.0, 5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0, 250.0],
+};
+
 const COUNTERS: &[&CounterDef] = &[
     &REQUESTS,
     &BACKEND_RESPONSES,
@@ -105,9 +138,13 @@ const COUNTERS: &[&CounterDef] = &[
     &RESPONSE_BYTES,
     &KEY_REQUESTS,
     &KEY_TOKENS,
+    &GEN_SECONDS,
+    &GEN_TOKENS,
+    &PROMPT_SECONDS,
+    &PROMPT_EVAL_TOKENS,
     &CONTROL_OPS,
 ];
-const HISTOGRAMS: &[&HistogramDef] = &[&QUEUE_WAIT, &TTFB, &DURATION];
+const HISTOGRAMS: &[&HistogramDef] = &[&QUEUE_WAIT, &TTFB, &TTFT, &DURATION, &GEN_SPEED];
 
 #[derive(Default)]
 struct HistValue {
@@ -433,14 +470,26 @@ pub fn render(state: &Arc<AppState>) -> String {
             .collect(),
     );
     // Runs in progress, grouped so each label set is one series.
-    let mut active: BTreeMap<Vec<String>, (f64, f64, f64)> = BTreeMap::new();
+    #[derive(Default)]
+    struct Active {
+        n: f64,
+        oldest: f64,
+        tokens: f64,
+        prefilling: f64,
+        gen_secs: f64,
+    }
+    let mut active: BTreeMap<Vec<String>, Active> = BTreeMap::new();
     for r in state.runs.list() {
         let e = active
             .entry(vec![r.client, r.key, r.model, r.backend])
-            .or_insert((0.0, 0.0, 0.0));
-        e.0 += 1.0;
-        e.1 = e.1.max(r.started.elapsed().as_secs_f64());
-        e.2 += r.tokens as f64;
+            .or_default();
+        e.n += 1.0;
+        e.oldest = e.oldest.max(r.started.elapsed().as_secs_f64());
+        e.tokens += r.tokens as f64;
+        match r.first_token {
+            Some(t) => e.gen_secs += t.elapsed().as_secs_f64(),
+            None => e.prefilling += 1.0,
+        }
     }
     let labels = ["client", "key", "model", "backend"];
     gauge(
@@ -448,21 +497,35 @@ pub fn render(state: &Arc<AppState>) -> String {
         "ollamamq_active_requests",
         "Requests being served right now.",
         &labels,
-        active.iter().map(|(k, v)| (k.clone(), v.0)).collect(),
+        active.iter().map(|(k, v)| (k.clone(), v.n)).collect(),
     );
     gauge(
         &mut out,
         "ollamamq_active_oldest_seconds",
         "How long the oldest request in progress has been running.",
         &labels,
-        active.iter().map(|(k, v)| (k.clone(), v.1)).collect(),
+        active.iter().map(|(k, v)| (k.clone(), v.oldest)).collect(),
     );
     gauge(
         &mut out,
         "ollamamq_active_generated_tokens",
         "Tokens generated so far by requests in progress (estimated from the stream).",
         &labels,
-        active.iter().map(|(k, v)| (k.clone(), v.2)).collect(),
+        active.iter().map(|(k, v)| (k.clone(), v.tokens)).collect(),
+    );
+    gauge(
+        &mut out,
+        "ollamamq_active_prefilling",
+        "Requests in progress still waiting for their first token.",
+        &labels,
+        active.iter().map(|(k, v)| (k.clone(), v.prefilling)).collect(),
+    );
+    gauge(
+        &mut out,
+        "ollamamq_active_generation_seconds",
+        "Time since the first token, summed over requests in progress. Live speed = active_generated_tokens / this.",
+        &labels,
+        active.iter().map(|(k, v)| (k.clone(), v.gen_secs)).collect(),
     );
     gauge(
         &mut out,
@@ -741,39 +804,68 @@ pub fn render(state: &Arc<AppState>) -> String {
 
 // ------------------------------------------------------------------ tokens
 
-/// Token usage at the end of a response body: `(prompt, completion)`.
+/// Token usage and timings at the end of a response body.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Usage {
+    pub prompt: u64,
+    pub completion: u64,
+    /// Prompt evaluation (prefill) time, when the backend reports it.
+    pub prompt_secs: Option<f64>,
+    /// Prompt tokens actually evaluated (not served from cache).
+    pub prompt_eval: Option<u64>,
+    /// Generation (decode) time, when the backend reports it.
+    pub gen_secs: Option<f64>,
+}
+
+/// Token usage at the end of a response body.
 ///
 /// Understands a single JSON body (OpenAI `usage`, Ollama
 /// `prompt_eval_count`/`eval_count`), Ollama's NDJSON stream (the final line
 /// carries the counts) and OpenAI-style SSE (`data:` lines; usage is in the
-/// last chunk when the backend sends it). `tail` is the end of the body, so
-/// its first line may be cut — only complete lines are parsed.
-pub fn parse_usage(tail: &[u8]) -> Option<(u64, u64)> {
+/// last chunk when the backend sends it). Timings come from llama.cpp's
+/// `timings` and Ollama's `*_duration` fields. `tail` is the end of the body,
+/// so its first line may be cut — only complete lines are parsed.
+pub fn parse_usage(tail: &[u8]) -> Option<Usage> {
     let text = String::from_utf8_lossy(tail);
-    let from = |v: &serde_json::Value| -> Option<(u64, u64)> {
-        if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-            let p = u.get("prompt_tokens").and_then(|x| x.as_u64());
-            let c = u.get("completion_tokens").and_then(|x| x.as_u64());
+    let from = |v: &serde_json::Value| -> Option<Usage> {
+        let num = |o: &serde_json::Value, k: &str| o.get(k).and_then(|x| x.as_u64());
+        let secs = |o: &serde_json::Value, k: &str, scale: f64| {
+            o.get(k).and_then(|x| x.as_f64()).filter(|x| *x > 0.0).map(|x| x / scale)
+        };
+        let tm = v.get("timings").filter(|t| t.is_object());
+        let mut u = Usage::default();
+        let mut found = false;
+        if let Some(us) = v.get("usage").filter(|u| u.is_object()) {
+            let (p, c) = (num(us, "prompt_tokens"), num(us, "completion_tokens"));
             if p.is_some() || c.is_some() {
-                return Some((p.unwrap_or(0), c.unwrap_or(0)));
+                (u.prompt, u.completion, found) = (p.unwrap_or(0), c.unwrap_or(0), true);
             }
         }
-        let p = v.get("prompt_eval_count").and_then(|x| x.as_u64());
-        let c = v.get("eval_count").and_then(|x| x.as_u64());
-        if p.is_some() || c.is_some() {
-            return Some((p.unwrap_or(0), c.unwrap_or(0)));
+        if !found {
+            let (p, c) = (num(v, "prompt_eval_count"), num(v, "eval_count"));
+            if p.is_some() || c.is_some() {
+                (u.prompt, u.completion, found) = (p.unwrap_or(0), c.unwrap_or(0), true);
+                // Ollama: durations in nanoseconds; prefill includes loading.
+                u.gen_secs = secs(v, "eval_duration", 1e9);
+                u.prompt_eval = p;
+                u.prompt_secs = secs(v, "prompt_eval_duration", 1e9)
+                    .map(|s| s + secs(v, "load_duration", 1e9).unwrap_or(0.0));
+            }
         }
         // llama.cpp streams carry no `usage` (unless asked), but the last
         // chunk has `timings`: prompt = cached + newly evaluated tokens.
-        let tm = v.get("timings").filter(|t| t.is_object())?;
-        let field = |k: &str| tm.get(k).and_then(|x| x.as_u64());
-        let (prompt_n, predicted_n) = (field("prompt_n"), field("predicted_n"));
-        (prompt_n.is_some() || predicted_n.is_some()).then(|| {
-            (
-                prompt_n.unwrap_or(0) + field("cache_n").unwrap_or(0),
-                predicted_n.unwrap_or(0),
-            )
-        })
+        if let Some(tm) = tm {
+            let (prompt_n, predicted_n) = (num(tm, "prompt_n"), num(tm, "predicted_n"));
+            if !found && (prompt_n.is_some() || predicted_n.is_some()) {
+                u.prompt = prompt_n.unwrap_or(0) + num(tm, "cache_n").unwrap_or(0);
+                u.completion = predicted_n.unwrap_or(0);
+                found = true;
+            }
+            u.prompt_eval = prompt_n;
+            u.prompt_secs = secs(tm, "prompt_ms", 1e3);
+            u.gen_secs = secs(tm, "predicted_ms", 1e3);
+        }
+        found.then_some(u)
     };
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim())
         && let Some(u) = from(&v)
@@ -808,6 +900,8 @@ pub struct Run {
     pub backend: String,
     pub started: std::time::Instant,
     pub first_byte: Option<std::time::Instant>,
+    /// First generated token (streams only); `None` while prefilling.
+    pub first_token: Option<std::time::Instant>,
     /// Generated tokens so far, estimated from the stream (see
     /// [`estimate_stream_tokens`]).
     pub tokens: u64,
@@ -835,6 +929,7 @@ impl Runs {
                 backend: backend.to_string(),
                 started: std::time::Instant::now(),
                 first_byte: None,
+                first_token: None,
                 tokens: 0,
             },
         );
@@ -872,17 +967,29 @@ impl Drop for RunGuard<'_> {
 /// servers send about one token per event, so this tracks a run while it is
 /// going; the exact count from the final usage tops it up when it ends.
 pub fn estimate_stream_tokens(chunk: &[u8]) -> u64 {
-    const FIELDS: &[&[u8]] = &[b"content\":\"", b"\"response\":\"", b"\"text\":\""];
+    // `content"` also matches `reasoning_content`.
+    const KEYS: &[&[u8]] = &[b"content\"", b"\"response\"", b"\"text\""];
+    let skip_ws = |mut i: usize| {
+        while chunk.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        i
+    };
     let mut n = 0;
-    for f in FIELDS {
+    for key in KEYS {
         let mut from = 0;
-        while let Some(pos) = chunk[from..].windows(f.len()).position(|w| w == *f) {
-            let end = from + pos + f.len();
-            // `"content":""` is an empty delta, not a token.
-            if chunk.get(end) != Some(&b'"') {
+        while let Some(pos) = chunk[from..].windows(key.len()).position(|w| w == *key) {
+            from += pos + key.len();
+            // A string value (`"key": "…"`, with or without spaces); an
+            // empty one (`"content":""`) is not a token.
+            let colon = skip_ws(from);
+            if chunk.get(colon) != Some(&b':') {
+                continue;
+            }
+            let quote = skip_ws(colon + 1);
+            if chunk.get(quote) == Some(&b'"') && chunk.get(quote + 1) != Some(&b'"') {
                 n += 1;
             }
-            from = end;
         }
     }
     n
@@ -959,6 +1066,11 @@ mod tests {
         let ollama = b"{\"message\":{\"role\":\"assistant\",\"content\":\"He\"},\"done\":false}\n{\"response\":\"llo\",\"done\":false}\n";
         assert_eq!(estimate_stream_tokens(ollama), 2);
         assert_eq!(estimate_stream_tokens(b"{\"error\":\"x\"}"), 0);
+        // Python servers put a space after the colon.
+        let spaced = b"data: {\"choices\": [{\"delta\": {\"role\": \"assistant\", \"content\": \"\"}}]}\n\ndata: {\"choices\": [{\"delta\": {\"reasoning_content\": \" request\"}}]}\n\ndata: {\"choices\": [{\"delta\": {\"content\": \"Hi\"}}]}\n\n";
+        assert_eq!(estimate_stream_tokens(spaced), 2);
+        // A content-parts array is not generated text.
+        assert_eq!(estimate_stream_tokens(br#"{"content": [{"type": "text"}]}"#), 0);
     }
 
     #[test]
@@ -1000,25 +1112,48 @@ mod tests {
 
     #[test]
     fn usage_from_each_response_shape() {
+        let tokens = |b: &[u8]| parse_usage(b).map(|u| (u.prompt, u.completion));
         // OpenAI / llama.cpp, non-streaming.
         let openai = br#"{"id":"x","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}"#;
-        assert_eq!(parse_usage(openai), Some((12, 34)));
+        assert_eq!(tokens(openai), Some((12, 34)));
         // Ollama, non-streaming.
         let ollama = br#"{"model":"llama3","done":true,"prompt_eval_count":7,"eval_count":9}"#;
-        assert_eq!(parse_usage(ollama), Some((7, 9)));
+        assert_eq!(tokens(ollama), Some((7, 9)));
         // Ollama NDJSON stream; the tail starts mid-line.
         let ndjson = b"ent\":\"Hi\"},\"done\":false}\n{\"message\":{\"content\":\"!\"},\"done\":false}\n{\"done\":true,\"prompt_eval_count\":3,\"eval_count\":5}\n";
-        assert_eq!(parse_usage(ndjson), Some((3, 5)));
+        assert_eq!(tokens(ndjson), Some((3, 5)));
         // OpenAI SSE with usage in the last chunk.
         let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6}}\n\ndata: [DONE]\n\n";
-        assert_eq!(parse_usage(sse), Some((4, 6)));
+        assert_eq!(tokens(sse), Some((4, 6)));
         // llama.cpp stream: no usage, but `timings` in the last chunk
         // (captured from a real llama.cpp b11347 server).
         let llama = b"data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"timings\":{\"cache_n\":13,\"prompt_n\":5,\"prompt_ms\":63.5,\"predicted_n\":4,\"predicted_ms\":36.9}}\n\ndata: [DONE]\n\n";
-        assert_eq!(parse_usage(llama), Some((18, 4)));
+        assert_eq!(tokens(llama), Some((18, 4)));
         // SSE without usage: unknown, not zero.
         let bare = b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n";
         assert_eq!(parse_usage(bare), None);
+    }
+
+    #[test]
+    fn usage_timings() {
+        // llama.cpp: prefill = prompt_ms over newly evaluated prompt_n.
+        let llama = b"data: {\"choices\":[],\"timings\":{\"cache_n\":13,\"prompt_n\":5,\"prompt_ms\":63.5,\"predicted_n\":4,\"predicted_ms\":40.0}}\n\ndata: [DONE]\n\n";
+        let u = parse_usage(llama).unwrap();
+        assert_eq!((u.prompt_eval, u.prompt_secs, u.gen_secs), (Some(5), Some(0.0635), Some(0.04)));
+        // llama.cpp non-streamed: usage and timings side by side.
+        let both = br#"{"usage":{"prompt_tokens":18,"completion_tokens":4},"timings":{"prompt_n":5,"prompt_ms":50,"predicted_ms":80}}"#;
+        let u = parse_usage(both).unwrap();
+        assert_eq!((u.prompt, u.completion, u.gen_secs), (18, 4, Some(0.08)));
+        // Ollama: nanoseconds; loading counts towards prefill.
+        let ollama = br#"{"done":true,"prompt_eval_count":7,"eval_count":9,"prompt_eval_duration":200000000,"load_duration":100000000,"eval_duration":300000000}"#;
+        let u = parse_usage(ollama).unwrap();
+        assert_eq!(u.prompt_eval, Some(7));
+        assert!((u.prompt_secs.unwrap() - 0.3).abs() < 1e-9);
+        assert_eq!(u.gen_secs, Some(0.3));
+        // OpenAI usage only: no timings.
+        let openai = br#"{"usage":{"prompt_tokens":1,"completion_tokens":2}}"#;
+        let u = parse_usage(openai).unwrap();
+        assert_eq!((u.prompt_secs, u.gen_secs, u.prompt_eval), (None, None, None));
     }
 
     #[test]
