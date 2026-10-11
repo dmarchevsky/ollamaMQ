@@ -63,6 +63,11 @@ pub const KEY_REQUESTS: CounterDef = CounterDef {
     help: "Requests authenticated by each client API key (id and label, never the key).",
     labels: &["client", "key_id", "key_label"],
 };
+pub const KEY_TOKENS: CounterDef = CounterDef {
+    name: "ollamamq_client_key_tokens_total",
+    help: "Tokens used through each client API key (key label, or id when unlabelled).",
+    labels: &["client", "key", "kind"],
+};
 pub const CONTROL_OPS: CounterDef = CounterDef {
     name: "ollamamq_model_control_operations_total",
     help: "Model load/unload operations by result.",
@@ -99,6 +104,7 @@ const COUNTERS: &[&CounterDef] = &[
     &REQUEST_BYTES,
     &RESPONSE_BYTES,
     &KEY_REQUESTS,
+    &KEY_TOKENS,
     &CONTROL_OPS,
 ];
 const HISTOGRAMS: &[&HistogramDef] = &[&QUEUE_WAIT, &TTFB, &DURATION];
@@ -376,15 +382,45 @@ pub fn render(state: &Arc<AppState>) -> String {
     };
     let b = |v: bool| if v { "true" } else { "false" }.to_string();
 
+    // Waiting requests by client and model. Copied out under the queues lock,
+    // labelled afterwards (that takes the backends lock).
+    let waiting: Vec<(String, Option<String>, f64)> = state
+        .queues
+        .lock_or_recover()
+        .iter()
+        .flat_map(|(client, q)| {
+            q.iter().map(move |t| {
+                (
+                    client.clone(),
+                    t.requested_model.clone(),
+                    t.queued_at.elapsed().as_secs_f64(),
+                )
+            })
+        })
+        .collect();
+    let mut queued: BTreeMap<Vec<String>, (f64, f64)> = BTreeMap::new();
+    {
+        let backends = state.backends.lock_or_recover();
+        for (client, model, age) in waiting {
+            let model = crate::dispatcher::model_label_in(&backends, model.as_deref());
+            let e = queued.entry(vec![client, model]).or_insert((0.0, 0.0));
+            e.0 += 1.0;
+            e.1 = e.1.max(age);
+        }
+    }
     gauge(
         &mut out,
         "ollamamq_queue_depth",
-        "Requests waiting in each client's queue.",
-        &["client"],
-        snap.users
-            .iter()
-            .map(|u| (vec![u.id.clone()], u.queued as f64))
-            .collect(),
+        "Requests waiting in the queue, by client and model.",
+        &["client", "model"],
+        queued.iter().map(|(k, v)| (k.clone(), v.0)).collect(),
+    );
+    gauge(
+        &mut out,
+        "ollamamq_queue_oldest_seconds",
+        "How long the oldest waiting request has been queued, by client and model.",
+        &["client", "model"],
+        queued.iter().map(|(k, v)| (k.clone(), v.1)).collect(),
     );
     gauge(
         &mut out,
@@ -400,13 +436,13 @@ pub fn render(state: &Arc<AppState>) -> String {
     let mut active: BTreeMap<Vec<String>, (f64, f64, f64)> = BTreeMap::new();
     for r in state.runs.list() {
         let e = active
-            .entry(vec![r.client, r.model, r.backend])
+            .entry(vec![r.client, r.key, r.model, r.backend])
             .or_insert((0.0, 0.0, 0.0));
         e.0 += 1.0;
         e.1 = e.1.max(r.started.elapsed().as_secs_f64());
         e.2 += r.tokens as f64;
     }
-    let labels = ["client", "model", "backend"];
+    let labels = ["client", "key", "model", "backend"];
     gauge(
         &mut out,
         "ollamamq_active_requests",
@@ -441,6 +477,8 @@ pub fn render(state: &Arc<AppState>) -> String {
         )],
     );
 
+    let busy_with_control: HashSet<usize> = snap.active_ops.iter().map(|o| o.backend_idx).collect();
+    let mut free = Vec::new();
     let mut up = Vec::new();
     let mut in_flight = Vec::new();
     let mut max_conc = Vec::new();
@@ -455,6 +493,19 @@ pub fn render(state: &Arc<AppState>) -> String {
         ));
         in_flight.push((vec![label.clone()], bk.active_requests as f64));
         max_conc.push((vec![label.clone()], state.max_concurrent_per_backend as f64));
+        // What the scheduler could start now: none while offline or while a
+        // model load/unload runs (it treats that backend as busy).
+        let idx = snap
+            .backends
+            .iter()
+            .position(|x| x.url == bk.url)
+            .unwrap_or(usize::MAX);
+        let slots = if !bk.is_online || busy_with_control.contains(&idx) {
+            0
+        } else {
+            (state.max_concurrent_per_backend as usize).saturating_sub(bk.active_requests)
+        };
+        free.push((vec![label.clone()], slots as f64));
         let mut models: Vec<_> = bk.active_by_model.iter().collect();
         models.sort();
         for (m, n) in models {
@@ -491,6 +542,27 @@ pub fn render(state: &Arc<AppState>) -> String {
         "Requests a backend is serving now.",
         &["backend"],
         in_flight,
+    );
+    gauge(
+        &mut out,
+        "ollamamq_backend_free_slots",
+        "Requests a backend could start now: capacity minus in-flight, 0 while offline or loading/unloading a model.",
+        &["backend"],
+        free,
+    );
+    let mut limits: Vec<(Vec<String>, f64)> = state
+        .model_limits
+        .lock_or_recover()
+        .iter()
+        .map(|(m, n)| (vec![m.clone()], *n as f64))
+        .collect();
+    limits.sort_by(|a, b| a.0.cmp(&b.0));
+    gauge(
+        &mut out,
+        "ollamamq_model_max_concurrency",
+        "Per-model in-flight cap per backend (models[].max_concurrent_requests).",
+        &["model"],
+        limits,
     );
     gauge(
         &mut out,
@@ -723,6 +795,8 @@ pub fn parse_usage(tail: &[u8]) -> Option<(u64, u64)> {
 #[derive(Clone, Debug)]
 pub struct Run {
     pub client: String,
+    /// API key label (or id); `none` for requests without a client key.
+    pub key: String,
     pub model: String,
     pub backend: String,
     pub started: std::time::Instant,
@@ -743,12 +817,13 @@ pub struct Runs {
 impl Runs {
     /// Register a run; it is removed when the returned guard drops, so every
     /// exit path (finished, client gone, backend error, panic) clears it.
-    pub fn start(&self, client: &str, model: &str, backend: &str) -> RunGuard<'_> {
+    pub fn start(&self, client: &str, key: &str, model: &str, backend: &str) -> RunGuard<'_> {
         let id = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.lock_or_recover().insert(
             id,
             Run {
                 client: client.to_string(),
+                key: key.to_string(),
                 model: model.to_string(),
                 backend: backend.to_string(),
                 started: std::time::Instant::now(),
@@ -883,7 +958,7 @@ mod tests {
     fn runs_clear_on_drop_and_show_as_gauges() {
         let runs = Runs::default();
         {
-            let g = runs.start("dm", "qwen", "b:1");
+            let g = runs.start("dm", "laptop", "qwen", "b:1");
             g.update(|r| r.tokens += 5);
             let l = runs.list();
             assert_eq!((l.len(), l[0].tokens), (1, 5));

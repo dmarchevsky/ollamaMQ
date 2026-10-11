@@ -536,10 +536,14 @@ scrape_configs:
 | `ollamamq_tokens_total` | counter | client, model, backend, kind (`prompt` / `completion`) |
 | `ollamamq_request_bytes_total` / `ollamamq_response_bytes_total` | counter | client, model (, backend) |
 | `ollamamq_client_key_requests_total` | counter | client, key_id, key_label |
+| `ollamamq_client_key_tokens_total` | counter | client, key (label, else id), kind |
 | `ollamamq_queue_wait_seconds` | histogram | client, model |
 | `ollamamq_time_to_first_byte_seconds` / `ollamamq_request_duration_seconds` | histogram | model, backend |
-| `ollamamq_queue_depth`, `ollamamq_requests_in_flight`, `ollamamq_client_fair_share_score` | gauge | client |
-| `ollamamq_active_requests`, `ollamamq_active_oldest_seconds`, `ollamamq_active_generated_tokens` | gauge | client, model, backend — requests in progress right now |
+| `ollamamq_queue_depth`, `ollamamq_queue_oldest_seconds` | gauge | client, model — waiting requests and the age of the oldest |
+| `ollamamq_requests_in_flight`, `ollamamq_client_fair_share_score` | gauge | client |
+| `ollamamq_active_requests`, `ollamamq_active_oldest_seconds`, `ollamamq_active_generated_tokens` | gauge | client, key, model, backend — requests in progress right now |
+| `ollamamq_backend_free_slots` | gauge | backend — requests it could start now (0 while offline or loading a model) |
+| `ollamamq_model_max_concurrency` | gauge | model — `models[].max_concurrent_requests` |
 | `ollamamq_client_info` | gauge (=1) | client, registered, disabled, vip, boost |
 | `ollamamq_backend_up`, `ollamamq_backend_requests_in_flight`, `ollamamq_backend_max_concurrency`, `ollamamq_backend_models`, `ollamamq_model_loaded`, `ollamamq_backend_model_requests_in_flight` | gauge | backend (, api_type / state / model) |
 | `ollamamq_model_control_operations_total` | counter | backend, model, action, result |

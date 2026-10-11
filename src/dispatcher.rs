@@ -76,6 +76,8 @@ pub struct Task {
     /// When the request was queued; used to fail fast (503) when no backend
     /// can ever serve it instead of letting the client hang forever.
     pub queued_at: std::time::Instant,
+    /// Label (or id) of the client API key that sent it, for per-key metrics.
+    pub key_label: Option<String>,
 }
 
 /// Which API flavours a backend speaks — and, on the route side of the
@@ -2345,7 +2347,20 @@ pub async fn run_worker(state: Arc<AppState>) {
                     let m_model = state_clone.model_label(task.requested_model.as_deref());
                     let m_endpoint = route_template(&task.path);
                     let m_backend = crate::metrics::backend_label(&backend_url);
+                    let m_key = task.key_label.clone();
                     let metrics = &state_clone.metrics;
+                    // Tokens go to the per-request counter and, for requests
+                    // sent with a client key, the per-key one.
+                    let count_tokens = |kind: &str, n: u64| {
+                        metrics.inc(
+                            &crate::metrics::TOKENS,
+                            &[&user_id, &m_model, &m_backend, kind],
+                            n as f64,
+                        );
+                        if let Some(key) = &m_key {
+                            metrics.inc(&crate::metrics::KEY_TOKENS, &[&user_id, key, kind], n as f64);
+                        }
+                    };
                     let outcome = |o: &str| {
                         metrics.inc(
                             &crate::metrics::REQUESTS,
@@ -2362,6 +2377,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                     // long request's tokens are not lost (see `Metrics::touch`).
                     for kind in ["prompt", "completion"] {
                         metrics.touch(&crate::metrics::TOKENS, &[&user_id, &m_model, &m_backend, kind]);
+                        if let Some(key) = &m_key {
+                            metrics.touch(&crate::metrics::KEY_TOKENS, &[&user_id, key, kind]);
+                        }
                     }
                     metrics.touch(&crate::metrics::RESPONSE_BYTES, &[&user_id, &m_model, &m_backend]);
                     metrics.touch_histogram(&crate::metrics::TTFB, &[&m_model, &m_backend]);
@@ -2422,7 +2440,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                         let path_str = task.path.clone();
 
                         // Shown as running until this block ends, on any path.
-                        let run = state_clone.runs.start(&user_id, &m_model, &m_backend);
+                        let run = state_clone.runs.start(
+                            &user_id,
+                            m_key.as_deref().unwrap_or("none"),
+                            &m_model,
+                            &m_backend,
+                        );
                         // Completion tokens already counted from the stream.
                         let mut live_tokens: u64 = 0;
 
@@ -2486,11 +2509,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 let est = crate::metrics::estimate_stream_tokens(&chunk);
                                                 if est > 0 {
                                                     live_tokens += est;
-                                                    metrics.inc(
-                                                        &crate::metrics::TOKENS,
-                                                        &[&user_id, &m_model, &m_backend, "completion"],
-                                                        est as f64,
-                                                    );
+                                                    count_tokens("completion", est);
                                                     run.update(|r| r.tokens += est);
                                                 }
                                                 if content_acc.len() < state_clone.log_content_limit
@@ -2547,13 +2566,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         crate::metrics::parse_usage(&tail)
                                     {
                                         let completion = completion.saturating_sub(live_tokens);
-                                        for (kind, n) in [("prompt", prompt), ("completion", completion)] {
-                                            metrics.inc(
-                                                &crate::metrics::TOKENS,
-                                                &[&user_id, &m_model, &m_backend, kind],
-                                                n as f64,
-                                            );
-                                        }
+                                        count_tokens("prompt", prompt);
+                                        count_tokens("completion", completion);
                                     }
                                     outcome(if client_disconnected { "client_gone" } else { "ok" });
 
@@ -2854,6 +2868,13 @@ pub async fn proxy_handler(
         requested_model: requested_model.clone(),
         stuck_warned: false,
         queued_at: std::time::Instant::now(),
+        key_label: client.as_ref().map(|c| {
+            if c.key_label.is_empty() {
+                c.key_id.clone()
+            } else {
+                c.key_label.clone()
+            }
+        }),
     };
 
     {
@@ -3704,6 +3725,7 @@ mod tests {
                 requested_model: Some("no-such-model-xyz".to_string()),
                 stuck_warned: false,
                 queued_at: std::time::Instant::now(),
+                key_label: None,
             });
         }
 
@@ -3789,6 +3811,7 @@ mod tests {
                 requested_model: Some("llama3".to_string()),
                 stuck_warned: false,
                 queued_at: std::time::Instant::now(),
+                key_label: None,
             });
         rx
     }
@@ -4070,6 +4093,7 @@ mod tests {
             requested_model: None,
             stuck_warned: false,
             queued_at: std::time::Instant::now(),
+            key_label: None,
         });
         state.processed_counts.lock_or_recover().insert("old".into(), 7);
         state.toggle_boost("old");
@@ -4233,10 +4257,20 @@ mod tests {
         });
         let state = new_test_state(vec![url.clone()]);
         arm_ollama_backend(&state, None);
+        {
+            let mut clients = state.clients.lock_or_recover();
+            clients.create_client("alice", "").expect("client");
+            clients
+                .add_key("alice", Some("alice-key-123"), "laptop")
+                .expect("key");
+        }
         let worker = tokio::spawn(run_worker(state.clone()));
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-User-ID", "alice".parse().expect("header value"));
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer alice-key-123".parse().expect("header value"),
+        );
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             proxy_handler(
@@ -4267,9 +4301,29 @@ mod tests {
             r#"ollamamq_queue_wait_seconds_count{client="alice",model="llama3"} 1"#.to_string(),
             format!(r#"ollamamq_request_duration_seconds_count{{model="llama3",backend="{backend}"}} 1"#),
             format!(r#"ollamamq_backend_up{{backend="{backend}",api_type="Ollama"}} 1"#),
+            r#"ollamamq_client_key_tokens_total{client="alice",key="laptop",kind="completion"} 9"#.to_string(),
+            r#"ollamamq_client_key_tokens_total{client="alice",key="laptop",kind="prompt"} 7"#.to_string(),
+            format!(r#"ollamamq_backend_free_slots{{backend="{backend}"}} 1"#),
         ] {
             assert!(text.contains(&line), "missing: {line}\n{text}");
         }
+    }
+
+    /// Waiting requests are reported by client and model, with the age of
+    /// the oldest; an offline backend has no free slots.
+    #[test]
+    fn queue_and_slot_gauges() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        state.backends.lock_or_recover()[0].available_models = Arc::new(set(&["llama3"]));
+        let _rx = enqueue_llama_chat(&state, HeaderMap::new());
+        state.backends.lock_or_recover()[0].is_online = false;
+        let text = crate::metrics::render(&state);
+        assert!(
+            text.contains(r#"ollamamq_queue_depth{client="tester",model="llama3"} 1"#),
+            "{text}"
+        );
+        assert!(text.contains(r#"ollamamq_queue_oldest_seconds{client="tester",model="llama3"} "#));
+        assert!(text.contains(r#"ollamamq_backend_free_slots{backend="127.0.0.1:9"} 0"#));
     }
 
     // -- Scheduler-tier integration tests ------------------------------------
@@ -4468,6 +4522,7 @@ mod tests {
                 requested_model: Some("qwen3.8-27b".to_string()),
                 stuck_warned: false,
                 queued_at: std::time::Instant::now(),
+                key_label: None,
             });
         rx
     }
@@ -4819,6 +4874,7 @@ mod tests {
                     requested_model: None,
                     stuck_warned: false,
                     queued_at: std::time::Instant::now(),
+                    key_label: None,
                 });
             }
         }
@@ -4966,6 +5022,7 @@ mod tests {
                     requested_model: None,
                     stuck_warned: false,
                     queued_at: now,
+                    key_label: None,
                 });
         }
 
@@ -5352,6 +5409,7 @@ mod tests {
                 requested_model: None,
                 stuck_warned: false,
                 queued_at: std::time::Instant::now(),
+                key_label: None,
             });
 
         let worker = tokio::spawn(run_worker(state.clone()));
@@ -5511,6 +5569,7 @@ mod tests {
                 requested_model: Some(model.to_string()),
                 stuck_warned: false,
                 queued_at: std::time::Instant::now(),
+                key_label: None,
             });
         rx
     }

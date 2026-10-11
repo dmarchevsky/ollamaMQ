@@ -277,9 +277,10 @@ function renderRuns(st) {
   const runs = st.runs || [];
   $('#ov-runs-count').textContent = runs.length ? `${runs.length} in progress` : '';
   setHTML($('#ov-runs'), runs.length ? `<table>
-    <tr><th>Client</th><th>Model</th><th>Backend</th><th class="num">Elapsed</th><th class="num">First byte</th><th class="num">Tokens</th><th class="num">tok/s</th></tr>
+    <tr><th>Client</th><th>Key</th><th>Model</th><th>Backend</th><th class="num">Elapsed</th><th class="num">First byte</th><th class="num">Tokens</th><th class="num">tok/s</th></tr>
     ${runs.map(r => `<tr>
       <td><span class="mono">${esc(r.client)}</span></td>
+      <td class="dim">${r.key && r.key !== 'none' ? esc(r.key) : '—'}</td>
       <td class="trunc">${esc(r.model)}</td>
       <td class="mono dim">${esc(r.backend)}</td>
       <td class="num">${fmtDur(r.elapsed_secs)}</td>

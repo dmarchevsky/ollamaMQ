@@ -296,6 +296,8 @@ struct StateView {
 #[derive(Serialize)]
 struct RunView {
     client: String,
+    /// API key label, or `none`.
+    key: String,
     model: String,
     backend: String,
     elapsed_secs: f64,
@@ -484,6 +486,7 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
                         .map(|s| r.tokens as f64 / s),
                     tokens: r.tokens,
                     client: r.client,
+                    key: r.key,
                     model: r.model,
                     backend: r.backend,
                 }
