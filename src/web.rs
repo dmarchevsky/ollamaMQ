@@ -38,6 +38,8 @@ const APP_CSS: &str = include_str!("web/app.css");
 const DEMO_JS: &str = include_str!("web/demo.js");
 const LOGIN_HTML: &str = include_str!("web/login.html");
 const LOGIN_JS: &str = include_str!("web/login.js");
+const FAVICON_SVG: &str = include_str!("web/favicon.svg");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("web/apple-touch-icon.png");
 
 /// Reachable without signing in: the login page and what it needs.
 const PUBLIC_PATHS: &[&str] = &[
@@ -45,6 +47,8 @@ const PUBLIC_PATHS: &[&str] = &[
     "/ui/login",
     "/ui/login.js",
     "/ui/app.css",
+    "/ui/favicon.svg",
+    "/ui/apple-touch-icon.png",
     "/ui/api/login",
     "/ui/api/logout",
 ];
@@ -144,6 +148,14 @@ pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
             get(|| async { asset(LOGIN_HTML, "text/html; charset=utf-8") }),
         )
         .route(
+            "/ui/favicon.svg",
+            get(|| async { icon(FAVICON_SVG.as_bytes(), "image/svg+xml") }),
+        )
+        .route(
+            "/ui/apple-touch-icon.png",
+            get(|| async { icon(APPLE_TOUCH_ICON, "image/png") }),
+        )
+        .route(
             "/ui/login.js",
             get(|| async { asset(LOGIN_JS, "text/javascript; charset=utf-8") }),
         )
@@ -152,6 +164,18 @@ pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
         .layer(middleware::from_fn_with_state(auth.clone(), require_auth))
         .layer(axum::Extension(auth))
         .layer(middleware::from_fn(security_headers))
+}
+
+/// Icons rarely change: let browsers keep them for a day.
+fn icon(body: &'static [u8], content_type: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 fn asset(body: &'static str, content_type: &'static str) -> Response {
@@ -1084,7 +1108,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert!(res.headers().get(header::CONTENT_SECURITY_POLICY).is_some());
         assert!(res.text().await.unwrap().contains("Sign in"));
-        for asset in ["login.js", "app.css"] {
+        for asset in ["login.js", "app.css", "favicon.svg", "apple-touch-icon.png"] {
             let res = c.get(format!("{base}/ui/{asset}")).send().await.unwrap();
             assert_eq!(res.status(), StatusCode::OK, "{asset}");
         }
