@@ -43,6 +43,13 @@ pub struct Client {
     pub note: String,
     #[serde(default)]
     pub disabled: bool,
+    /// Scheduling priority that survives restarts: at most one client is
+    /// VIP and at most one is boosted (mirrors `AppState::vip_user` /
+    /// `boost_user`, which the scheduler reads).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vip: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub boost: bool,
     pub created_at_ms: u64,
     #[serde(default)]
     pub keys: Vec<ApiKey>,
@@ -68,6 +75,8 @@ pub struct ClientView {
     pub name: String,
     pub note: String,
     pub disabled: bool,
+    pub vip: bool,
+    pub boost: bool,
     pub created_at_ms: u64,
     pub keys: Vec<KeyView>,
 }
@@ -223,6 +232,8 @@ impl ClientStore {
                 name: c.name.clone(),
                 note: c.note.clone(),
                 disabled: c.disabled,
+                vip: c.vip,
+                boost: c.boost,
                 created_at_ms: c.created_at_ms,
                 keys: c
                     .keys
@@ -234,6 +245,65 @@ impl ClientStore {
                     .collect(),
             })
             .collect()
+    }
+
+    /// Whether `name` is a registered client. Registered names are reserved:
+    /// only a request presenting one of the client's keys may queue under it.
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.clients.iter().any(|c| c.name == name)
+    }
+
+    /// True only for a registered client that is disabled.
+    pub fn is_disabled(&self, name: &str) -> bool {
+        self.clients.iter().any(|c| c.name == name && c.disabled)
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.clients.iter().map(|c| c.name.clone()).collect()
+    }
+
+    pub fn disabled_names(&self) -> Vec<String> {
+        self.clients
+            .iter()
+            .filter(|c| c.disabled)
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
+    pub fn set_disabled(&mut self, name: &str, disabled: bool) -> Result<(), StoreError> {
+        self.update_client(
+            name,
+            ClientPatch {
+                disabled: Some(disabled),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The persisted (VIP, boost) clients.
+    pub fn priority(&self) -> (Option<String>, Option<String>) {
+        let pick =
+            |f: fn(&Client) -> bool| self.clients.iter().find(|c| f(c)).map(|c| c.name.clone());
+        (pick(|c| c.vip), pick(|c| c.boost))
+    }
+
+    /// Record which clients hold VIP and boost (`None`, or a name that is not
+    /// a registered client, clears the flag everywhere). Writes only when
+    /// something changed.
+    pub fn set_priority(
+        &mut self,
+        vip: Option<&str>,
+        boost: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mut next = self.clients.clone();
+        for c in &mut next {
+            c.vip = vip == Some(c.name.as_str());
+            c.boost = boost == Some(c.name.as_str());
+        }
+        if next == self.clients {
+            return Ok(());
+        }
+        self.commit(next)
     }
 
     pub fn create_client(&mut self, name: &str, note: &str) -> Result<(), StoreError> {
@@ -249,6 +319,8 @@ impl ClientStore {
             name: name.to_string(),
             note: clip(note),
             disabled: false,
+            vip: false,
+            boost: false,
             created_at_ms: now_ms(),
             keys: Vec::new(),
         });
@@ -518,6 +590,25 @@ mod tests {
         .unwrap();
         assert_eq!(s.resolve("rename-key-1").unwrap().client, "new");
         assert_eq!(s.list()[0].note, "hello");
+    }
+
+    #[test]
+    fn registration_disable_and_priority() {
+        let mut s = store_with("alice", "alice-key-123");
+        s.create_client("bob", "").unwrap();
+        assert!(s.is_registered("alice") && !s.is_registered("carol"));
+        assert!(!s.is_disabled("alice") && !s.is_disabled("carol"));
+        s.set_disabled("alice", true).unwrap();
+        assert!(s.is_disabled("alice"));
+        assert_eq!(s.disabled_names(), vec!["alice".to_string()]);
+
+        s.set_priority(Some("bob"), Some("alice")).unwrap();
+        assert_eq!(s.priority(), (Some("bob".into()), Some("alice".into())));
+        // An unregistered name clears the flag rather than failing.
+        s.set_priority(Some("carol"), None).unwrap();
+        assert_eq!(s.priority(), (None, None));
+        let v = s.list();
+        assert!(v.iter().all(|c| !c.vip && !c.boost));
     }
 
     #[test]

@@ -338,12 +338,14 @@ pre.content {
   .client-sub { font-weight: 400; }
 
   /* Overview summaries: fields flow inline under the title. */
-  #page-overview .panel table:not(.logs) tr:not(:has(> th)) {
+  #page-overview .panel table:not(.logs) tr:not(:has(> th)),
+  #client-list table tr:not(:has(> th)) {
     display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 14px;
   }
-  #page-overview .panel table:not(.logs) td { width: auto; }
-  #page-overview .panel table:not(.logs) td:first-child { flex-basis: 100%; }
-  #page-overview .panel table:not(.logs) td[data-label]::before { float: none; margin-right: 5px; }
+  #page-overview .panel table:not(.logs) td, #client-list table td { width: auto; }
+  #page-overview .panel table:not(.logs) td:first-child, #client-list table td:first-child { flex-basis: 100%; }
+  #page-overview .panel table:not(.logs) td[data-label]::before,
+  #client-list table td[data-label]::before { float: none; margin-right: 5px; }
   .panel td.actions, .panel:not(.flush) table td.actions { text-align: left; padding-top: 8px; white-space: normal; }
   /* Row highlights paint the whole card, not one cell; touch screens get
      no sticky hover. */
@@ -370,3 +372,19 @@ pre.content {
   .panel table.logs td:nth-child(6) { grid-column: span 3; }
   .panel table.logs td.none { display: none; }
 }
+
+/* Clients page: filter + action row, three-column Blocked page. */
+.page-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.page-tools .seg { margin: 0; }
+.detail-actions { margin: -4px 0 16px; }
+.note { color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin: 0; }
+.grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin-bottom: 18px; }
+.grid3 > .panel { margin-bottom: 0; }
+.client-name .badge { margin-left: 4px; }
+@media (max-width: 1100px) { .grid3 { grid-template-columns: 1fr; gap: 12px; } }
+@media (max-width: 720px) {
+  .page-tools { width: 100%; justify-content: space-between; }
+  .page-tools .seg span { padding: 5px 10px; }
+}
+.detail-h h2 .mono { font-size: inherit; }
+.client-name .mono { font-size: 13px; }

@@ -944,6 +944,11 @@ impl AppState {
     }
 
     fn save_blocked_items(&self) {
+        // The file lives in the working directory: tests must not write it
+        // into the source tree.
+        if cfg!(test) {
+            return;
+        }
         let config = BlockedConfig {
             ips: self.blocked_ips.lock_or_recover().clone(),
             users: self.blocked_users.lock_or_recover().clone(),
@@ -962,7 +967,20 @@ impl AppState {
         warn!("IP blocked: {}", ip);
     }
 
+    /// Block a queue identity. A registered client is blocked by disabling
+    /// it (saved with the client), so there is one switch per client rather
+    /// than a user block and a client flag that can disagree.
     pub fn block_user(&self, user_id: String) {
+        {
+            let mut clients = self.clients.lock_or_recover();
+            if clients.is_registered(&user_id) {
+                match clients.set_disabled(&user_id, true) {
+                    Ok(()) => warn!("Client disabled: {}", user_id),
+                    Err(e) => warn!("Cannot disable client {}: {}", user_id, e),
+                }
+                return;
+            }
+        }
         {
             let mut users = self.blocked_users.lock_or_recover();
             users.insert(user_id.clone());
@@ -981,14 +999,22 @@ impl AppState {
         info!("IP unblocked: {}", ip);
     }
 
-    #[allow(dead_code)]
+    /// Lift a block; for a registered client this enables it again.
     pub fn unblock_user(&self, user_id: &str) {
         {
-            let mut users = self.blocked_users.lock_or_recover();
-            users.remove(user_id);
+            let mut clients = self.clients.lock_or_recover();
+            if clients.is_disabled(user_id) {
+                match clients.set_disabled(user_id, false) {
+                    Ok(()) => info!("Client enabled: {}", user_id),
+                    Err(e) => warn!("Cannot enable client {}: {}", user_id, e),
+                }
+            }
         }
-        self.save_blocked_items();
-        info!("User unblocked: {}", user_id);
+        let removed = self.blocked_users.lock_or_recover().remove(user_id);
+        if removed {
+            self.save_blocked_items();
+            info!("User unblocked: {}", user_id);
+        }
     }
 
     /// Toggle `user_id` as the VIP user. A user is never VIP and boost at
@@ -1002,10 +1028,13 @@ impl AppState {
                 *vip = Some(user_id.to_string());
             }
         }
-        let mut boost = self.boost_user.lock_or_recover();
-        if boost.as_deref() == Some(user_id) {
-            *boost = None;
+        {
+            let mut boost = self.boost_user.lock_or_recover();
+            if boost.as_deref() == Some(user_id) {
+                *boost = None;
+            }
         }
+        self.persist_priority();
     }
 
     /// Toggle `user_id` as the boost user; the mirror of [`Self::toggle_vip`].
@@ -1018,18 +1047,136 @@ impl AppState {
                 *boost = Some(user_id.to_string());
             }
         }
-        let mut vip = self.vip_user.lock_or_recover();
-        if vip.as_deref() == Some(user_id) {
-            *vip = None;
+        {
+            let mut vip = self.vip_user.lock_or_recover();
+            if vip.as_deref() == Some(user_id) {
+                *vip = None;
+            }
         }
+        self.persist_priority();
     }
 
     pub fn is_ip_blocked(&self, ip: &IpAddr) -> bool {
         self.blocked_ips.lock_or_recover().contains(ip)
     }
 
+    /// Blocked user id, or disabled registered client.
     pub fn is_user_blocked(&self, user_id: &str) -> bool {
-        self.blocked_users.lock_or_recover().contains(user_id)
+        // Separate statements: the two locks are never held together.
+        let blocked = self.blocked_users.lock_or_recover().contains(user_id);
+        blocked || self.clients.lock_or_recover().is_disabled(user_id)
+    }
+
+    /// The queue identity for a request without a client key, from its
+    /// `X-User-ID`. Registered client names are reserved for requests that
+    /// present that client's key: a keyless claim of one is queued apart, as
+    /// `unverified:<name>`, so it gets none of the client's queue position,
+    /// priority or stats (client names cannot contain ':', so this never
+    /// collides with a real client).
+    pub fn unkeyed_identity(&self, claimed: &str) -> String {
+        if self.clients.lock_or_recover().is_registered(claimed) {
+            format!("unverified:{claimed}")
+        } else {
+            claimed.to_string()
+        }
+    }
+
+    /// Save which registered clients hold VIP / boost.
+    fn persist_priority(&self) {
+        let vip = self.vip_user.lock_or_recover().clone();
+        let boost = self.boost_user.lock_or_recover().clone();
+        if let Err(e) = self
+            .clients
+            .lock_or_recover()
+            .set_priority(vip.as_deref(), boost.as_deref())
+        {
+            warn!("Cannot save VIP/boost: {}", e);
+        }
+    }
+
+    /// Startup: restore VIP / boost from the client store, and turn user
+    /// blocks on registered names (from before blocking a client meant
+    /// disabling it) into disabled clients.
+    pub fn apply_client_store(&self) {
+        let (vip, boost) = self.clients.lock_or_recover().priority();
+        *self.vip_user.lock_or_recover() = vip;
+        *self.boost_user.lock_or_recover() = boost;
+
+        let names = self.clients.lock_or_recover().names();
+        let migrate: Vec<String> = {
+            let blocked = self.blocked_users.lock_or_recover();
+            names.into_iter().filter(|n| blocked.contains(n)).collect()
+        };
+        if migrate.is_empty() {
+            return;
+        }
+        for name in &migrate {
+            if let Err(e) = self.clients.lock_or_recover().set_disabled(name, true) {
+                warn!("Cannot disable client {}: {}", name, e);
+                continue;
+            }
+            self.blocked_users.lock_or_recover().remove(name);
+            info!("User block on client {} converted to disabled client", name);
+        }
+        self.save_blocked_items();
+    }
+
+    /// Move a renamed client's live state to its new name: queued requests,
+    /// counters, last IP, fair-share score, VIP / boost. Requests already in
+    /// flight finish under the old name (their accounting holds that key).
+    pub fn rename_identity(&self, old: &str, new: &str) {
+        fn move_key<V>(map: &mut HashMap<String, V>, old: &str, new: &str) {
+            if let Some(v) = map.remove(old) {
+                map.insert(new.to_string(), v);
+            }
+        }
+        {
+            let mut queues = self.queues.lock_or_recover();
+            if let Some(mut q) = queues.remove(old) {
+                // Keep anything that raced in under the new name behind it.
+                if let Some(newer) = queues.remove(new) {
+                    q.extend(newer);
+                }
+                queues.insert(new.to_string(), q);
+            }
+        }
+        move_key(&mut self.processed_counts.lock_or_recover(), old, new);
+        move_key(&mut self.dropped_counts.lock_or_recover(), old, new);
+        move_key(&mut self.user_ips.lock_or_recover(), old, new);
+        move_key(&mut self.fair_share.lock_or_recover(), old, new);
+        for slot in [&self.vip_user, &self.boost_user] {
+            let mut v = slot.lock_or_recover();
+            if v.as_deref() == Some(old) {
+                *v = Some(new.to_string());
+            }
+        }
+        self.persist_priority();
+        self.notify.notify_one();
+    }
+
+    /// A client was just created. If its name was already in use as a plain
+    /// id, carry that id's settings over: a user block becomes "disabled", and
+    /// VIP / boost become saved with the client.
+    pub fn client_registered(&self, name: &str) {
+        let was_blocked = self.blocked_users.lock_or_recover().remove(name);
+        if was_blocked {
+            self.save_blocked_items();
+            if let Err(e) = self.clients.lock_or_recover().set_disabled(name, true) {
+                warn!("Cannot disable client {}: {}", name, e);
+            }
+        }
+        self.persist_priority();
+    }
+
+    /// A client was deleted: its name is an ordinary id again, so it loses
+    /// the client's VIP / boost.
+    pub fn forget_client(&self, name: &str) {
+        for slot in [&self.vip_user, &self.boost_user] {
+            let mut v = slot.lock_or_recover();
+            if v.as_deref() == Some(name) {
+                *v = None;
+            }
+        }
     }
 
     /// Append an event to the logs ring buffer (bounded).
@@ -2056,7 +2203,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 .get(&user_id)
                                 .map(|ip| blocked_ips.contains(ip))
                                 .unwrap_or(false)
-                    };
+                    } || state_clone.clients.lock_or_recover().is_disabled(&user_id);
 
                     if is_blocked || task.responder.is_closed() {
                         let mut dropped = state_clone.dropped_counts.lock_or_recover();
@@ -2293,11 +2440,12 @@ pub async fn proxy_handler(
         .and_then(|key| state.clients.lock_or_recover().resolve(&key));
     let user_id = match &client {
         Some(c) => c.client.clone(),
-        None => headers
-            .get("X-User-ID")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("anonymous")
-            .to_string(),
+        None => state.unkeyed_identity(
+            headers
+                .get("X-User-ID")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("anonymous"),
+        ),
     };
     if let Some(c) = &client {
         if c.disabled {
@@ -3486,6 +3634,130 @@ mod tests {
             .await
             .expect("body");
         assert_eq!(&body[..], b"User blocked");
+    }
+
+    /// A keyless request may not take a registered client's name through
+    /// `X-User-ID`: it is queued apart as `unverified:<name>`.
+    #[tokio::test]
+    async fn unkeyed_claim_of_client_name_is_queued_apart() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        add_test_client(&state, "alice", "alice-key-123");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-User-ID", "alice".parse().expect("header value"));
+        // No backend can serve it: it waits out stuck_timeout (1 s), then 503.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proxy_handler(
+                State(state.clone()),
+                ConnectInfo("127.0.0.1:41013".parse().expect("addr")),
+                Method::POST,
+                headers,
+                axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+                Bytes::from_static(br#"{"model":"llama3"}"#),
+            ),
+        );
+        let worker = tokio::spawn(run_worker(state.clone()));
+        let _ = res.await;
+        worker.abort();
+
+        let ips = state.user_ips.lock_or_recover();
+        assert!(ips.contains_key("unverified:alice"), "got {:?}", ips.keys());
+        assert!(!ips.contains_key("alice"));
+    }
+
+    #[test]
+    fn blocking_a_client_disables_it() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        add_test_client(&state, "alice", "alice-key-123");
+
+        state.block_user("alice".into());
+        assert!(state.clients.lock_or_recover().is_disabled("alice"));
+        assert!(state.blocked_users.lock_or_recover().is_empty());
+        assert!(state.is_user_blocked("alice"));
+
+        state.unblock_user("alice");
+        assert!(!state.clients.lock_or_recover().is_disabled("alice"));
+        assert!(!state.is_user_blocked("alice"));
+
+        // Unregistered ids still use the user block list.
+        state.block_user("bob".into());
+        assert!(state.blocked_users.lock_or_recover().contains("bob"));
+    }
+
+    #[test]
+    fn client_store_restores_priority_and_converts_blocks() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        add_test_client(&state, "alice", "alice-key-123");
+        add_test_client(&state, "bob", "bob-key-0001");
+        state
+            .clients
+            .lock_or_recover()
+            .set_priority(Some("alice"), Some("bob"))
+            .expect("priority");
+        state.blocked_users.lock_or_recover().insert("bob".into());
+        state.blocked_users.lock_or_recover().insert("carol".into());
+
+        state.apply_client_store();
+        assert_eq!(state.vip_user.lock_or_recover().as_deref(), Some("alice"));
+        assert_eq!(state.boost_user.lock_or_recover().as_deref(), Some("bob"));
+        assert!(state.clients.lock_or_recover().is_disabled("bob"));
+        let blocked = state.blocked_users.lock_or_recover().clone();
+        assert_eq!(blocked, ["carol".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn vip_and_boost_persist_on_clients_only() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        add_test_client(&state, "alice", "alice-key-123");
+        state.toggle_vip("alice");
+        assert_eq!(
+            state.clients.lock_or_recover().priority(),
+            (Some("alice".into()), None)
+        );
+        // An unregistered id gets the runtime toggle, which clears the saved one.
+        state.toggle_vip("ip-10.0.0.9");
+        assert_eq!(state.vip_user.lock_or_recover().as_deref(), Some("ip-10.0.0.9"));
+        assert_eq!(state.clients.lock_or_recover().priority(), (None, None));
+    }
+
+    #[test]
+    fn rename_moves_live_state() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        add_test_client(&state, "old", "rename-key-01");
+        let (tx, _rx) = mpsc::channel(1);
+        state.queues.lock_or_recover().entry("old".into()).or_default().push_back(Task {
+            method: Method::POST,
+            user: "127.0.0.1:41000".to_string(),
+            path: "/api/chat".into(),
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"{}"),
+            responder: tx,
+            requested_model: None,
+            stuck_warned: false,
+            queued_at: std::time::Instant::now(),
+        });
+        state.processed_counts.lock_or_recover().insert("old".into(), 7);
+        state.toggle_boost("old");
+
+        state
+            .clients
+            .lock_or_recover()
+            .update_client(
+                "old",
+                crate::clients::ClientPatch {
+                    name: Some("new".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("rename");
+        state.rename_identity("old", "new");
+
+        assert_eq!(state.queues.lock_or_recover()["new"].len(), 1);
+        assert!(!state.queues.lock_or_recover().contains_key("old"));
+        assert_eq!(state.processed_counts.lock_or_recover()["new"], 7);
+        assert_eq!(state.boost_user.lock_or_recover().as_deref(), Some("new"));
+        assert_eq!(state.clients.lock_or_recover().priority(), (None, Some("new".into())));
     }
 
     // -- Scheduler-tier integration tests ------------------------------------

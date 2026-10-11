@@ -44,6 +44,8 @@ pub struct UserRow {
     pub processed: usize,
     pub dropped: usize,
     pub ip: Option<IpAddr>,
+    /// The id is a registered client's name.
+    pub registered: bool,
 }
 
 impl UserRow {
@@ -60,7 +62,11 @@ pub struct StateSnapshot {
     /// Request-log records dropped because the log channel was full.
     pub reqlog_dropped: u64,
     pub blocked_ips: HashSet<IpAddr>,
+    /// Blocked user ids plus disabled registered clients (blocking a client
+    /// disables it, so both read as "blocked" here).
     pub blocked_users: HashSet<String>,
+    /// The disabled clients among `blocked_users`.
+    pub disabled_clients: HashSet<String>,
     pub vip_user: Option<String>,
     pub boost_user: Option<String>,
     pub backends: Vec<BackendStatus>,
@@ -85,13 +91,26 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
                 processed: processed.get(id).copied().unwrap_or(0),
                 dropped: dropped.get(id).copied().unwrap_or(0),
                 ip: ips.get(id).copied(),
+                registered: false,
                 id: id.clone(),
             })
             .collect()
     };
+    // Taken on its own, after the per-user locks are released.
+    let (registered, disabled_clients): (HashSet<String>, HashSet<String>) = {
+        let clients = state.clients.lock_or_recover();
+        (
+            clients.names().into_iter().collect(),
+            clients.disabled_names().into_iter().collect(),
+        )
+    };
+    for u in &mut users {
+        u.registered = registered.contains(&u.id);
+    }
     let reqlog_dropped = state.reqlog.dropped_count();
     let blocked_ips = state.blocked_ips.lock_or_recover().clone();
-    let blocked_users = state.blocked_users.lock_or_recover().clone();
+    let mut blocked_users = state.blocked_users.lock_or_recover().clone();
+    blocked_users.extend(disabled_clients.iter().cloned());
     let vip_user = state.vip_user.lock_or_recover().clone();
     let boost_user = state.boost_user.lock_or_recover().clone();
     let backends = state.backends.lock_or_recover().clone();
@@ -143,6 +162,7 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
         reqlog_dropped,
         blocked_ips,
         blocked_users,
+        disabled_clients,
         vip_user,
         boost_user,
         backends,

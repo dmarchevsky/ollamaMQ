@@ -1151,6 +1151,10 @@ impl TuiDashboard {
                         },
                     ),
                 ];
+                // Registered client: its id is reserved for its API keys.
+                if row.registered {
+                    spans.push(Span::styled(" [KEY]", Style::default().fg(Color::Cyan)));
+                }
                 if is_vip {
                     spans.push(Span::styled(
                         " [VIP]",
@@ -1165,7 +1169,8 @@ impl TuiDashboard {
                 }
                 if is_blocked {
                     spans.push(Span::styled(
-                        " [BLOCKED]",
+                        // Blocking a registered client disables it.
+                        if row.registered { " [DISABLED]" } else { " [BLOCKED]" },
                         Style::default().fg(Color::Red).bold(),
                     ));
                 }
@@ -1515,6 +1520,7 @@ mod tests {
             processed,
             dropped,
             ip: Some("10.0.0.7".parse().expect("ip")),
+            registered: false,
         }
     }
 
@@ -1524,6 +1530,7 @@ mod tests {
             reqlog_dropped: 0,
             blocked_ips: HashSet::new(),
             blocked_users: HashSet::new(),
+            disabled_clients: HashSet::new(),
             vip_user: None,
             boost_user: None,
             backends: Vec::new(),

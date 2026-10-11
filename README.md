@@ -479,16 +479,22 @@ The web UI is **off** unless a password is configured (`OLLAMA_MQ_UI_PASSWORD`, 
 It covers everything the TUI does:
 
 - **Overview / Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload** (TUI `L` / `U`)
-- **Users** — queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock** (TUI `p` `b` `x` `X` `u`)
-- **Blocked** — blocked users and IPs
+- **Clients** — every queue identity with its queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock** (TUI `p` `b` `x` `X` `u`)
+- **Blocked** — disabled clients, blocked ids and blocked IPs
 - **Logs** — recent requests with a filter; click a row for the full captured content
 - **Reload config** — re-read `appconf.yaml` (TUI `r`)
 
-It also manages **clients and their API keys**:
+It also manages **clients and their API keys**. The Clients page lists two kinds of client together (filter with *All / Registered / Unregistered*):
+
+- **Registered clients** are created in the UI and saved in `clients.json`. They authenticate with their API keys and are listed even when idle.
+- **Unregistered ids** are what requests without a key are queued under: their `X-User-ID`, or the IP a front proxy fills in, else `anonymous`. They live in memory and drop off the list after an hour idle. **Register** turns one into a client of the same name and opens the add-key dialog.
 
 - Create a client (its name becomes its queue id), then add keys — **generated** (`omq-…`) or **any string you choose** (8–256 printable characters, unique across clients). A key can be relabelled, moved to another client, or revoked; a client can be renamed, disabled (its keys get `403`) or deleted.
 - A request carrying a client key (`Authorization: Bearer <key>` or `X-Api-Key: <key>`) queues under that client's name, **whatever `X-User-ID` it sends**. The key is removed before the request is forwarded, so it never reaches a backend (the backend's own `token` applies instead).
-- Requests with no key, or a key no client owns, behave as before: `X-User-ID` decides the queue.
+- Requests with no key, or a key no client owns, are queued by `X-User-ID` — **except that registered names are reserved**: a keyless request claiming one (e.g. `X-User-ID: alice` without alice's key) is queued apart as `unverified:alice`, with none of alice's queue position, priority or stats.
+- **Blocking a registered client disables it** (TUI `x`, web *Block* / *Disable*): its keys get `403` and its queued requests are dropped. That is the client's one block switch, saved with it; a user block on a client name from before this rule is converted to *disabled* at startup. Unregistered ids and IPs are blocked as before (`blocked_items.json`).
+- **VIP and boost on a registered client are saved** with it and restored at startup; on an unregistered id they last until restart.
+- **Renaming a client moves its live state** — queued requests, counters, last IP, fair-share position, VIP/boost — to the new name. Requests already being served finish under the old name. Deleting a client turns its name back into an ordinary id and clears its VIP/boost.
 - Keys are stored in plaintext in `settings.clients_file` (default `clients.json` in the working directory) so they can be looked up again; the file is written owner-only (`0600`). Changes are saved immediately (atomic replace). A clients file that exists but cannot be parsed stops the proxy at startup rather than being overwritten.
 
 ### Port Configuration

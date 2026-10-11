@@ -257,15 +257,18 @@ struct UserView {
     processing: usize,
     done: usize,
     dropped: usize,
-    /// The id is a client's name (it authenticates with a client key).
-    client: bool,
+    /// The id is a registered client's name (only its keys can use it).
+    registered: bool,
     blocked: bool,
 }
 
 #[derive(Serialize)]
 struct BlockedView {
+    /// Blocked ids that are not registered clients.
     users: Vec<String>,
     ips: Vec<String>,
+    /// Disabled registered clients (blocking a client disables it).
+    clients: Vec<String>,
 }
 
 fn sorted(set: &HashSet<String>) -> Vec<String> {
@@ -276,13 +279,6 @@ fn sorted(set: &HashSet<String>) -> Vec<String> {
 
 async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
     let snap = snapshot::capture(&state, 0);
-    let client_names: HashSet<String> = state
-        .clients
-        .lock_or_recover()
-        .list()
-        .into_iter()
-        .map(|c| c.name)
-        .collect();
 
     let backends = snap
         .backends
@@ -335,7 +331,7 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
             processing: u.processing,
             done: u.processed,
             dropped: u.dropped,
-            client: client_names.contains(&u.id),
+            registered: u.registered,
             blocked: snap.blocked_users.contains(&u.id)
                 || u.ip.is_some_and(|ip| snap.blocked_ips.contains(&ip)),
         })
@@ -358,8 +354,15 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
         backends,
         users,
         blocked: BlockedView {
-            users: sorted(&snap.blocked_users),
+            users: sorted(
+                &snap
+                    .blocked_users
+                    .difference(&snap.disabled_clients)
+                    .cloned()
+                    .collect(),
+            ),
             ips,
+            clients: sorted(&snap.disabled_clients),
         },
     })
 }
@@ -477,7 +480,8 @@ async fn unblock(
     Json(body): Json<UnblockBody>,
 ) -> ApiResult<serde_json::Value> {
     match body.kind.as_str() {
-        "user" => state.unblock_user(&body.value),
+        // A client's block is its disabled flag; `unblock_user` lifts both.
+        "user" | "client" => state.unblock_user(&body.value),
         "ip" => {
             let ip = body
                 .value
@@ -488,7 +492,7 @@ async fn unblock(
         _ => {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "kind must be 'user' or 'ip'",
+                "kind must be 'user', 'client' or 'ip'",
             ));
         }
     }
@@ -554,6 +558,7 @@ async fn create_client(
         .clients
         .lock_or_recover()
         .create_client(&body.name, &body.note)?;
+    state.client_registered(body.name.trim());
     info!("web: client '{}' created", body.name.trim());
     ok()
 }
@@ -564,10 +569,20 @@ async fn update_client(
     Json(patch): Json<ClientPatch>,
 ) -> ApiResult<serde_json::Value> {
     let disabled = patch.disabled;
+    let renamed = patch
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| *n != name)
+        .map(str::to_string);
     state
         .clients
         .lock_or_recover()
         .update_client(&name, patch)?;
+    if let Some(new) = &renamed {
+        state.rename_identity(&name, new);
+        info!("web: client '{}' renamed to '{}'", name, new);
+    }
     match disabled {
         Some(true) => warn!("web: client '{}' disabled", name),
         Some(false) => info!("web: client '{}' enabled", name),
@@ -581,6 +596,7 @@ async fn delete_client(
     Path(name): Path<String>,
 ) -> ApiResult<serde_json::Value> {
     state.clients.lock_or_recover().delete_client(&name)?;
+    state.forget_client(&name);
     warn!("web: client '{}' deleted", name);
     ok()
 }
@@ -810,10 +826,51 @@ mod tests {
         assert_eq!(list[0]["keys"].as_array().unwrap().len(), 1);
         assert_eq!(list[0]["keys"][0]["key"], "my-own-key-1");
 
-        // VIP toggle reaches the shared state.
+        // VIP toggle reaches the shared state and is saved on the client.
         let res = post("users/alice/vip", json!({}), true).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(state.vip_user.lock_or_recover().as_deref(), Some("alice"));
+        assert_eq!(
+            state.clients.lock_or_recover().priority().0.as_deref(),
+            Some("alice")
+        );
+
+        // Blocking a registered client disables it; it lists as a disabled
+        // client, not a blocked id.
+        let res = post("users/alice/block", json!({}), true).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let st: serde_json::Value = c
+            .get(format!("{base}/ui/api/state"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(st["blocked"]["clients"], json!(["alice"]));
+        assert_eq!(st["blocked"]["users"], json!([]));
+        let res = post(
+            "blocked/unblock",
+            json!({"kind": "client", "value": "alice"}),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!state.clients.lock_or_recover().is_disabled("alice"));
+
+        // Renaming moves the saved VIP with the client.
+        let res = c
+            .patch(format!("{base}/ui/api/clients/alice"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+            .json(&json!({"name": "alice2"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(state.vip_user.lock_or_recover().as_deref(), Some("alice2"));
     }
 
     #[tokio::test]

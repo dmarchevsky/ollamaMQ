@@ -21,6 +21,7 @@ const S = {
   showAll: new Set(),        // backend URLs showing every model
   revealed: new Set(),       // key ids shown unmasked
   selectedClient: null,
+  clientFilter: 'all',       // all | registered | unregistered
   online: true,
 };
 
@@ -191,7 +192,6 @@ function render() {
   ({
     overview: renderOverview,
     backends: renderBackends,
-    users: renderUsers,
     clients: renderClients,
     blocked: renderBlocked,
     logs: renderLogs,
@@ -211,9 +211,10 @@ function renderStats(st) {
 }
 
 function renderNav(st) {
-  $('#nav-users').textContent = st.users.length || '';
-  $('#nav-clients').textContent = S.clients.length || '';
-  const nb = st.blocked.users.length + st.blocked.ips.length;
+  // Registered clients plus the unregistered ids currently tracked.
+  const unregistered = st.users.filter(u => !u.registered).length;
+  $('#nav-clients').textContent = (S.clients.length + unregistered) || '';
+  const nb = st.blocked.users.length + st.blocked.ips.length + st.blocked.clients.length;
   $('#nav-blocked').textContent = nb || '';
 }
 
@@ -320,102 +321,126 @@ function renderBackends(st) {
     ${rows}</table>`);
 }
 
-// --- Users
+// --- Clients: registered clients and unregistered queue ids in one list
 
-function userCell(u, st) {
-  let h = `<span class="mono">${esc(u.id)}</span>`;
-  if (st.vip === u.id) h += ' <span class="badge vip">★ VIP</span>';
-  if (st.boost === u.id) h += ' <span class="badge warn">⚡ Boost</span>';
-  if (u.client) h += ' <span class="badge accent" title="Authenticated with a client key">⚿ client</span>';
-  if (u.blocked) h += ' <span class="badge bad">blocked</span>';
+/** Names a client can be registered under (mirrors the server's rule). */
+const NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** Badges after an id: kind, priority, and block state. */
+function idBadges(id, { registered, disabled, blocked }, st, compact = false) {
+  let h = '';
+  if (registered) h += ` <span class="badge accent" title="Registered client: authenticates with its API keys">${compact ? '⚿' : '⚿ registered'}</span>`;
+  else if (id.startsWith('unverified:')) h += ' <span class="badge warn" title="A keyless request claimed a registered name">unverified</span>';
+  if (st.vip === id) h += ' <span class="badge vip">★ VIP</span>';
+  if (st.boost === id) h += ' <span class="badge warn">⚡ Boost</span>';
+  if (disabled) h += ' <span class="badge bad">disabled</span>';
+  else if (blocked) h += ' <span class="badge bad">blocked</span>';
   return h;
 }
 
+/** Overview row title for a live queue id. */
+function userCell(u, st) {
+  return `<span class="mono">${esc(u.id)}</span>` + idBadges(u.id, {
+    registered: u.registered,
+    disabled: u.registered && st.blocked.clients.includes(u.id),
+    blocked: u.blocked,
+  }, st);
+}
+
 function queueCell(u) {
-  if (!u.queued && !u.processing) return '<span class="dim">0</span>';
+  if (!u || (!u.queued && !u.processing)) return '<span class="dim">0</span>';
   return `<b class="st-warn">${u.queued + u.processing}</b>${u.processing ? ` <span class="dim">(${u.processing} running)</span>` : ''}`;
 }
 
-function renderUsers(st) {
-  if (!st.users.length) {
-    setHTML($('#users'), '<div class="empty">No users have sent requests yet</div>');
-    return;
-  }
-  setHTML($('#users'), `<table>
-    <tr><th>User</th><th>Last IP</th><th class="num">Queue</th><th class="num">Done</th><th class="num">Drop</th><th class="num">Actions</th></tr>
-    ${st.users.map(u => {
-      const id = esc(u.id);
-      return `<tr>
-      <td>${userCell(u, st)}</td>
-      <td class="mono dim">${esc(u.ip ?? '—')}</td>
-      <td class="num">${queueCell(u)}</td>
-      <td class="num">${fmtNum(u.done)}</td>
-      <td class="num">${fmtNum(u.dropped)}</td>
-      <td class="actions"><span class="btn-group">
-        <button class="btn sm ${st.vip === u.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Toggle VIP (TUI: p)">★ VIP</button>
-        <button class="btn sm ${st.boost === u.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Toggle boost (TUI: b)">⚡ Boost</button>
-        ${u.blocked
-          ? `<button class="btn sm" data-action="user" data-op="unblock" data-id="${id}" title="Unblock user and IP (TUI: u)">Unblock</button>`
-          : `<button class="btn sm danger" data-action="user" data-op="block" data-id="${id}" title="Block user (TUI: x)">Block</button>
-             <button class="btn sm danger" data-action="user" data-op="block-ip" data-id="${id}" ${u.ip ? '' : 'disabled'} title="Block last IP (TUI: X)">Block IP</button>`}
-      </span></td></tr>`;
-    }).join('')}</table>`);
-}
-
-// --- Clients & keys
-
-function clientStats(c) {
-  const u = S.state?.users.find(x => x.id === c.name);
-  return { queue: u ? u.queued + u.processing : 0, done: u?.done ?? 0, dropped: u?.dropped ?? 0 };
+/** Queue depth for the narrow list column; the running count is a tooltip. */
+function queueShort(u) {
+  const n = u ? u.queued + u.processing : 0;
+  return n ? `<b class="st-warn" title="${u.processing} running">${n}</b>` : '<span class="dim">0</span>';
 }
 
 function lastUsed(c) {
   return Math.max(0, ...c.keys.map(k => k.last_used_ms || 0));
 }
 
-function renderClients() {
-  const cs = S.clients;
-  if (S.selectedClient && !cs.some(c => c.name === S.selectedClient)) S.selectedClient = null;
-  if (!S.selectedClient && cs.length) S.selectedClient = cs[0].name;
+/**
+ * Every client: registered ones (listed even when idle) and the
+ * unregistered ids that currently have live state, busiest first.
+ */
+function identities() {
+  const st = S.state;
+  const live = new Map(st.users.map(u => [u.id, u]));
+  const rows = S.clients.map(c => ({ id: c.name, reg: c, u: live.get(c.name) }));
+  const known = new Set(S.clients.map(c => c.name));
+  for (const u of st.users) if (!known.has(u.id)) rows.push({ id: u.id, reg: null, u });
+  const out = r => (r.u ? r.u.queued + r.u.processing : 0);
+  rows.sort((a, b) => out(b) - out(a)
+    || (b.u?.done ?? 0) - (a.u?.done ?? 0)
+    || Number(!!b.reg) - Number(!!a.reg)
+    || a.id.localeCompare(b.id));
+  return rows;
+}
 
-  setHTML($('#client-list'), cs.length ? `<table>
-    <tr><th>Client</th><th class="num">Keys</th><th class="num">Queue</th><th>Last used</th></tr>
-    ${cs.map(c => {
-      const s = clientStats(c);
-      return `<tr class="clickable ${c.name === S.selectedClient ? 'selected' : ''}" data-action="select-client" data-name="${esc(c.name)}">
-        <td><div class="client-name">${esc(c.name)} ${c.disabled ? '<span class="badge bad">disabled</span>' : ''}</div>
-            <div class="client-sub trunc">${esc(c.note || '—')}</div></td>
-        <td class="num">${c.keys.length}</td>
-        <td class="num">${s.queue ? `<b class="st-warn">${s.queue}</b>` : '<span class="dim">0</span>'}</td>
-        <td class="dim nowrap">${fmtAgo(lastUsed(c))}</td></tr>`;
-    }).join('')}</table>`
-    : '<div class="empty">No clients yet.<br>Create one to hand out API keys.</div>');
+function rowFlags(r) {
+  return { registered: !!r.reg, disabled: !!r.reg?.disabled, blocked: !!r.u?.blocked };
+}
 
-  const c = cs.find(x => x.name === S.selectedClient);
-  if (!c) {
-    setHTML($('#client-detail'), '<div class="empty">Select a client</div>');
-    return;
-  }
-  const s = clientStats(c);
-  const n = esc(c.name);
-  setHTML($('#client-detail'), `
-    <div class="detail-h">
-      <div><h2>${n} ${c.disabled ? '<span class="badge bad">disabled</span>' : '<span class="badge ok">active</span>'}</h2>
-        <div class="dim">${esc(c.note || 'No note')}</div></div>
-      <span class="btn-group">
-        <button class="btn sm" data-action="edit-client" data-name="${n}">Edit</button>
-        <button class="btn sm" data-action="toggle-client" data-name="${n}">${c.disabled ? 'Enable' : 'Disable'}</button>
-        <button class="btn sm danger" data-action="delete-client" data-name="${n}">Delete</button>
-      </span>
-    </div>
-    <div class="detail-meta">
-      <div><b>${s.queue}</b>in queue</div>
-      <div><b>${fmtNum(s.done)}</b>requests done</div>
-      <div><b>${fmtNum(s.dropped)}</b>dropped</div>
-      <div><b>${fmtAgo(lastUsed(c))}</b>last request</div>
-      <div><b>${fmtDate(c.created_at_ms)}</b>created</div>
-    </div>
-    <div class="section-h"><h2>API keys</h2><button class="btn sm primary" data-action="add-key" data-name="${n}">+ Add key</button></div>
+function renderClients(st) {
+  const all = identities();
+  const rows = all.filter(r => S.clientFilter === 'all'
+    || (S.clientFilter === 'registered') === !!r.reg);
+  if (!rows.some(r => r.id === S.selectedClient)) S.selectedClient = rows[0]?.id ?? null;
+
+  setHTML($('#client-list'), rows.length ? `<table>
+    <tr><th>Client</th><th class="num">Queue</th><th class="num">Done</th><th class="num">Drop</th></tr>
+    ${rows.map(r => `<tr class="clickable ${r.id === S.selectedClient ? 'selected' : ''}" data-action="select-client" data-name="${esc(r.id)}">
+      <td><div class="client-name"><span class="mono">${esc(r.id)}</span>${idBadges(r.id, rowFlags(r), st, true)}</div>
+          <div class="client-sub trunc">${esc(r.reg ? (r.reg.note || `${r.reg.keys.length} key${r.reg.keys.length === 1 ? '' : 's'}`) : (r.u?.ip ? `last IP ${r.u.ip}` : 'unregistered'))}</div></td>
+      <td class="num">${queueShort(r.u)}</td>
+      <td class="num">${fmtNum(r.u?.done ?? 0)}</td>
+      <td class="num">${fmtNum(r.u?.dropped ?? 0)}</td></tr>`).join('')}
+    </table>`
+    : `<div class="empty">${S.clientFilter === 'unregistered'
+      ? 'No unregistered ids are active.'
+      : 'No clients yet.<br>Create one to hand out API keys.'}</div>`);
+
+  const r = rows.find(x => x.id === S.selectedClient);
+  setHTML($('#client-detail'), r ? clientDetail(r, st) : '<div class="empty">Select a client</div>');
+}
+
+function clientDetail(r, st) {
+  const c = r.reg, u = r.u, id = esc(r.id);
+  const ipBlocked = !!u?.ip && st.blocked.ips.includes(u.ip);
+  const status = c
+    ? (c.disabled ? '<span class="badge bad">disabled</span>' : '<span class="badge ok">active</span>')
+    : (u?.blocked ? '<span class="badge bad">blocked</span>' : '<span class="badge">unregistered</span>');
+  const prio = `
+    <button class="btn sm ${st.vip === r.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Always served first (TUI: p)">★ VIP</button>
+    <button class="btn sm ${st.boost === r.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Extra share of turns (TUI: b)">⚡ Boost</button>`;
+  const ipBtn = !u?.ip ? '' : ipBlocked
+    ? `<button class="btn sm" data-action="unblock" data-kind="ip" data-value="${esc(u.ip)}">Unblock IP</button>`
+    : `<button class="btn sm danger" data-action="user" data-op="block-ip" data-id="${id}" title="Block ${esc(u.ip)} (TUI: X)">Block IP</button>`;
+  const actions = c
+    ? `${prio}
+       <button class="btn sm" data-action="edit-client" data-name="${id}">Edit</button>
+       <button class="btn sm ${c.disabled ? '' : 'danger'}" data-action="toggle-client" data-name="${id}">${c.disabled ? 'Enable' : 'Disable'}</button>
+       ${ipBtn}
+       <button class="btn sm danger" data-action="delete-client" data-name="${id}">Delete</button>`
+    : `${prio}
+       <button class="btn sm primary" data-action="register" data-id="${id}" ${NAME_RE.test(r.id) ? '' : 'disabled title="Not a valid client name"'}>Register</button>
+       ${u?.blocked && !ipBlocked
+         ? `<button class="btn sm" data-action="user" data-op="unblock" data-id="${id}">Unblock</button>`
+         : `<button class="btn sm danger" data-action="user" data-op="block" data-id="${id}" title="Block this id (TUI: x)">Block</button>`}
+       ${ipBtn}`;
+  const meta = `
+    <div><b>${u ? u.queued + u.processing : 0}</b>in queue</div>
+    <div><b>${fmtNum(u?.done ?? 0)}</b>requests done</div>
+    <div><b>${fmtNum(u?.dropped ?? 0)}</b>dropped</div>
+    <div><b class="mono">${esc(u?.ip ?? '—')}</b>last IP</div>
+    ${c ? `<div><b>${fmtAgo(lastUsed(c))}</b>last key use</div><div><b>${fmtDate(c.created_at_ms)}</b>created</div>` : ''}`;
+  let body;
+  if (c) {
+    body = `
+    <div class="section-h"><h2>API keys</h2><button class="btn sm primary" data-action="add-key" data-name="${id}">+ Add key</button></div>
     ${c.keys.length ? `<div class="tscroll"><table>
       <tr><th>Key</th><th>Label</th><th>Created</th><th>Last used</th><th class="num"></th></tr>
       ${c.keys.map(k => {
@@ -428,12 +453,31 @@ function renderClients() {
           <td class="dim nowrap">${fmtAgo(k.last_used_ms)}</td>
           <td class="actions"><span class="btn-group">
             <button class="btn sm" data-action="copy-key" data-id="${esc(k.id)}">Copy</button>
-            <button class="btn sm" data-action="reassign-key" data-id="${esc(k.id)}" ${cs.length < 2 ? 'disabled' : ''}>Reassign</button>
+            <button class="btn sm" data-action="reassign-key" data-id="${esc(k.id)}" ${S.clients.length < 2 ? 'disabled' : ''}>Reassign</button>
             <button class="btn sm danger" data-action="revoke-key" data-id="${esc(k.id)}">Revoke</button>
           </span></td></tr>`;
       }).join('')}</table></div>`
       : '<div class="empty">No keys — this client cannot authenticate yet.</div>'}
-    <p class="field-hint" style="margin-top:14px !important">Clients send a key as <code>Authorization: Bearer &lt;key&gt;</code> or <code>X-Api-Key: &lt;key&gt;</code>. Unknown keys fall back to <code>X-User-ID</code>.</p>`);
+    <p class="field-hint" style="margin-top:14px !important">Requests send a key as <code>Authorization: Bearer &lt;key&gt;</code> or <code>X-Api-Key: &lt;key&gt;</code>.
+      Only requests with one of these keys can use the name <code>${id}</code>; VIP, boost and disabled are saved with the client.</p>`;
+  } else if (r.id.startsWith('unverified:')) {
+    const claimed = esc(r.id.slice('unverified:'.length));
+    body = `<p class="note">Requests <b>without an API key</b> claimed the registered name <code>${claimed}</code> in <code>X-User-ID</code>.
+      They are queued apart under this id, so they get none of <code>${claimed}</code>'s queue position, priority or stats.
+      If they are legitimate, give that tool one of <code>${claimed}</code>'s keys.</p>`;
+  } else {
+    body = `<p class="note">Identified only by <code>X-User-ID</code> (or the IP the front proxy fills in), so any request can use this id.
+      VIP and boost on it last until restart. <b>Register</b> it to give it API keys and saved settings —
+      after that, only requests with one of its keys queue here.</p>`;
+  }
+  return `
+    <div class="detail-h">
+      <div><h2><span class="mono">${id}</span> ${status}</h2>
+        <div class="dim">${esc(c ? (c.note || 'No note') : 'Unregistered id')}</div></div>
+    </div>
+    <div class="btn-group detail-actions">${actions}</div>
+    <div class="detail-meta">${meta}</div>
+    ${body}`;
 }
 
 function findKey(id) {
@@ -447,12 +491,13 @@ function findKey(id) {
 // --- Blocked
 
 function renderBlocked(st) {
-  const tbl = (items, kind) => items.length ? `<table>
+  const tbl = (items, kind, label, empty) => items.length ? `<table>
     ${[...items].sort().map(v => `<tr><td class="mono">${esc(v)}</td>
-      <td class="actions"><button class="btn sm" data-action="unblock" data-kind="${kind}" data-value="${esc(v)}">Unblock</button></td></tr>`).join('')}
-    </table>` : `<div class="empty">No blocked ${kind === 'ip' ? 'IP addresses' : 'users'}</div>`;
-  setHTML($('#blocked-users'), tbl(st.blocked.users, 'user'));
-  setHTML($('#blocked-ips'), tbl(st.blocked.ips, 'ip'));
+      <td class="actions"><button class="btn sm" data-action="unblock" data-kind="${kind}" data-value="${esc(v)}">${label}</button></td></tr>`).join('')}
+    </table>` : `<div class="empty">${empty}</div>`;
+  setHTML($('#blocked-clients'), tbl(st.blocked.clients, 'client', 'Enable', 'No disabled clients'));
+  setHTML($('#blocked-users'), tbl(st.blocked.users, 'user', 'Unblock', 'No blocked ids'));
+  setHTML($('#blocked-ips'), tbl(st.blocked.ips, 'ip', 'Unblock', 'No blocked IP addresses'));
 }
 
 // --- Logs
@@ -613,14 +658,27 @@ const actions = {
     const { op, id } = el.dataset;
     const labels = { vip: 'VIP toggled', boost: 'Boost toggled', block: `Blocked ${id}`, 'block-ip': `Blocked IP of ${id}`, unblock: `Unblocked ${id}` };
     if (op === 'block' || op === 'block-ip') {
-      const what = op === 'block' ? `user <b>${esc(id)}</b>` : `the last IP of <b>${esc(id)}</b>`;
-      if (!await confirmDlg('Block?', `New requests from ${what} will be rejected with 403. Queued requests are not cancelled.`, 'Block')) return;
+      const what = op === 'block' ? `<b>${esc(id)}</b>` : `the last IP of <b>${esc(id)}</b>`;
+      if (!await confirmDlg('Block?', `New requests from ${what} get 403, and its requests still waiting in the queue are dropped.`, 'Block')) return;
     }
     return act('POST', `users/${encodeURIComponent(id)}/${op}`, {}, labels[op]);
   },
-  'unblock': el => act('POST', 'blocked/unblock', { kind: el.dataset.kind, value: el.dataset.value }, `Unblocked ${el.dataset.value}`),
+  'unblock': el => act('POST', 'blocked/unblock', { kind: el.dataset.kind, value: el.dataset.value },
+    `${el.dataset.kind === 'client' ? 'Enabled' : 'Unblocked'} ${el.dataset.value}`),
 
   'new-client': () => clientDialog(null),
+  // Turn an unregistered id into a client of the same name, then offer to
+  // give it a key straight away.
+  'register': async el => {
+    const name = el.dataset.id;
+    const r = await act('POST', 'clients', { name, note: '' }, `${name} registered — add a key so it can authenticate`);
+    if (r) {
+      S.selectedClient = name;
+      S.clients = await api('GET', 'clients');
+      render();
+      addKeyDialog(name);
+    }
+  },
   'select-client': el => {
     S.selectedClient = el.dataset.name;
     render();
@@ -633,7 +691,7 @@ const actions = {
   'toggle-client': el => {
     const c = S.clients.find(x => x.name === el.dataset.name);
     return act('PATCH', `clients/${encodeURIComponent(c.name)}`, { disabled: !c.disabled },
-      c.disabled ? `${c.name} enabled` : `${c.name} disabled — its keys now get 403`);
+      c.disabled ? `${c.name} enabled` : `${c.name} disabled — its keys get 403 and its queue is dropped`);
   },
   'delete-client': async el => {
     const name = el.dataset.name;
@@ -702,11 +760,13 @@ document.addEventListener('keydown', e => {
 $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close('cancel'); }));
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
+$('#client-filter').addEventListener('change', e => { S.clientFilter = e.target.value; render(); });
 
 // ------------------------------------------------------------------- routing
 
 function route() {
-  const page = (location.hash.slice(1) || 'overview').split('?')[0];
+  let page = (location.hash.slice(1) || 'overview').split('?')[0];
+  if (page === 'users') page = 'clients';  // Users merged into Clients
   S.page = $(`#page-${page}`) ? page : 'overview';
   $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${S.page}`));
   $$('.nav nav a').forEach(a => a.classList.toggle('active', a.dataset.page === S.page));

@@ -308,6 +308,7 @@ async fn main() {
         Ok(store) => {
             info!("Loaded {} client(s) from {}", store.len(), clients_file);
             *state.clients.lock_or_recover() = store;
+            state.apply_client_store();
         }
         Err(e) => {
             eprintln!("Error: {e}");

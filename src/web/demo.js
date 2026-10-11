@@ -41,19 +41,21 @@
   ].map((b, idx) => ({ idx, ...b }));
 
   const users = [
-    { id: 'codex-laptop', ip: '172.22.0.1', queued: 3, processing: 1, done: 812, dropped: 2, client: true, blocked: false },
-    { id: 'openwebui', ip: '172.22.0.5', queued: 1, processing: 1, done: 1440, dropped: 0, client: true, blocked: false },
-    { id: 'n8n-agents', ip: '192.168.6.40', queued: 0, processing: 0, done: 2210, dropped: 11, client: true, blocked: false },
-    { id: 'dm-desktop', ip: '192.168.6.21', queued: 0, processing: 0, done: 351, dropped: 0, client: true, blocked: false },
-    { id: 'ip-192.168.6.77', ip: '192.168.6.77', queued: 0, processing: 0, done: 4, dropped: 9, client: false, blocked: true },
-    { id: 'anonymous', ip: '172.22.0.1', queued: 0, processing: 0, done: 17, dropped: 1, client: false, blocked: false },
+    { id: 'codex-laptop', ip: '172.22.0.1', queued: 3, processing: 1, done: 812, dropped: 2, registered: true, blocked: false },
+    { id: 'openwebui', ip: '172.22.0.5', queued: 1, processing: 1, done: 1440, dropped: 0, registered: true, blocked: false },
+    { id: 'n8n-agents', ip: '192.168.6.40', queued: 0, processing: 0, done: 2210, dropped: 11, registered: true, blocked: false },
+    { id: 'dm-desktop', ip: '192.168.6.21', queued: 0, processing: 0, done: 351, dropped: 0, registered: true, blocked: false },
+    { id: 'grafana-alerts', ip: '192.168.6.30', queued: 1, processing: 0, done: 96, dropped: 0, registered: false, blocked: false },
+    { id: 'unverified:openwebui', ip: '192.168.6.88', queued: 0, processing: 0, done: 0, dropped: 3, registered: false, blocked: false },
+    { id: 'ip-192.168.6.77', ip: '192.168.6.77', queued: 0, processing: 0, done: 4, dropped: 9, registered: false, blocked: true },
+    { id: 'anonymous', ip: '172.22.0.1', queued: 0, processing: 0, done: 17, dropped: 1, registered: false, blocked: false },
   ];
 
   const state = {
     version: '0.5.0',
     vip: 'openwebui',
     boost: null,
-    blocked: { users: ['ip-192.168.6.77'], ips: ['192.168.6.77', '10.8.0.14'] },
+    blocked: { users: ['ip-192.168.6.77'], ips: ['192.168.6.77', '10.8.0.14'], clients: ['old-intern'] },
   };
 
   let keySeq = 1;
@@ -117,6 +119,14 @@
   const allKeys = () => clients.flatMap(c => c.keys.map(k => ({ c, k })));
   const NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
+  const isClient = (id) => clients.some(c => c.name === id);
+  const clientList = () => clients.map(c => ({ ...c, vip: state.vip === c.name, boost: state.boost === c.name }));
+  // Mirror the server: a client's block state is its disabled flag.
+  const syncDisabled = () => {
+    state.blocked.clients = clients.filter(c => c.disabled).map(c => c.name);
+    users.forEach(u => { if (u.registered) u.blocked = clients.find(c => c.name === u.id)?.disabled ?? false; });
+  };
+
   function snapshot() {
     const sum = (f) => users.reduce((a, u) => a + u[f], 0);
     return {
@@ -138,7 +148,7 @@
       const [p] = path.split('?');
       const seg = p.split('/').map(decodeURIComponent);
       if (method === 'GET' && p === 'state') return delay(snapshot());
-      if (method === 'GET' && p === 'clients') return delay(clients);
+      if (method === 'GET' && p === 'clients') return delay(clientList());
       if (method === 'GET' && seg[0] === 'logs' && seg.length === 1) return delay(logs);
       if (method === 'GET' && seg[0] === 'logs') {
         const ev = logs.find(l => String(l.seq) === seg[1]) || err('log event expired');
@@ -152,9 +162,13 @@
         const u = users.find(x => x.id === id);
         if (op === 'vip') { state.vip = state.vip === id ? null : id; if (state.boost === id) state.boost = null; }
         if (op === 'boost') { state.boost = state.boost === id ? null : id; if (state.vip === id) state.vip = null; }
-        if (op === 'block') { u.blocked = true; state.blocked.users.push(id); }
+        if (op === 'block') {
+          if (isClient(id)) { findClient(id).disabled = true; syncDisabled(); }
+          else { u.blocked = true; state.blocked.users.push(id); }
+        }
         if (op === 'block-ip' && u.ip) state.blocked.ips.push(u.ip);
         if (op === 'unblock') {
+          if (isClient(id)) { findClient(id).disabled = false; syncDisabled(); }
           u.blocked = false;
           state.blocked.users = state.blocked.users.filter(x => x !== id);
           state.blocked.ips = state.blocked.ips.filter(x => x !== u.ip);
@@ -162,6 +176,7 @@
         return delay({});
       }
       if (method === 'POST' && p === 'blocked/unblock') {
+        if (body.kind === 'client') { findClient(body.value).disabled = false; syncDisabled(); return delay({}); }
         const list = body.kind === 'ip' ? 'ips' : 'users';
         state.blocked[list] = state.blocked[list].filter(x => x !== body.value);
         users.forEach(u => { if (u.id === body.value) u.blocked = false; });
@@ -184,19 +199,31 @@
         if (!NAME_RE.test(body.name)) err('invalid client name');
         if (clients.some(c => c.name === body.name)) err(`client '${body.name}' already exists`);
         clients.push({ name: body.name, note: body.note, disabled: false, created_at_ms: Date.now(), keys: [] });
+        users.forEach(u => { if (u.id === body.name) u.registered = true; });
         return delay({});
       }
       if (seg[0] === 'clients' && seg.length === 2) {
         const c = findClient(seg[1]);
-        if (method === 'DELETE') { clients.splice(clients.indexOf(c), 1); return delay({}); }
+        if (method === 'DELETE') {
+          clients.splice(clients.indexOf(c), 1);
+          users.forEach(u => { if (u.id === c.name) u.registered = false; });
+          if (state.vip === c.name) state.vip = null;
+          if (state.boost === c.name) state.boost = null;
+          syncDisabled();
+          return delay({});
+        }
         if (method === 'PATCH') {
           if (body.name !== undefined && body.name !== c.name) {
             if (!NAME_RE.test(body.name)) err('invalid client name');
             if (clients.some(x => x.name === body.name)) err(`client '${body.name}' already exists`);
+            // The server moves live state to the new name.
+            users.forEach(u => { if (u.id === c.name) u.id = body.name; });
+            if (state.vip === c.name) state.vip = body.name;
+            if (state.boost === c.name) state.boost = body.name;
             c.name = body.name;
           }
           if (body.note !== undefined) c.note = body.note;
-          if (body.disabled !== undefined) c.disabled = body.disabled;
+          if (body.disabled !== undefined) { c.disabled = body.disabled; syncDisabled(); }
           return delay({});
         }
       }

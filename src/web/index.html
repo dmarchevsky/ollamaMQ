@@ -14,8 +14,7 @@
     <nav>
       <a href="#overview" data-page="overview"><span class="ico">▦</span>Overview</a>
       <a href="#backends" data-page="backends"><span class="ico">⛁</span>Backends</a>
-      <a href="#users" data-page="users"><span class="ico">☰</span>Users<span class="count" id="nav-users"></span></a>
-      <a href="#clients" data-page="clients"><span class="ico">⚿</span>Clients &amp; Keys<span class="count" id="nav-clients"></span></a>
+      <a href="#clients" data-page="clients"><span class="ico">⚿</span>Clients<span class="count" id="nav-clients"></span></a>
       <a href="#blocked" data-page="blocked"><span class="ico">⊘</span>Blocked<span class="count" id="nav-blocked"></span></a>
       <a href="#logs" data-page="logs"><span class="ico">≡</span>Logs</a>
     </nav>
@@ -38,7 +37,7 @@
       <div class="cards" id="ov-cards"></div>
       <div class="grid2">
         <div class="panel"><div class="panel-h"><h2>Backends</h2><a href="#backends" class="more">Manage →</a></div><div id="ov-backends"></div></div>
-        <div class="panel"><div class="panel-h"><h2>Active users</h2><a href="#users" class="more">All users →</a></div><div id="ov-users"></div></div>
+        <div class="panel"><div class="panel-h"><h2>Active clients</h2><a href="#clients" class="more">All clients →</a></div><div id="ov-users"></div></div>
       </div>
       <div class="panel"><div class="panel-h"><h2>Recent requests</h2><a href="#logs" class="more">All logs →</a></div><div id="ov-logs"></div></div>
     </section>
@@ -48,17 +47,20 @@
       <div class="panel flush" id="backends"></div>
     </section>
 
-    <section class="page" id="page-users">
-      <h1>Users</h1>
-      <p class="hint">Queue identities seen since startup, busiest first. Requests with a client key queue under the client's name; others use <code>X-User-ID</code>.</p>
-      <div class="panel flush" id="users"></div>
-    </section>
-
     <section class="page" id="page-clients">
       <div class="page-h">
-        <h1>Clients &amp; Keys</h1>
-        <button class="btn primary" data-action="new-client">+ New client</button>
+        <h1>Clients</h1>
+        <div class="page-tools">
+          <div class="seg" id="client-filter" role="radiogroup" aria-label="Show">
+            <label><input type="radio" name="client-filter" value="all" checked><span>All</span></label>
+            <label><input type="radio" name="client-filter" value="registered"><span>Registered</span></label>
+            <label><input type="radio" name="client-filter" value="unregistered"><span>Unregistered</span></label>
+          </div>
+          <button class="btn primary" data-action="new-client">+ New client</button>
+        </div>
       </div>
+      <p class="hint"><b>Registered</b> clients authenticate with their API keys and keep their settings across restarts.
+        <b>Unregistered</b> ids come from <code>X-User-ID</code> (or the client's IP) and are shown while active.</p>
       <div class="split">
         <div class="panel flush" id="client-list"></div>
         <div class="panel" id="client-detail"></div>
@@ -67,8 +69,9 @@
 
     <section class="page" id="page-blocked">
       <h1>Blocked</h1>
-      <div class="grid2">
-        <div class="panel"><div class="panel-h"><h2>Users</h2></div><div id="blocked-users"></div></div>
+      <div class="grid3">
+        <div class="panel"><div class="panel-h"><h2>Disabled clients</h2></div><div id="blocked-clients"></div></div>
+        <div class="panel"><div class="panel-h"><h2>Blocked ids</h2></div><div id="blocked-users"></div></div>
         <div class="panel"><div class="panel-h"><h2>IP addresses</h2></div><div id="blocked-ips"></div></div>
       </div>
     </section>
