@@ -20,6 +20,7 @@
   --nav-text: #c3c9d4;
   --nav-active: #ffffff;
   --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .08);
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   color-scheme: light;
 }
@@ -53,7 +54,7 @@ html, body { margin: 0; height: 100%; }
 body {
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+  font: 14px/1.45 var(--sans);
 }
 code, .mono { font-family: var(--mono); font-size: 12.5px; }
 a { color: var(--accent); text-decoration: none; }
@@ -180,7 +181,7 @@ tr.selected > td { background: var(--accent-soft); }
 .bk-detail > td { background: var(--surface-2); padding: 14px 18px 18px 42px; }
 .bk-detail-h { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
 .bk-detail-h .sp { flex: 1; }
-.models { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 8px; }
+.models { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); gap: 8px; }
 .model { display: flex; align-items: center; gap: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; min-width: 0; }
 .model .name { font-family: var(--mono); font-size: 12.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model.loaded { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
@@ -264,15 +265,108 @@ pre.content {
   .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .grid2, .split { grid-template-columns: 1fr; }
 }
+/* Phone-only chrome: hidden on wider screens. */
+.nav-toggle, .top-title, .nav-close, .nav-backdrop { display: none; }
+.nav-toggle, .nav-close {
+  background: none; border: none; color: inherit; font: inherit; font-size: 20px; line-height: 1;
+  width: 36px; height: 36px; border-radius: 8px; cursor: pointer; align-items: center; justify-content: center;
+}
+.nav-toggle:hover { background: var(--surface-2); }
+.nav-close { color: var(--nav-text); margin-left: auto; font-size: 16px; }
+.nav-close:hover { background: rgba(255,255,255,.08); }
+
 @media (max-width: 720px) {
   .shell { grid-template-columns: minmax(0, 1fr); background: none; }
-  .panel { overflow-x: auto; }
-  .split { grid-template-columns: minmax(0, 1fr); }
-  .nav { position: static; height: auto; }
-  .nav nav { flex-direction: row; overflow-x: auto; padding-bottom: 8px; }
-  .nav-foot { display: none; }
-  .page, .topbar { padding-left: 16px; padding-right: 16px; }
-  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .panel.flush { overflow-x: auto; }
-  #log-filter { width: 100%; }
+
+  /* Sidebar becomes an off-canvas drawer behind the ☰ button. */
+  .nav {
+    position: fixed; inset: 0 auto 0 0; width: min(280px, 84vw); height: 100%; z-index: 40;
+    transform: translateX(-100%); transition: transform .2s ease; visibility: hidden;
+  }
+  body.nav-open .nav { transform: none; visibility: visible; box-shadow: 0 0 40px rgba(0,0,0,.35); }
+  .brand { display: flex; align-items: center; gap: 6px; padding: 12px 10px 16px 18px; }
+  .nav-close { display: inline-flex; }
+  .nav nav a { padding: 11px 12px; }
+  .nav-backdrop {
+    display: block; position: fixed; inset: 0; z-index: 30; background: rgba(10, 14, 22, .45);
+    opacity: 0; pointer-events: none; transition: opacity .2s ease;
+  }
+  body.nav-open .nav-backdrop { opacity: 1; pointer-events: auto; }
+  body.nav-open { overflow: hidden; }
+
+  /* Top bar: menu button, page title, reload; the stats wrap underneath. */
+  .topbar { flex-wrap: wrap; gap: 4px 10px; padding: 8px 12px 10px; }
+  .nav-toggle { display: inline-flex; margin-left: -4px; }
+  .top-title { display: block; flex: 1; min-width: 0; font-weight: 650; font-size: 16px; }
+  .reload-label { display: none; }
+  .btn.reload { padding: 6px 10px; }
+  .stats { order: 3; flex-basis: 100%; gap: 2px 12px; font-size: 12.5px; padding: 0 4px; }
+
+  /* Page titles move to the top bar. */
+  .page { padding: 14px 12px 40px; }
+  .page h1 { display: none; }
+  .page-h { justify-content: flex-end; margin-bottom: 12px; }
+  .hint { margin: 0 4px 12px; font-size: 13px; }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+  .card { padding: 12px 14px; }
+  .card .v { font-size: 20px; }
+  .grid2 { gap: 12px; margin-bottom: 12px; }
+  .panel { margin-bottom: 12px; padding: 14px; }
+  .split { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .toolbar { width: 100%; }
+  #log-filter { width: auto; flex: 1 1 100%; }
+
+  /* Tables become stacked cards: the first cell is the title, every other
+     cell is "label ........ value" (labels come from data-label). */
+  .panel table, .panel tbody, .panel tr, .panel td { display: block; width: 100%; }
+  .panel tr:has(> th) { display: none; }
+  .panel tr { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .panel:not(.flush) tr { padding-left: 0; padding-right: 0; }
+  .panel tr:last-child { border-bottom: none; }
+  .panel td, .panel:not(.flush) table td {
+    padding: 2px 0; border: none; text-align: right; overflow-wrap: anywhere; min-width: 0;
+  }
+  .panel td:empty { display: none; }
+  .panel td[data-label]::before {
+    content: attr(data-label); float: left; margin-right: 12px;
+    font: 500 12px/21px var(--sans); color: var(--muted);
+  }
+  /* Two selectors so this beats the desktop `.panel:not(.flush) table td`. */
+  .panel td:first-child, .panel:not(.flush) table td:first-child {
+    text-align: left; font-weight: 600; padding-bottom: 4px;
+  }
+  .client-sub { font-weight: 400; }
+
+  /* Overview summaries: fields flow inline under the title. */
+  #page-overview .panel table:not(.logs) tr:not(:has(> th)) {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 14px;
+  }
+  #page-overview .panel table:not(.logs) td { width: auto; }
+  #page-overview .panel table:not(.logs) td:first-child { flex-basis: 100%; }
+  #page-overview .panel table:not(.logs) td[data-label]::before { float: none; margin-right: 5px; }
+  .panel td.actions, .panel:not(.flush) table td.actions { text-align: left; padding-top: 8px; white-space: normal; }
+  /* Row highlights paint the whole card, not one cell; touch screens get
+     no sticky hover. */
+  tr.clickable:hover > td, .bk-row:hover > td, tr.selected > td { background: none; }
+  tr.selected { background: var(--accent-soft); }
+  .btn-group { flex-wrap: wrap; }
+  .trunc { max-width: none; white-space: normal; }
+  .keycell { max-width: none; }
+
+  /* Backends: the expanded model list spans the card. */
+  .bk-detail > td { padding: 10px 0 4px !important; text-align: left !important; background: none; }
+  .bk-detail { background: var(--surface-2); }
+  .meter { margin-left: 6px; }
+
+  /* Logs: compact three-line entries instead of label/value rows. */
+  .panel table.logs tr:not(:has(> th)) {
+    display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 2px 10px; align-items: baseline;
+  }
+  .panel table.logs td { padding: 0; text-align: left; font-weight: 400; }
+  .panel table.logs td::before { content: none; }
+  .panel table.logs td:nth-child(3) { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .panel table.logs td:nth-child(4), .panel table.logs td:nth-child(5) { grid-column: span 3; font-size: 12.5px; }
+  .panel table.logs td:nth-child(4) { color: var(--text); }
+  .panel table.logs td:nth-child(6) { grid-column: span 3; }
+  .panel table.logs td.none { display: none; }
 }

@@ -8,8 +8,9 @@
 </head>
 <body>
 <div class="shell">
-  <aside class="nav">
-    <div class="brand"><span class="brand-mark">◆</span> ollamaMQ <span class="version" id="version"></span></div>
+  <aside class="nav" id="sidebar">
+    <div class="brand"><span class="brand-mark">◆</span> ollamaMQ <span class="version" id="version"></span>
+      <button class="nav-close" data-action="nav-close" aria-label="Close menu">✕</button></div>
     <nav>
       <a href="#overview" data-page="overview"><span class="ico">▦</span>Overview</a>
       <a href="#backends" data-page="backends"><span class="ico">⛁</span>Backends</a>
@@ -22,11 +23,14 @@
       <span class="live" id="live"><span class="dot"></span>live</span>
     </div>
   </aside>
+  <div class="nav-backdrop" data-action="nav-close"></div>
 
   <main>
     <header class="topbar">
+      <button class="nav-toggle" id="nav-toggle" data-action="nav-open" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">☰</button>
+      <span class="top-title" id="top-title">Overview</span>
       <div class="stats" id="stats"></div>
-      <button class="btn" data-action="reload-config" title="Re-read appconf.yaml and apply it (TUI: r)">⟳ Reload config</button>
+      <button class="btn reload" data-action="reload-config" title="Re-read appconf.yaml and apply it (TUI: r)" aria-label="Reload config">⟳<span class="reload-label"> Reload config</span></button>
     </header>
 
     <section class="page" id="page-overview">

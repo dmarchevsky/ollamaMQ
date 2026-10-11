@@ -67,7 +67,37 @@ function setHTML(el, html) {
   if (el._html !== html) {
     el.innerHTML = html;
     el._html = html;
+    labelCells(el);
   }
+}
+
+/**
+ * Copy each table's header text onto its cells as `data-label`. On phones
+ * the CSS turns rows into stacked cards and shows these as the field names.
+ */
+function labelCells(root) {
+  for (const table of root.querySelectorAll('table')) {
+    const head = table.querySelector('tr:has(> th)');
+    if (!head) continue;
+    const names = [...head.children].map(th => th.textContent.trim());
+    for (const tr of table.querySelectorAll('tr')) {
+      if (tr === head) continue;
+      // The first cell is the card's title and action cells stand alone,
+      // so neither gets a label.
+      [...tr.children].forEach((td, i) => {
+        if (i > 0 && names[i] && !td.hasAttribute('colspan') && !td.classList.contains('actions')) {
+          td.dataset.label = names[i];
+        }
+      });
+    }
+  }
+}
+
+const isPhone = () => matchMedia('(max-width: 720px)').matches;
+
+function setNav(open) {
+  document.body.classList.toggle('nav-open', open);
+  $('#nav-toggle').setAttribute('aria-expanded', String(open));
 }
 
 function toast(text, ok = true) {
@@ -442,8 +472,8 @@ function logTable(logs, clickable = true) {
       <td class="time">${fmtTime(l.at_ms)}</td>
       <td><span class="dir ${esc(l.dir)}">${esc(l.dir)}</span></td>
       <td class="mono">${esc(l.user)}</td>
-      <td class="trunc">${esc(l.model ?? '—')}</td>
-      <td class="mono dim">${esc(l.backend ? hostOf(l.backend) : '—')}</td>
+      <td class="trunc ${l.model ? '' : 'none'}">${esc(l.model ?? '—')}</td>
+      <td class="mono dim ${l.backend ? '' : 'none'}">${esc(l.backend ? hostOf(l.backend) : '—')}</td>
       <td class="${infoClass(l.info)}">${esc(l.info)}${l.has_content ? ' <span class="dim">· ⌕</span>' : ''}</td></tr>`).join('')}
     </table>`;
 }
@@ -591,7 +621,14 @@ const actions = {
   'unblock': el => act('POST', 'blocked/unblock', { kind: el.dataset.kind, value: el.dataset.value }, `Unblocked ${el.dataset.value}`),
 
   'new-client': () => clientDialog(null),
-  'select-client': el => { S.selectedClient = el.dataset.name; render(); },
+  'select-client': el => {
+    S.selectedClient = el.dataset.name;
+    render();
+    // The detail panel sits below the list on phones: bring it into view.
+    if (isPhone()) $('#client-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  },
+  'nav-open': () => setNav(true),
+  'nav-close': () => setNav(false),
   'edit-client': el => clientDialog(S.clients.find(c => c.name === el.dataset.name)),
   'toggle-client': el => {
     const c = S.clients.find(x => x.name === el.dataset.name);
@@ -653,6 +690,14 @@ document.addEventListener('click', e => {
   if (fn) { e.preventDefault(); fn(el); }
 });
 
+// Following a nav link closes the drawer, even for the page already shown
+// (which fires no hashchange).
+$$('.nav nav a').forEach(a => a.addEventListener('click', () => setNav(false)));
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.body.classList.contains('nav-open')) setNav(false);
+});
+
 // Click on a dialog's backdrop closes it.
 $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close('cancel'); }));
 
@@ -665,6 +710,10 @@ function route() {
   S.page = $(`#page-${page}`) ? page : 'overview';
   $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${S.page}`));
   $$('.nav nav a').forEach(a => a.classList.toggle('active', a.dataset.page === S.page));
+  // The link's own text, without its icon and counter spans.
+  $('#top-title').textContent = [...$(`.nav nav a[data-page="${S.page}"]`).childNodes]
+    .filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent).join('').trim();
+  setNav(false);
   poll();
 }
 window.addEventListener('hashchange', route);
