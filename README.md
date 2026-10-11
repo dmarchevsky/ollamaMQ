@@ -543,7 +543,7 @@ scrape_configs:
 | `ollamamq_model_control_operations_total` | counter | backend, model, action, result |
 | `ollamamq_clients`, `ollamamq_blocked`, `ollamamq_model_policy_rules`, `ollamamq_model_policy_mode`, `ollamamq_queued_bytes`, `ollamamq_request_log_dropped_total`, `ollamamq_build_info`, `ollamamq_start_time_seconds` | various | — |
 
-**Tokens** are read from the end of each response: OpenAI/llama.cpp `usage`, Ollama `prompt_eval_count`/`eval_count`. Streamed OpenAI-style responses only carry usage when the client asks for it (`"stream_options": {"include_usage": true}`) or the server always sends it (recent llama.cpp); otherwise nothing is counted for that request.
+**Tokens** are read from the end of each response: OpenAI/llama.cpp `usage`, Ollama `prompt_eval_count`/`eval_count`, and for llama.cpp streams (which send no `usage` unless asked) the final chunk's `timings` (`cache_n + prompt_n` prompt, `predicted_n` completion). Other OpenAI-style streams only carry usage when the client asks for it (`"stream_options": {"include_usage": true}`); without it nothing is counted for that request.
 
 Useful queries:
 

@@ -622,7 +622,20 @@ pub fn parse_usage(tail: &[u8]) -> Option<(u64, u64)> {
         }
         let p = v.get("prompt_eval_count").and_then(|x| x.as_u64());
         let c = v.get("eval_count").and_then(|x| x.as_u64());
-        (p.is_some() || c.is_some()).then(|| (p.unwrap_or(0), c.unwrap_or(0)))
+        if p.is_some() || c.is_some() {
+            return Some((p.unwrap_or(0), c.unwrap_or(0)));
+        }
+        // llama.cpp streams carry no `usage` (unless asked), but the last
+        // chunk has `timings`: prompt = cached + newly evaluated tokens.
+        let tm = v.get("timings").filter(|t| t.is_object())?;
+        let field = |k: &str| tm.get(k).and_then(|x| x.as_u64());
+        let (prompt_n, predicted_n) = (field("prompt_n"), field("predicted_n"));
+        (prompt_n.is_some() || predicted_n.is_some()).then(|| {
+            (
+                prompt_n.unwrap_or(0) + field("cache_n").unwrap_or(0),
+                predicted_n.unwrap_or(0),
+            )
+        })
     };
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim())
         && let Some(u) = from(&v)
@@ -724,6 +737,10 @@ mod tests {
         // OpenAI SSE with usage in the last chunk.
         let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6}}\n\ndata: [DONE]\n\n";
         assert_eq!(parse_usage(sse), Some((4, 6)));
+        // llama.cpp stream: no usage, but `timings` in the last chunk
+        // (captured from a real llama.cpp b11347 server).
+        let llama = b"data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"timings\":{\"cache_n\":13,\"prompt_n\":5,\"prompt_ms\":63.5,\"predicted_n\":4,\"predicted_ms\":36.9}}\n\ndata: [DONE]\n\n";
+        assert_eq!(parse_usage(llama), Some((18, 4)));
         // SSE without usage: unknown, not zero.
         let bare = b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n";
         assert_eq!(parse_usage(bare), None);
