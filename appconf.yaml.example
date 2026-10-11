@@ -46,6 +46,9 @@ settings:
                                  # Metadata reads (/api/tags, /api/ps, /api/show,
                                  # /v1/models, /api/version, /) are exempt: they run no
                                  # inference, so they never wait for a slot or take one.
+  detect_backend_slots: true   # capacity = slots a backend reports (llama.cpp /props total_slots,
+                               # halogen /health slots); unreported backends use max_concurrent_per_backend.
+                               # Models without max_concurrent_requests may use all reported slots (default true)
   max_body_bytes: 67108864     # largest request body accepted; 413 beyond it (default 64 MiB).
                                # Bodies are buffered whole while a request waits for a backend,
                                # so this is the per-request memory commitment.

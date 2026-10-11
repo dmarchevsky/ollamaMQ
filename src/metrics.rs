@@ -492,7 +492,14 @@ pub fn render(state: &Arc<AppState>) -> String {
             if bk.is_online { 1.0 } else { 0.0 },
         ));
         in_flight.push((vec![label.clone()], bk.active_requests as f64));
-        max_conc.push((vec![label.clone()], state.max_concurrent_per_backend as f64));
+        let (cap, detected) = state.backend_capacity(bk);
+        max_conc.push((
+            vec![
+                label.clone(),
+                if detected { "detected" } else { "config" }.to_string(),
+            ],
+            cap as f64,
+        ));
         // What the scheduler could start now: none while offline or while a
         // model load/unload runs (it treats that backend as busy).
         let idx = snap
@@ -503,7 +510,7 @@ pub fn render(state: &Arc<AppState>) -> String {
         let slots = if !bk.is_online || busy_with_control.contains(&idx) {
             0
         } else {
-            (state.max_concurrent_per_backend as usize).saturating_sub(bk.active_requests)
+            (cap as usize).saturating_sub(bk.active_requests)
         };
         free.push((vec![label.clone()], slots as f64));
         let mut models: Vec<_> = bk.active_by_model.iter().collect();
@@ -567,8 +574,8 @@ pub fn render(state: &Arc<AppState>) -> String {
     gauge(
         &mut out,
         "ollamamq_backend_max_concurrency",
-        "In-flight request cap per backend.",
-        &["backend"],
+        "In-flight request cap per backend; source = detected (slots the backend reports) or config (max_concurrent_per_backend).",
+        &["backend", "source"],
         max_conc,
     );
     gauge(

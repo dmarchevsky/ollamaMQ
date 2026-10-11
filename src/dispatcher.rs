@@ -653,6 +653,8 @@ pub struct BackendStatus {
     /// no listing endpoint); for backends that can, the union is a no-op in
     /// practice because the declared names are also the discovered ones.
     pub declared_models: Vec<String>,
+    /// Parallel request slots the server reports (see `BackendProbe::slots`).
+    pub detected_slots: Option<u32>,
 }
 
 pub struct AppState {
@@ -697,6 +699,9 @@ pub struct AppState {
     /// Max simultaneous in-flight requests per backend (default 1 — the
     /// historical behavior). Per-model sub-limits come from `model_limits`.
     pub max_concurrent_per_backend: u32,
+    /// Use the slot count a backend reports as its capacity
+    /// (`settings.detect_backend_slots`, default on).
+    pub detect_slots: std::sync::atomic::AtomicBool,
     /// Per-model concurrency limits keyed by `model_concurrency_key`; rebuilt
     /// whenever the model config changes. Unlisted models default to 1.
     pub model_limits: Mutex<HashMap<String, u32>>,
@@ -876,6 +881,7 @@ impl AppState {
                 family_fail_counts: HashMap::new(),
                 forced_api: ApiSet::EMPTY,
                 declared_models: declared.get(i).cloned().unwrap_or_default(),
+                detected_slots: None,
             })
             .collect();
 
@@ -907,6 +913,7 @@ impl AppState {
             control_history: Mutex::new(VecDeque::new()),
             load_keep_alive,
             max_concurrent_per_backend,
+            detect_slots: std::sync::atomic::AtomicBool::new(true),
             model_limits: Mutex::new(build_model_limits(&model_config)),
             model_config: Mutex::new(model_config),
             model_config_path,
@@ -1078,6 +1085,16 @@ impl AppState {
 
     pub fn is_ip_blocked(&self, ip: &IpAddr) -> bool {
         self.blocked_ips.lock_or_recover().contains(ip)
+    }
+
+    /// How many requests this backend may run at once, and whether that came
+    /// from the backend itself: the slots it reports (llama.cpp, halogen)
+    /// when detection is on, else `settings.max_concurrent_per_backend`.
+    pub fn backend_capacity(&self, b: &BackendStatus) -> (u32, bool) {
+        match b.detected_slots {
+            Some(n) if self.detect_slots.load(std::sync::atomic::Ordering::Relaxed) => (n, true),
+            _ => (self.max_concurrent_per_backend, false),
+        }
     }
 
     /// The `model` metric label for a request (see [`model_label_in`]).
@@ -1994,20 +2011,28 @@ pub async fn run_worker(state: Arc<AppState>) {
                         // it used to be locked and dropped for every task examined.
                         let model_key =
                             task_ref.requested_model.as_deref().map(model_concurrency_key);
-                        let model_limit = match &model_key {
-                            Some(k) => limits.get(k).copied().unwrap_or(1),
+                        // Per-model limit on a given backend: the configured
+                        // `max_concurrent_requests`, else 1 — or, on a backend that
+                        // reports its slots, all of them (the server runs its own
+                        // model in parallel on those slots).
+                        let model_limit_on = |cap: u32, detected: bool| match &model_key {
+                            Some(k) => limits
+                                .get(k)
+                                .copied()
+                                .unwrap_or(if detected { cap } else { 1 }),
                             None => 0, // unused for model-less requests
                         };
                         let mut eligible_indices: Vec<usize> = backends.iter()
                             .enumerate()
                             .filter(|(i, b)| {
                                 let online = b.is_online;
+                                let (cap, detected) = state.backend_capacity(b);
                                 let free = metadata
                                     || backend_has_capacity(
                                         b,
                                         model_key.as_deref(),
-                                        model_limit,
-                                        state.max_concurrent_per_backend,
+                                        model_limit_on(cap, detected),
+                                        cap,
                                     );
                                 let no_op = metadata || !control_busy.contains(i);
                                 if !online || !free || !no_op {
@@ -2016,7 +2041,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         b.url,
                                         online,
                                         b.active_requests,
-                                        state.max_concurrent_per_backend,
+                                        cap,
                                         !no_op
                                     );
                                 }
@@ -3181,6 +3206,7 @@ mod tests {
             family_fail_counts: HashMap::new(),
             forced_api: BackendApiType::EMPTY,
             declared_models: Vec::new(),
+            detected_slots: None,
         }
     }
 
@@ -4324,6 +4350,51 @@ mod tests {
         );
         assert!(text.contains(r#"ollamamq_queue_oldest_seconds{client="tester",model="llama3"} "#));
         assert!(text.contains(r#"ollamamq_backend_free_slots{backend="127.0.0.1:9"} 0"#));
+    }
+
+    /// A backend that reports 2 slots runs two requests for the same
+    /// (unlisted) model at once; with detection off it runs one at a time.
+    #[tokio::test]
+    async fn detected_slots_allow_parallel_requests() {
+        async fn run(detect: bool) -> usize {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let url = format!("http://{}", listener.local_addr().expect("addr"));
+            tokio::spawn(async move {
+                let app = axum::Router::new()
+                    .route(
+                        "/api/tags",
+                        axum::routing::get(|| async {
+                            axum::Json(serde_json::json!({ "models": [{ "name": "llama3" }] }))
+                        }),
+                    )
+                    .route(
+                        "/api/chat",
+                        axum::routing::post(|| async {
+                            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                            axum::Json(serde_json::json!({ "done": true }))
+                        }),
+                    );
+                let _ = axum::serve(listener, app).await;
+            });
+            let state = new_test_state(vec![url]);
+            arm_ollama_backend(&state, None);
+            state.backends.lock_or_recover()[0].detected_slots = Some(2);
+            state
+                .detect_slots
+                .store(detect, std::sync::atomic::Ordering::Relaxed);
+            let _a = enqueue_llama_chat(&state, HeaderMap::new());
+            let _b = enqueue_llama_chat(&state, HeaderMap::new());
+            let worker = tokio::spawn(run_worker(state.clone()));
+            let mut peak = 0;
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                peak = peak.max(state.backends.lock_or_recover()[0].active_requests);
+            }
+            worker.abort();
+            peak
+        }
+        assert_eq!(run(true).await, 2, "both slots used");
+        assert_eq!(run(false).await, 1, "configured cap of 1");
     }
 
     // -- Scheduler-tier integration tests ------------------------------------

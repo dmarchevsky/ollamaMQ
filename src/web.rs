@@ -326,6 +326,8 @@ struct BackendView {
     api_type: &'static str,
     active: usize,
     max: u32,
+    /// `max` is the slot count the backend reports (else the configured cap).
+    max_detected: bool,
     processed: usize,
     current_model: Option<String>,
     models_available: Vec<String>,
@@ -398,7 +400,8 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
             online: b.is_online,
             api_type: b.api_type.display(),
             active: b.active_requests,
-            max: state.max_concurrent_per_backend,
+            max: state.backend_capacity(b).0,
+            max_detected: state.backend_capacity(b).1,
             processed: b.processed_count,
             current_model: b.current_model.clone(),
             models_available: sorted(&b.available_models),

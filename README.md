@@ -310,6 +310,9 @@ settings:
                                  # neither wait for a slot nor take one.
   max_body_bytes: 67108864       # largest request body accepted, 413 beyond it (default 64 MiB).
                                  # /api/blobs/{digest} keeps its own 1 GiB allowance.
+  detect_backend_slots: true     # use the parallel slots a backend reports (llama.cpp /props total_slots,
+                                 # halogen /health slots) as its capacity instead of max_concurrent_per_backend;
+                                 # models without max_concurrent_requests may then use all of them (default true)
   max_queued_bytes: 536870912    # total bytes of request bodies waiting in all queues, 503 beyond it
                                  # (default 512 MiB); a request is always admitted when the queues are empty
   request_log_path: ollamamq-requests.jsonl   # request/response JSONL log file (default shown)
@@ -543,6 +546,7 @@ scrape_configs:
 | `ollamamq_requests_in_flight`, `ollamamq_client_fair_share_score` | gauge | client |
 | `ollamamq_active_requests`, `ollamamq_active_oldest_seconds`, `ollamamq_active_generated_tokens` | gauge | client, key, model, backend — requests in progress right now |
 | `ollamamq_backend_free_slots` | gauge | backend — requests it could start now (0 while offline or loading a model) |
+| `ollamamq_backend_max_concurrency` | gauge | backend, source — its capacity; `source` is `detected` (slots the backend reports) or `config` |
 | `ollamamq_model_max_concurrency` | gauge | model — `models[].max_concurrent_requests` |
 | `ollamamq_client_info` | gauge (=1) | client, registered, disabled, vip, boost |
 | `ollamamq_backend_up`, `ollamamq_backend_requests_in_flight`, `ollamamq_backend_max_concurrency`, `ollamamq_backend_models`, `ollamamq_model_loaded`, `ollamamq_backend_model_requests_in_flight` | gauge | backend (, api_type / state / model) |

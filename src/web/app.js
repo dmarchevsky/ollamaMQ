@@ -323,7 +323,7 @@ function renderBackends(st) {
     let html = `<tr class="bk-row ${open ? 'open' : ''}" data-action="toggle-backend" data-url="${esc(b.url)}">
       <td><span class="caret">${open ? '▾' : '▸'}</span><span class="sdot ${b.online ? 'on' : 'off'}"></span><span class="bk-url">${esc(hostOf(b.url))}</span></td>
       <td>${typeBadge(b.api_type)}</td>
-      <td class="num">${b.active}/${b.max}<span class="meter"><i style="width:${pct}%"></i></span></td>
+      <td class="num" title="${b.max_detected ? `${b.max} slots reported by the backend` : `${b.max} = settings.max_concurrent_per_backend`}">${b.active}/${b.max}<span class="meter"><i style="width:${pct}%"></i></span></td>
       <td class="num">${fmtNum(b.processed)}</td>
       <td>${b.loaded_known ? `<b>${loaded.size}</b> <span class="dim">loaded ·</span> ` : ''}${b.models_available.length} <span class="dim">available</span></td>
       <td>${opCell(b)}</td></tr>`;

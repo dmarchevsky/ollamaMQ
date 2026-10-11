@@ -134,6 +134,9 @@ pub struct BackendProbe {
     /// Endpoints probed this round that answered successfully — any previous
     /// "bad" memory for these is stale and can be dropped.
     pub good_endpoints: HashSet<String>,
+    /// Parallel request slots the server reports (llama.cpp `/props`
+    /// `total_slots`, halogen `/health` `slots`); `None` when it doesn't say.
+    pub slots: Option<u32>,
 }
 
 /// Per-request timeout for health probes.
@@ -458,6 +461,41 @@ pub async fn probe_backend(
         detected_type
     };
 
+    // How many requests the server itself runs in parallel, so ollamaMQ can
+    // use all of its slots: llama.cpp reports `total_slots` in `/props`,
+    // halogen `slots` in `/health`. A 404 is remembered like any rejected
+    // endpoint, so servers without them (Ollama, LM Studio) are asked once.
+    let mut slots: Option<u32> = None;
+    if is_online {
+        for (endpoint, field) in [("/props", "total_slots"), ("/health", "slots")] {
+            if skip.contains(endpoint) {
+                continue;
+            }
+            match authed(client.get(format!("{url}{endpoint}")).timeout(timeout))
+                .send()
+                .await
+            {
+                Ok(res) if res.status().is_success() => {
+                    good_endpoints.insert(endpoint.to_string());
+                    if let Ok(j) = res.json::<serde_json::Value>().await
+                        && let Some(n) = j
+                            .get(field)
+                            .and_then(|v| v.as_u64())
+                            .filter(|n| (1..=1024).contains(n))
+                    {
+                        debug!("Backend {} reports {} slots via {}", url, n, endpoint);
+                        slots = Some(n as u32);
+                        break;
+                    }
+                }
+                Ok(res) if res.status() == reqwest::StatusCode::NOT_FOUND => {
+                    bad_endpoints.insert(endpoint.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
     BackendProbe {
         is_online,
         api_type: detected_type,
@@ -468,6 +506,7 @@ pub async fn probe_backend(
         native_models,
         bad_endpoints,
         good_endpoints,
+        slots,
     }
 }
 
@@ -508,6 +547,11 @@ pub fn apply_probe(b: &mut BackendStatus, probe: BackendProbe) {
     b.loaded_ctx = probe.loaded_ctx;
     b.lmstudio = probe.lmstudio;
     b.native_models = Arc::new(probe.native_models);
+    // A backend that went offline keeps what it reported: it comes back with
+    // the same server, and capacity does not matter while it is down.
+    if probe.is_online {
+        b.detected_slots = probe.slots;
+    }
     for e in &probe.good_endpoints {
         b.known_bad_endpoints.remove(e);
     }
@@ -1737,6 +1781,7 @@ mod tests {
             family_fail_counts: HashMap::new(),
             forced_api: BackendApiType::EMPTY,
             declared_models: Vec::new(),
+            detected_slots: None,
         }
     }
 
@@ -2234,6 +2279,7 @@ mod tests {
                 native_models: Vec::new(),
                 bad_endpoints: HashSet::new(),
                 good_endpoints: ["/v1/models".to_string()].into_iter().collect(),
+                slots: None,
             },
         );
         assert!(!b.known_bad_endpoints.contains("/v1/models"));
@@ -2251,6 +2297,7 @@ mod tests {
                 native_models: Vec::new(),
                 bad_endpoints: ["/api/ps".to_string()].into_iter().collect(),
                 good_endpoints: HashSet::new(),
+                slots: None,
             },
         );
         assert!(b.known_bad_endpoints.contains("/api/ps"));
@@ -2277,6 +2324,42 @@ mod tests {
 
     /// A `BackendProbe` that reports nothing but `api_type` — stands in for a
     /// probe round whose observations must not override configuration.
+    /// Slot detection: llama.cpp `/props` `total_slots`, else halogen's
+    /// `/health` `slots`; a 404 is remembered so it is not asked again.
+    #[tokio::test]
+    async fn probe_detects_backend_slots() {
+        async fn serve(app: axum::Router) -> String {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", l.local_addr().unwrap());
+            tokio::spawn(async move {
+                let _ = axum::serve(l, app).await;
+            });
+            url
+        }
+        let listing = || async { Json(json!({"object": "list", "data": [{"id": "m"}]})) };
+        let llama = serve(
+            axum::Router::new()
+                .route("/v1/models", get(listing))
+                .route("/props", get(|| async { Json(json!({"total_slots": 4})) })),
+        )
+        .await;
+        let halogen = serve(
+            axum::Router::new()
+                .route("/v1/models", get(listing))
+                .route("/health", get(|| async { Json(json!({"status": "ok", "slots": 2})) })),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let t = Duration::from_secs(2);
+
+        let p = probe_backend(&client, &llama, None, &HashSet::new(), t).await;
+        assert_eq!(p.slots, Some(4));
+
+        let p = probe_backend(&client, &halogen, None, &HashSet::new(), t).await;
+        assert_eq!(p.slots, Some(2));
+        assert!(p.bad_endpoints.contains("/props"), "404 remembered");
+    }
+
     fn probe_claiming(api_type: BackendApiType) -> BackendProbe {
         BackendProbe {
             is_online: true,
@@ -2288,6 +2371,7 @@ mod tests {
             native_models: Vec::new(),
             bad_endpoints: HashSet::new(),
             good_endpoints: HashSet::new(),
+            slots: None,
         }
     }
 

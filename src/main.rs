@@ -367,6 +367,14 @@ async fn main() {
         }
     }
 
+    let detect_slots = file_cfg.settings.detect_backend_slots.unwrap_or(true);
+    state
+        .detect_slots
+        .store(detect_slots, std::sync::atomic::Ordering::Relaxed);
+    if !detect_slots {
+        info!("Backend slot detection off: every backend uses max_concurrent_per_backend");
+    }
+
     // Pin the `kind:`-configured API families now, BEFORE the health loop
     // starts: a Laya-style backend answers nothing that identifies it, so a
     // probe round running first would classify it `???` and leave it there for

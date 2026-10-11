@@ -61,6 +61,12 @@ pub struct Settings {
     /// from each model entry's `max_concurrent_requests`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_per_backend: Option<u32>,
+    /// Use the parallel slots a backend reports (llama.cpp `/props`
+    /// `total_slots`, halogen `/health` `slots`) as its capacity instead of
+    /// `max_concurrent_per_backend` (default true). Models without their own
+    /// `max_concurrent_requests` may then use all of those slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detect_backend_slots: Option<bool>,
     /// Path of the size-rotated request log file (default
     /// "ollamamq-requests.jsonl" in the working directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
