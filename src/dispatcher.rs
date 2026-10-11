@@ -2355,6 +2355,14 @@ pub async fn run_worker(state: Arc<AppState>) {
                         &[&user_id, &m_model],
                         task.queued_at.elapsed().as_secs_f64(),
                     );
+                    // Updated when the response ends; start them at zero so a
+                    // long request's tokens are not lost (see `Metrics::touch`).
+                    for kind in ["prompt", "completion"] {
+                        metrics.touch(&crate::metrics::TOKENS, &[&user_id, &m_model, &m_backend, kind]);
+                    }
+                    metrics.touch(&crate::metrics::RESPONSE_BYTES, &[&user_id, &m_model, &m_backend]);
+                    metrics.touch_histogram(&crate::metrics::TTFB, &[&m_model, &m_backend]);
+                    metrics.touch_histogram(&crate::metrics::DURATION, &[&m_model, &m_backend]);
                     let log_out = |info: String,
                                    backend: Option<String>,
                                    content: Option<Arc<String>>| {
@@ -2911,6 +2919,14 @@ pub async fn proxy_handler(
         &[&user_id, &model_label],
         body_len as f64,
     );
+    // Series this request updates only when it finishes start at zero now
+    // (see `Metrics::touch`).
+    state
+        .metrics
+        .touch(&crate::metrics::REQUESTS, &[&user_id, &model_label, endpoint, "ok"]);
+    state
+        .metrics
+        .touch_histogram(&crate::metrics::QUEUE_WAIT, &[&user_id, &model_label]);
 
     state.reqlog.log(crate::reqlog::ReqRecord {
         ts: crate::reqlog::now_unix_millis(),

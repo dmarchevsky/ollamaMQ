@@ -188,7 +188,41 @@ impl Metrics {
             .or_insert(0.0) += by;
     }
 
+    /// Create the series at zero without counting anything.
+    ///
+    /// `rate()`/`increase()` only see growth between scraped samples, so a
+    /// series born already holding a value hides that first value. Series
+    /// that a request will update when it *finishes* (tokens, duration, ok
+    /// count) are touched when it is accepted or dispatched instead, so a
+    /// long request's numbers are measured from a zero Prometheus has seen.
+    pub fn touch(&self, def: &'static CounterDef, values: &[&str]) {
+        self.inc(def, values, 0.0);
+    }
+
+    /// [`Self::touch`] for a histogram: buckets, sum and count at zero.
+    pub fn touch_histogram(&self, def: &'static HistogramDef, values: &[&str]) {
+        self.histogram(def, values, |_| {});
+    }
+
     pub fn observe(&self, def: &'static HistogramDef, values: &[&str], v: f64) {
+        self.histogram(def, values, |h| {
+            let slot = def
+                .buckets
+                .iter()
+                .position(|b| v <= *b)
+                .unwrap_or(def.buckets.len());
+            h.counts[slot] += 1;
+            h.sum += v;
+            h.count += 1;
+        });
+    }
+
+    fn histogram(
+        &self,
+        def: &'static HistogramDef,
+        values: &[&str],
+        update: impl FnOnce(&mut HistValue),
+    ) {
         debug_assert_eq!(def.labels.len(), values.len(), "{}", def.name);
         let mut inner = self.inner.lock_or_recover();
         let key = inner.key(def.labels, values);
@@ -201,14 +235,7 @@ impl Metrics {
         if h.counts.is_empty() {
             h.counts = vec![0; def.buckets.len() + 1];
         }
-        let slot = def
-            .buckets
-            .iter()
-            .position(|b| v <= *b)
-            .unwrap_or(def.buckets.len());
-        h.counts[slot] += 1;
-        h.sum += v;
-        h.count += 1;
+        update(h);
     }
 
     fn render_recorded(&self, out: &mut String) {
@@ -696,6 +723,26 @@ mod tests {
         ));
         // Families with no data still declare themselves.
         assert!(out.contains("# TYPE ollamamq_tokens_total counter"));
+    }
+
+    #[test]
+    fn touch_creates_zero_series() {
+        let m = Metrics::new();
+        m.touch(&TOKENS, &["dm", "qwen", "b:1", "completion"]);
+        m.touch_histogram(&DURATION, &["qwen", "b:1"]);
+        let mut out = String::new();
+        m.render_recorded(&mut out);
+        assert!(out.contains(
+            r#"ollamamq_tokens_total{client="dm",model="qwen",backend="b:1",kind="completion"} 0"#
+        ));
+        assert!(
+            out.contains(
+                r#"ollamamq_request_duration_seconds_count{model="qwen",backend="b:1"} 0"#
+            )
+        );
+        assert!(out.contains(
+            r#"ollamamq_request_duration_seconds_bucket{model="qwen",backend="b:1",le="+Inf"} 0"#
+        ));
     }
 
     #[test]
