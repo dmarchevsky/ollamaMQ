@@ -389,61 +389,29 @@ Every proxied request (`IN`) and upstream response (`OUT`) is written as JSON li
 
 ### Docker Compose
 
-The included `docker-compose.yml` provides a ready-to-use configuration:
-
-```yaml
-services:
-  ollamamq:
-    build: .
-    image: chlebon/ollamamq:latest
-    container_name: ollamamq
-    ports:
-      - "11435:11435"
-    environment:
-      # URLs of backend servers (Ollama, LM Studio, etc.)
-      - BACKEND_URLS=http://host.docker.internal:11434,http://host.docker.internal:1234
-      - PORT=11435
-      - TIMEOUT=300
-      - RUST_LOG=info
-    command: ["--no-tui"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:11435/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-```
-
-**Note for Linux Users:**
-When running in Docker on Linux to access a host-based Ollama:
-
-1.  **Listen on all interfaces:** Ollama must be configured to listen on `0.0.0.0`. You can do this by setting `export OLLAMA_HOST=0.0.0.0` before starting the Ollama service (or editing the systemd unit file).
-2.  **Firewall:** Ensure your firewall (e.g., `ufw`) allows traffic from the Docker bridge (usually `172.17.0.1/16`) to port `11434`.
-3.  **Host Gateway:** The `extra_hosts` setting in `docker-compose.yml` maps `host.docker.internal` to your host's IP address.
-
-### Docker with a config folder
-
-[`deploy/docker-compose.yml`](deploy/docker-compose.yml) keeps everything in one host folder, with relative paths only:
+The included [`docker-compose.yml`](docker-compose.yml) keeps everything in one host folder, with relative paths only:
 
 ```
 ollamamq/
 ├── docker-compose.yml
 ├── config/   → /config   appconf.yaml, .env, clients.json, models.json, settings.json, admin.json
-└── logs/     → /data     ollamamq-requests.jsonl*, ollamamq.log
+└── logs/     → /data     ollamamq-requests.jsonl* (the service log: docker logs ollamamq)
 ```
 
-1. Copy `deploy/docker-compose.yml` into an empty folder.
+1. Copy `docker-compose.yml` into an empty folder (or run it in this checkout).
 2. Create `config/appconf.yaml` and `config/.env` (`OLLAMA_MQ_UI_PASSWORD=…`).
 3. Run `docker compose up -d --build`.
 
-The image is built straight from GitHub. To build local changes, clone the repo into `./src` and use the commented `context: ./src` instead.
+Set `build.context` to where the source is:
+- `.` in this checkout
+- `./src` for a clone inside the server folder
+- `https://github.com/dmarchevsky/ollamaMQ.git#master` to build straight from GitHub (pushed commits only)
+
+**Backends on the Docker host:** use `http://host.docker.internal:<port>` in `appconf.yaml`. On Linux, the server must listen on `0.0.0.0` (for Ollama: `OLLAMA_HOST=0.0.0.0`), and the firewall must let the Docker bridge reach that port.
 
 **Moving to another server:** stop the service and copy the folder. The files in `config/` are written by the container as root with mode 600, so copy them with `sudo` (or `docker run --rm -v "$PWD":/s alpine tar …`).
 
-**Where store files go:** relative paths for `clients_file`, `models_file`, `settings_file` and `admin_file` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. Logs (`request_log_path`, `ollamamq.log`) stay relative to the working directory.
+**Where store files go:** relative paths for `clients_file`, `models_file`, `settings_file` and `admin_file` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. Logs (`request_log_path`, and `ollamamq.log` when the TUI runs) stay relative to the working directory.
 
 Earlier versions kept the store files in the working directory. If such a file exists there and not next to `appconf.yaml`, it keeps being used, and the startup log says so. To switch, move it next to `appconf.yaml`.
 

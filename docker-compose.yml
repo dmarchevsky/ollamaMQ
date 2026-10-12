@@ -1,39 +1,56 @@
+# ollamaMQ with its whole configuration in one host folder.
+#
+#   <this folder>/
+#   ├── docker-compose.yml   (this file)
+#   ├── config/              -> /config  appconf.yaml, .env, and what the web UI
+#   │                                    saves: clients.json, models.json,
+#   │                                    settings.json, admin.json
+#   └── logs/                -> /data    request logs (ollamamq-requests.jsonl*)
+#
+# Every path is relative to this file, so moving the server is copying the
+# folder. Store files named in appconf.yaml without a path are kept next to
+# it, i.e. in config/.
 services:
-  # Optional: Uncomment if you want to run Ollama in Docker as well
-  # ollama:
-  #   image: ollama/ollama:latest
-  #   container_name: ollama
-  #   volumes:
-  #     - ollama_data:/root/.ollama
-  #   ports:
-  #     - "11434:11434"
-  #   restart: unless-stopped
-
   ollamamq:
-    build: .
-    image: chlebon/ollamamq:latest
+    # In a checkout of this repo: build it. In a server folder, point this
+    # at a clone inside the folder (`context: ./src`), or build straight from
+    # GitHub (only pushed commits): context: https://github.com/dmarchevsky/ollamaMQ.git#master
+    build:
+      context: .
+    image: ollamamq:local
+    pull_policy: build
     container_name: ollamamq
     ports:
-      - "11435:11435"
-    environment:
-      # URLs of backend servers (Ollama, LM Studio, etc.)
-      # If using host Ollama/LM Studio on Linux:
-      # 1. Ensure the server is listening on 0.0.0.0
-      # 2. Use http://host.docker.internal:<port>
-      - BACKEND_URLS=http://host.docker.internal:11434,http://host.docker.internal:1234
-      - PORT=11435
-      - TIMEOUT=300
-      - RUST_LOG=info
-    command: ["--no-tui"]
+      - "8081:11435"
+    # Lets appconf.yaml reach servers on the Docker host as
+    # http://host.docker.internal:<port> (they must listen on 0.0.0.0).
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Bypass the image entrypoint: it always passes --backend-urls, which
+    # would override the backends in appconf.yaml.
+    entrypoint: ["/app/ollamaMQ"]
+    # No terminal dashboard: the service log goes to `docker logs ollamamq`,
+    # and the web UI at /ui shows what the TUI did.
+    command: ["--no-tui", "-c", "/config/appconf.yaml"]
+    working_dir: /data
+    # OLLAMA_MQ_UI_USER / OLLAMA_MQ_UI_PASSWORD: the web UI's first-run (and
+    # recovery) password; a password changed in the UI is kept in config/admin.json.
+    env_file: ./config/.env
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./config:/config
+      - ./logs:/data
+    mem_limit: 256m
     restart: unless-stopped
+    logging:                    # `docker logs` keeps at most 2 x 10 MB
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:11435/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:11435/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-
-# volumes:
-#   ollama_data:
