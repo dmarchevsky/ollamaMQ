@@ -24,6 +24,7 @@ mod model_policy;
 mod reqlog;
 mod session;
 mod snapshot;
+mod stats;
 mod tui;
 mod web;
 
@@ -393,6 +394,7 @@ async fn main() {
     tokio::spawn(async move {
         run_worker(worker_state).await;
     });
+    tokio::spawn(stats::run_sampler(state.clone()));
 
     // Apply appconf.yaml once backends have been probed by the health loop
     // (first probe round runs immediately; wait up to 30 s for it).

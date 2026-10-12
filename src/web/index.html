@@ -38,13 +38,23 @@
     </header>
 
     <section class="page" id="page-overview">
-      <h1>Overview</h1>
-      <div class="cards" id="ov-cards"></div>
-      <div class="panel"><div class="panel-h"><h2>Running now</h2><span class="dim" id="ov-runs-count"></span></div><div id="ov-runs"></div></div>
-      <div class="grid2">
-        <div class="panel"><div class="panel-h"><h2>Backends</h2><a href="#backends" class="more">Manage →</a></div><div id="ov-backends"></div></div>
-        <div class="panel"><div class="panel-h"><h2>Active clients</h2><a href="#clients" class="more">All clients →</a></div><div id="ov-users"></div></div>
+      <div class="page-h">
+        <h1>Overview</h1>
+        <div class="page-tools">
+          <div class="seg" id="ov-window" role="radiogroup" aria-label="Time window">
+            <label><input type="radio" name="ov-window" value="5m"><span>5 min</span></label>
+            <label><input type="radio" name="ov-window" value="15m" checked><span>15 min</span></label>
+            <label><input type="radio" name="ov-window" value="1h"><span>1 hour</span></label>
+          </div>
+        </div>
       </div>
+      <div class="ov-status" id="ov-status"></div>
+      <div class="cards kpis" id="ov-kpis"></div>
+      <div class="panel"><div class="panel-h"><h2>Capacity</h2><span class="dim" id="ov-cap-sum"></span></div><div id="ov-capacity"></div></div>
+      <div class="panel"><div class="panel-h"><h2>Activity</h2><span class="dim" id="ov-act-sum"></span></div><div class="chart" id="ov-activity"></div></div>
+      <div class="panel"><div class="panel-h"><h2>Requests now</h2><span class="dim" id="ov-now-count"></span></div><div id="ov-now"></div></div>
+      <div class="panel"><div class="panel-h"><h2>Backends</h2><a href="#backends" class="more">Manage →</a></div><div class="tscroll" id="ov-backends"></div></div>
+      <div class="panel"><div class="panel-h"><h2>Clients</h2><a href="#clients" class="more">All clients →</a></div><div class="tscroll" id="ov-clients"></div></div>
       <div class="panel"><div class="panel-h"><h2>Recent requests</h2><a href="#logs" class="more">All logs →</a></div><div id="ov-logs"></div></div>
     </section>
 

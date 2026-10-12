@@ -493,13 +493,26 @@ The web UI is **off** unless a password is configured (`OLLAMA_MQ_UI_PASSWORD`, 
 
 It covers everything the TUI does:
 
-- **Overview / Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload** (TUI `L` / `U`)
+- **Overview** — status at a glance over the last 5 min / 15 min / 1 hour (see below)
+- **Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload** (TUI `L` / `U`)
 - **Clients** — every queue identity with its queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock** (TUI `p` `b` `x` `X` `u`)
 - **Models** — every model the backends list, with a switch per model and filter rules (below)
 - **Blocked** — disabled clients, blocked ids and blocked IPs
 - **Logs** — recent requests with a filter; click a row for the full captured content
-- **Running now** (on Overview) — every request being served: client, model, backend, elapsed, time to first byte, tokens so far and tok/s, refreshed every second
 - **Reload config** — re-read `appconf.yaml` (TUI `r`)
+
+The **Overview** page shows:
+- a one-line health summary
+- tiles with sparklines: slots in use, waiting requests, throughput and error rate, output tok/s, time to first token, generation speed
+- a **Capacity** board with one square per backend slot, coloured by the client using it
+- an **Activity** chart of running and waiting requests, with errors and timeouts marked
+- **Requests now**: every running and waiting request in one table
+- **Backends** and **Clients** tables with requests, errors, first-token p50/p95, generation and prefill speed, and token totals
+
+Numbers cover the chosen window and come from an in-memory history of the last hour (finished requests, plus a 5-second activity sample). The history starts empty on every restart.
+- *First token* is measured from dispatch to the first generated token for streams, or is the prompt time the backend reports for non-streamed responses.
+- *Generation speed* is per stream (median).
+- *Share of slot time* is each client's part of the backend time used in the window, which is what fair scheduling divides.
 
 It also manages **clients and their API keys**. The Clients page lists two kinds of client together (filter with *All / Registered / Unregistered*):
 

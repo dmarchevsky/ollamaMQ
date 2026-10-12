@@ -153,14 +153,15 @@
 
   // Runs in progress: tokens grow with time like a streaming backend.
   const demoRuns = [
-    { client: 'codex-laptop', key: 'laptop', model: 'Qwen3.8-Flash-Next', backend: '192.168.6.11:8731', started: now - 94_000, ttfb: 2.4, rate: 38.5 },
-    { client: 'openwebui', key: 'webui', model: 'Qwen3.8-27B', backend: '192.168.255.224:8000', started: now - 21_000, ttfb: 6.8, rate: 11.2 },
-    { client: 'n8n-agents', key: 'prod', model: 'llama3.3:70b', backend: 'gpu-box.lan:11434', started: now - 3_000, ttfb: null, rate: 0 },
+    { client: 'codex-laptop', key: 'laptop', model: 'Qwen3.8-Flash-Next', backend: '192.168.6.11:8731', started: now - 94_000, ttfb: 2.4, rate: 38.5, waited: 0.4 },
+    { client: 'openwebui', key: 'webui', model: 'Qwen3.8-27B', backend: '192.168.255.224:8000', started: now - 21_000, ttfb: 6.8, rate: 11.2, waited: 2.1 },
+    { client: 'n8n-agents', key: 'prod', model: 'llama3.3:70b', backend: 'gpu-box.lan:11434', started: now - 3_000, ttfb: null, rate: 0, waited: 12.6 },
   ];
   const runView = () => demoRuns.map(r => {
     const elapsed = (Date.now() - r.started) / 1000;
     const gen = r.ttfb == null ? 0 : Math.max(0, elapsed - r.ttfb);
     return { client: r.client, key: r.key, model: r.model, backend: r.backend, elapsed_secs: elapsed,
+      state: r.ttfb != null && elapsed >= r.ttfb ? 'generating' : 'prefill', waited_secs: r.waited,
       ttfb_secs: r.ttfb, ttft_secs: r.ttfb, tokens: Math.floor(gen * r.rate), tokens_per_sec: gen >= 1 ? r.rate : null };
   });
 
@@ -175,6 +176,110 @@
     };
   }
 
+  // Overview history. Values come from a hash of the sample time, so a
+  // sample looks the same on every poll and the chart scrolls steadily.
+  const noise = n => { const x = Math.sin(n * 12.9898) * 43758.5453; return x - Math.floor(x); };
+  const demoQueue = [
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 38_000, pos: 1 },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 21_000, pos: 2 },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 4_000, pos: 3 },
+    { client: 'openwebui', model: 'Qwen3.8-27B', since: now - 9_000, pos: 1 },
+    { client: 'grafana-alerts', model: 'Gemma-4-E4B', since: now - 2_000, pos: 1 },
+  ];
+  // Per backend over 15 minutes: requests, errors, first token p50/p95, gen tok/s, prefill tok/s.
+  const BACKEND_STATS = {
+    '192.168.6.11:8731': [188, 2, 0.5, 1.1, 64.0, 2950],
+    '192.168.255.224:8000': [141, 0, 0.7, 2.4, 38.4, 1610],
+    '192.168.255.224:8001': [52, 0, 0.3, 0.6, 92.0, 4100],
+    '192.168.255.224:8002': [3, 3, null, null, null, null],
+    'gpu-box.lan:11434': [96, 1, 1.2, 6.8, 17.9, 480],
+  };
+  // Per client: requests, errors, first token p50, wait p95, gen tok/s, tokens in, tokens out, slot seconds.
+  const CLIENT_STATS = {
+    'codex-laptop': [142, 1, 0.9, 41.0, 51.4, 1_240_000, 96_000, 2100],
+    'openwebui': [118, 0, 0.6, 3.1, 29.4, 880_000, 141_000, 1650],
+    'n8n-agents': [61, 4, 4.2, 12.0, 17.0, 210_000, 22_000, 850],
+    'dm-desktop': [24, 0, 0.4, 0.8, 88.5, 40_000, 9_000, 120],
+    'grafana-alerts': [11, 0, 0.3, 2.0, 90.1, 6_000, 1_800, 30],
+  };
+
+  function overviewView(path) {
+    const w = new URLSearchParams(path.split('?')[1] || '').get('window');
+    const secs = { '5m': 300, '1h': 3600 }[w] || 900;
+    const scale = secs / 900;
+    const t = Date.now(), from = t - secs * 1000;
+    const online = backends.filter(b => b.online);
+    const capacity = online.reduce((a, b) => a + b.max, 0);
+    const timeline = [];
+    for (let at = Math.ceil(from / 5000) * 5000; at <= t; at += 5000) {
+      const k = at / 5000;
+      const wave = Math.sin(at / 170_000) + 0.5 * Math.sin(at / 47_000);
+      const running = Math.max(0, Math.min(capacity, Math.round(3 + 1.6 * wave + noise(k) - 0.5)));
+      const queued = Math.max(0, Math.round(2.4 * Math.sin(at / 240_000 + 1) + 2 * noise(k + 0.5) - 1));
+      timeline.push({ at_ms: at, running, queued, capacity, free: capacity - running, out_tokens: Math.round(running * (24 + 16 * noise(k + 0.25)) * 5) });
+    }
+    const spark = f => Array.from({ length: 30 }, (_, i) => {
+      const a = from + i * secs * 1000 / 30, b = a + secs * 1000 / 30;
+      const v = timeline.filter(p => p.at_ms >= a && p.at_ms < b);
+      return v.length ? f(v, i) : null;
+    });
+    const avg = (v, f) => v.reduce((a, p) => a + f(p), 0) / v.length;
+    const queue = demoQueue.map(q => ({ client: q.client, model: q.model, pos: q.pos, waited_secs: (t - q.since) / 1000 }));
+    const loadingOf = b => b.active_op && { backend: hostOf(b.url), verb: b.active_op.verb, model: b.active_op.model };
+    const be = backends.map(b => {
+      const label = hostOf(b.url);
+      const [requests, errors, ttft_p50, ttft_p95, gen_p50, prefill_tps] = BACKEND_STATS[label] || [0, 0, null, null, null, null];
+      return {
+        idx: b.idx, label, online: b.online, api_type: b.api_type, running: b.active, max: b.max,
+        free: b.online && !b.active_op ? Math.max(0, b.max - b.active) : 0, loading: loadingOf(b),
+        requests: Math.round(requests * scale), errors: Math.round(errors * scale), ttft_p50, ttft_p95, gen_p50, wait_p95: null,
+        prefill_tps, prompt_tokens: 0, completion_tokens: 0, busy_secs: 0,
+        spark: b.online ? spark((v, i) => (gen_p50 || 0) * (0.6 + 0.6 * noise(i + label.length)) * (b.max)) : Array(30).fill(0),
+      };
+    });
+    const totalBusy = Object.values(CLIENT_STATS).reduce((a, c) => a + c[7], 0);
+    const clientRows = Object.entries(CLIENT_STATS).map(([id, c]) => {
+      const u = users.find(x => x.id === id) || { queued: 0, processing: 0, registered: false };
+      return {
+        id, registered: u.registered, running: demoRuns.filter(r => r.client === id).length,
+        queued: queue.filter(q => q.client === id).length,
+        requests: Math.round(c[0] * scale), errors: Math.round(c[1] * scale), ttft_p50: c[2], ttft_p95: c[2] * 3,
+        wait_p95: c[3], gen_p50: c[4], prefill_tps: null,
+        prompt_tokens: Math.round(c[5] * scale), completion_tokens: Math.round(c[6] * scale),
+        busy_secs: c[7] * scale, share: c[7] / totalBusy,
+      };
+    });
+    const requests = be.reduce((a, b) => a + b.requests, 0);
+    const errors = be.reduce((a, b) => a + b.errors, 0);
+    const markers = [7, 12, 13.5, 41].map(m => t - m * min).filter(at => at >= from).map((at, i) => ({
+      at_ms: at, outcome: i % 2 ? 'timeout' : 'backend_error', client: i % 2 ? 'n8n-agents' : 'codex-laptop',
+      model: i % 2 ? 'BGE-M3' : 'Qwen3.8-Flash-Next', backend: null }));
+    return {
+      window_secs: secs, now_ms: t,
+      status: {
+        backends_total: backends.length, backends_online: online.length, capacity,
+        running: demoRuns.length, free: be.reduce((a, b) => a + b.free, 0), queued: queue.length,
+        oldest_wait_secs: Math.max(...queue.map(q => q.waited_secs)),
+        loading: backends.filter(b => b.active_op).map(loadingOf),
+      },
+      kpis: {
+        requests, errors, ttft_p50: 0.8, ttft_p95: 3.9, gen_p50: 41.2, wait_p95: 12.0, prefill_tps: 1820,
+        prompt_tokens: 0, completion_tokens: 0, busy_secs: 0,
+        req_per_min: requests / (secs / 60), error_pct: requests ? errors * 100 / requests : null,
+        out_tps: avg(timeline, p => p.out_tokens) / 5,
+        spark: {
+          running: spark(v => avg(v, p => p.running)),
+          queued: spark(v => Math.max(...v.map(p => p.queued))),
+          req_per_min: spark((v, i) => 20 + 8 * noise(i)),
+          out_tps: spark(v => avg(v, p => p.out_tokens) / 5),
+          ttft: spark((v, i) => 0.6 + 0.5 * noise(i + 3) + (i === 22 ? 2.5 : 0)),
+          gen_tps: spark((v, i) => 36 + 10 * noise(i + 7)),
+        },
+      },
+      timeline, markers, backends: be, clients: clientRows, queue,
+    };
+  }
+
   function genKey() {
     const b = new Uint8Array(16);
     crypto.getRandomValues(b);
@@ -186,6 +291,7 @@
       const [p] = path.split('?');
       const seg = p.split('/').map(decodeURIComponent);
       if (method === 'GET' && p === 'state') return delay(snapshot());
+      if (method === 'GET' && p === 'overview') return delay(overviewView(path));
       if (method === 'GET' && p === 'clients') return delay(clientList());
       if (method === 'GET' && seg[0] === 'logs' && seg.length === 1) return delay(logs);
       if (method === 'GET' && seg[0] === 'logs') {

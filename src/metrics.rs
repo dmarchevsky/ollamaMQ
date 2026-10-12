@@ -563,18 +563,12 @@ pub fn render(state: &Arc<AppState>) -> String {
             ],
             cap as f64,
         ));
-        // What the scheduler could start now: none while offline or while a
-        // model load/unload runs (it treats that backend as busy).
         let idx = snap
             .backends
             .iter()
             .position(|x| x.url == bk.url)
             .unwrap_or(usize::MAX);
-        let slots = if !bk.is_online || busy_with_control.contains(&idx) {
-            0
-        } else {
-            (cap as usize).saturating_sub(bk.active_requests)
-        };
+        let slots = state.free_slots(bk, busy_with_control.contains(&idx));
         free.push((vec![label.clone()], slots as f64));
         let mut models: Vec<_> = bk.active_by_model.iter().collect();
         models.sort();
@@ -899,6 +893,8 @@ pub struct Run {
     pub model: String,
     pub backend: String,
     pub started: std::time::Instant,
+    /// Seconds it waited in the queue before dispatch.
+    pub waited_secs: f64,
     pub first_byte: Option<std::time::Instant>,
     /// First generated token (streams only); `None` while prefilling.
     pub first_token: Option<std::time::Instant>,
@@ -918,7 +914,14 @@ pub struct Runs {
 impl Runs {
     /// Register a run; it is removed when the returned guard drops, so every
     /// exit path (finished, client gone, backend error, panic) clears it.
-    pub fn start(&self, client: &str, key: &str, model: &str, backend: &str) -> RunGuard<'_> {
+    pub fn start(
+        &self,
+        client: &str,
+        key: &str,
+        model: &str,
+        backend: &str,
+        waited_secs: f64,
+    ) -> RunGuard<'_> {
         let id = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.lock_or_recover().insert(
             id,
@@ -928,6 +931,7 @@ impl Runs {
                 model: model.to_string(),
                 backend: backend.to_string(),
                 started: std::time::Instant::now(),
+                waited_secs,
                 first_byte: None,
                 first_token: None,
                 tokens: 0,
@@ -1077,7 +1081,7 @@ mod tests {
     fn runs_clear_on_drop_and_show_as_gauges() {
         let runs = Runs::default();
         {
-            let g = runs.start("dm", "laptop", "qwen", "b:1");
+            let g = runs.start("dm", "laptop", "qwen", "b:1", 0.5);
             g.update(|r| r.tokens += 5);
             let l = runs.list();
             assert_eq!((l.len(), l[0].tokens), (1, 5));

@@ -19,6 +19,13 @@
   --nav-bg: #161a22;
   --nav-text: #c3c9d4;
   --nav-active: #ffffff;
+  /* Client colours on the Overview (colour-blind safe as a set; names are
+     always printed beside them). */
+  --c1: #2a78d6;
+  --c2: #1baf7a;
+  --c3: #6250d6;
+  --c4: #e87ba4;
+  --c-other: #98a2b3;
   --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .08);
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
@@ -44,6 +51,11 @@
     --vip: #b48cff;
     --vip-soft: #261b3d;
     --nav-bg: #0b0d12;
+    --c1: #3987e5;
+    --c2: #199e70;
+    --c3: #9085e9;
+    --c4: #d55181;
+    --c-other: #667085;
     --shadow: none;
     color-scheme: dark;
   }
@@ -451,3 +463,78 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 .login-submit { width: 100%; padding: 10px; font-size: 15px; margin-top: 4px; }
 .login-error { background: var(--bad-soft); color: var(--bad); border-radius: 8px; padding: 9px 12px; font-size: 13px; margin-bottom: 12px; }
 .login-note { color: var(--faint); font-size: 12px; text-align: center; margin: 14px 0 0; }
+
+/* --- Overview --- */
+.ov-status { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 18px; margin: -4px 0 16px; color: var(--muted); font-size: 13px; }
+.ov-status .lvl { font-weight: 650; display: inline-flex; align-items: center; }
+.ov-status .lvl.ok { color: var(--ok); } .ov-status .lvl.ok .sdot { background: var(--ok); }
+.ov-status .lvl.warn { color: var(--warn); } .ov-status .lvl.warn .sdot { background: var(--warn); }
+.ov-status .lvl.bad { color: var(--bad); } .ov-status .lvl.bad .sdot { background: var(--bad); }
+.kpi { display: flex; flex-direction: column; }
+.kpi .v .of { font-size: 13px; font-weight: 500; color: var(--muted); }
+.kpi .sub { margin-bottom: 8px; }
+.spark { position: relative; height: 28px; margin-top: auto; }
+.spark svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.spark .a { fill: var(--accent-soft); }
+.spark .l { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round; }
+.spark .end { position: absolute; width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 2px var(--surface); }
+.kpi.q .spark .a { fill: var(--warn-soft); } .kpi.q .spark .l { stroke: var(--warn); } .kpi.q .spark .end { background: var(--warn); }
+.sparkcell { width: 130px; min-width: 100px; }
+.sparkcell .spark { height: 22px; }
+
+.c1 { --c: var(--c1); } .c2 { --c: var(--c2); } .c3 { --c: var(--c3); } .c4 { --c: var(--c4); } .cother { --c: var(--c-other); }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; background: var(--c, var(--c-other)); margin-right: 7px; vertical-align: -1px; }
+.sw.free { background: none; border: 1.5px solid var(--border); }
+.sw.loading, .slot.loading { background: repeating-linear-gradient(135deg, var(--warn) 0 2px, transparent 2px 5px); }
+.sw.run { background: var(--accent); } .sw.que { background: var(--warn); }
+.sw.capl { height: 0; border-top: 2px dashed var(--muted); border-radius: 0; vertical-align: 3px; background: none; }
+.sw.mk { background: var(--bad); clip-path: polygon(50% 0, 100% 100%, 0 100%); border-radius: 0; }
+
+.caps { display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content; gap: 8px 16px; align-items: center; }
+.cap-row { display: contents; }
+.cap-name { white-space: nowrap; }
+.cap-note { text-align: right; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.slots { display: flex; flex-wrap: wrap; gap: 4px; }
+.slot { width: 22px; height: 22px; border-radius: 5px; background: var(--c, var(--c-other)); }
+.slot.free { background: none; border: 1.5px dashed var(--border); }
+.slot.busy { background: var(--c-other); }
+.slot.loading { border: 1.5px solid var(--warn); }
+.cap-wait { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 13px; }
+.chip.q { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; }
+
+.chart { position: relative; overflow: hidden; }
+.chart svg.act { display: block; width: 100%; height: auto; }
+.act .g { stroke: var(--border); stroke-width: 1; }
+.act .ax { fill: var(--faint); font: 11px var(--sans); font-variant-numeric: tabular-nums; }
+.act .run { fill: color-mix(in srgb, var(--accent) 70%, transparent); }
+.act .que { fill: color-mix(in srgb, var(--warn) 60%, transparent); }
+.act .cap { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 4 4; }
+.act .mk { fill: var(--bad); }
+.act .cross { stroke: var(--text); stroke-width: 1; opacity: .5; }
+.chart .tip {
+  position: absolute; top: 8px; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.12); padding: 7px 10px; font-size: 12px; line-height: 1.5;
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+
+.share { display: inline-block; width: 70px; height: 8px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); vertical-align: middle; overflow: hidden; margin-right: 6px; }
+.share > i { display: block; height: 100%; background: var(--c, var(--c-other)); }
+
+@media (max-width: 1100px) {
+  .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ov-status { margin: 0 4px 12px; gap: 2px 12px; }
+  .ov-status .lvl { flex-basis: 100%; }
+  .caps { grid-template-columns: minmax(0, 1fr) max-content; }
+  .cap-name { grid-column: 1 / -1; margin-bottom: -4px; }
+  .slot { width: 20px; height: 20px; }
+  .sparkcell { width: auto; }
+  .sparkcell .spark { width: 120px; margin-left: auto; }
+  #page-overview .tscroll { overflow: visible; }
+  #page-overview td.ph-hide { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }

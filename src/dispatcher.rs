@@ -739,6 +739,8 @@ pub struct AppState {
     pub metrics: crate::metrics::Metrics,
     /// Requests being served right now (live views).
     pub runs: crate::metrics::Runs,
+    /// The last hour of finished requests and activity, for the Overview.
+    pub stats: crate::stats::Stats,
     /// Events evicted from the front of `logs` so far. The event at index `i`
     /// of the ring has the stable sequence number `logs_evicted + i`, which
     /// the web UI uses to fetch one event's full content.
@@ -933,6 +935,7 @@ impl AppState {
             model_policy: Mutex::new(crate::model_policy::ModelPolicyStore::in_memory()),
             metrics: crate::metrics::Metrics::new(),
             runs: crate::metrics::Runs::default(),
+            stats: crate::stats::Stats::default(),
             logs_evicted: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1102,6 +1105,16 @@ impl AppState {
             Some(n) if self.detect_slots.load(std::sync::atomic::Ordering::Relaxed) => (n, true),
             _ => (self.max_concurrent_per_backend, false),
         }
+    }
+
+    /// Requests a backend could start now: capacity minus in-flight, none
+    /// while offline or while a model load/unload runs on it (the scheduler
+    /// treats that backend as busy).
+    pub fn free_slots(&self, b: &BackendStatus, control_busy: bool) -> usize {
+        if !b.is_online || control_busy {
+            return 0;
+        }
+        (self.backend_capacity(b).0 as usize).saturating_sub(b.active_requests)
     }
 
     /// Replace the model aliases (keys matched case-insensitively).
@@ -1444,7 +1457,7 @@ pub fn strip_olla_prefix(path: &str) -> &str {
 }
 
 /// TTFT for non-streamed responses, and generation / prefill speed, once a
-/// response has finished. Backend timings win; for streams without them,
+/// response has finished; also noted in `timing` for the Overview. Backend timings win; for streams without them,
 /// generation time is measured from the first token to the end.
 fn record_speed(
     metrics: &crate::metrics::Metrics,
@@ -1452,6 +1465,7 @@ fn record_speed(
     usage: Option<crate::metrics::Usage>,
     first_token: Option<std::time::Instant>,
     live_tokens: u64,
+    timing: &mut crate::stats::Timing,
 ) {
     use crate::metrics::{GEN_SECONDS, GEN_SPEED, GEN_TOKENS, PROMPT_EVAL_TOKENS, PROMPT_SECONDS, TTFT};
     let labels = [client, model, backend];
@@ -1460,12 +1474,14 @@ fn record_speed(
         && let Some(p) = u.prompt_secs
     {
         metrics.observe(&TTFT, &labels, p);
+        timing.ttft = Some(p);
     }
     if let (Some(secs), Some(n)) = (u.prompt_secs, u.prompt_eval)
         && n > 0
     {
         metrics.inc(&PROMPT_SECONDS, &labels, secs);
         metrics.inc(&PROMPT_EVAL_TOKENS, &labels, n as f64);
+        timing.prefill = Some((secs, n));
     }
     let tokens = if usage.is_some() { u.completion } else { live_tokens };
     let secs = u
@@ -1478,6 +1494,7 @@ fn record_speed(
         metrics.inc(&GEN_SECONDS, &labels, secs);
         metrics.inc(&GEN_TOKENS, &labels, tokens as f64);
         metrics.observe(&GEN_SPEED, &[model, backend], tokens as f64 / secs);
+        timing.decode = Some((secs, tokens));
     }
 }
 
@@ -2301,16 +2318,22 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 let mut dropped_counts = state.dropped_counts.lock_or_recover();
                                 *dropped_counts.entry(user_id.clone()).or_insert(0) += 1;
                                 drop(dropped_counts);
+                                let model =
+                                    model_label_in(&backends, dropped.requested_model.as_deref());
                                 state.metrics.inc(
                                     &crate::metrics::REQUESTS,
-                                    &[
-                                        user_id,
-                                        &model_label_in(&backends, dropped.requested_model.as_deref()),
-                                        route_template(&dropped.path),
-                                        "timeout",
-                                    ],
+                                    &[user_id, &model, route_template(&dropped.path), "timeout"],
                                     1.0,
                                 );
+                                state.stats.record(crate::stats::Finished {
+                                    at_ms: crate::stats::now_ms(),
+                                    client: user_id.clone(),
+                                    model,
+                                    backend: None,
+                                    outcome: "timeout",
+                                    queue_wait: Some(dropped.queued_at.elapsed().as_secs_f64()),
+                                    timing: Default::default(),
+                                });
                                 state.log_event(LogEvent {
                                     at: std::time::SystemTime::now(),
                                     dir: "OUT",
@@ -2473,6 +2496,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                     // Tokens go to the per-request counter and, for requests
                     // sent with a client key, the per-key one.
                     let count_tokens = |kind: &str, n: u64| {
+                        if kind == "completion" {
+                            state_clone.stats.add_out_tokens(n);
+                        }
                         metrics.inc(
                             &crate::metrics::TOKENS,
                             &[&user_id, &m_model, &m_backend, kind],
@@ -2482,18 +2508,25 @@ pub async fn run_worker(state: Arc<AppState>) {
                             metrics.inc(&crate::metrics::KEY_TOKENS, &[&user_id, key, kind], n as f64);
                         }
                     };
-                    let outcome = |o: &str| {
+                    let queue_wait = task.queued_at.elapsed().as_secs_f64();
+                    // Counted for Prometheus and kept for the Overview.
+                    let outcome = |o: &'static str, timing: crate::stats::Timing| {
                         metrics.inc(
                             &crate::metrics::REQUESTS,
                             &[&user_id, &m_model, m_endpoint, o],
                             1.0,
                         );
+                        state_clone.stats.record(crate::stats::Finished {
+                            at_ms: crate::stats::now_ms(),
+                            client: user_id.clone(),
+                            model: m_model.clone(),
+                            backend: Some(m_backend.clone()),
+                            outcome: o,
+                            queue_wait: Some(queue_wait),
+                            timing,
+                        });
                     };
-                    metrics.observe(
-                        &crate::metrics::QUEUE_WAIT,
-                        &[&user_id, &m_model],
-                        task.queued_at.elapsed().as_secs_f64(),
-                    );
+                    metrics.observe(&crate::metrics::QUEUE_WAIT, &[&user_id, &m_model], queue_wait);
                     // Updated when the response ends; start them at zero so a
                     // long request's tokens are not lost (see `Metrics::touch`).
                     for kind in ["prompt", "completion"] {
@@ -2550,7 +2583,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                         let mut dropped = state_clone.dropped_counts.lock_or_recover();
                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
                         log_out("dropped (blocked)".into(), Some(backend_url.clone()), None);
-                        outcome("blocked");
+                        outcome("blocked", Default::default());
                     } else {
                         {
                             let mut processing = state_clone.processing_counts.lock_or_recover();
@@ -2576,6 +2609,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             m_key.as_deref().unwrap_or("none"),
                             &m_model,
                             &m_backend,
+                            queue_wait,
                         );
                         // Completion tokens already counted from the stream.
                         let mut live_tokens: u64 = 0;
@@ -2717,6 +2751,14 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             u.completion.saturating_sub(live_tokens),
                                         );
                                     }
+                                    let mut timing = crate::stats::Timing {
+                                        status: Some(status.as_u16()),
+                                        duration: Some(started.elapsed().as_secs_f64()),
+                                        ttft: first_token.map(|t| (t - started).as_secs_f64()),
+                                        prompt_tokens: usage.map_or(0, |u| u.prompt),
+                                        completion_tokens: usage.map_or(live_tokens, |u| u.completion),
+                                        ..Default::default()
+                                    };
                                     if status.is_success() && !client_disconnected {
                                         record_speed(
                                             metrics,
@@ -2724,9 +2766,13 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             usage,
                                             first_token,
                                             live_tokens,
+                                            &mut timing,
                                         );
                                     }
-                                    outcome(if client_disconnected { "client_gone" } else { "ok" });
+                                    outcome(
+                                        if client_disconnected { "client_gone" } else { "ok" },
+                                        timing,
+                                    );
 
                                     if !client_disconnected {
                                         delivered = true;
@@ -2770,7 +2816,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         );
                                     }
                                 } else {
-                                    outcome("client_gone");
+                                    outcome("client_gone", Default::default());
                                 }
                             }
                             Err(e) => {
@@ -2796,7 +2842,13 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     Some(backend_url.clone()),
                                     Some(err_msg),
                                 );
-                                outcome("backend_error");
+                                outcome(
+                                    "backend_error",
+                                    crate::stats::Timing {
+                                        duration: Some(started.elapsed().as_secs_f64()),
+                                        ..Default::default()
+                                    },
+                                );
                             }
                         }
 
@@ -3077,6 +3129,15 @@ pub async fn proxy_handler(
                 &[&user_id, &model_label, endpoint, "queue_full"],
                 1.0,
             );
+            state.stats.record(crate::stats::Finished {
+                at_ms: crate::stats::now_ms(),
+                client: user_id.clone(),
+                model: model_label.clone(),
+                backend: None,
+                outcome: "queue_full",
+                queue_wait: None,
+                timing: Default::default(),
+            });
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 axum::Json(serde_json::json!({
@@ -3118,6 +3179,15 @@ pub async fn proxy_handler(
                 &[&user_id, &model_label, endpoint, "overloaded"],
                 1.0,
             );
+            state.stats.record(crate::stats::Finished {
+                at_ms: crate::stats::now_ms(),
+                client: user_id.clone(),
+                model: model_label.clone(),
+                backend: None,
+                outcome: "overloaded",
+                queue_wait: None,
+                timing: Default::default(),
+            });
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 axum::Json(serde_json::json!({

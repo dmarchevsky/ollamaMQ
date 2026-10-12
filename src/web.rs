@@ -28,6 +28,8 @@ use crate::auth::{basic_credentials, constant_time_eq};
 use crate::clients::{ClientPatch, StoreError};
 use crate::control::{self, ControlAction, LoadOptions};
 use crate::dispatcher::AppState;
+
+mod overview;
 use crate::lock::LockExt;
 use crate::model_policy::{Action, Mode, Rule};
 use crate::snapshot;
@@ -98,6 +100,7 @@ pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
         .route("/logout", post(logout))
         .route("/me", get(me))
         .route("/state", get(get_state))
+        .route("/overview", get(overview::get_overview))
         .route("/logs", get(list_logs))
         .route("/logs/{seq}", get(get_log))
         .route("/users/{id}/{op}", post(user_action))
@@ -324,6 +327,10 @@ struct RunView {
     key: String,
     model: String,
     backend: String,
+    /// `prefill` until the first token arrives, then `generating`.
+    state: &'static str,
+    /// Time it waited in the queue before dispatch.
+    waited_secs: f64,
     elapsed_secs: f64,
     /// Time to first byte; `None` while the backend has not answered yet.
     ttfb_secs: Option<f64>,
@@ -510,6 +517,8 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
                 let ttft = r.first_token.map(|f| (f - r.started).as_secs_f64());
                 let gen_secs = r.first_token.map(|f| f.elapsed().as_secs_f64());
                 RunView {
+                    state: if r.first_token.is_some() { "generating" } else { "prefill" },
+                    waited_secs: r.waited_secs,
                     elapsed_secs: r.started.elapsed().as_secs_f64(),
                     ttfb_secs: ttfb,
                     ttft_secs: ttft,
