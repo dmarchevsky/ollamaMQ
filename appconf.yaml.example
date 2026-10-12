@@ -4,7 +4,7 @@
 # and models (what to load where via the model-control load/unload logic).
 #
 # The web UI's Settings page saves its changes in settings.json (next to
-# clients.json) and never rewrites this file; a value set there wins over the
+# this file) and never rewrites this file; a value set there wins over the
 # one here. CLI flags and environment variables win over both.
 #
 # CLI flags always win when explicitly given:
@@ -68,9 +68,13 @@ settings:
   request_log_max_bytes: 10485760             # rotate when file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
   log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
-  clients_file: clients.json                  # clients and their API keys, managed from the web UI (default shown)
-  models_file: models.json                    # model filter rules, managed from the web UI (default shown)
-  settings_file: settings.json                # settings changed in the web UI (default shown)
+  # Files the web UI writes. A relative path is resolved from the folder
+  # holding this file, so by default they sit next to it (logs above stay
+  # relative to the working directory). Defaults shown.
+  clients_file: clients.json                  # clients and their API keys
+  models_file: models.json                    # model filter rules
+  settings_file: settings.json                # settings changed in the web UI
+  admin_file: admin.json                      # web UI password changed in the UI (hashed)
   # metrics_token: ""                         # bearer token for GET /metrics; unset = open (default)
   # web_ui:                    # web UI at /ui behind basic auth; off unless a password is set here
   #   username: admin          # or in OLLAMA_MQ_UI_PASSWORD (env vars OLLAMA_MQ_UI_USER /

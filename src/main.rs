@@ -218,13 +218,33 @@ async fn main() {
         pinned_by.insert("metrics_token", "OLLAMA_MQ_METRICS_TOKEN".to_string());
     }
 
+    // Store files (clients, model rules, UI settings, admin password) live
+    // next to appconf.yaml unless a path says otherwise; logs go to the
+    // working directory. See `settings::store_path`.
+    let config_dir = settings::config_dir(&args.model_config);
+    let mut resolved = std::collections::BTreeMap::new();
+    let mut legacy_notes = Vec::new();
+    let mut store_file = |key: &'static str, name: Option<String>, default: &str| -> String {
+        let name = name.unwrap_or_else(|| default.to_string());
+        let (path, legacy) = settings::store_path(&name, &config_dir, std::path::Path::new(""));
+        let path = path.to_string_lossy().into_owned();
+        if legacy {
+            legacy_notes.push(format!(
+                "{key}: using {path} from the working directory; move it next to {} to keep the configuration in one folder",
+                args.model_config
+            ));
+        }
+        resolved.insert(key, path.clone());
+        path
+    };
+
     // Settings changed in the web UI. Unreadable = fatal, like the client
     // store: starting without them would quietly undo the operator's changes.
-    let settings_file = file_cfg
-        .settings
-        .settings_file
-        .clone()
-        .unwrap_or_else(|| settings_store::DEFAULT_SETTINGS_FILE.to_string());
+    let settings_file = store_file(
+        "settings_file",
+        file_cfg.settings.settings_file.clone(),
+        settings_store::DEFAULT_SETTINGS_FILE,
+    );
     let store = match settings_store::SettingsStore::load(&settings_file) {
         Ok(s) => s,
         Err(e) => {
@@ -240,6 +260,7 @@ async fn main() {
         fallback_backends: Vec::new(),
         startup: config::Settings::default(),
         store,
+        resolved: Default::default(),
     };
     let eff = layers.effective();
     layers.startup = eff.clone();
@@ -272,19 +293,15 @@ async fn main() {
     // It used to be a flat 1 GiB on every route.
     let max_body_bytes = eff.max_body_bytes.unwrap_or(64 * 1024 * 1024);
     let max_queued_bytes = eff.max_queued_bytes.unwrap_or(512 * 1024 * 1024);
-    let clients_file = eff
-        .clients_file
-        .clone()
-        .unwrap_or_else(|| clients::DEFAULT_CLIENTS_FILE.to_string());
-    let models_file = eff
-        .models_file
-        .clone()
-        .unwrap_or_else(|| model_policy::DEFAULT_MODELS_FILE.to_string());
+    let clients_file = store_file("clients_file", eff.clients_file.clone(), clients::DEFAULT_CLIENTS_FILE);
+    let models_file = store_file("models_file", eff.models_file.clone(), model_policy::DEFAULT_MODELS_FILE);
+    let admin_file = store_file("admin_file", eff.admin_file.clone(), admin::DEFAULT_ADMIN_FILE);
+    layers.resolved = resolved;
     // Web UI credentials: a password changed in the UI (admin.json) wins;
     // otherwise env vars, then appconf.yaml. No password at all = UI off.
     let web_cfg = file_cfg.settings.web_ui.clone().unwrap_or_default();
     let web_auth = web::WebAuth::resolve(
-        admin::DEFAULT_ADMIN_FILE,
+        &admin_file,
         env_nonempty("OLLAMA_MQ_UI_USER").or(web_cfg.username.filter(|u| !u.is_empty())),
         env_nonempty("OLLAMA_MQ_UI_PASSWORD")
             .map(|p| (p, "OLLAMA_MQ_UI_PASSWORD"))
@@ -384,6 +401,10 @@ async fn main() {
         log_content_limit,
         max_queued_bytes,
     ));
+
+    for note in &legacy_notes {
+        info!("{note}");
+    }
 
     // A clients file that exists but cannot be read is fatal: running with an
     // empty store would answer every keyed client as a stranger, and the

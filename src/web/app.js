@@ -1009,6 +1009,7 @@ const SET_GROUPS = [
 const STARTUP_LABEL = {
   host: 'Listen address', port: 'Port', request_log_path: 'Request log file', request_log_max_bytes: 'Log file size',
   request_log_max_files: 'Log files kept', clients_file: 'Clients file', models_file: 'Model rules file', settings_file: 'Settings file',
+  admin_file: 'Admin password file',
 };
 const SOURCE_LABEL = { default: 'default', file: 'appconf.yaml', ui: 'set here', cli: 'command line', env: 'environment' };
 

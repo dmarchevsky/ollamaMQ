@@ -96,7 +96,17 @@ pub fn view(state: &AppState) -> SettingsView {
         }
     };
     let fields = EDITABLE.iter().map(|(k, live)| make(k, *live)).collect();
-    let startup = STARTUP_ONLY.iter().map(|k| make(k, false)).collect();
+    // Store files: where they were actually found, not the bare name.
+    let startup = STARTUP_ONLY
+        .iter()
+        .map(|k| {
+            let mut f = make(k, false);
+            if let Some(path) = layers.resolved.get(k) {
+                f.value = Value::String(path.clone());
+            }
+            f
+        })
+        .collect();
     let restart_pending = layers.restart_pending();
     let can_undo = layers.store.can_undo();
     let list = layers.backend_list();

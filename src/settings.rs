@@ -5,6 +5,7 @@
 //! UI's overlay (`settings.json`), `appconf.yaml`, built-in defaults.
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -41,6 +42,7 @@ pub const STARTUP_ONLY: &[&str] = &[
     "clients_file",
     "models_file",
     "settings_file",
+    "admin_file",
 ];
 
 /// The value each setting has when nothing sets it.
@@ -65,6 +67,7 @@ pub fn defaults() -> Settings {
         clients_file: Some(crate::clients::DEFAULT_CLIENTS_FILE.into()),
         models_file: Some(crate::model_policy::DEFAULT_MODELS_FILE.into()),
         settings_file: Some(crate::settings_store::DEFAULT_SETTINGS_FILE.into()),
+        admin_file: Some(crate::admin::DEFAULT_ADMIN_FILE.into()),
         metrics_token: None,
         web_ui: None,
     }
@@ -87,6 +90,8 @@ pub struct Layers {
     /// changes are still waiting for a restart.
     pub startup: Settings,
     pub store: SettingsStore,
+    /// Where each store file was found (setting name -> path), for display.
+    pub resolved: BTreeMap<&'static str, String>,
 }
 
 impl Default for Layers {
@@ -99,6 +104,7 @@ impl Default for Layers {
             fallback_backends: Vec::new(),
             startup: Settings::default(),
             store: SettingsStore::in_memory(),
+            resolved: BTreeMap::new(),
         }
     }
 }
@@ -235,6 +241,37 @@ pub fn reload(state: &Arc<AppState>) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Where a store file named in the settings (`clients_file`, `models_file`,
+/// `settings_file`, `admin_file`) lives.
+///
+/// An absolute path is used as given. A relative one is resolved from
+/// `config_dir`, the folder holding `appconf.yaml`, so the whole
+/// configuration can live in one folder while logs go to the working
+/// directory. Older layouts kept these files in the working directory
+/// (`cwd`): when the file exists there and not next to the config, that copy
+/// is used, and the second value is true so the caller can say so.
+pub fn store_path(name: &str, config_dir: &Path, cwd: &Path) -> (PathBuf, bool) {
+    let p = Path::new(name);
+    if p.is_absolute() {
+        return (p.to_path_buf(), false);
+    }
+    let preferred = config_dir.join(p);
+    let legacy = cwd.join(p);
+    if !preferred.exists() && legacy.exists() && preferred != legacy {
+        (legacy, true)
+    } else {
+        (preferred, false)
+    }
+}
+
+/// The folder of the config file; `.` for a bare file name.
+pub fn config_dir(config_file: &str) -> PathBuf {
+    match Path::new(config_file).parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 /// `http://host:port`, no trailing slash; `http://` added when missing.
 pub fn normalize_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
@@ -339,6 +376,48 @@ mod tests {
         ui.settings.max_body_bytes = Some(2048);
         l.store.save(ui).unwrap();
         assert_eq!(l.restart_pending(), vec!["max_body_bytes"]);
+    }
+
+    #[test]
+    fn store_files_live_next_to_the_config() {
+        let root = std::env::temp_dir().join(format!("omq-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, cwd) = (root.join("config"), root.join("data"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // New setup: nothing anywhere yet -> next to the config.
+        assert_eq!(
+            store_path("clients.json", &cfg, &cwd),
+            (cfg.join("clients.json"), false)
+        );
+        // Old layout: the file is only in the working directory -> keep using it.
+        std::fs::write(cwd.join("clients.json"), "{}").unwrap();
+        assert_eq!(
+            store_path("clients.json", &cfg, &cwd),
+            (cwd.join("clients.json"), true)
+        );
+        // Moved next to the config: that copy wins.
+        std::fs::write(cfg.join("clients.json"), "{}").unwrap();
+        assert_eq!(
+            store_path("clients.json", &cfg, &cwd),
+            (cfg.join("clients.json"), false)
+        );
+        // Absolute paths are taken as given.
+        assert_eq!(
+            store_path("/x/y.json", &cfg, &cwd),
+            (PathBuf::from("/x/y.json"), false)
+        );
+        // Config in the working directory: one place, never "legacy".
+        assert_eq!(
+            store_path("clients.json", &cwd, &cwd),
+            (cwd.join("clients.json"), false)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(config_dir("/config/appconf.yaml"), PathBuf::from("/config"));
+        assert_eq!(config_dir("appconf.yaml"), PathBuf::from("."));
+        assert_eq!(config_dir("conf/app.yaml"), PathBuf::from("conf"));
     }
 
     #[test]

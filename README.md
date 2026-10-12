@@ -424,6 +424,29 @@ When running in Docker on Linux to access a host-based Ollama:
 2.  **Firewall:** Ensure your firewall (e.g., `ufw`) allows traffic from the Docker bridge (usually `172.17.0.1/16`) to port `11434`.
 3.  **Host Gateway:** The `extra_hosts` setting in `docker-compose.yml` maps `host.docker.internal` to your host's IP address.
 
+### Docker with a config folder
+
+[`deploy/docker-compose.yml`](deploy/docker-compose.yml) keeps everything in one host folder, with relative paths only:
+
+```
+ollamamq/
+├── docker-compose.yml
+├── config/   → /config   appconf.yaml, .env, clients.json, models.json, settings.json, admin.json
+└── logs/     → /data     ollamamq-requests.jsonl*, ollamamq.log
+```
+
+1. Copy `deploy/docker-compose.yml` into an empty folder.
+2. Create `config/appconf.yaml` and `config/.env` (`OLLAMA_MQ_UI_PASSWORD=…`).
+3. Run `docker compose up -d --build`.
+
+The image is built straight from GitHub. To build local changes, clone the repo into `./src` and use the commented `context: ./src` instead.
+
+**Moving to another server:** stop the service and copy the folder. The files in `config/` are written by the container as root with mode 600, so copy them with `sudo` (or `docker run --rm -v "$PWD":/s alpine tar …`).
+
+**Where store files go:** relative paths for `clients_file`, `models_file`, `settings_file` and `admin_file` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. Logs (`request_log_path`, `ollamamq.log`) stay relative to the working directory.
+
+Earlier versions kept the store files in the working directory. If such a file exists there and not next to `appconf.yaml`, it keeps being used, and the startup log says so. To switch, move it next to `appconf.yaml`.
+
 ### Dockerfile
 
 The Dockerfile uses a multi-stage build:
@@ -517,7 +540,7 @@ Numbers cover the chosen window and come from an in-memory history of the last h
 
 #### Settings
 
-The **Settings** page edits the configuration while the proxy runs. Changes are saved in `settings.json` (next to `clients.json`; path: `settings.settings_file`).
+The **Settings** page edits the configuration while the proxy runs. Changes are saved in `settings.json`, next to `appconf.yaml` (path: `settings.settings_file`).
 - **Never rewritten:** `appconf.yaml`. Its comments survive.
 - **Precedence:** command-line flags and environment variables > `settings.json` > `appconf.yaml` > built-in defaults. A value set on the command line or in the environment shows as locked.
 - **Source:** each setting shows where its value comes from, and **Use the appconf.yaml value** drops the UI's value.
@@ -536,7 +559,7 @@ The **Settings** page edits the configuration while the proxy runs. Changes are 
 - **`--backend-urls`:** when given, the list is fixed.
 
 **Admin password:**
-- **Change password** stores an argon2id hash in `admin.json` (mode 600, next to `clients.json`).
+- **Change password** stores an argon2id hash in `admin.json` (mode 600, next to `appconf.yaml`; path: `settings.admin_file`).
 - **Precedence:** it wins over `OLLAMA_MQ_UI_PASSWORD` and `settings.web_ui.password`. Those become the first-run password.
 - **Sessions:** other sessions are signed out.
 - **Forgot it?** Delete `admin.json` and restart; the configured password works again.
@@ -552,7 +575,7 @@ It also manages **clients and their API keys**. The Clients page lists two kinds
 - **Blocking a registered client disables it** (TUI `x`, web *Block* / *Disable*): its keys get `403` and its queued requests are dropped. That is the client's one block switch, saved with it; a user block on a client name from before this rule is converted to *disabled* at startup. Unregistered ids and IPs are blocked as before (`blocked_items.json`).
 - **VIP and boost on a registered client are saved** with it and restored at startup; on an unregistered id they last until restart.
 - **Renaming a client moves its live state** — queued requests, counters, last IP, fair-share position, VIP/boost — to the new name. Requests already being served finish under the old name. Deleting a client turns its name back into an ordinary id and clears its VIP/boost.
-- Keys are stored in plaintext in `settings.clients_file` (default `clients.json` in the working directory) so they can be looked up again; the file is written owner-only (`0600`). Changes are saved immediately (atomic replace). A clients file that exists but cannot be parsed stops the proxy at startup rather than being overwritten.
+- Keys are stored in plaintext in `settings.clients_file` (default `clients.json` next to `appconf.yaml`) so they can be looked up again; the file is written owner-only (`0600`). Changes are saved immediately (atomic replace). A clients file that exists but cannot be parsed stops the proxy at startup rather than being overwritten.
 
 #### Model filtering
 

@@ -107,18 +107,24 @@ pub struct Settings {
     /// one oversized body can never deadlock the proxy against itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_queued_bytes: Option<u64>,
-    /// Where clients and their API keys are stored (default "clients.json"
-    /// in the working directory). Managed from the web UI.
+    /// Where clients and their API keys are stored (default "clients.json").
+    /// Managed from the web UI. Like the other store files, a relative path
+    /// is resolved from the folder holding this config file (see
+    /// `settings::store_path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clients_file: Option<String>,
-    /// Where the model filter rules are stored (default "models.json" in the
-    /// working directory). Managed from the web UI's Models page.
+    /// Where the model filter rules are stored (default "models.json").
+    /// Managed from the web UI's Models page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_file: Option<String>,
     /// Where settings changed in the web UI are stored (default
-    /// "settings.json" in the working directory). They override this file.
+    /// "settings.json"). They override this file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_file: Option<String>,
+    /// Where a web UI password changed in the UI is stored, hashed (default
+    /// "admin.json").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_file: Option<String>,
     /// Bearer token required by `GET /metrics`. Unset (the default) leaves
     /// the endpoint open, like `/health`. `OLLAMA_MQ_METRICS_TOKEN` overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -270,7 +276,7 @@ impl Settings {
             max_concurrent_per_backend, detect_backend_slots, model_aliases, ip_identity,
             request_log_path, request_log_max_bytes, request_log_max_files, log_content_limit,
             max_body_bytes, max_queued_bytes, clients_file, models_file, settings_file,
-            metrics_token, web_ui
+            admin_file, metrics_token, web_ui
         )
     }
 
