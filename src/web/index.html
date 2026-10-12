@@ -60,7 +60,10 @@
     </section>
 
     <section class="page" id="page-backends">
-      <h1>Backends</h1>
+      <div class="page-h">
+        <h1>Backends</h1>
+        <div class="page-tools"><button class="btn primary" data-action="add-backend" id="bk-add-backend" hidden>+ Add backend</button></div>
+      </div>
       <div class="panel flush" id="backends"></div>
     </section>
 
@@ -142,12 +145,9 @@
         <div class="page-tools" id="set-tools"></div>
       </div>
       <p class="hint">Changes are saved in <code id="set-file">settings.json</code> and win over <code>appconf.yaml</code>, which is never rewritten.
-        Most apply at once; the ones marked <span class="badge warn">restart</span> wait for a restart.</p>
+        Most apply at once; the ones marked <span class="badge warn">restart</span> wait for a restart.
+        Backends are managed on the <a href="#backends">Backends page</a>.</p>
       <div id="set-banner"></div>
-      <div class="panel flush">
-        <div class="panel-h padded"><h2>Backends</h2><button class="btn sm primary" data-action="add-backend" id="set-add-backend">+ Add backend</button></div>
-        <div class="tscroll" id="set-backends"></div>
-      </div>
       <div id="set-form"></div>
       <datalist id="dl-set-models"></datalist>
     </section>

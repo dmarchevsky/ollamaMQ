@@ -216,7 +216,7 @@ async function poll() {
     const needClients = S.page === 'clients' || !S.clients.length;
     const needModels = S.page === 'models' || !S.modelPolicy;
     const needOverview = S.page === 'overview';
-    const needSettings = S.page === 'settings';
+    const needSettings = S.page === 'settings' || S.page === 'backends';
     const [state, logs, clients, models, overview, settings, me] = await Promise.all([
       api('GET', 'state'),
       needLogs && !$('#log-pause').checked ? api('GET', `logs?limit=${LOG_LIMIT}`) : null,
@@ -607,22 +607,31 @@ function opCell(b) {
 }
 
 function renderBackends(st) {
+  // Backend config editing lives here, not in Settings; the settings view
+  // (fetched on this page by poll) carries name/token/kind/removed per URL.
+  const locked = S.settings?.backends_locked;
+  $('#bk-add-backend').hidden = !!locked;
+  const note = locked ? `<p class="note flush-note">The backends are set by <code>${esc(locked)}</code>, which wins over the web UI, so they cannot be changed here.</p>` : '';
   if (!st.backends.length) {
-    setHTML($('#backends'), '<div class="empty">No backends configured</div>');
+    setHTML($('#backends'), note + '<div class="empty">No backends configured</div>');
     return;
   }
+  const cfg = new Map((S.settings?.backends || []).map(b => [b.url, b]));
+  const editable = !!S.settings && !locked;
+  const cols = editable ? 7 : 6;
   const rows = st.backends.map(b => {
+    const c = cfg.get(b.url);
     const open = S.expanded.has(b.url);
     const pct = b.max ? Math.min(100, (b.active / b.max) * 100) : 0;
     const loaded = new Set(b.models_loaded);
     const hiddenHere = new Set(b.models_hidden);
     let html = `<tr class="bk-row ${open ? 'open' : ''}" data-action="toggle-backend" data-url="${esc(b.url)}">
-      <td><span class="caret">${open ? '▾' : '▸'}</span><span class="sdot ${b.online ? 'on' : 'off'}"></span>${bkCell(b.url, true)}${b.disabled ? ' <span class="badge">disabled</span>' : ''}</td>
+      <td><span class="caret">${open ? '▾' : '▸'}</span><span class="sdot ${b.online ? 'on' : 'off'}"></span>${bkCell(b.url, true)}${b.disabled ? ' <span class="badge">disabled</span>' : ''}${c?.removed ? ' <span class="badge">removed — gone after a restart</span>' : ''}</td>
       <td>${typeBadge(b.api_type)}</td>
       <td class="num" title="${b.max_detected ? `${b.max} slots reported by the backend` : `${b.max} = settings.max_concurrent_per_backend`}">${b.active}/${b.max}<span class="meter"><i style="width:${pct}%"></i></span></td>
       <td class="num">${fmtNum(b.processed)}</td>
       <td>${b.loaded_known ? `<b>${loaded.size}</b> <span class="dim">loaded ·</span> ` : ''}${b.models_available.length} <span class="dim">available</span></td>
-      <td>${opCell(b)}</td></tr>`;
+      <td>${opCell(b)}</td>${bkActions(b, c, editable)}</tr>`;
     if (open) {
       // Loaded first, then alphabetical — the TUI's order.
       const models = [...b.models_available].sort((x, y) =>
@@ -630,7 +639,7 @@ function renderBackends(st) {
       const all = S.showAll.has(b.url);
       const shown = all ? models : models.slice(0, MODEL_LIMIT);
       const busy = !!b.active_op;
-      html += `<tr class="bk-detail"><td colspan="6">
+      html += `<tr class="bk-detail"><td colspan="${cols}">
         <div class="bk-detail-h">
           <h2>Models</h2>
           ${b.can_control ? '' : '<span class="badge">no load/unload API — models are always ready</span>'}
@@ -655,9 +664,19 @@ function renderBackends(st) {
     }
     return html;
   }).join('');
-  setHTML($('#backends'), `<table>
-    <tr><th>Backend</th><th>Type</th><th class="num">Active</th><th class="num">Done</th><th>Models</th><th>Control</th></tr>
+  setHTML($('#backends'), `${note}<table>
+    <tr><th>Backend</th><th>Type</th><th class="num">Active</th><th class="num">Done</th><th>Models</th><th>Control</th>${editable ? '<th></th>' : ''}</tr>
     ${rows}</table>`);
+}
+
+/** Config controls for a row: Edit / Disable·Enable / Remove, or Add back for a removed one. */
+function bkActions(b, c, editable) {
+  if (!editable) return '';
+  if (c?.removed) return `<td class="actions"><button class="btn sm" data-action="backend-restore" data-url="${esc(b.url)}" data-name="${esc(c.name ?? '')}">Add back</button></td>`;
+  return `<td class="actions"><span class="btn-group">
+    <button class="btn sm" data-action="backend-edit" data-url="${esc(b.url)}">Edit</button>
+    <button class="btn sm" data-action="backend-toggle" data-url="${esc(b.url)}">${b.disabled ? 'Enable' : 'Disable'}</button>
+    <button class="btn sm danger" data-action="backend-remove" data-url="${esc(b.url)}">Remove</button></span></td>`;
 }
 
 // --- Clients: registered clients and unregistered queue ids in one list
@@ -1142,25 +1161,6 @@ function renderSettings() {
   setHTML($('#set-banner'), set.restart_pending.length
     ? `<div class="note warn-note"><b>Restart needed.</b> ${set.restart_pending.map(k => esc(names[k])).join(', ')} take${set.restart_pending.length === 1 ? 's' : ''} effect after ollamaMQ restarts.</div>` : '');
   $('#set-file').textContent = set.startup.find(f => f.key === 'settings_file')?.value ?? 'settings.json';
-  $('#set-add-backend').hidden = !!set.backends_locked;
-  const status = b => b.removed ? '<span class="dim">removed — gone after a restart</span>'
-    : b.disabled ? '<span class="badge">disabled</span>'
-    : b.online ? '<span class="st-ok">online</span>' : '<span class="st-bad">offline</span>';
-  setHTML($('#set-backends'), (set.backends_locked ? `<p class="note flush-note">The backends are set by <code>${esc(set.backends_locked)}</code>, so they cannot be changed here.</p>` : '') + `<table>
-    <tr><th>Backend</th><th>Type</th><th class="num">Slots</th><th>Token</th><th>State</th><th></th></tr>
-    ${set.backends.map(b => `<tr class="${b.disabled ? 'is-off' : ''}">
-      <td>${b.name ? `<span class="bk-name">${esc(b.name)}</span><span class="bk-addr">${esc(b.label)}</span>` : `<span class="bk-url">${esc(b.label)}</span>`}</td>
-      <td>${b.removed || b.disabled ? '<span class="dim">—</span>' : typeBadge(b.kind === 'systemone' ? 'System One' : b.api_type)}</td>
-      <td class="num">${b.removed || b.disabled ? '<span class="dim">—</span>' : `${b.slots} <span class="dim">${b.slots_detected ? 'reported' : 'fallback'}</span>`}</td>
-      <td>${b.token_set ? '••••' : '<span class="dim">none</span>'}</td>
-      <td>${status(b)}</td>
-      <td class="actions">${set.backends_locked ? '' : b.removed
-        ? `<button class="btn sm" data-action="backend-restore" data-url="${esc(b.url)}" data-name="${esc(b.name ?? '')}">Add back</button>`
-        : `<span class="btn-group">
-          <button class="btn sm" data-action="backend-edit" data-url="${esc(b.url)}">Edit</button>
-          <button class="btn sm" data-action="backend-toggle" data-url="${esc(b.url)}">${b.disabled ? 'Enable' : 'Disable'}</button>
-          <button class="btn sm danger" data-action="backend-remove" data-url="${esc(b.url)}">Remove</button></span>`}</td>
-    </tr>`).join('')}</table>`);
 }
 
 /** Apply a settings response and redraw the form from it. */
