@@ -655,6 +655,40 @@ pub struct BackendStatus {
     pub declared_models: Vec<String>,
     /// Parallel request slots the server reports (see `BackendProbe::slots`).
     pub detected_slots: Option<u32>,
+    /// Display name (`backends[].name`), shown instead of `host:port`.
+    pub name: Option<String>,
+    /// Turned off in the settings: never probed, kept offline, never routed to.
+    pub disabled: bool,
+}
+
+impl BackendStatus {
+    /// A backend nothing is known about yet; the health loop fills it in.
+    pub fn new(url: String, token: Option<String>, declared_models: Vec<String>) -> Self {
+        BackendStatus {
+            url,
+            token,
+            active_requests: 0,
+            processed_count: 0,
+            is_online: true,
+            api_type: BackendApiType::Unknown,
+            available_models: Arc::default(),
+            loaded_models: Arc::default(),
+            loaded_state_known: false,
+            loaded_ctx: HashMap::new(),
+            current_model: None,
+            active_by_model: HashMap::new(),
+            lmstudio: false,
+            native_models: Arc::default(),
+            known_bad_endpoints: HashSet::new(),
+            rejected_families: HashSet::new(),
+            family_fail_counts: HashMap::new(),
+            forced_api: ApiSet::EMPTY,
+            declared_models,
+            detected_slots: None,
+            name: None,
+            disabled: false,
+        }
+    }
 }
 
 pub struct AppState {
@@ -679,12 +713,13 @@ pub struct AppState {
     /// Last backend index handed a request, for round-robin among equally
     /// loaded backends. Atomic for the same reason as `global_counter`.
     pub last_backend_idx: std::sync::atomic::AtomicUsize,
-    pub timeout: u64,
+    /// Request timeout in seconds (`settings.timeout`), live-editable.
+    pub timeout: std::sync::atomic::AtomicU64,
     /// How long a request may wait when no backend can *ever* serve it
     /// (all offline / wrong API family / model absent everywhere) before the
     /// proxy answers 503 instead of letting the client hang. Requests that
     /// are merely waiting for a busy or loading backend are exempt.
-    pub stuck_timeout: std::time::Duration,
+    pub stuck_timeout_secs: std::sync::atomic::AtomicU64,
     /// Shared HTTP client for proxying and backend control probes.
     pub client: reqwest::Client,
     /// In-flight model control operations, keyed by backend index
@@ -695,10 +730,10 @@ pub struct AppState {
     pub control_history: Mutex<VecDeque<crate::control::ControlResult>>,
     /// `keep_alive` (seconds) sent with control "load" requests so explicitly
     /// loaded models stay resident (Ollama's own default is only 5 minutes).
-    pub load_keep_alive: i64,
+    pub load_keep_alive: std::sync::atomic::AtomicI64,
     /// Max simultaneous in-flight requests per backend (default 1 — the
     /// historical behavior). Per-model sub-limits come from `model_limits`.
-    pub max_concurrent_per_backend: u32,
+    pub max_concurrent_per_backend: std::sync::atomic::AtomicU32,
     /// Use the slot count a backend reports as its capacity
     /// (`settings.detect_backend_slots`, default on).
     pub detect_slots: std::sync::atomic::AtomicBool,
@@ -720,9 +755,16 @@ pub struct AppState {
     /// Size-rotated request/response content logger (no-op when disabled).
     pub reqlog: crate::reqlog::RequestLogger,
     /// Max bytes of body content captured per record in the request log.
-    pub log_content_limit: usize,
+    pub log_content_limit: std::sync::atomic::AtomicUsize,
     /// Ceiling on `queued_bytes` (`settings.max_queued_bytes`).
-    pub max_queued_bytes: u64,
+    pub max_queued_bytes: std::sync::atomic::AtomicU64,
+    /// Proxy routes the proxy does not know (`settings.allow_all_routes`).
+    pub allow_all_routes: std::sync::atomic::AtomicBool,
+    /// Bearer token `GET /metrics` requires; `None` leaves it open.
+    pub metrics_token: Mutex<Option<String>>,
+    /// Where each setting comes from: appconf.yaml, the web UI's overlay,
+    /// and the CLI/env values that pin some of them.
+    pub config: Mutex<crate::settings::Layers>,
     /// Bytes of request bodies currently waiting in the queues. Queued tasks
     /// own their whole body, so the per-user request cap alone still allowed
     /// gigabytes to pile up; this bounds it in bytes. Read and updated only
@@ -868,27 +910,8 @@ impl AppState {
         let backends = backends
             .into_iter()
             .enumerate()
-            .map(|(i, (url, token))| BackendStatus {
-                url,
-                token,
-                active_requests: 0,
-                processed_count: 0,
-                is_online: true,
-                api_type: BackendApiType::Unknown,
-                available_models: Arc::default(),
-                loaded_models: Arc::default(),
-                loaded_state_known: false,
-                loaded_ctx: HashMap::new(),
-                current_model: None,
-                active_by_model: HashMap::new(),
-                lmstudio: false,
-                native_models: Arc::default(),
-                known_bad_endpoints: HashSet::new(),
-                rejected_families: HashSet::new(),
-                family_fail_counts: HashMap::new(),
-                forced_api: ApiSet::EMPTY,
-                declared_models: declared.get(i).cloned().unwrap_or_default(),
-                detected_slots: None,
+            .map(|(i, (url, token))| {
+                BackendStatus::new(url, token, declared.get(i).cloned().unwrap_or_default())
             })
             .collect();
 
@@ -913,13 +936,13 @@ impl AppState {
             backend_freed: Notify::new(),
             backends: Mutex::new(backends),
             last_backend_idx: std::sync::atomic::AtomicUsize::new(0),
-            timeout,
-            stuck_timeout: std::time::Duration::from_secs(stuck_timeout_secs),
+            timeout: std::sync::atomic::AtomicU64::new(timeout),
+            stuck_timeout_secs: std::sync::atomic::AtomicU64::new(stuck_timeout_secs),
             client,
             control_ops: Mutex::new(HashMap::new()),
             control_history: Mutex::new(VecDeque::new()),
-            load_keep_alive,
-            max_concurrent_per_backend,
+            load_keep_alive: std::sync::atomic::AtomicI64::new(load_keep_alive),
+            max_concurrent_per_backend: std::sync::atomic::AtomicU32::new(max_concurrent_per_backend),
             detect_slots: std::sync::atomic::AtomicBool::new(true),
             model_aliases: Mutex::new(HashMap::new()),
             ip_identity: std::sync::atomic::AtomicBool::new(true),
@@ -928,8 +951,11 @@ impl AppState {
             model_config_path,
             logs: Mutex::new(VecDeque::new()),
             reqlog,
-            log_content_limit,
-            max_queued_bytes,
+            log_content_limit: std::sync::atomic::AtomicUsize::new(log_content_limit),
+            max_queued_bytes: std::sync::atomic::AtomicU64::new(max_queued_bytes),
+            allow_all_routes: std::sync::atomic::AtomicBool::new(false),
+            metrics_token: Mutex::new(None),
+            config: Mutex::new(crate::settings::Layers::default()),
             queued_bytes: std::sync::atomic::AtomicU64::new(0),
             clients: Mutex::new(crate::clients::ClientStore::in_memory()),
             model_policy: Mutex::new(crate::model_policy::ModelPolicyStore::in_memory()),
@@ -1103,8 +1129,13 @@ impl AppState {
     pub fn backend_capacity(&self, b: &BackendStatus) -> (u32, bool) {
         match b.detected_slots {
             Some(n) if self.detect_slots.load(std::sync::atomic::Ordering::Relaxed) => (n, true),
-            _ => (self.max_concurrent_per_backend, false),
+            _ => (self.max_concurrent_per_backend.load(std::sync::atomic::Ordering::Relaxed), false),
         }
+    }
+
+    /// How long a request may wait when no backend can ever serve it.
+    pub fn stuck_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.stuck_timeout_secs.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Requests a backend could start now: capacity minus in-flight, none
@@ -1855,6 +1886,8 @@ async fn health_check_round(
         backends
             .iter()
             .enumerate()
+            // Disabled backends stay offline and unprobed.
+            .filter(|(_, b)| !b.disabled)
             .map(|(i, b)| {
                 // Skip endpoints this backend is known to reject — except on a
                 // full re-probe or right after recovery from offline (memory
@@ -2263,8 +2296,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                             // model), it may just be busy or loading — keep waiting. Otherwise
                             // nothing will ever pick it up: warn once, then fail fast with 503
                             // after stuck_timeout instead of letting the client hang forever.
+                            // A disabled backend never comes back by itself.
                             let satisfiable = backends.iter().any(|b| {
-                                family_compatible(b, route_families)
+                                !b.disabled
+                                    && family_compatible(b, route_families)
                                     && match &task_ref.requested_model {
                                         // A pinned model is only satisfiable by a backend
                                         // that also passes the pin filter — strict pinning
@@ -2282,7 +2317,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             });
 
                             if !satisfiable
-                                && task_ref.queued_at.elapsed() >= state.stuck_timeout
+                                && task_ref.queued_at.elapsed() >= state.stuck_timeout()
                             {
                                 let dropped = queues
                                     .get_mut(user_id)
@@ -2384,11 +2419,11 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             "no backend can serve model '{}' (pinned to: {}); will fail with 503 after {}s",
                                             task_ref.requested_model.as_deref().unwrap_or("-"),
                                             pins.join(", "),
-                                            state.stuck_timeout.as_secs()
+                                            state.stuck_timeout().as_secs()
                                         ),
                                         None => format!(
                                             "No backend can serve; will fail with 503 after {}s",
-                                            state.stuck_timeout.as_secs()
+                                            state.stuck_timeout().as_secs()
                                         ),
                                     }
                                 };
@@ -2621,6 +2656,9 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                         let res_fut = client_clone
                             .request(task.method, &url)
+                            .timeout(std::time::Duration::from_secs(
+                                state_clone.timeout.load(std::sync::atomic::Ordering::Relaxed),
+                            ))
                             .headers(headers)
                             .body(task.body)
                             .send();
@@ -2693,9 +2731,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                     count_tokens("completion", est);
                                                     run.update(|r| r.tokens += est);
                                                 }
-                                                if content_acc.len() < state_clone.log_content_limit
+                                                if content_acc.len() < state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)
                                                 {
-                                                    let room = state_clone.log_content_limit
+                                                    let room = state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)
                                                         - content_acc.len();
                                                     content_acc
                                                         .extend_from_slice(&chunk[..n.min(room)]);
@@ -2782,7 +2820,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         drop(counts);
                                         let content_str = Arc::new(crate::reqlog::truncate_utf8(
                                             &content_acc,
-                                            state_clone.log_content_limit,
+                                            state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed),
                                         ));
                                         state_clone.reqlog.log(crate::reqlog::ReqRecord {
                                             ts: crate::reqlog::now_unix_millis(),
@@ -3079,7 +3117,7 @@ pub async fn proxy_handler(
     let model_label = state.model_label(requested_model.as_deref());
     // Request-log content is captured before `body` moves into the Task.
     let body_len = body.len() as u64;
-    let content = Arc::new(crate::reqlog::truncate_utf8(&body, state.log_content_limit));
+    let content = Arc::new(crate::reqlog::truncate_utf8(&body, state.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)));
     let task = Task {
         path: path.clone(),
         method,
@@ -3154,11 +3192,12 @@ pub async fn proxy_handler(
         let queued_now = state
             .queued_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
-        if queued_now > 0 && queued_now + body_len > state.max_queued_bytes {
+        let max_queued = state.max_queued_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if queued_now > 0 && queued_now + body_len > max_queued {
             drop(queues);
             warn!(
                 "queued bodies at {} B (limit {}); refusing a {} B request from {}",
-                queued_now, state.max_queued_bytes, body_len, user_id
+                queued_now, max_queued, body_len, user_id
             );
             *state
                 .dropped_counts
@@ -3422,6 +3461,8 @@ mod tests {
             forced_api: BackendApiType::EMPTY,
             declared_models: Vec::new(),
             detected_slots: None,
+            name: None,
+            disabled: false,
         }
     }
 

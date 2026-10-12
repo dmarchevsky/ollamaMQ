@@ -97,6 +97,7 @@ struct Marker {
 struct BackendStats {
     idx: usize,
     label: String,
+    name: Option<String>,
     online: bool,
     api_type: &'static str,
     running: usize,
@@ -226,6 +227,7 @@ pub async fn get_overview(
             .collect();
             BackendStats {
                 idx,
+                name: b.name.clone(),
                 online: b.is_online,
                 api_type: b.api_type.display(),
                 running: b.active_requests,

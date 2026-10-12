@@ -962,7 +962,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                         resident,
                         b.map(|b| b.lmstudio).unwrap_or(false),
                         b.map(|b| b.native_models.clone()).unwrap_or_default(),
-                        Duration::from_secs(st.timeout.max(600)),
+                        Duration::from_secs(st.timeout.load(std::sync::atomic::Ordering::Relaxed).max(600)),
                     )
                 };
 
@@ -1447,8 +1447,10 @@ pub fn start_model_control(
                 b.url.clone(),
                 b.token.clone(),
                 b.lmstudio,
-                state.timeout,
-                load_options.keep_alive.unwrap_or(state.load_keep_alive),
+                state.timeout.load(std::sync::atomic::Ordering::Relaxed),
+                load_options
+                    .keep_alive
+                    .unwrap_or(state.load_keep_alive.load(std::sync::atomic::Ordering::Relaxed)),
                 b.native_models.clone(),
             )
         };
@@ -1730,6 +1732,8 @@ pub async fn admin_models_state(State(state): State<Arc<AppState>>) -> impl Into
             json!({
                 "index": i,
                 "url": b.url,
+                "name": b.name,
+                "disabled": b.disabled,
                 "online": b.is_online,
                 "api": b.api_type.display(),
                 "lmstudio": b.lmstudio,
@@ -1784,6 +1788,8 @@ mod tests {
             forced_api: BackendApiType::EMPTY,
             declared_models: Vec::new(),
             detected_slots: None,
+            name: None,
+            disabled: false,
         }
     }
 

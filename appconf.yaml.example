@@ -3,6 +3,10 @@
 # Three sections: backends (what to connect to), settings (runtime options)
 # and models (what to load where via the model-control load/unload logic).
 #
+# The web UI's Settings page saves its changes in settings.json (next to
+# clients.json) and never rewrites this file; a value set there wins over the
+# one here. CLI flags and environment variables win over both.
+#
 # CLI flags always win when explicitly given:
 #   --backend-urls overrides `backends`
 #   --port / --host / --timeout / --load-keep-alive / --allow-all-routes
@@ -26,7 +30,8 @@ backends:
   - http://10.137.1.1:11434        # Ollama — no auth needed
   - url: http://10.137.1.2:11434   # object form, e.g. for a backend behind an
     token: "some-api-key"          #   authenticated reverse proxy (LM Studio, vLLM, ...)
-  - http://10.137.1.5:1234         # LM Studio
+  - url: http://10.137.1.5:1234    # LM Studio
+    name: lmstudio-box             # optional: shown in the web UI instead of host:port
 
 # --- Runtime settings -------------------------------------------------------
 settings:
@@ -65,6 +70,7 @@ settings:
   log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
   clients_file: clients.json                  # clients and their API keys, managed from the web UI (default shown)
   models_file: models.json                    # model filter rules, managed from the web UI (default shown)
+  settings_file: settings.json                # settings changed in the web UI (default shown)
   # metrics_token: ""                         # bearer token for GET /metrics; unset = open (default)
   # web_ui:                    # web UI at /ui behind basic auth; off unless a password is set here
   #   username: admin          # or in OLLAMA_MQ_UI_PASSWORD (env vars OLLAMA_MQ_UI_USER /

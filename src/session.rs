@@ -75,6 +75,11 @@ impl Sessions {
     pub fn remove(&self, token: &str) {
         self.inner.lock_or_recover().remove(token);
     }
+
+    /// End every session but `keep` (all of them when `None`).
+    pub fn retain_only(&self, keep: Option<&str>) {
+        self.inner.lock_or_recover().retain(|t, _| Some(t.as_str()) == keep);
+    }
 }
 
 /// Refuses login attempts after too many failures in a short window, so
@@ -131,6 +136,18 @@ mod tests {
         assert_eq!(s.user("nope"), None);
         s.remove(&t);
         assert_eq!(s.user(&t), None);
+    }
+
+    #[test]
+    fn retain_only_keeps_one_session() {
+        let s = Sessions::default();
+        let a = s.create("admin");
+        let b = s.create("admin");
+        s.retain_only(Some(&a));
+        assert!(s.user(&a).is_some());
+        assert!(s.user(&b).is_none());
+        s.retain_only(None);
+        assert!(s.user(&a).is_none());
     }
 
     #[test]

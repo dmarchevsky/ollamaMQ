@@ -38,7 +38,12 @@
       loaded_ctx: { 'llama3.3:70b': 32768, 'nomic-embed-text:latest': 8192 }, can_control: true,
       active_op: { verb: 'loading', model: 'qwen3:32b', elapsed_secs: 14 }, results: [],
     },
-  ].map((b, idx) => ({ idx, ...b }));
+  ].map((b, idx) => ({ idx, disabled: false, ...b }));
+  // Names set in the settings; gpu-box is left unnamed to show both forms.
+  Object.assign(backends[0], { name: 'brainiac-halogen' });
+  Object.assign(backends[1], { name: 'ryzen-router' });
+  Object.assign(backends[2], { name: 'ryzen-e4b' });
+  Object.assign(backends[3], { name: 'ryzen-bge' });
 
   const users = [
     { id: 'codex-laptop', ip: '172.22.0.1', queued: 3, processing: 1, done: 812, dropped: 2, registered: true, blocked: false },
@@ -283,6 +288,58 @@
     };
   }
 
+  // Settings page: fields as /ui/api/settings returns them.
+  const F = (key, value, source, live = true, fallback = value, fallback_source = source === 'ui' ? 'file' : source) =>
+    ({ key, value, source, locked_by: null, live, fallback, fallback_source });
+  const MiB = 1 << 20;
+  const settings = {
+    fields: [
+      F('timeout', 900, 'file'), F('stuck_timeout', 60, 'file'), F('max_concurrent_per_backend', 1, 'file'),
+      F('detect_backend_slots', true, 'default'), F('max_queued_bytes', 512 * MiB, 'default'),
+      F('max_body_bytes', 64 * MiB, 'default', false), F('load_keep_alive', 86400, 'default'),
+      F('model_aliases', { 'codex-auto-review': 'Qwen3.8-Flash-Next' }, 'file'), F('ip_identity', true, 'default'),
+      F('allow_all_routes', false, 'file'), F('metrics_token', null, 'default'), F('log_content_limit', 65536, 'default'),
+    ],
+    startup: [
+      F('host', '0.0.0.0', 'file', false), F('port', 11435, 'file', false),
+      F('request_log_path', '/data/ollamamq-requests.jsonl', 'file', false), F('request_log_max_bytes', 10 * MiB, 'default', false),
+      F('request_log_max_files', 5, 'default', false), F('clients_file', 'clients.json', 'default', false),
+      F('models_file', 'models.json', 'default', false), F('settings_file', 'settings.json', 'default', false),
+    ],
+    restart_pending: [],
+    can_undo: false,
+    backends_locked: null,
+  };
+  const removedUrls = new Set();
+  const tokenSet = new Set(['http://192.168.255.224:8000']);
+  let lastSaved = null;
+  const settingsView = () => ({
+    ...settings,
+    backends: backends.map(b => ({
+      url: b.url, label: hostOf(b.url), name: b.name ?? null, token_set: tokenSet.has(b.url), kind: null,
+      disabled: b.disabled || removedUrls.has(b.url), removed: removedUrls.has(b.url), online: b.online && !b.disabled,
+      api_type: b.api_type, slots: b.max, slots_detected: b.max > 1,
+    })),
+  });
+  function putSettings(set) {
+    lastSaved = structuredClone(settings.fields);
+    for (const [k, v] of Object.entries(set)) {
+      const f = settings.fields.find(x => x.key === k) || err(`'${k}' cannot be changed here`);
+      if (typeof v === 'number' && v < 1 && k !== 'load_keep_alive') err(`${k} must be at least 1`);
+      if (v === null) { f.value = f.fallback; f.source = f.fallback_source; }
+      else { f.value = k === 'metrics_token' ? (v ? '••••••••' : null) : v; f.source = 'ui'; }
+    }
+    const body = settings.fields.find(f => f.key === 'max_body_bytes');
+    settings.restart_pending = body.value !== 64 * MiB ? ['max_body_bytes'] : [];
+    settings.can_undo = true;
+  }
+  const findBackend = url => backends.find(b => b.url === url) || err(`no backend ${url}`);
+  const normUrl = u => { const t = u.trim().replace(/\/+$/, ''); return /^https?:\/\//.test(t) ? t : `http://${t}`; };
+  const checkName = (name, url) => {
+    if (name && backends.some(b => b.url !== url && (b.name || '').toLowerCase() === name.toLowerCase())) err(`two backends are named '${name}'`);
+  };
+  let me = { user: 'admin', password_source: 'OLLAMA_MQ_UI_PASSWORD', password_changed_at_ms: null };
+
   function genKey() {
     const b = new Uint8Array(16);
     crypto.getRandomValues(b);
@@ -295,6 +352,42 @@
       const seg = p.split('/').map(decodeURIComponent);
       if (method === 'GET' && p === 'state') return delay(snapshot());
       if (method === 'GET' && p === 'overview') return delay(overviewView(path));
+      if (method === 'GET' && p === 'me') return delay(me);
+      if (method === 'GET' && p === 'settings') return delay(settingsView());
+      if (method === 'PUT' && p === 'settings') { putSettings(body.set); return delay(settingsView()); }
+      if (method === 'POST' && p === 'settings/undo') {
+        if (!lastSaved) err('nothing to undo');
+        [settings.fields, lastSaved] = [lastSaved, settings.fields];
+        return delay(settingsView());
+      }
+      if (method === 'POST' && p === 'settings/backends') {
+        const url = normUrl(body.url);
+        checkName(body.name, url);
+        if (removedUrls.delete(url)) { findBackend(url).disabled = false; return delay(settingsView()); }
+        if (backends.some(b => b.url === url)) err(`${url} is already a backend`);
+        backends.push({ idx: backends.length, url, name: body.name, disabled: false, online: true, api_type: 'OpenAI',
+          active: 0, max: 1, processed: 0, current_model: null, models_available: [], models_loaded: [], loaded_known: false,
+          loaded_ctx: {}, can_control: false, active_op: null, results: [] });
+        if (body.token) tokenSet.add(url);
+        return delay(settingsView());
+      }
+      if (method === 'PUT' && p === 'settings/backends') {
+        const b = findBackend(normUrl(body.url));
+        if ('name' in body) { checkName(body.name, b.url); b.name = body.name || null; }
+        if ('disabled' in body) b.disabled = body.disabled;
+        if (body.token) tokenSet.add(b.url); else if ('token' in body) tokenSet.delete(b.url);
+        return delay(settingsView());
+      }
+      if (method === 'POST' && p === 'settings/backends/remove') { removedUrls.add(findBackend(normUrl(body.url)).url); return delay(settingsView()); }
+      if (method === 'POST' && p === 'settings/backends/test') {
+        return delay({ online: true, api_type: 'OpenAI', slots: 4, model_count: 3, models: ['Gemma-4-12B', 'Qwen3.8-27B', 'Qwen3.8-27B-Instruct-Q6'] });
+      }
+      if (method === 'POST' && p === 'account/password') {
+        if (body.current === 'wrong') err('the current password is wrong');
+        if ((body.new || '').length < 12) err('use at least 12 characters');
+        me = { ...me, password_source: 'admin.json', password_changed_at_ms: Date.now() };
+        return delay({ changed_at_ms: me.password_changed_at_ms });
+      }
       if (method === 'GET' && p === 'clients') return delay(clientList());
       if (method === 'GET' && seg[0] === 'logs' && seg.length === 1) return delay(logs);
       if (method === 'GET' && seg[0] === 'logs') {

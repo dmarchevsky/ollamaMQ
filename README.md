@@ -443,7 +443,7 @@ The Dockerfile uses a multi-stage build:
 | `OLLAMA_MQ_API_KEY` | Optional API key; enables auth when set | *(unset — auth disabled)* |
 | `OLLAMA_MQ_UI_USER` | Web UI sign-in user (overrides `settings.web_ui.username`) | `admin` |
 | `OLLAMA_MQ_METRICS_TOKEN` | Bearer token required by `GET /metrics` (overrides `settings.metrics_token`) | *(unset — open)* |
-| `OLLAMA_MQ_UI_PASSWORD` | Web UI sign-in password (overrides `settings.web_ui.password`); enables the web UI | *(unset — web UI off)* |
+| `OLLAMA_MQ_UI_PASSWORD` | Web UI sign-in password (overrides `settings.web_ui.password`); enables the web UI. A password changed in the UI (`admin.json`) wins over it | *(unset — web UI off)* |
 
 ### 🔒 Security (Optional API-Key Auth)
 
@@ -499,6 +499,7 @@ It covers everything the TUI does:
 - **Models** — every model the backends list, with a switch per model and filter rules (below)
 - **Blocked** — disabled clients, blocked ids and blocked IPs
 - **Logs** — recent requests with a filter; click a row for the full captured content
+- **Settings** — backends (add, name, token, disable, remove), limits, model aliases, metrics token, and the admin password (see below)
 - **Reload config** — re-read `appconf.yaml` (TUI `r`)
 
 The **Overview** page shows:
@@ -513,6 +514,32 @@ Numbers cover the chosen window and come from an in-memory history of the last h
 - *First token* is measured from dispatch to the first generated token for streams, or is the prompt time the backend reports for non-streamed responses.
 - *Generation speed* is per stream (median).
 - *Share of slot time* is each client's part of the backend time used in the window, which is what fair scheduling divides.
+
+#### Settings
+
+The **Settings** page edits the configuration while the proxy runs. Changes are saved in `settings.json` (next to `clients.json`; path: `settings.settings_file`).
+- **Never rewritten:** `appconf.yaml`. Its comments survive.
+- **Precedence:** command-line flags and environment variables > `settings.json` > `appconf.yaml` > built-in defaults. A value set on the command line or in the environment shows as locked.
+- **Source:** each setting shows where its value comes from, and **Use the appconf.yaml value** drops the UI's value.
+- **Undo last save** restores the previous `settings.json`, kept as `settings.json.bak`.
+
+**What applies at once:**
+- **Live:** timeouts, slots and queue limits, model aliases, keyless IP identity, unknown-route proxying, and the metrics token.
+- **After a restart:** largest request body.
+- **Read-only:** listen address, log files and store paths. Set these in `appconf.yaml`.
+
+**Backends:**
+- **Adding** a backend probes it within 10 s. **Test connection** shows its type, slots and models before you add it.
+- **Disabling** one stops new requests at once; running ones finish.
+- **Removing** one disables it now and drops it from the list at the next restart.
+- **Names:** a backend can have a **name** (`backends: - url: …` with `name: gpu-box` in `appconf.yaml`, or in the UI). The UI shows the name instead of `host:port`. Prometheus keeps `backend="host:port"` and adds `ollamamq_backend_info{backend, name}` for dashboards.
+- **`--backend-urls`:** when given, the list is fixed.
+
+**Admin password:**
+- **Change password** stores an argon2id hash in `admin.json` (mode 600, next to `clients.json`).
+- **Precedence:** it wins over `OLLAMA_MQ_UI_PASSWORD` and `settings.web_ui.password`. Those become the first-run password.
+- **Sessions:** other sessions are signed out.
+- **Forgot it?** Delete `admin.json` and restart; the configured password works again.
 
 It also manages **clients and their API keys**. The Clients page lists two kinds of client together (filter with *All / Registered / Unregistered*):
 

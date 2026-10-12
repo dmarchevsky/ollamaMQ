@@ -29,6 +29,11 @@ const S = {
   window: storedWindow(),    // 5m | 15m | 1h
   colorOf: new Map(),        // client id -> colour slot 1..4
   activity: null,            // activity chart geometry, for the hover
+  settings: null,            // api/settings
+  draft: new Map(),          // unsaved settings: name -> value (null = reset)
+  formShown: false,          // settings form drawn since entering the page
+  revealToken: null,         // a generated metrics token, shown until saved
+  me: null,                  // api/me: user and where the password comes from
   online: true,
 };
 
@@ -54,6 +59,23 @@ function esc(v) {
 
 const fmtNum = n => (n ?? 0).toLocaleString('en-US');
 const hostOf = url => String(url).replace(/^https?:\/\//, '');
+
+/** The backend with this URL or `host:port` label, from the last poll. */
+const bkFind = urlOrLabel => S.state?.backends.find(b => hostOf(b.url) === hostOf(urlOrLabel));
+
+/** A backend's display name: its configured name, else `host:port`. */
+const bkName = urlOrLabel => bkFind(urlOrLabel)?.name || hostOf(urlOrLabel);
+
+/**
+ * A backend for display. Named: the name, with the address beside it
+ * (`addr`) or on hover. Unnamed: the address.
+ */
+function bkCell(urlOrLabel, addr = false) {
+  const label = hostOf(urlOrLabel);
+  const name = bkFind(urlOrLabel)?.name;
+  if (!name) return `<span class="bk-url">${esc(label)}</span>`;
+  return `<span class="bk-name" title="${esc(label)}">${esc(name)}</span>${addr ? `<span class="bk-addr">${esc(label)}</span>` : ''}`;
+}
 
 function fmtAgo(ms) {
   if (!ms) return 'never';
@@ -194,18 +216,23 @@ async function poll() {
     const needClients = S.page === 'clients' || !S.clients.length;
     const needModels = S.page === 'models' || !S.modelPolicy;
     const needOverview = S.page === 'overview';
-    const [state, logs, clients, models, overview] = await Promise.all([
+    const needSettings = S.page === 'settings';
+    const [state, logs, clients, models, overview, settings, me] = await Promise.all([
       api('GET', 'state'),
       needLogs && !$('#log-pause').checked ? api('GET', `logs?limit=${LOG_LIMIT}`) : null,
       needClients ? api('GET', 'clients') : null,
       needModels ? api('GET', 'models') : null,
       needOverview ? api('GET', `overview?window=${S.window}`) : null,
+      needSettings ? api('GET', 'settings') : null,
+      needSettings && !S.me ? api('GET', 'me') : null,
     ]);
     S.state = state;
     if (logs) S.logs = logs;
     if (clients) S.clients = clients;
     if (models) S.modelPolicy = models;
     if (overview) S.overview = overview;
+    if (settings) S.settings = settings;
+    if (me) S.me = me;
     S.online = true;
   } catch (e) {
     S.online = false;
@@ -230,6 +257,7 @@ function render() {
     models: renderModels,
     blocked: renderBlocked,
     logs: renderLogs,
+    settings: renderSettings,
   })[S.page]?.(st);
 }
 
@@ -338,7 +366,7 @@ function renderOverview(st) {
     `${s.backends_online} of ${s.backends_total} backends online`,
     `${s.free} of ${s.capacity} slots free`,
     s.queued ? `${s.queued} waiting (oldest ${fmtDur(s.oldest_wait_secs)})` : 'nothing waiting',
-    ...s.loading.map(l => `${esc(l.verb)} ${esc(l.model)} on ${esc(l.backend)}`),
+    ...s.loading.map(l => `${esc(l.verb)} ${esc(l.model)} on ${esc(bkName(l.backend))}`),
   ];
   if (k.errors) parts.push(`${k.errors} error${k.errors === 1 ? '' : 's'} in the last ${WINDOW_LABEL[S.window]}`);
   setHTML($('#ov-status'), `<span class="lvl ${level}"><span class="sdot"></span>${word}</span>${parts.map(p => `<span>${p}</span>`).join('')}`);
@@ -373,7 +401,7 @@ function renderCapacity(st, ov) {
     if (w.backends.length === 1) (waitAt.get(w.backends[0]) || waitAt.set(w.backends[0], []).get(w.backends[0])).push(w);
     else shared.push(w);
   }
-  const label = new Map(ov.backends.map(b => [b.idx, b.label]));
+  const label = new Map(ov.backends.map(b => [b.idx, b.name || b.label]));
   const waitSquares = (ws, gap) => ws.length ? `${gap ? '<span class="slot-gap"></span>' : ''}${ws.map(w => `<span class="slot queued" title="${esc(
     `${w.client} · ${w.model}\nwaiting ${fmtDur(w.waited_secs)} · #${w.pos} in its client's queue`
     + (w.backends.length > 1 ? `\ncan run on ${w.backends.map(i => label.get(i)).join(', ')}` : ''))}"></span>`).join('')}` : '';
@@ -398,7 +426,7 @@ function renderCapacity(st, ov) {
       : b.loading ? `<span class="st-warn">${esc(b.loading.verb)} ${esc(b.loading.model)}</span>`
       : `${b.free} free`) + waitNote(waits);
     return `<div class="cap-row">
-      <div class="cap-name"><span class="sdot ${b.online ? 'on' : 'off'}"></span><span class="bk-url">${esc(b.label)}</span></div>
+      <div class="cap-name"><span class="sdot ${b.online ? 'on' : 'off'}"></span>${bkCell(b.label, true)}</div>
       <div class="slots">${slots}</div>
       <div class="cap-note">${note}</div></div>`;
   }).join('');
@@ -489,7 +517,7 @@ function renderNow(st, ov) {
       <td>${pill(r)}</td>
       <td>${swatch(r.client)}<span class="mono">${esc(r.client)}</span></td>
       <td class="trunc">${esc(r.model)}</td>
-      <td class="mono dim">${esc(r.backend)}</td>
+      <td>${bkCell(r.backend)}</td>
       <td class="num">${fmtDur(r.waited_secs ?? 0)}</td>
       <td class="num">${firstToken(r)}</td>
       <td class="num">${fmtNum(r.tokens)}</td>
@@ -517,7 +545,7 @@ function renderBackendStats(ov) {
   setHTML($('#ov-backends'), ov.backends.length ? `<table>
     <tr><th>Backend</th><th class="num">Slots</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">First token p50 / p95</th><th class="num">Gen tok/s</th><th class="num">Prefill tok/s</th><th>Output tok/s</th></tr>
     ${ov.backends.map(b => `<tr>
-      <td><span class="sdot ${b.online ? 'on' : 'off'}"></span><span class="bk-url">${esc(b.label)}</span> ${typeBadge(b.api_type)}</td>
+      <td><span class="sdot ${b.online ? 'on' : 'off'}"></span>${bkCell(b.label, true)} ${typeBadge(b.api_type)}</td>
       <td class="num">${b.online ? `${b.running}/${b.max}` : '<span class="st-bad">offline</span>'}</td>
       <td class="num">${fmtNum(b.requests)}</td>
       <td class="num ${b.errors ? 'st-bad' : 'dim'}">${fmtNum(b.errors)}</td>
@@ -584,7 +612,7 @@ function renderBackends(st) {
     const loaded = new Set(b.models_loaded);
     const hiddenHere = new Set(b.models_hidden);
     let html = `<tr class="bk-row ${open ? 'open' : ''}" data-action="toggle-backend" data-url="${esc(b.url)}">
-      <td><span class="caret">${open ? '▾' : '▸'}</span><span class="sdot ${b.online ? 'on' : 'off'}"></span><span class="bk-url">${esc(hostOf(b.url))}</span></td>
+      <td><span class="caret">${open ? '▾' : '▸'}</span><span class="sdot ${b.online ? 'on' : 'off'}"></span>${bkCell(b.url, true)}${b.disabled ? ' <span class="badge">disabled</span>' : ''}</td>
       <td>${typeBadge(b.api_type)}</td>
       <td class="num" title="${b.max_detected ? `${b.max} slots reported by the backend` : `${b.max} = settings.max_concurrent_per_backend`}">${b.active}/${b.max}<span class="meter"><i style="width:${pct}%"></i></span></td>
       <td class="num">${fmtNum(b.processed)}</td>
@@ -834,14 +862,14 @@ function renderModels(st) {
     <tr><th>Model</th><th>Backends</th><th>Status</th><th class="num">Serve</th></tr>
     ${shown.map(r => `<tr class="${r.status === 'hidden' ? 'is-hidden' : ''}">
       <td><span class="mono">${esc(r.name)}</span></td>
-      <td><span class="chips">${r.per.map(p => `<span class="chip ${p.ok ? '' : 'off'}" title="${esc(p.b.url)}${p.ok ? '' : ' — hidden here'}">${esc(hostOf(p.b.url))}</span>`).join('')}</span></td>
+      <td><span class="chips">${r.per.map(p => `<span class="chip ${p.ok ? '' : 'off'}" title="${esc(p.b.url)}${p.ok ? '' : ' — hidden here'}">${esc(bkName(p.b.url))}</span>`).join('')}</span></td>
       <td>${badge(r)}</td>
       <td class="num"><label class="switch" title="${r.status === 'hidden' ? 'Serve on every backend' : 'Hide on every backend'}">
         <input type="checkbox" data-model="${esc(r.name)}" ${r.status !== 'hidden' ? 'checked' : ''}><span></span></label></td></tr>`).join('')}
     </table>` : `<div class="empty">${rows.length ? 'No models match' : 'No backend lists any models yet'}</div>`);
 
   const scope = r => r.backends.length
-    ? r.backends.map(u => `<span class="chip">${esc(hostOf(u))}</span>`).join('')
+    ? r.backends.map(u => `<span class="chip" title="${esc(hostOf(u))}">${esc(bkName(u))}</span>`).join('')
     : '<span class="dim">all backends</span>';
   const list = rules => `<ul class="rules">${rules.map(r => `<li>
       <div class="rule-top"><span class="keyval">${esc(r.pattern)}</span>
@@ -872,7 +900,7 @@ async function addRuleDialog() {
   form.reset();
   form.action.value = S.modelPolicy?.mode === 'allow' ? 'allow' : 'hide';
   form.scope.innerHTML = '<option value="">All backends</option>' +
-    S.state.backends.map(b => `<option value="${esc(b.url)}">${esc(hostOf(b.url))}</option>`).join('');
+    S.state.backends.map(b => `<option value="${esc(b.url)}">${esc(bkName(b.url))}</option>`).join('');
   const catalog = modelCatalog(S.state);
   form.oninput = () => {
     const p = form.pattern.value.trim();
@@ -937,7 +965,7 @@ function logTable(logs, clickable = true) {
       <td><span class="dir ${esc(l.dir)}">${esc(l.dir)}</span></td>
       <td class="mono">${esc(l.user)}</td>
       <td class="trunc ${l.model ? '' : 'none'}">${esc(l.model ?? '—')}</td>
-      <td class="mono dim ${l.backend ? '' : 'none'}">${esc(l.backend ? hostOf(l.backend) : '—')}</td>
+      <td class="dim ${l.backend ? '' : 'none'}">${l.backend ? bkCell(l.backend) : '—'}</td>
       <td class="${infoClass(l.info)}">${esc(fmtInfo(l.info))}${l.has_content ? ' <span class="dim">· ⌕</span>' : ''}</td></tr>`).join('')}
     </table>`;
 }
@@ -947,8 +975,296 @@ function renderLogs() {
   const dir = $('#log-dir').value;
   const logs = S.logs.filter(l =>
     (!dir || l.dir === dir) &&
-    (!q || [l.user, l.model, l.backend, l.info].some(v => v && String(v).toLowerCase().includes(q))));
+    (!q || [l.user, l.model, l.backend, l.backend && bkName(l.backend), l.info].some(v => v && String(v).toLowerCase().includes(q))));
   setHTML($('#logs'), logTable(logs));
+}
+
+// --- Settings
+//
+// The form is drawn only on demand (entering the page, save, undo, adding a
+// row): polling redraws the backends table and the save bar, never the
+// inputs, so a half-typed value survives. Edits collect in `S.draft`
+// (setting -> new value; `null` = drop the UI's value) until Save.
+
+const FIELD_META = {
+  timeout: { label: 'Request timeout', unit: 's', min: 1, help: 'How long a backend may take for one request before it is cut off.' },
+  stuck_timeout: { label: 'Give up when no backend fits', unit: 's', min: 1, help: 'A request that no backend can ever serve gets a 503 after this long.' },
+  max_concurrent_per_backend: { label: 'Requests per backend', unit: 'at once', min: 1, help: 'For backends that do not report their slots.' },
+  detect_backend_slots: { label: 'Use the slots backends report', kind: 'bool', help: 'llama.cpp and halogen say how many requests they run in parallel.' },
+  max_queued_bytes: { label: 'Queue memory cap', unit: 'MiB', scale: 1 << 20, min: 1, help: 'Request bodies waiting in all queues together; past this, new requests get a 503.' },
+  max_body_bytes: { label: 'Largest request body', unit: 'MiB', scale: 1 << 20, min: 1, help: 'Bigger requests get a 413.' },
+  load_keep_alive: { label: 'Keep loaded models for', unit: 's', min: -1, help: 'Sent with model loads (Ollama); -1 keeps them loaded.' },
+  model_aliases: { label: 'Model aliases', kind: 'aliases', help: 'A request for the alias (any letter case) is served by the model.' },
+  ip_identity: { label: 'Identify keyless clients by IP', kind: 'bool', help: 'No key and no X-User-ID: queue as ip-&lt;address&gt;. Off: they share the "anonymous" queue.' },
+  allow_all_routes: { label: 'Proxy unknown routes', kind: 'bool', help: 'Forward paths ollamaMQ does not know to the backends.' },
+  metrics_token: { label: 'Metrics token', kind: 'secret', help: 'Bearer token that <code>GET /metrics</code> requires.' },
+  log_content_limit: { label: 'Captured text per log record', unit: 'KiB', scale: 1024, min: 1, help: 'Request and response text kept for the Logs page.' },
+};
+const SET_GROUPS = [
+  ['Scheduling & limits', ['timeout', 'stuck_timeout', 'max_concurrent_per_backend', 'detect_backend_slots', 'max_queued_bytes', 'max_body_bytes', 'load_keep_alive']],
+  ['Routing', ['model_aliases', 'ip_identity', 'allow_all_routes']],
+  ['Security', ['@password', 'metrics_token']],
+  ['Logging & server', ['log_content_limit', '@startup']],
+];
+const STARTUP_LABEL = {
+  host: 'Listen address', port: 'Port', request_log_path: 'Request log file', request_log_max_bytes: 'Log file size',
+  request_log_max_files: 'Log files kept', clients_file: 'Clients file', models_file: 'Model rules file', settings_file: 'Settings file',
+};
+const SOURCE_LABEL = { default: 'default', file: 'appconf.yaml', ui: 'set here', cli: 'command line', env: 'environment' };
+
+const setField = key => S.settings?.fields.find(f => f.key === key);
+const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+/** The value the form shows: the draft's, else the saved one. */
+function draftValue(f) {
+  if (!S.draft.has(f.key)) return f.value;
+  const v = S.draft.get(f.key);
+  return v === null ? f.fallback : v;
+}
+
+function setDraft(key, value) {
+  const f = setField(key);
+  if (!f) return;
+  if (value !== null && sameJson(value, f.value)) S.draft.delete(key);
+  else S.draft.set(key, value);
+  $(`[data-row="${key}"]`)?.classList.toggle('dirty', S.draft.has(key));
+  renderSettingsBar();
+}
+
+function sourceChip(f) {
+  if (f.locked_by) return `<span class="src locked" title="Set by ${esc(f.locked_by)}; it wins over the web UI">🔒 ${esc(f.locked_by)}</span>`;
+  return `<span class="src ${f.source}">${SOURCE_LABEL[f.source] ?? f.source}</span>`;
+}
+
+function setControl(f) {
+  const m = FIELD_META[f.key];
+  const v = draftValue(f);
+  const dis = f.locked_by ? 'disabled' : '';
+  if (m.kind === 'bool') {
+    return `<label class="switch"><input type="checkbox" id="set-${f.key}" data-key="${f.key}" ${v ? 'checked' : ''} ${dis}><span></span></label>`;
+  }
+  if (m.kind === 'secret') {
+    const shown = S.revealToken && S.draft.get(f.key) === S.revealToken;
+    const isSet = v !== null && v !== '';
+    return `<div class="secret">
+      ${shown ? `<div class="keybox"><code>${esc(S.revealToken)}</code><button type="button" class="btn sm" data-action="copy-token">Copy</button></div>
+        <div class="set-help">Save to apply. The token is shown only now.</div>`
+        : `<span class="${isSet ? '' : 'st-warn'}">${isSet ? 'Set' : 'Not set: /metrics is open'}</span>`}
+      <span class="btn-group">
+        <button type="button" class="btn sm" data-action="token-generate" ${dis}>Generate</button>
+        ${isSet ? `<button type="button" class="btn sm" data-action="token-clear" ${dis}>Remove</button>` : ''}
+      </span></div>`;
+  }
+  if (m.kind === 'aliases') {
+    const rows = Object.entries(v || {}).concat([['', '']]);
+    return `<div class="aliases">${rows.map(([a, t], i) => `<div class="alias-row">
+        <input data-alias="k" value="${esc(a)}" placeholder="${i === rows.length - 1 ? 'new alias' : ''}" aria-label="Alias" autocomplete="off" spellcheck="false" ${dis}>
+        <span class="dim">→</span>
+        <input data-alias="v" value="${esc(t)}" list="dl-set-models" placeholder="${i === rows.length - 1 ? 'model' : ''}" aria-label="Model" autocomplete="off" spellcheck="false" ${dis}>
+        ${a ? `<button type="button" class="btn sm" data-action="alias-remove" data-alias-key="${esc(a)}" aria-label="Remove alias ${esc(a)}" ${dis}>✕</button>` : '<span></span>'}
+      </div>`).join('')}</div>`;
+  }
+  const shown = v == null ? '' : (m.scale ? +(v / m.scale).toFixed(2) : v);
+  return `<span class="num-in"><input type="number" id="set-${f.key}" data-key="${f.key}" value="${esc(shown)}" min="${m.min ?? ''}" step="any" ${dis}><span class="dim">${m.unit}</span></span>`;
+}
+
+function setRow(f) {
+  const m = FIELD_META[f.key];
+  const resettable = !f.locked_by && (f.source === 'ui' || S.draft.has(f.key));
+  const back = f.source === 'ui' && !S.draft.has(f.key) ? `Use the ${SOURCE_LABEL[f.fallback_source]} value` : 'Undo change';
+  return `<div class="set-row ${S.draft.has(f.key) ? 'dirty' : ''}" data-row="${f.key}">
+    <div class="set-l"><label for="set-${f.key}">${m.label}</label><div class="set-help">${m.help}</div></div>
+    <div class="set-c">${setControl(f)}</div>
+    <div class="set-s">${sourceChip(f)}${f.live ? '' : ' <span class="badge warn" title="Takes effect after a restart">restart</span>'}
+      ${resettable ? `<button type="button" class="linkbtn" data-action="set-reset" data-key="${f.key}">${back}</button>` : ''}</div>
+  </div>`;
+}
+
+function fmtStartup(key, v) {
+  if (v == null) return '<span class="dim">—</span>';
+  if (key === 'request_log_max_bytes') return fmtBytes(v);
+  return `<code>${esc(v)}</code>`;
+}
+
+function passwordRow() {
+  const me = S.me || {};
+  const src = me.password_source || '';
+  const from = src.endsWith('.json')
+    ? `changed here${me.password_changed_at_ms ? ` on ${fmtDate(me.password_changed_at_ms)}` : ''}`
+    : `from ${src === 'appconf.yaml' ? 'appconf.yaml' : `the environment (${esc(src)})`}`;
+  return `<div class="set-row" data-row="password">
+    <div class="set-l"><label>Admin password</label><div class="set-help">Signed in as <b>${esc(me.user || '')}</b>. Password ${from}.</div></div>
+    <div class="set-c"><button type="button" class="btn" data-action="change-password">Change password</button></div>
+    <div class="set-s"></div></div>`;
+}
+
+function startupRows() {
+  const pending = new Set(S.settings.restart_pending);
+  return `<div class="set-row startup"><div class="set-l"><label>Read at startup</label>
+      <div class="set-help">Set in appconf.yaml or on the command line; shown here for reference.</div></div>
+    <dl class="kv startup-kv">${S.settings.startup.map(f => `<dt>${STARTUP_LABEL[f.key] ?? f.key}</dt>
+      <dd>${fmtStartup(f.key, f.value)} ${sourceChip(f)}${pending.has(f.key) ? ' <span class="badge warn">restart to apply</span>' : ''}</dd>`).join('')}</dl></div>`;
+}
+
+/** The whole form; called on demand only (see above). */
+function renderSettingsForm() {
+  if (!S.settings) return;
+  S.formShown = true;
+  const models = new Set((S.state?.backends || []).flatMap(b => b.models_available));
+  $('#dl-set-models').innerHTML = [...models].sort().map(m => `<option value="${esc(m)}">`).join('');
+  $('#set-form').innerHTML = SET_GROUPS.map(([title, keys]) => `<div class="panel set-panel">
+    <div class="panel-h"><h2>${title}</h2></div>
+    ${keys.map(k => k === '@password' ? passwordRow() : k === '@startup' ? startupRows() : setRow(setField(k))).join('')}
+  </div>`).join('');
+  renderSettingsBar();
+}
+
+function renderSettingsBar() {
+  const n = S.draft.size;
+  setHTML($('#set-tools'), `
+    ${S.settings?.can_undo ? '<button class="btn" data-action="settings-undo" title="Restore the settings before the last save">Undo last save</button>' : ''}
+    ${n ? '<button class="btn" data-action="settings-discard">Discard</button>' : ''}
+    <button class="btn primary" data-action="settings-save" ${n ? '' : 'disabled'}>${n ? `Save ${n} change${n === 1 ? '' : 's'}` : 'Saved'}</button>`);
+  $('#nav-settings').textContent = n ? '•' : '';
+}
+
+function renderSettings() {
+  const set = S.settings;
+  if (!set) return;
+  if (!S.formShown) renderSettingsForm();
+  renderSettingsBar();
+  const names = Object.fromEntries([...set.fields, ...set.startup].map(f => [f.key, FIELD_META[f.key]?.label ?? STARTUP_LABEL[f.key] ?? f.key]));
+  setHTML($('#set-banner'), set.restart_pending.length
+    ? `<div class="note warn-note"><b>Restart needed.</b> ${set.restart_pending.map(k => esc(names[k])).join(', ')} take${set.restart_pending.length === 1 ? 's' : ''} effect after ollamaMQ restarts.</div>` : '');
+  $('#set-file').textContent = set.startup.find(f => f.key === 'settings_file')?.value ?? 'settings.json';
+  $('#set-add-backend').hidden = !!set.backends_locked;
+  const status = b => b.removed ? '<span class="dim">removed — gone after a restart</span>'
+    : b.disabled ? '<span class="badge">disabled</span>'
+    : b.online ? '<span class="st-ok">online</span>' : '<span class="st-bad">offline</span>';
+  setHTML($('#set-backends'), (set.backends_locked ? `<p class="note flush-note">The backends are set by <code>${esc(set.backends_locked)}</code>, so they cannot be changed here.</p>` : '') + `<table>
+    <tr><th>Backend</th><th>Type</th><th class="num">Slots</th><th>Token</th><th>State</th><th></th></tr>
+    ${set.backends.map(b => `<tr class="${b.disabled ? 'is-off' : ''}">
+      <td>${b.name ? `<span class="bk-name">${esc(b.name)}</span><span class="bk-addr">${esc(b.label)}</span>` : `<span class="bk-url">${esc(b.label)}</span>`}</td>
+      <td>${b.removed || b.disabled ? '<span class="dim">—</span>' : typeBadge(b.kind === 'systemone' ? 'System One' : b.api_type)}</td>
+      <td class="num">${b.removed || b.disabled ? '<span class="dim">—</span>' : `${b.slots} <span class="dim">${b.slots_detected ? 'reported' : 'fallback'}</span>`}</td>
+      <td>${b.token_set ? '••••' : '<span class="dim">none</span>'}</td>
+      <td>${status(b)}</td>
+      <td class="actions">${set.backends_locked ? '' : b.removed
+        ? `<button class="btn sm" data-action="backend-restore" data-url="${esc(b.url)}" data-name="${esc(b.name ?? '')}">Add back</button>`
+        : `<span class="btn-group">
+          <button class="btn sm" data-action="backend-edit" data-url="${esc(b.url)}">Edit</button>
+          <button class="btn sm" data-action="backend-toggle" data-url="${esc(b.url)}">${b.disabled ? 'Enable' : 'Disable'}</button>
+          <button class="btn sm danger" data-action="backend-remove" data-url="${esc(b.url)}">Remove</button></span>`}</td>
+    </tr>`).join('')}</table>`);
+}
+
+/** Apply a settings response and redraw the form from it. */
+function settingsChanged(r) {
+  if (!r) return;
+  S.settings = r;
+  renderSettingsForm();
+  renderSettings();
+}
+
+async function saveSettings() {
+  const set = Object.fromEntries(S.draft);
+  try {
+    const r = await api('PUT', 'settings', { set });
+    S.draft.clear();
+    S.revealToken = null;
+    const restart = r.restart_pending.some(k => k in set);
+    toast(restart ? 'Settings saved. Some take effect after a restart.' : 'Settings saved and applied');
+    settingsChanged(r);
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
+
+function readAliases() {
+  const out = {};
+  for (const row of $$('#set-form .alias-row')) {
+    const k = $('[data-alias="k"]', row).value.trim();
+    const v = $('[data-alias="v"]', row).value.trim();
+    if (k && v) out[k] = v;
+  }
+  return out;
+}
+
+function onSettingsInput(e) {
+  const el = e.target;
+  if (el.dataset.alias) { setDraft('model_aliases', readAliases()); return; }
+  const key = el.dataset.key;
+  const f = key && setField(key);
+  if (!f) return;
+  const m = FIELD_META[key];
+  if (m.kind === 'bool') { setDraft(key, el.checked); return; }
+  if (el.value === '') { S.draft.delete(key); el.closest('.set-row')?.classList.remove('dirty'); renderSettingsBar(); return; }
+  const n = Number(el.value);
+  if (Number.isFinite(n)) setDraft(key, Math.round(n * (m.scale || 1)));
+}
+
+async function backendDialog(existing) {
+  const dlg = $('#dlg-backend');
+  const form = $('form', dlg);
+  form.reset();
+  $('[data-test]', dlg).textContent = '';
+  $('[data-title]', dlg).textContent = existing ? `Edit ${existing.name || existing.label}` : 'Add backend';
+  $('[data-submit]', dlg).textContent = existing ? 'Save' : 'Add backend';
+  $('[data-only="edit"]', dlg).style.display = existing ? '' : 'none';
+  $('[data-only="token-set"]', dlg).style.display = existing?.token_set ? '' : 'none';
+  form.url.readOnly = !!existing;
+  form.token.placeholder = existing?.token_set ? 'unchanged — type to replace' : 'optional';
+  if (existing) {
+    form.url.value = existing.url;
+    form.name.value = existing.name || '';
+    form.kind.value = existing.kind === 'systemone' ? 'systemone' : '';
+  }
+  const fd = await ask(dlg);
+  if (!fd) return;
+  const body = { url: fd.get('url').trim(), name: fd.get('name').trim() || null, kind: fd.get('kind') || null };
+  const token = fd.get('token');
+  if (token) body.token = token;
+  else if (fd.get('clear_token')) body.token = null;
+  settingsChanged(await act(existing ? 'PUT' : 'POST', 'settings/backends', body,
+    existing ? 'Backend saved' : `Backend ${body.name || body.url} added; probing it`));
+}
+
+async function testBackend() {
+  const form = $('#dlg-backend form');
+  const out = $('[data-test]', form);
+  const url = form.url.value.trim();
+  if (!url) { out.innerHTML = '<span class="st-bad">Enter a URL first</span>'; return; }
+  out.innerHTML = '<span class="dim">Testing…</span>';
+  try {
+    const body = { url };
+    if (form.token.value) body.token = form.token.value;
+    const r = await api('POST', 'settings/backends/test', body);
+    out.innerHTML = r.online
+      ? `<span class="st-ok">✓ ${esc(r.api_type)}</span>${r.slots ? ` · ${r.slots} slots` : ''} · ${r.model_count} model${r.model_count === 1 ? '' : 's'}${r.models.length ? `: ${esc(r.models.slice(0, 4).join(', '))}${r.model_count > 4 ? ', …' : ''}` : ''}`
+      : '<span class="st-bad">✕ No answer from that address</span>';
+  } catch (e) {
+    out.innerHTML = `<span class="st-bad">${esc(e.message)}</span>`;
+  }
+}
+
+async function passwordDialog() {
+  const dlg = $('#dlg-password');
+  $('form', dlg).reset();
+  const fd = await ask(dlg);
+  if (!fd) return;
+  if (fd.get('new') !== fd.get('repeat')) { toast('The new passwords do not match', false); return; }
+  const r = await act('POST', 'account/password', { current: fd.get('current'), new: fd.get('new'), sign_out_others: !!fd.get('others') },
+    fd.get('others') ? 'Password changed. Other sessions are signed out.' : 'Password changed');
+  if (r) {
+    S.me = await api('GET', 'me').catch(() => S.me);
+    renderSettingsForm();
+  }
+}
+
+/** A random token for /metrics (hex, 32 bytes). */
+function newToken() {
+  const b = new Uint8Array(32);
+  crypto.getRandomValues(b);
+  return [...b].map(x => x.toString(16).padStart(2, '0')).join('');
 }
 
 // ------------------------------------------------------------------ dialogs
@@ -1044,7 +1360,7 @@ async function loadDialog(idx) {
   const dlg = $('#dlg-load');
   const form = $('form', dlg);
   form.reset();
-  $('[data-backend]', dlg).textContent = `on ${hostOf(b.url)} — pick a listed model or type any name the backend can resolve.`;
+  $('[data-backend]', dlg).textContent = `on ${bkName(b.url)} — pick a listed model or type any name the backend can resolve.`;
   $('#dl-models').innerHTML = b.models_available.map(m => `<option value="${esc(m)}">`).join('');
   const fd = await ask(dlg);
   if (!fd) return;
@@ -1055,6 +1371,46 @@ async function loadDialog(idx) {
 // ------------------------------------------------------------------ actions
 
 const actions = {
+  'add-backend': () => backendDialog(null),
+  'backend-edit': el => backendDialog(S.settings.backends.find(b => b.url === el.dataset.url)),
+  'backend-toggle': async el => {
+    const b = S.settings.backends.find(x => x.url === el.dataset.url);
+    if (!b.disabled && !await confirmDlg(`Disable ${esc(b.name || b.label)}?`,
+      'It stops taking requests now; requests already running there finish. It stays in the list and can be enabled again.', 'Disable')) return;
+    settingsChanged(await act('PUT', 'settings/backends', { url: b.url, disabled: !b.disabled },
+      b.disabled ? 'Backend enabled; probing it' : 'Backend disabled'));
+  },
+  'backend-remove': async el => {
+    const b = S.settings.backends.find(x => x.url === el.dataset.url);
+    if (!await confirmDlg(`Remove ${esc(b.name || b.label)}?`,
+      'It stops taking requests now and leaves the list after the next restart. Requests already running there finish.', 'Remove')) return;
+    settingsChanged(await act('POST', 'settings/backends/remove', { url: b.url }, 'Backend removed'));
+  },
+  'backend-restore': el => act('POST', 'settings/backends', { url: el.dataset.url, name: el.dataset.name || null }, 'Backend added back').then(settingsChanged),
+  'test-backend': () => testBackend(),
+  'change-password': () => passwordDialog(),
+  'settings-save': () => saveSettings(),
+  'settings-discard': () => { S.draft.clear(); S.revealToken = null; renderSettingsForm(); },
+  'settings-undo': async () => {
+    if (!await confirmDlg('Undo the last save?', 'The settings go back to how they were before the last save, and apply at once.', 'Undo')) return;
+    settingsChanged(await act('POST', 'settings/undo', {}, 'Last save undone'));
+  },
+  'set-reset': el => {
+    const f = setField(el.dataset.key);
+    if (S.draft.has(f.key)) S.draft.delete(f.key);
+    else S.draft.set(f.key, null);
+    renderSettingsForm();
+  },
+  'alias-remove': el => {
+    const f = setField('model_aliases');
+    const next = { ...draftValue(f) };
+    delete next[el.dataset.aliasKey];
+    setDraft('model_aliases', next);
+    renderSettingsForm();
+  },
+  'token-generate': () => { S.revealToken = newToken(); setDraft('metrics_token', S.revealToken); renderSettingsForm(); },
+  'token-clear': () => { S.revealToken = null; setDraft('metrics_token', ''); renderSettingsForm(); },
+  'copy-token': () => copyText(S.revealToken),
   'reload-config': () => act('POST', 'config/reload', {}, r => `model config reloaded: ${r.models} model(s), applying`),
 
   'toggle-backend': el => {
@@ -1191,6 +1547,9 @@ $('#model-search').addEventListener('input', e => { S.modelQuery = e.target.valu
 $('#model-show').addEventListener('change', e => { S.modelShow = e.target.value; render(); });
 $('#model-mode').addEventListener('change', e => setModelMode(e.target.value));
 $(`#ov-window input[value="${S.window}"]`).checked = true;
+['input', 'change'].forEach(t => $('#set-form').addEventListener(t, onSettingsInput));
+// Leaving with unsaved settings: the browser asks first.
+window.addEventListener('beforeunload', e => { if (S.draft.size) e.preventDefault(); });
 $('#ov-window').addEventListener('change', e => {
   S.window = e.target.value;
   try { localStorage.setItem('omq.window', S.window); } catch { /* storage blocked */ }
@@ -1215,7 +1574,10 @@ $('#model-list').addEventListener('change', e => {
 function route() {
   let page = (location.hash.slice(1) || 'overview').split('?')[0];
   if (page === 'users') page = 'clients';  // Users merged into Clients
+  const was = S.page;
   S.page = $(`#page-${page}`) ? page : 'overview';
+  // Coming back to Settings draws the form again (from the draft, if any).
+  if (S.page === 'settings' && was !== 'settings') S.formShown = false;
   $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${S.page}`));
   $$('.nav nav a').forEach(a => a.classList.toggle('active', a.dataset.page === S.page));
   // The link's own text, without its icon and counter spans.

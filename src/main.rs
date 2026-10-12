@@ -3,7 +3,7 @@ use axum::{
     extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{any, get, post},
 };
 use clap::Parser;
@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod admin;
 mod auth;
 mod clients;
 mod config;
@@ -23,6 +24,8 @@ mod metrics;
 mod model_policy;
 mod reqlog;
 mod session;
+mod settings;
+mod settings_store;
 mod snapshot;
 mod stats;
 mod tui;
@@ -126,6 +129,24 @@ async fn auth_middleware(
     }
 }
 
+/// Routes the proxy does not know: proxied when `allow_all_routes` is on,
+/// else 404 like any other router.
+async fn fallback_handler(
+    State(state): State<Arc<AppState>>,
+    connect: axum::extract::ConnectInfo<SocketAddr>,
+    method: axum::http::Method,
+    headers: axum::http::HeaderMap,
+    uri: axum::extract::OriginalUri,
+    body: bytes::Bytes,
+) -> Response {
+    if !state.allow_all_routes.load(std::sync::atomic::Ordering::Relaxed) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    proxy_handler(State(state), connect, method, headers, uri, body)
+        .await
+        .into_response()
+}
+
 /// `GET /metrics`: Prometheus text format, behind an optional bearer token.
 fn metrics_handler(
     state: Arc<AppState>,
@@ -150,15 +171,6 @@ fn metrics_handler(
 
 /// Normalize a backend URL from the CLI or config: strip trailing slashes
 /// and add `http://` when no scheme is given.
-fn normalize_backend_url(url: String) -> String {
-    let trimmed = url.trim_end_matches('/').to_string();
-    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
-        format!("http://{}", trimmed)
-    } else {
-        trimmed
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -176,105 +188,144 @@ async fn main() {
         }
     };
 
-    let port = args.port.or(file_cfg.settings.port).unwrap_or(11435);
-    let host = args
-        .host
-        .or(file_cfg.settings.host)
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let timeout = args.timeout.or(file_cfg.settings.timeout).unwrap_or(300);
-    let load_keep_alive = args
-        .load_keep_alive
-        .or(file_cfg.settings.load_keep_alive)
-        .unwrap_or(86400);
-    let stuck_timeout = file_cfg.settings.stuck_timeout.unwrap_or(60);
+    // Values given on the command line or in the environment win over both
+    // files; the web UI shows them as locked.
+    let env_nonempty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let mut pinned = config::Settings::default();
+    let mut pinned_by = std::collections::BTreeMap::new();
+    if let Some(v) = args.port {
+        pinned.port = Some(v);
+        pinned_by.insert("port", "--port".to_string());
+    }
+    if let Some(v) = args.host.clone() {
+        pinned.host = Some(v);
+        pinned_by.insert("host", "--host".to_string());
+    }
+    if let Some(v) = args.timeout {
+        pinned.timeout = Some(v);
+        pinned_by.insert("timeout", "--timeout".to_string());
+    }
+    if let Some(v) = args.load_keep_alive {
+        pinned.load_keep_alive = Some(v);
+        pinned_by.insert("load_keep_alive", "--load-keep-alive".to_string());
+    }
+    if args.allow_all_routes {
+        pinned.allow_all_routes = Some(true);
+        pinned_by.insert("allow_all_routes", "--allow-all-routes".to_string());
+    }
+    if let Some(v) = env_nonempty("OLLAMA_MQ_METRICS_TOKEN") {
+        pinned.metrics_token = Some(v);
+        pinned_by.insert("metrics_token", "OLLAMA_MQ_METRICS_TOKEN".to_string());
+    }
+
+    // Settings changed in the web UI. Unreadable = fatal, like the client
+    // store: starting without them would quietly undo the operator's changes.
+    let settings_file = file_cfg
+        .settings
+        .settings_file
+        .clone()
+        .unwrap_or_else(|| settings_store::DEFAULT_SETTINGS_FILE.to_string());
+    let store = match settings_store::SettingsStore::load(&settings_file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut layers = settings::Layers {
+        file: file_cfg.clone(),
+        pinned,
+        pinned_by,
+        backends_from_cli: args.backend_urls.is_some(),
+        fallback_backends: Vec::new(),
+        startup: config::Settings::default(),
+        store,
+    };
+    let eff = layers.effective();
+    layers.startup = eff.clone();
+
+    let port = eff.port.unwrap_or(11435);
+    let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+    let timeout = eff.timeout.unwrap_or(300);
+    let load_keep_alive = eff.load_keep_alive.unwrap_or(86400);
+    let stuck_timeout = eff.stuck_timeout.unwrap_or(60);
     // Default the global per-backend cap to the highest configured per-model
     // concurrency so `max_concurrent_requests: N` isn't silently capped at 1
     // when `settings.max_concurrent_per_backend` is omitted.
-    let max_concurrent_per_backend = file_cfg
-        .settings
-        .max_concurrent_per_backend
-        .unwrap_or_else(|| {
-            file_cfg
-                .models
-                .iter()
-                .map(|m| m.max_concurrent_requests)
-                .max()
-                .unwrap_or(1)
-        });
-    let request_log_path = file_cfg
-        .settings
+    let max_concurrent_per_backend = eff.max_concurrent_per_backend.unwrap_or_else(|| {
+        file_cfg
+            .models
+            .iter()
+            .map(|m| m.max_concurrent_requests)
+            .max()
+            .unwrap_or(1)
+    });
+    let request_log_path = eff
         .request_log_path
         .clone()
         .unwrap_or_else(|| "ollamamq-requests.jsonl".to_string());
-    let request_log_max_bytes = file_cfg.settings.request_log_max_bytes.unwrap_or(10 * 1024 * 1024);
-    let request_log_max_files = file_cfg.settings.request_log_max_files.unwrap_or(5);
-    let log_content_limit = file_cfg
-        .settings
-        .log_content_limit
-        .map(|v| v.max(1024))
-        .unwrap_or(65_536);
+    let request_log_max_bytes = eff.request_log_max_bytes.unwrap_or(10 * 1024 * 1024);
+    let request_log_max_files = eff.request_log_max_files.unwrap_or(5);
+    let log_content_limit = eff.log_content_limit.map(|v| v.max(1024)).unwrap_or(65_536);
     // Request bodies are buffered whole (a queued request may wait before a
     // backend takes it), so the body limit is a per-request memory commitment.
     // It used to be a flat 1 GiB on every route.
-    let max_body_bytes = file_cfg.settings.max_body_bytes.unwrap_or(64 * 1024 * 1024);
-    let max_queued_bytes = file_cfg
-        .settings
-        .max_queued_bytes
-        .unwrap_or(512 * 1024 * 1024);
-    let allow_all_routes =
-        args.allow_all_routes || file_cfg.settings.allow_all_routes.unwrap_or(false);
-    let clients_file = file_cfg
-        .settings
+    let max_body_bytes = eff.max_body_bytes.unwrap_or(64 * 1024 * 1024);
+    let max_queued_bytes = eff.max_queued_bytes.unwrap_or(512 * 1024 * 1024);
+    let clients_file = eff
         .clients_file
         .clone()
         .unwrap_or_else(|| clients::DEFAULT_CLIENTS_FILE.to_string());
-    let models_file = file_cfg
-        .settings
+    let models_file = eff
         .models_file
         .clone()
         .unwrap_or_else(|| model_policy::DEFAULT_MODELS_FILE.to_string());
-    // Web UI credentials: env vars win over appconf.yaml; no password = off.
+    // Web UI credentials: a password changed in the UI (admin.json) wins;
+    // otherwise env vars, then appconf.yaml. No password at all = UI off.
     let web_cfg = file_cfg.settings.web_ui.clone().unwrap_or_default();
-    let env_nonempty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let metrics_token = env_nonempty("OLLAMA_MQ_METRICS_TOKEN")
-        .or(file_cfg.settings.metrics_token.clone().filter(|t| !t.is_empty()));
-    let web_auth = env_nonempty("OLLAMA_MQ_UI_PASSWORD")
-        .or(web_cfg.password.filter(|p| !p.is_empty()))
-        .map(|password| web::WebAuth {
-            username: env_nonempty("OLLAMA_MQ_UI_USER")
-                .or(web_cfg.username.filter(|u| !u.is_empty()))
-                .unwrap_or_else(|| "admin".to_string()),
-            password,
-        });
+    let web_auth = web::WebAuth::resolve(
+        admin::DEFAULT_ADMIN_FILE,
+        env_nonempty("OLLAMA_MQ_UI_USER").or(web_cfg.username.filter(|u| !u.is_empty())),
+        env_nonempty("OLLAMA_MQ_UI_PASSWORD")
+            .map(|p| (p, "OLLAMA_MQ_UI_PASSWORD"))
+            .or(web_cfg.password.filter(|p| !p.is_empty()).map(|p| (p, "appconf.yaml"))),
+    );
 
-    // `kind:` per backend, in config order, collected before `file_cfg.backends`
-    // is consumed below. Only the config file can carry one: `--backend-urls`
-    // takes bare URLs, so those backends stay probe-classified (an empty slice
-    // pins nothing).
-    let backend_kinds: Vec<Option<String>> = if args.backend_urls.is_some() {
-        Vec::new()
-    } else {
-        file_cfg.backends.iter().map(|b| b.kind.clone()).collect()
+    // The backend list: `--backend-urls` (fixed), else the UI's or the file's.
+    let backend_list: Vec<config::Backend> = match &args.backend_urls {
+        Some(urls) => urls
+            .iter()
+            .map(|u| config::Backend {
+                url: u.clone(),
+                name: None,
+                disabled: false,
+                token: None,
+                kind: None,
+            })
+            .collect(),
+        None => layers.backend_list(),
     };
-
-    // (url, optional auth token) per backend. The CLI --backend-urls always
-    // wins; tokens only come from appconf.yaml.
-    let backends: Vec<(String, Option<String>)> = if let Some(urls) = args.backend_urls {
-        urls.into_iter()
-            .map(|u| (normalize_backend_url(u), None))
-            .collect()
-    } else if file_cfg.backends.is_empty() {
-        vec![(
-            normalize_backend_url("http://localhost:11434".to_string()),
-            None,
-        )]
+    let backend_list = if backend_list.is_empty() {
+        vec![config::Backend {
+            url: "http://localhost:11434".to_string(),
+            name: None,
+            disabled: false,
+            token: None,
+            kind: None,
+        }]
     } else {
-        file_cfg
-            .backends
-            .into_iter()
-            .map(|b| (normalize_backend_url(b.url), b.token))
-            .collect()
+        backend_list
     };
+    if args.backend_urls.is_some() || layers.backend_list().is_empty() {
+        // `--backend-urls`, or the built-in default: what the UI starts from.
+        layers.fallback_backends = backend_list.clone();
+    }
+    // `kind:` per backend, in list order (pinned before the first probe).
+    let backend_kinds: Vec<Option<String>> = backend_list.iter().map(|b| b.kind.clone()).collect();
+    let backends: Vec<(String, Option<String>)> = backend_list
+        .iter()
+        .map(|b| (settings::normalize_url(&b.url), b.token.clone()))
+        .collect();
 
     // Determine if we should run TUI
     let use_tui = !args.no_tui && std::io::stdout().is_terminal();
@@ -368,21 +419,20 @@ async fn main() {
         }
     }
 
-    state.set_model_aliases(file_cfg.settings.model_aliases.as_ref());
+    // Live settings, names and enabled state of backends; then keep every
+    // layer so the web UI can show and change them.
+    settings::apply(&state, &eff);
+    settings::apply_backends(&state, &backend_list);
+    if *layers.store.overlay() != config::UiOverlay::default() {
+        info!("Settings changed in the web UI loaded from {}", settings_file);
+    }
     if !state.model_aliases.lock_or_recover().is_empty() {
         info!("{} model alias(es) loaded", state.model_aliases.lock_or_recover().len());
     }
-    state.ip_identity.store(
-        file_cfg.settings.ip_identity.unwrap_or(true),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let detect_slots = file_cfg.settings.detect_backend_slots.unwrap_or(true);
-    state
-        .detect_slots
-        .store(detect_slots, std::sync::atomic::Ordering::Relaxed);
-    if !detect_slots {
+    if !eff.detect_backend_slots.unwrap_or(true) {
         info!("Backend slot detection off: every backend uses max_concurrent_per_backend");
     }
+    *state.config.lock_or_recover() = layers;
 
     // Pin the `kind:`-configured API families now, BEFORE the health loop
     // starts: a Laya-style backend answers nothing that identifies it, so a
@@ -477,10 +527,8 @@ async fn main() {
         .route("/admin/models/load", post(admin_model_load))
         .route("/admin/models/unload", post(admin_model_unload));
 
-    // Optional fallback
-    if allow_all_routes {
-        app = app.fallback(proxy_handler);
-    }
+    // Unknown routes: proxied while `allow_all_routes` is on (live setting).
+    app = app.fallback(fallback_handler);
 
     // Protect all proxy routes (including the fallback) with optional API-key auth.
     // /health is registered separately below and stays unauthenticated.
@@ -492,7 +540,7 @@ async fn main() {
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .with_state(state.clone());
 
-    if metrics_token.is_some() {
+    if state.metrics_token.lock_or_recover().is_some() {
         info!("/metrics requires a bearer token");
     }
     let mut app = Router::new()
@@ -502,9 +550,9 @@ async fn main() {
         .route(
             "/metrics",
             get(
-                move |State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap| {
-                    let token = metrics_token.clone();
-                    async move { metrics_handler(state, headers, token.as_deref()) }
+                |State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap| async move {
+                    let token = state.metrics_token.lock_or_recover().clone();
+                    metrics_handler(state, headers, token.as_deref())
                 },
             ),
         )
@@ -512,7 +560,7 @@ async fn main() {
     // The web UI has its own (basic) auth, so it sits outside the API-key layer.
     match web_auth {
         Some(auth) => {
-            info!("Web UI enabled at /ui (user '{}')", auth.username);
+            info!("Web UI enabled at /ui (user '{}', password from {})", auth.username, auth.source);
             app = app.merge(web::router(auth));
         }
         None => info!("Web UI disabled (set OLLAMA_MQ_UI_PASSWORD or settings.web_ui.password)"),

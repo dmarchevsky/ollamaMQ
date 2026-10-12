@@ -313,7 +313,7 @@ impl TuiDashboard {
                         }
                         KeyCode::Char('r') => {
                             // Re-read appconf.yaml and re-apply it.
-                            match control::reload_model_config(state) {
+                            match crate::settings::reload(state) {
                                 Ok(n) => {
                                     self.flash = Some(FlashMsg {
                                         text: format!(

@@ -34,7 +34,10 @@ use std::fs;
 pub const DEFAULT_CONFIG_FILE: &str = "appconf.yaml";
 
 /// Runtime settings (all optional; CLI flags take precedence).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+///
+/// The same shape is stored in the web UI's overlay file (see
+/// [`crate::settings_store`]): a value set there wins over the one here.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// Port to listen on (default 11435).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +115,10 @@ pub struct Settings {
     /// working directory). Managed from the web UI's Models page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_file: Option<String>,
+    /// Where settings changed in the web UI are stored (default
+    /// "settings.json" in the working directory). They override this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_file: Option<String>,
     /// Bearer token required by `GET /metrics`. Unset (the default) leaves
     /// the endpoint open, like `/health`. `OLLAMA_MQ_METRICS_TOKEN` overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,7 +131,7 @@ pub struct Settings {
 
 /// `settings.web_ui`. The environment variables `OLLAMA_MQ_UI_USER` and
 /// `OLLAMA_MQ_UI_PASSWORD` override these values.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WebUiSettings {
     /// Basic-auth user name (default "admin").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,10 +142,16 @@ pub struct WebUiSettings {
 }
 
 /// One backend entry from the `backends:` list.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Backend {
     /// The backend's base URL (scheme included).
     pub url: String,
+    /// Display name shown in the UI instead of `host:port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Kept in the list but never probed or routed to.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
     /// Optional API key sent to this backend as
     /// `Authorization: Bearer <token>` on every request the proxy makes to
     /// it — proxied inference, model listings and metadata reads, health
@@ -179,6 +192,8 @@ where
         .map(|spec| match spec {
             BackendEntrySpec::Url(url) => Backend {
                 url,
+                name: None,
+                disabled: false,
                 token: None,
                 kind: None,
             },
@@ -228,6 +243,86 @@ pub struct ModelConfig {
     /// Backend URLs to load this model on. Empty = any suitable backend.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<String>,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// What the web UI stores (`settings.json`): settings changed there and,
+/// once backends were edited there, the whole backend list.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct UiOverlay {
+    #[serde(default)]
+    pub settings: Settings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backends: Option<Vec<Backend>>,
+}
+
+impl Settings {
+    /// `self` with every value `top` sets replacing this one's.
+    pub fn overlay(&self, top: &Settings) -> Settings {
+        macro_rules! pick {
+            ($($f:ident),*) => { Settings { $($f: top.$f.clone().or_else(|| self.$f.clone()),)* } };
+        }
+        pick!(
+            port, host, timeout, load_keep_alive, allow_all_routes, stuck_timeout,
+            max_concurrent_per_backend, detect_backend_slots, model_aliases, ip_identity,
+            request_log_path, request_log_max_bytes, request_log_max_files, log_content_limit,
+            max_body_bytes, max_queued_bytes, clients_file, models_file, settings_file,
+            metrics_token, web_ui
+        )
+    }
+
+    /// Values a person could set that would break the proxy.
+    pub fn validate(&self) -> Result<(), String> {
+        let at_least = |v: Option<u64>, min: u64, what: &str| match v {
+            Some(v) if v < min => Err(format!("{what} must be at least {min}")),
+            _ => Ok(()),
+        };
+        at_least(self.timeout, 1, "timeout")?;
+        at_least(self.stuck_timeout, 1, "stuck_timeout")?;
+        at_least(self.max_concurrent_per_backend.map(u64::from), 1, "max_concurrent_per_backend")?;
+        at_least(self.max_queued_bytes, 1024 * 1024, "max_queued_bytes")?;
+        at_least(self.max_body_bytes.map(|v| v as u64), 1024, "max_body_bytes")?;
+        at_least(self.log_content_limit.map(|v| v as u64), 1024, "log_content_limit")?;
+        if self.load_keep_alive.is_some_and(|v| v < -1) {
+            return Err("load_keep_alive must be -1 (forever) or more".into());
+        }
+        if let Some(aliases) = &self.model_aliases {
+            for (k, v) in aliases {
+                if k.trim().is_empty() || v.trim().is_empty() {
+                    return Err("model aliases need both a name and a model".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Checks a backend list: http(s) URLs, no duplicates, names unique and short.
+pub fn validate_backends(list: &[Backend]) -> Result<(), String> {
+    let mut urls = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    for b in list {
+        let url = b.url.trim().trim_end_matches('/').to_lowercase();
+        if !(url.starts_with("http://") || url.starts_with("https://")) || url.len() < 10 {
+            return Err(format!("'{}' is not an http:// or https:// URL", b.url));
+        }
+        if !urls.insert(url) {
+            return Err(format!("backend {} is listed twice", b.url));
+        }
+        if let Some(n) = &b.name {
+            let n = n.trim();
+            if n.is_empty() || n.chars().count() > 40 {
+                return Err("backend names are 1–40 characters".into());
+            }
+            if !names.insert(n.to_lowercase()) {
+                return Err(format!("two backends are named '{n}'"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn one() -> u32 {

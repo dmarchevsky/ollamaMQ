@@ -20,6 +20,7 @@
       <a href="#clients" data-page="clients"><span class="ico">⚿</span>Clients<span class="count" id="nav-clients"></span></a>
       <a href="#blocked" data-page="blocked"><span class="ico">⊘</span>Blocked<span class="count" id="nav-blocked"></span></a>
       <a href="#logs" data-page="logs"><span class="ico">≡</span>Logs</a>
+      <a href="#settings" data-page="settings"><span class="ico">⚙</span>Settings<span class="count" id="nav-settings"></span></a>
     </nav>
     <div class="nav-foot">
       <span class="live" id="live"><span class="dot"></span>live</span>
@@ -134,6 +135,22 @@
       </div>
       <div class="panel flush" id="logs"></div>
     </section>
+
+    <section class="page" id="page-settings">
+      <div class="page-h">
+        <h1>Settings</h1>
+        <div class="page-tools" id="set-tools"></div>
+      </div>
+      <p class="hint">Changes are saved in <code id="set-file">settings.json</code> and win over <code>appconf.yaml</code>, which is never rewritten.
+        Most apply at once; the ones marked <span class="badge warn">restart</span> wait for a restart.</p>
+      <div id="set-banner"></div>
+      <div class="panel flush">
+        <div class="panel-h padded"><h2>Backends</h2><button class="btn sm primary" data-action="add-backend" id="set-add-backend">+ Add backend</button></div>
+        <div class="tscroll" id="set-backends"></div>
+      </div>
+      <div id="set-form"></div>
+      <datalist id="dl-set-models"></datalist>
+    </section>
   </main>
 </div>
 
@@ -219,6 +236,37 @@
     <div class="drawer-h"><h3 data-title>Log detail</h3><button value="close" class="btn sm">Close</button></div>
     <dl class="kv" data-meta></dl>
     <pre class="content" data-content></pre>
+  </form>
+</dialog>
+
+<dialog id="dlg-backend">
+  <form method="dialog" data-form="backend">
+    <h3 data-title>Add backend</h3>
+    <label>URL <input name="url" required placeholder="http://192.168.1.20:8000" autocomplete="off" spellcheck="false"></label>
+    <p class="field-hint" data-only="edit">The address identifies the backend; to change it, remove this one and add the new address.</p>
+    <label>Name <input name="name" maxlength="40" placeholder="optional, e.g. gpu-box" autocomplete="off"></label>
+    <p class="field-hint">Shown instead of the address everywhere in the UI.</p>
+    <label>Token <input name="token" type="password" autocomplete="new-password" placeholder="optional"></label>
+    <p class="field-hint">Sent to the backend as <code>Authorization: Bearer …</code>.</p>
+    <label class="check" data-only="token-set"><input type="checkbox" name="clear_token"> Remove the saved token</label>
+    <label>Type <select name="kind">
+      <option value="">Detect automatically</option>
+      <option value="systemone">System One (Laya and other servers that list no models)</option>
+    </select></label>
+    <div class="test-row"><button type="button" class="btn sm" data-action="test-backend">Test connection</button><span class="test-result" data-test></span></div>
+    <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary" data-submit>Add backend</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-password">
+  <form method="dialog" data-form="password">
+    <h3>Change admin password</h3>
+    <label>Current password <input name="current" type="password" required autocomplete="current-password"></label>
+    <label>New password <input name="new" type="password" required minlength="12" autocomplete="new-password"></label>
+    <p class="field-hint">At least 12 characters. Stored as a hash in <code>admin.json</code>; it replaces the password from the environment or appconf.yaml.</p>
+    <label>Repeat new password <input name="repeat" type="password" required minlength="12" autocomplete="new-password"></label>
+    <label class="check"><input type="checkbox" name="others" checked> Sign out all other sessions</label>
+    <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary">Change password</button></div>
   </form>
 </dialog>
 

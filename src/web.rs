@@ -30,6 +30,7 @@ use crate::control::{self, ControlAction, LoadOptions};
 use crate::dispatcher::AppState;
 
 mod overview;
+mod settings;
 use crate::lock::LockExt;
 use crate::model_policy::{Action, Mode, Rule};
 use crate::snapshot;
@@ -65,24 +66,83 @@ const CSRF_HEADER: &str = "x-ollamamq-ui";
 const CSP: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; \
                    img-src 'self' data:; frame-ancestors 'none'";
 
+#[derive(Clone)]
+enum Secret {
+    /// From `OLLAMA_MQ_UI_PASSWORD` or `settings.web_ui.password`.
+    Plain(String),
+    /// argon2id hash from `admin.json` (set in the UI).
+    Hash(String),
+}
+
 /// The web UI's credentials (one admin user).
 #[derive(Clone)]
 pub struct WebAuth {
     pub username: String,
-    pub password: String,
+    secret: Secret,
+    /// Where the password comes from: `admin.json`, `OLLAMA_MQ_UI_PASSWORD`
+    /// or `appconf.yaml`.
+    pub source: String,
+    changed_at_ms: Option<u64>,
+    /// Where a password changed in the UI is saved.
+    admin_file: String,
 }
 
 impl WebAuth {
+    /// The password set in the UI when there is one, else the configured
+    /// one; `None` (web UI off) when neither exists. A damaged `admin.json`
+    /// stops the proxy rather than falling back to the old password.
+    pub fn resolve(
+        admin_file: &str,
+        username: Option<String>,
+        password: Option<(String, &str)>,
+    ) -> Option<Self> {
+        match crate::admin::load(admin_file) {
+            Ok(Some(f)) => Some(Self {
+                username: f.username,
+                secret: Secret::Hash(f.password_hash),
+                source: admin_file.to_string(),
+                changed_at_ms: Some(f.changed_at_ms),
+                admin_file: admin_file.to_string(),
+            }),
+            Ok(None) => password.map(|(p, source)| Self {
+                username: username.unwrap_or_else(|| "admin".to_string()),
+                secret: Secret::Plain(p),
+                source: source.to_string(),
+                changed_at_ms: None,
+                admin_file: admin_file.to_string(),
+            }),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn plain(username: &str, password: &str, admin_file: &str) -> Self {
+        Self {
+            username: username.into(),
+            secret: Secret::Plain(password.into()),
+            source: "test".into(),
+            changed_at_ms: None,
+            admin_file: admin_file.into(),
+        }
+    }
+
     fn check(&self, user: &str, pass: &str) -> bool {
         // Evaluate both so the response time does not reveal which one failed.
         let user_ok = constant_time_eq(user, &self.username);
-        let pass_ok = constant_time_eq(pass, &self.password);
+        let pass_ok = match &self.secret {
+            Secret::Plain(p) => constant_time_eq(pass, p),
+            Secret::Hash(h) => crate::admin::verify(h, pass),
+        };
         user_ok & pass_ok
     }
 }
 
 struct AuthState {
-    creds: WebAuth,
+    /// Replaced when the password is changed in the UI.
+    creds: std::sync::Mutex<WebAuth>,
     sessions: crate::session::Sessions,
     limiter: crate::session::LoginLimiter,
 }
@@ -91,7 +151,7 @@ struct AuthState {
 /// (or basic-auth credentials).
 pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
     let auth = Arc::new(AuthState {
-        creds: auth,
+        creds: std::sync::Mutex::new(auth),
         sessions: Default::default(),
         limiter: Default::default(),
     });
@@ -107,6 +167,12 @@ pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
         .route("/blocked/unblock", post(unblock))
         .route("/backends/{idx}/{op}", post(model_control))
         .route("/config/reload", post(reload_config))
+        .route("/account/password", post(change_password))
+        .route("/settings", get(settings::get_settings).put(settings::put_settings))
+        .route("/settings/undo", post(settings::undo))
+        .route("/settings/backends", post(settings::add_backend).put(settings::update_backend))
+        .route("/settings/backends/remove", post(settings::remove_backend))
+        .route("/settings/backends/test", post(settings::test_backend))
         .route("/clients", get(list_clients).post(create_client))
         .route(
             "/clients/{name}",
@@ -204,8 +270,9 @@ fn authenticated(auth: &AuthState, headers: &axum::http::HeaderMap) -> Option<St
     if let Some(user) = cookie.and_then(|t| auth.sessions.user(t)) {
         return Some(user);
     }
+    let creds = auth.creds.lock_or_recover().clone();
     basic_credentials(headers)
-        .filter(|(u, p)| auth.creds.check(u, p))
+        .filter(|(u, p)| creds.check(u, p))
         .map(|(u, _)| u)
 }
 
@@ -356,6 +423,10 @@ struct Stats {
 struct BackendView {
     idx: usize,
     url: String,
+    /// Display name; the UI shows `host:port` when unset.
+    name: Option<String>,
+    /// Turned off in the settings (never probed or routed to).
+    disabled: bool,
     online: bool,
     api_type: &'static str,
     active: usize,
@@ -431,6 +502,8 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
         .map(|(idx, b)| BackendView {
             idx,
             url: b.url.clone(),
+            name: b.name.clone(),
+            disabled: b.disabled,
             online: b.is_online,
             api_type: b.api_type.display(),
             active: b.active_requests,
@@ -707,7 +780,7 @@ async fn model_control(
 }
 
 async fn reload_config(State(state): State<Arc<AppState>>) -> ApiResult<serde_json::Value> {
-    control::reload_model_config(&state)
+    crate::settings::reload(&state)
         .map(|n| Json(json!({ "models": n })))
         .map_err(|e| {
             ApiError::new(
@@ -868,7 +941,8 @@ async fn login(
         )
         .into_response();
     }
-    if !auth.creds.check(&body.username, &body.password) {
+    let creds = auth.creds.lock_or_recover().clone();
+    if !creds.check(&body.username, &body.password) {
         auth.limiter.fail();
         warn!("web: failed sign-in for user '{}'", body.username);
         return ApiError::new(StatusCode::UNAUTHORIZED, "wrong user name or password")
@@ -914,7 +988,89 @@ async fn me(
     axum::Extension(auth): axum::Extension<Arc<AuthState>>,
     headers: axum::http::HeaderMap,
 ) -> Json<serde_json::Value> {
-    Json(json!({ "user": authenticated(&auth, &headers) }))
+    let creds = auth.creds.lock_or_recover().clone();
+    Json(json!({
+        "user": authenticated(&auth, &headers),
+        "password_source": creds.source,
+        "password_changed_at_ms": creds.changed_at_ms,
+    }))
+}
+
+#[derive(Deserialize)]
+struct PasswordBody {
+    current: String,
+    new: String,
+    #[serde(default = "yes")]
+    sign_out_others: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Change the web UI password. The new one is stored hashed in `admin.json`
+/// and takes effect at once; other sessions end unless asked not to.
+async fn change_password(
+    axum::Extension(auth): axum::Extension<Arc<AuthState>>,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<PasswordBody>,
+) -> ApiResult<serde_json::Value> {
+    if let Some(secs) = auth.limiter.locked_for() {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("too many failed attempts; try again in {secs}s"),
+        ));
+    }
+    let creds = auth.creds.lock_or_recover().clone();
+    if !creds.check(&creds.username, &body.current) {
+        auth.limiter.fail();
+        warn!("web: password change refused, wrong current password");
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "the current password is wrong"));
+    }
+    auth.limiter.succeed();
+    if body.new.chars().count() < crate::admin::MIN_PASSWORD_CHARS {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("use at least {} characters", crate::admin::MIN_PASSWORD_CHARS),
+        ));
+    }
+    if body.new == body.current {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "the new password is the current one"));
+    }
+    let password_hash = crate::admin::hash(&body.new)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let file = crate::admin::AdminFile {
+        username: creds.username.clone(),
+        password_hash: password_hash.clone(),
+        changed_at_ms: crate::stats::now_ms(),
+    };
+    crate::admin::save(&creds.admin_file, &file)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    *auth.creds.lock_or_recover() = WebAuth {
+        secret: Secret::Hash(password_hash),
+        source: creds.admin_file.clone(),
+        changed_at_ms: Some(file.changed_at_ms),
+        ..creds
+    };
+    if body.sign_out_others {
+        let mine = headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| crate::session::cookie_value(c, crate::session::COOKIE));
+        auth.sessions.retain_only(mine);
+    }
+    info!("web: admin password changed");
+    state.log_event(crate::dispatcher::LogEvent {
+        at: std::time::SystemTime::now(),
+        dir: "CTL",
+        user: file.username,
+        model: None,
+        backend: None,
+        info: "web UI password changed".into(),
+        content: None,
+    });
+    Ok(Json(json!({ "changed_at_ms": file.changed_at_ms })))
 }
 
 // ------------------------------------------------------------ model policy
@@ -1073,11 +1229,15 @@ mod tests {
     }
 
     async fn serve(state: Arc<AppState>) -> String {
-        let app = router(WebAuth {
-            username: "admin".into(),
-            password: "pw".into(),
-        })
-        .with_state(state);
+        // A fresh admin.json path per server, so password tests never meet.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let admin = std::env::temp_dir().join(format!(
+            "omq-web-admin-{}-{}.json",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&admin);
+        let app = router(WebAuth::plain("admin", "pw", admin.to_str().unwrap())).with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
@@ -1486,5 +1646,134 @@ mod tests {
             get("logs/3".into()).await.unwrap().status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// Signed-in calls with basic auth, as scripts make them.
+    fn api(c: &reqwest::Client, method: reqwest::Method, base: &str, path: &str) -> reqwest::RequestBuilder {
+        c.request(method, format!("{base}/ui/api/{path}"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+    }
+
+    #[tokio::test]
+    async fn settings_change_live_and_report_their_source() {
+        let state = test_state();
+        let base = serve(state.clone()).await;
+        let c = http();
+        let put = |body: serde_json::Value| api(&c, reqwest::Method::PUT, &base, "settings").json(&body).send();
+
+        let res = put(json!({"set": {"timeout": 42, "model_aliases": {"short": "llama3"}}})).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let view: serde_json::Value = res.json().await.unwrap();
+        let timeout = view["fields"].as_array().unwrap().iter().find(|f| f["key"] == "timeout").unwrap().clone();
+        assert_eq!((timeout["value"].clone(), timeout["source"].clone()), (json!(42), json!("ui")));
+        assert_eq!(state.timeout.load(Ordering::Relaxed), 42);
+        assert!(state.model_aliases.lock_or_recover().contains_key("short"));
+
+        // Startup-only settings wait for a restart.
+        let view: serde_json::Value = put(json!({"set": {"max_body_bytes": 4096}})).await.unwrap().json().await.unwrap();
+        assert_eq!(view["restart_pending"], json!(["max_body_bytes"]));
+
+        // Unknown names, wrong types and unsafe values are refused.
+        for bad in [json!({"port": 1}), json!({"timeout": "soon"}), json!({"timeout": 0})] {
+            let res = put(json!({ "set": bad })).await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert_eq!(state.timeout.load(Ordering::Relaxed), 42);
+
+        // `null` falls back to the file/default value.
+        put(json!({"set": {"timeout": null}})).await.unwrap();
+        assert_eq!(state.timeout.load(Ordering::Relaxed), 300);
+
+        // A value pinned on the command line cannot be changed here.
+        state.config.lock_or_recover().pinned_by.insert("timeout", "--timeout".into());
+        let res = put(json!({"set": {"timeout": 7}})).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // The metrics token is never shown, only that it is set.
+        let view: serde_json::Value = put(json!({"set": {"metrics_token": "abc123"}})).await.unwrap().json().await.unwrap();
+        let tok = view["fields"].as_array().unwrap().iter().find(|f| f["key"] == "metrics_token").unwrap().clone();
+        assert_ne!(tok["value"], json!("abc123"));
+        assert_eq!(state.metrics_token.lock_or_recover().as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn backends_are_added_named_disabled_and_removed() {
+        let state = test_state();
+        // As at startup with no backends configured: the running one.
+        state.config.lock_or_recover().fallback_backends = vec![crate::config::Backend {
+            url: "http://127.0.0.1:9".into(),
+            name: None,
+            disabled: false,
+            token: None,
+            kind: None,
+        }];
+        let base = serve(state.clone()).await;
+        let c = http();
+        let call = |m: reqwest::Method, path: &str, body: serde_json::Value| api(&c, m, &base, path).json(&body).send();
+        let post = reqwest::Method::POST;
+        let put = reqwest::Method::PUT;
+
+        let res = call(post.clone(), "settings/backends", json!({"url": "10.0.0.9:8000/", "name": " gpu-a "})).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        {
+            let b = state.backends.lock_or_recover();
+            let added = b.iter().find(|b| b.url == "http://10.0.0.9:8000").expect("added");
+            assert_eq!(added.name.as_deref(), Some("gpu-a"));
+        }
+        assert!(!state.backends.lock_or_recover()[0].disabled, "first edit keeps the running backend");
+        // Same URL again, or a second backend with the same name: refused.
+        let res = call(post.clone(), "settings/backends", json!({"url": "http://10.0.0.9:8000"})).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = call(put.clone(), "settings/backends", json!({"url": "http://127.0.0.1:9", "name": "GPU-A"})).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Disable: offline and never probed.
+        call(put.clone(), "settings/backends", json!({"url": "http://10.0.0.9:8000", "disabled": true, "name": null})).await.unwrap();
+        {
+            let b = state.backends.lock_or_recover();
+            let x = b.iter().find(|b| b.url == "http://10.0.0.9:8000").unwrap();
+            assert!(x.disabled && !x.is_online);
+            assert_eq!(x.name, None);
+        }
+
+        // Remove: gone from the list, kept (disabled) until a restart.
+        let view: serde_json::Value = call(post, "settings/backends/remove", json!({"url": "http://10.0.0.9:8000"}))
+            .await.unwrap().json().await.unwrap();
+        let row = view["backends"].as_array().unwrap().iter().find(|b| b["url"] == "http://10.0.0.9:8000").unwrap().clone();
+        assert_eq!((row["removed"].clone(), row["disabled"].clone()), (json!(true), json!(true)));
+    }
+
+    #[tokio::test]
+    async fn password_change_takes_effect_and_ends_other_sessions() {
+        let base = serve(test_state()).await;
+        let c = http();
+        let login = || async {
+            let res = c.post(format!("{base}/ui/api/login")).header("X-OllamaMQ-UI", "1")
+                .json(&json!({"username": "admin", "password": "pw"})).send().await.unwrap();
+            res.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string()
+        };
+        let (mine, other) = (login().await, login().await);
+        let change = |current: &str, new: &str| {
+            c.post(format!("{base}/ui/api/account/password"))
+                .header("X-OllamaMQ-UI", "1")
+                .header(header::COOKIE, &mine)
+                .json(&json!({"current": current, "new": new}))
+                .send()
+        };
+        assert_eq!(change("wrong", "a-much-longer-password").await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(change("pw", "short").await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(change("pw", "a-much-longer-password").await.unwrap().status(), StatusCode::OK);
+
+        let state_with = |user: &str, pw: &str| c.get(format!("{base}/ui/api/state")).basic_auth(user, Some(pw)).send();
+        assert_eq!(state_with("admin", "pw").await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state_with("admin", "a-much-longer-password").await.unwrap().status(), StatusCode::OK);
+        let with_cookie = |ck: &str| c.get(format!("{base}/ui/api/state")).header(header::COOKIE, ck).send();
+        assert_eq!(with_cookie(&mine).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(with_cookie(&other).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let me: serde_json::Value = c.get(format!("{base}/ui/api/me")).header(header::COOKIE, &mine)
+            .send().await.unwrap().json().await.unwrap();
+        assert!(me["password_source"].as_str().unwrap().ends_with(".json"));
+        assert!(me["password_changed_at_ms"].as_u64().is_some());
     }
 }

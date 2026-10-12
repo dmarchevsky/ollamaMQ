@@ -595,6 +595,16 @@ pub fn render(state: &Arc<AppState>) -> String {
     }
     gauge(
         &mut out,
+        "ollamamq_backend_info",
+        "1 per backend, with the display name set in the settings (empty when none). Join on backend.",
+        &["backend", "name"],
+        snap.backends
+            .iter()
+            .map(|b| (vec![backend_label(&b.url), b.name.clone().unwrap_or_default()], 1.0))
+            .collect(),
+    );
+    gauge(
+        &mut out,
         "ollamamq_backend_up",
         "1 when the backend answered its last health probe.",
         &["backend", "api_type"],
