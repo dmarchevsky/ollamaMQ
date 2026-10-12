@@ -5,7 +5,7 @@
 #   ├── config/              -> /config  appconf.yaml, .env, and what the web UI
 #   │                                    saves: clients.json, models.json,
 #   │                                    settings.json, admin.json
-#   └── logs/                -> /data    request logs, ollamamq.log (TUI mode)
+#   └── logs/                -> /data    request logs (ollamamq-requests.jsonl*)
 #
 # Every path is relative to this file, so moving the server is copying the
 # folder. Store files named in appconf.yaml without a path are kept next to
@@ -29,24 +29,21 @@ services:
     # Bypass the image entrypoint: it always passes --backend-urls, which
     # would override the backends in appconf.yaml.
     entrypoint: ["/app/ollamaMQ"]
-    command: ["-c", "/config/appconf.yaml"]
-    # The TUI dashboard: `docker attach ollamamq`, detach with Ctrl-P Ctrl-Q.
-    # Without a TTY (or with --no-tui) logs go to `docker logs` instead.
-    tty: true
-    stdin_open: true
+    # No terminal dashboard: the service log goes to `docker logs ollamamq`,
+    # and the web UI at /ui shows what the TUI did.
+    command: ["--no-tui", "-c", "/config/appconf.yaml"]
     working_dir: /data
     # OLLAMA_MQ_UI_USER / OLLAMA_MQ_UI_PASSWORD: the web UI's first-run (and
     # recovery) password; a password changed in the UI is kept in config/admin.json.
     env_file: ./config/.env
     environment:
       - RUST_LOG=info
-      - TERM=xterm-256color
     volumes:
       - ./config:/config
       - ./logs:/data
     mem_limit: 256m
     restart: unless-stopped
-    logging:
+    logging:                    # `docker logs` keeps at most 2 x 10 MB
       driver: json-file
       options:
         max-size: "10m"

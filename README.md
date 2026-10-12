@@ -395,7 +395,7 @@ The included [`docker-compose.yml`](docker-compose.yml) keeps everything in one 
 ollamamq/
 ├── docker-compose.yml
 ├── config/   → /config   appconf.yaml, .env, clients.json, models.json, settings.json, admin.json
-└── logs/     → /data     ollamamq-requests.jsonl*, ollamamq.log
+└── logs/     → /data     ollamamq-requests.jsonl* (the service log: docker logs ollamamq)
 ```
 
 1. Copy `docker-compose.yml` into an empty folder (or run it in this checkout).
@@ -411,7 +411,7 @@ Set `build.context` to where the source is:
 
 **Moving to another server:** stop the service and copy the folder. The files in `config/` are written by the container as root with mode 600, so copy them with `sudo` (or `docker run --rm -v "$PWD":/s alpine tar …`).
 
-**Where store files go:** relative paths for `clients_file`, `models_file`, `settings_file` and `admin_file` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. Logs (`request_log_path`, `ollamamq.log`) stay relative to the working directory.
+**Where store files go:** relative paths for `clients_file`, `models_file`, `settings_file` and `admin_file` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. Logs (`request_log_path`, and `ollamamq.log` when the TUI runs) stay relative to the working directory.
 
 Earlier versions kept the store files in the working directory. If such a file exists there and not next to `appconf.yaml`, it keeps being used, and the startup log says so. To switch, move it next to `appconf.yaml`.
 
