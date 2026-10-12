@@ -179,12 +179,15 @@
   // Overview history. Values come from a hash of the sample time, so a
   // sample looks the same on every poll and the chart scrolls steadily.
   const noise = n => { const x = Math.sin(n * 12.9898) * 43758.5453; return x - Math.floor(x); };
+  // `backends`: indexes of the backends that can serve the model.
   const demoQueue = [
-    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 38_000, pos: 1 },
-    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 21_000, pos: 2 },
-    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 4_000, pos: 3 },
-    { client: 'openwebui', model: 'Qwen3.8-27B', since: now - 9_000, pos: 1 },
-    { client: 'grafana-alerts', model: 'Gemma-4-E4B', since: now - 2_000, pos: 1 },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 38_000, pos: 1, backends: [0] },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 21_000, pos: 2, backends: [0] },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 4_000, pos: 3, backends: [0] },
+    { client: 'openwebui', model: 'Qwen3.8-27B', since: now - 9_000, pos: 1, backends: [1] },
+    { client: 'grafana-alerts', model: 'Gemma-4-E4B', since: now - 2_000, pos: 1, backends: [2] },
+    { client: 'n8n-agents', model: 'BGE-M3', since: now - 17_000, pos: 1, backends: [3] },
+    { client: 'anonymous', model: 'unknown', since: now - 6_000, pos: 1, backends: [] },
   ];
   // Per backend over 15 minutes: requests, errors, first token p50/p95, gen tok/s, prefill tok/s.
   const BACKEND_STATS = {
@@ -224,7 +227,7 @@
       return v.length ? f(v, i) : null;
     });
     const avg = (v, f) => v.reduce((a, p) => a + f(p), 0) / v.length;
-    const queue = demoQueue.map(q => ({ client: q.client, model: q.model, pos: q.pos, waited_secs: (t - q.since) / 1000 }));
+    const queue = demoQueue.map(q => ({ client: q.client, model: q.model, pos: q.pos, backends: q.backends, waited_secs: (t - q.since) / 1000 }));
     const loadingOf = b => b.active_op && { backend: hostOf(b.url), verb: b.active_op.verb, model: b.active_op.model };
     const be = backends.map(b => {
       const label = hostOf(b.url);

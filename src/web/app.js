@@ -360,13 +360,28 @@ function renderOverview(st) {
   renderClientStats(st, ov);
 }
 
-/** One row of slot squares per backend; a busy slot wears its client's colour. */
+/**
+ * One row of slot squares per backend; a busy slot wears its client's colour.
+ * Waiting requests follow as orange squares on the one backend that can serve
+ * their model, or on a shared row when several (or none) can.
+ */
 function renderCapacity(st, ov) {
   const runsAt = new Map();
   for (const r of st.runs || []) (runsAt.get(r.backend) || runsAt.set(r.backend, []).get(r.backend)).push(r);
-  $('#ov-cap-sum').textContent = `${ov.status.running} running · ${ov.status.free} free`;
+  const waitAt = new Map(), shared = [];
+  for (const w of ov.queue) {
+    if (w.backends.length === 1) (waitAt.get(w.backends[0]) || waitAt.set(w.backends[0], []).get(w.backends[0])).push(w);
+    else shared.push(w);
+  }
+  const label = new Map(ov.backends.map(b => [b.idx, b.label]));
+  const waitSquares = (ws, gap) => ws.length ? `${gap ? '<span class="slot-gap"></span>' : ''}${ws.map(w => `<span class="slot queued" title="${esc(
+    `${w.client} · ${w.model}\nwaiting ${fmtDur(w.waited_secs)} · #${w.pos} in its client's queue`
+    + (w.backends.length > 1 ? `\ncan run on ${w.backends.map(i => label.get(i)).join(', ')}` : ''))}"></span>`).join('')}` : '';
+  const waitNote = ws => ws.length ? ` · <span class="st-warn">${ws.length} waiting</span>` : '';
+  $('#ov-cap-sum').textContent = `${ov.status.running} running · ${ov.status.free} free · ${ov.status.queued} waiting`;
   const rows = ov.backends.map(b => {
     const runs = runsAt.get(b.label) || [];
+    const waits = waitAt.get(b.idx) || [];
     let slots = '';
     if (b.online) {
       slots += runs.map(r => `<span class="slot ${colorClass(r.client)}" title="${esc(`${r.client} · ${r.model}\n${r.state === 'generating' ? 'generating' : 'waiting for first token'} · ${fmtDur(r.elapsed_secs)} · ${r.tokens} tok${r.tokens_per_sec ? ` · ${r.tokens_per_sec.toFixed(1)} tok/s` : ''}`)}"></span>`).join('');
@@ -378,27 +393,25 @@ function renderCapacity(st, ov) {
         ? `<span class="slot loading" title="${esc(`${b.loading.verb} ${b.loading.model}`)}"></span>`.repeat(rest)
         : '<span class="slot free" title="free"></span>'.repeat(rest);
     }
-    const note = !b.online ? '<span class="st-bad">offline</span>'
+    slots += waitSquares(waits, slots !== '');
+    const note = (!b.online ? '<span class="st-bad">offline</span>'
       : b.loading ? `<span class="st-warn">${esc(b.loading.verb)} ${esc(b.loading.model)}</span>`
-      : `${b.free} free`;
+      : `${b.free} free`) + waitNote(waits);
     return `<div class="cap-row">
       <div class="cap-name"><span class="sdot ${b.online ? 'on' : 'off'}"></span><span class="bk-url">${esc(b.label)}</span></div>
       <div class="slots">${slots}</div>
       <div class="cap-note">${note}</div></div>`;
   }).join('');
-  // What is waiting, by model: the demand the free slots are not meeting.
-  const byModel = new Map();
-  for (const w of ov.queue) {
-    const m = byModel.get(w.model) || { n: 0, oldest: 0 };
-    m.n++; m.oldest = Math.max(m.oldest, w.waited_secs);
-    byModel.set(w.model, m);
-  }
-  const waiting = byModel.size ? `<div class="cap-wait"><span class="dim">Waiting:</span> ${[...byModel].map(([m, v]) =>
-    `<span class="chip q">${esc(m)} ×${v.n} · ${fmtDur(v.oldest)}</span>`).join(' ')}</div>` : '';
+  // Requests more than one backend could take (or none lists their model).
+  const sharedRow = shared.length ? `<div class="cap-row">
+      <div class="cap-name cap-shared" title="Several backends can serve these models, or none lists them">any backend</div>
+      <div class="slots">${waitSquares(shared, false)}</div>
+      <div class="cap-note">${waitNote(shared).replace(' · ', '')}</div></div>` : '';
   const legend = [...S.colorOf.keys()].map(id => `<span>${swatch(id)}${esc(id)}</span>`).join('')
-    + '<span><i class="sw cother"></i>other</span><span><i class="sw free"></i>free</span><span><i class="sw loading"></i>loading a model</span>';
+    + '<span><i class="sw cother"></i>other</span><span><i class="sw free"></i>free</span>'
+    + '<span><i class="sw queued"></i>waiting</span><span><i class="sw loading"></i>loading a model</span>';
   setHTML($('#ov-capacity'), ov.backends.length
-    ? `<div class="caps">${rows}</div>${waiting}<div class="legend">${legend}</div>`
+    ? `<div class="caps">${rows}${sharedRow}</div><div class="legend">${legend}</div>`
     : '<div class="empty">No backends configured</div>');
 }
 
@@ -901,6 +914,20 @@ function infoClass(info) {
   return '';
 }
 
+/** Bytes as 512 B, 12.3 KB, 4.1 MB. */
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
+/** Log info with its byte counts (`resp=12345B`, `body=0B`, `(123 B waiting)`) made readable. */
+const fmtInfo = info => info
+  .replace(/\b(resp|body)=(\d+)B\b/g, (_, k, n) => `${k === 'resp' ? 'response' : 'body'} ${fmtBytes(+n)}`)
+  .replace(/\((\d+) B waiting\)/, (_, n) => `(${fmtBytes(+n)} waiting)`);
+
 function logTable(logs, clickable = true) {
   if (!logs.length) return '<div class="empty">No matching log events</div>';
   return `<table class="logs">
@@ -911,7 +938,7 @@ function logTable(logs, clickable = true) {
       <td class="mono">${esc(l.user)}</td>
       <td class="trunc ${l.model ? '' : 'none'}">${esc(l.model ?? '—')}</td>
       <td class="mono dim ${l.backend ? '' : 'none'}">${esc(l.backend ? hostOf(l.backend) : '—')}</td>
-      <td class="${infoClass(l.info)}">${esc(l.info)}${l.has_content ? ' <span class="dim">· ⌕</span>' : ''}</td></tr>`).join('')}
+      <td class="${infoClass(l.info)}">${esc(fmtInfo(l.info))}${l.has_content ? ' <span class="dim">· ⌕</span>' : ''}</td></tr>`).join('')}
     </table>`;
 }
 

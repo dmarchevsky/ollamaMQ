@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::dispatcher::{AppState, model_label_in};
+use crate::dispatcher::{AppState, model_label_in, model_routable};
 use crate::lock::LockExt;
 use crate::metrics::backend_label;
 use crate::snapshot;
@@ -128,6 +128,8 @@ struct Waiting {
     waited_secs: f64,
     /// 1-based position in the client's own queue.
     pos: usize,
+    /// Backends that list the model and serve it under the model policy.
+    backends: Vec<usize>,
 }
 
 fn window_secs(w: Option<&str>) -> u64 {
@@ -167,11 +169,23 @@ pub async fn get_overview(
             })
         })
         .collect();
+    let policy = state.model_policy();
     let mut queue: Vec<Waiting> = {
         let backends = state.backends.lock_or_recover();
         waiting
             .into_iter()
             .map(|(client, model, waited_secs, pos)| Waiting {
+                backends: model
+                    .as_deref()
+                    .map(|m| {
+                        backends
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, b)| model_routable(m, &b.available_models) && policy.served(m, &b.url))
+                            .map(|(i, _)| i)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 model: model_label_in(&backends, model.as_deref()),
                 client,
                 waited_secs,

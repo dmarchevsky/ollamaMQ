@@ -1439,7 +1439,7 @@ fn name_matches_listed(requested: &str, listed: &str) -> bool {
 ///
 /// Owner-prefixed requests are strict: the backend must list that exact id up to
 /// tag/quant normalization.
-fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
+pub(crate) fn model_routable(requested: &str, available: &HashSet<String>) -> bool {
     available.iter().any(|m| name_matches_listed(requested, m))
 }
 
