@@ -485,12 +485,12 @@ The web UI is **off** unless a password is configured (`OLLAMA_MQ_UI_PASSWORD`, 
 It covers everything the TUI does:
 
 - **Overview** — status at a glance over the last 5 min / 15 min / 1 hour (see below)
-- **Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload** (TUI `L` / `U`)
+- **Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload** (TUI `L` / `U`); also where backends are configured: **Add** (with **Test connection**), name, token, **Disable/Enable**, **Remove**
 - **Clients** — every queue identity with its queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock** (TUI `p` `b` `x` `X` `u`)
 - **Models** — every model the backends list, with a switch per model and filter rules (below)
 - **Blocked** — disabled clients, blocked ids and blocked IPs
 - **Logs** — recent requests with a filter; click a row for the full captured content
-- **Settings** — backends (add, name, token, disable, remove), limits, model aliases, metrics token, and the admin password (see below)
+- **Settings** — limits, model aliases, metrics token, and the admin password (see below)
 - **Reload config** — re-read `appconf.yaml` (TUI `r`)
 
 The **Overview** page shows:
@@ -506,6 +506,15 @@ Numbers cover the chosen window and come from an in-memory history of the last h
 - *Generation speed* is per stream (median).
 - *Share of slot time* is each client's part of the backend time used in the window, which is what fair scheduling divides.
 
+#### Backends
+
+The **Backends** page lists the configured backends and edits the backend list while the proxy runs (saved in `settings.json`, same rules as Settings):
+- **Adding** a backend probes it within 10 s. **Test connection** shows its type, slots and models before you add it.
+- **Disabling** one stops new requests at once; running ones finish.
+- **Removing** one disables it now and drops it from the list at the next restart.
+- **Names:** a backend can have a **name** (`backends: - url: …` with `name: gpu-box` in `appconf.yaml`, or in the UI). The UI shows the name instead of `host:port`. Prometheus keeps `backend="host:port"` and adds `ollamamq_backend_info{backend, name}` for dashboards.
+- **`--backend-urls`:** when given, the list is fixed and the page shows it read-only.
+
 #### Settings
 
 The **Settings** page edits the configuration while the proxy runs. Changes are saved in `settings.json`, next to `appconf.yaml` (path: `settings.settings_file`).
@@ -518,13 +527,6 @@ The **Settings** page edits the configuration while the proxy runs. Changes are 
 - **Live:** timeouts, slots and queue limits, model aliases, keyless IP identity, unknown-route proxying, and the metrics token.
 - **After a restart:** largest request body.
 - **Read-only:** listen address, log files and store paths. Set these in `appconf.yaml`.
-
-**Backends:**
-- **Adding** a backend probes it within 10 s. **Test connection** shows its type, slots and models before you add it.
-- **Disabling** one stops new requests at once; running ones finish.
-- **Removing** one disables it now and drops it from the list at the next restart.
-- **Names:** a backend can have a **name** (`backends: - url: …` with `name: gpu-box` in `appconf.yaml`, or in the UI). The UI shows the name instead of `host:port`. Prometheus keeps `backend="host:port"` and adds `ollamamq_backend_info{backend, name}` for dashboards.
-- **`--backend-urls`:** when given, the list is fixed.
 
 **Admin password:**
 - **Change password** stores an argon2id hash in `admin.json` (mode 600, next to `appconf.yaml`; path: `settings.admin_file`).
