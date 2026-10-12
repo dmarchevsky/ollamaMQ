@@ -305,15 +305,19 @@ function fmtTok(n) {
 }
 
 /**
- * Colour slots for the four busiest clients. A client keeps its colour while
- * it stays among them, so the board does not repaint when the order shifts.
+ * Colour every client with running or queued requests, 8 hues; past 8 the
+ * palette cycles. Only active clients get a colour, so the legend lists
+ * exactly the clients with squares. A client keeps its colour while it stays
+ * active, so the board does not repaint when the order shifts.
  */
+const N_COLORS = 8;
 function assignColors(ids) {
   for (const id of [...S.colorOf.keys()]) if (!ids.includes(id)) S.colorOf.delete(id);
   for (const id of ids) {
     if (S.colorOf.has(id)) continue;
     const used = new Set(S.colorOf.values());
-    S.colorOf.set(id, [1, 2, 3, 4].find(n => !used.has(n)));
+    // shortcut: >8 active clients share hues; cycle on demand if boards ever need more
+    S.colorOf.set(id, [1, 2, 3, 4, 5, 6, 7, 8].find(n => !used.has(n)) ?? S.colorOf.size % N_COLORS + 1);
   }
 }
 const colorClass = id => S.colorOf.has(id) ? `c${S.colorOf.get(id)}` : 'cother';
@@ -354,7 +358,7 @@ function renderOverview(st) {
   const ov = S.overview;
   setHTML($('#ov-logs'), logTable(S.logs.slice(0, OVERVIEW_LOGS), false));
   if (!ov) return;
-  assignColors(ov.clients.filter(c => c.busy_secs > 0 || c.running).slice(0, 4).map(c => c.id));
+  assignColors(ov.clients.filter(c => c.running || c.queued).map(c => c.id));
   const s = ov.status, k = ov.kpis;
 
   // Status line: the one sentence an operator reads first.
@@ -390,8 +394,9 @@ function renderOverview(st) {
 
 /**
  * One row of slot squares per backend; a busy slot wears its client's colour.
- * Waiting requests follow as orange squares on the one backend that can serve
- * their model, or on a shared row when several (or none) can.
+ * Waiting requests follow as dim client-coloured squares with a dashed border,
+ * on the one backend that can serve their model, or on a shared row when
+ * several (or none) can.
  */
 function renderCapacity(st, ov) {
   const runsAt = new Map();
@@ -402,7 +407,7 @@ function renderCapacity(st, ov) {
     else shared.push(w);
   }
   const label = new Map(ov.backends.map(b => [b.idx, b.name || b.label]));
-  const waitSquares = (ws, gap) => ws.length ? `${gap ? '<span class="slot-gap"></span>' : ''}${ws.map(w => `<span class="slot queued" title="${esc(
+  const waitSquares = (ws, gap) => ws.length ? `${gap ? '<span class="slot-gap"></span>' : ''}${ws.map(w => `<span class="slot q ${colorClass(w.client)}" title="${esc(
     `${w.client} · ${w.model}\nwaiting ${fmtDur(w.waited_secs)} · #${w.pos} in its client's queue`
     + (w.backends.length > 1 ? `\ncan run on ${w.backends.map(i => label.get(i)).join(', ')}` : ''))}"></span>`).join('')}` : '';
   const waitNote = ws => ws.length ? ` · <span class="st-warn">${ws.length} waiting</span>` : '';
@@ -437,7 +442,7 @@ function renderCapacity(st, ov) {
       <div class="cap-note">${waitNote(shared).replace(' · ', '')}</div></div>` : '';
   const legend = [...S.colorOf.keys()].map(id => `<span>${swatch(id)}${esc(id)}</span>`).join('')
     + '<span><i class="sw cother"></i>other</span><span><i class="sw free"></i>free</span>'
-    + '<span><i class="sw queued"></i>waiting</span><span><i class="sw loading"></i>loading a model</span>';
+    + '<span><i class="sw q cother"></i>waiting</span><span><i class="sw loading"></i>loading a model</span>';
   setHTML($('#ov-capacity'), ov.backends.length
     ? `<div class="caps">${rows}${sharedRow}</div><div class="legend">${legend}</div>`
     : '<div class="empty">No backends configured</div>');
