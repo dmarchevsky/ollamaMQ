@@ -496,7 +496,7 @@ It covers everything the TUI does:
 The **Overview** page shows:
 - a one-line health summary
 - tiles with sparklines: slots in use, waiting requests, throughput and error rate, output tok/s, time to first token, generation speed
-- a **Capacity** board with one square per backend slot, coloured by the client using it
+- a **Capacity** board with one square per backend slot, coloured by the client using it; waiting requests join their row as dim dashed squares in the waiting client's colour
 - an **Activity** chart of running and waiting requests, with errors and timeouts marked
 - **Requests now**: every running and waiting request in one table
 - **Backends** and **Clients** tables with requests, errors, first-token p50/p95, generation and prefill speed, and token totals

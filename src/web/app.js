@@ -306,8 +306,9 @@ function fmtTok(n) {
 
 /**
  * Colour every client with running or queued requests, 8 hues; past 8 the
- * palette cycles. A client keeps its colour while it stays active, so the
- * board does not repaint when the order shifts.
+ * palette cycles. Only active clients get a colour, so the legend lists
+ * exactly the clients with squares. A client keeps its colour while it stays
+ * active, so the board does not repaint when the order shifts.
  */
 const N_COLORS = 8;
 function assignColors(ids) {
@@ -357,7 +358,7 @@ function renderOverview(st) {
   const ov = S.overview;
   setHTML($('#ov-logs'), logTable(S.logs.slice(0, OVERVIEW_LOGS), false));
   if (!ov) return;
-  assignColors(ov.clients.filter(c => c.running || c.queued || c.busy_secs > 0).map(c => c.id));
+  assignColors(ov.clients.filter(c => c.running || c.queued).map(c => c.id));
   const s = ov.status, k = ov.kpis;
 
   // Status line: the one sentence an operator reads first.
@@ -393,9 +394,9 @@ function renderOverview(st) {
 
 /**
  * One row of slot squares per backend; a busy slot wears its client's colour.
- * Waiting requests follow as dim client-coloured squares with a dashed border
- * on the one backend that can serve
- * their model, or on a shared row when several (or none) can.
+ * Waiting requests follow as dim client-coloured squares with a dashed border,
+ * on the one backend that can serve their model, or on a shared row when
+ * several (or none) can.
  */
 function renderCapacity(st, ov) {
   const runsAt = new Map();
