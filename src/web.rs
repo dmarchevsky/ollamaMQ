@@ -1215,9 +1215,14 @@ mod tests {
     use crate::dispatcher::LogEvent;
 
     fn test_state() -> Arc<AppState> {
-        // A temp-dir config path: the password-change test saves appconf.yaml
-        // (and its .bak) there, never into the checkout.
-        let conf = std::env::temp_dir().join(format!("omq-web-conf-{}.yaml", std::process::id()));
+        // A per-test temp-dir config path: the password-change test saves
+        // appconf.yaml (and its .bak) there, never into the checkout. The
+        // random suffix keeps parallel tests from clobbering one another.
+        let conf = std::env::temp_dir().join(format!(
+            "omq-web-conf-{}-{}.yaml",
+            std::process::id(),
+            crate::clients::random_hex(6)
+        ));
         Arc::new(AppState::new(
             vec![("http://127.0.0.1:9".to_string(), None)],
             5,
@@ -1662,7 +1667,9 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let view: serde_json::Value = res.json().await.unwrap();
         let timeout = view["fields"].as_array().unwrap().iter().find(|f| f["key"] == "timeout").unwrap().clone();
-        assert_eq!((timeout["value"].clone(), timeout["source"].clone()), (json!(42), json!("ui")));
+        // The UI persists into appconf.yaml (single-store design), so the
+        // changed value reports its source as "file".
+        assert_eq!((timeout["value"].clone(), timeout["source"].clone()), (json!(42), json!("file")));
         assert_eq!(state.timeout.load(Ordering::Relaxed), 42);
         assert!(state.model_aliases.lock_or_recover().contains_key("short"));
 
