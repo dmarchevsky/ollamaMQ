@@ -1,9 +1,11 @@
 //! `/ui/api/settings`: view and change the configuration from the web UI.
 //!
-//! Changes are saved in the settings overlay (`settings.json`) and applied
-//! at once where the proxy allows it; see [`crate::settings`].
+//! Changes are saved straight into `appconf.yaml` (the previous version is
+//! kept as `appconf.yaml.bak`; saving rewrites the file, comments and all)
+//! and applied at once where the proxy allows it; see [`crate::settings`].
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::{Json, extract::State, http::StatusCode};
@@ -11,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::{ApiError, ApiResult};
-use crate::config::{Backend, Settings, UiOverlay};
+use crate::config::{AppConfig, Backend, Settings};
+use crate::config_store;
 use crate::dispatcher::AppState;
 use crate::lock::LockExt;
 use crate::metrics::backend_label;
@@ -37,15 +40,15 @@ pub struct SettingsView {
 struct FieldView {
     key: &'static str,
     value: Value,
-    /// `default`, `file` (appconf.yaml), `ui`, `cli` or `env`.
+    /// `default`, `file` (appconf.yaml), `cli` or `env`.
     source: &'static str,
     /// The flag or variable that pins it; the UI cannot change it then.
     locked_by: Option<String>,
     /// Applies without a restart.
     live: bool,
-    /// What it falls back to when the UI value is reset.
+    /// What it falls back to when the value is removed from the file.
     fallback: Value,
-    /// Where that fallback comes from: `file` or `default`.
+    /// Where that fallback comes from: `default` (or the pinning `cli`/`env`).
     fallback_source: &'static str,
 }
 
@@ -76,9 +79,7 @@ fn mask(key: &str, v: Value) -> Value {
 pub fn view(state: &AppState) -> SettingsView {
     let layers = state.config.lock_or_recover();
     let full = defaults().overlay(&layers.effective());
-    let below_ui = defaults()
-        .overlay(&layers.file.settings)
-        .overlay(&layers.pinned);
+    let below_file = defaults().overlay(&layers.pinned);
     let make = |key: &'static str, live: bool| {
         let (source, locked_by) = layers.source(key);
         FieldView {
@@ -87,12 +88,8 @@ pub fn view(state: &AppState) -> SettingsView {
             source,
             locked_by,
             live,
-            fallback: mask(key, field(&below_ui, key).unwrap_or_default()),
-            fallback_source: if field(&layers.file.settings, key).is_some_and(|v| !v.is_null()) {
-                "file"
-            } else {
-                "default"
-            },
+            fallback: mask(key, field(&below_file, key).unwrap_or_default()),
+            fallback_source: "default",
         }
     };
     let fields = EDITABLE.iter().map(|(k, live)| make(k, *live)).collect();
@@ -108,7 +105,7 @@ pub fn view(state: &AppState) -> SettingsView {
         })
         .collect();
     let restart_pending = layers.restart_pending();
-    let can_undo = layers.store.can_undo();
+    let can_undo = config_store::can_undo(Path::new(&state.model_config_path));
     let list = layers.backend_list();
     let backends_locked = layers
         .backends_from_cli
@@ -172,25 +169,20 @@ fn bad(msg: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, msg)
 }
 
-/// Validate and save a new overlay, then apply it. The caller passes the
-/// overlay to save; nothing changes when it is rejected.
-fn commit(state: &Arc<AppState>, next: UiOverlay) -> Result<(), ApiError> {
+fn save_error(e: String) -> ApiError {
+    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e)
+}
+
+/// Validate and save a new `appconf.yaml`, then apply it. Nothing changes
+/// when it is rejected.
+fn commit(state: &Arc<AppState>, next: AppConfig) -> Result<(), ApiError> {
+    next.settings.validate().map_err(bad)?;
+    crate::config::validate_backends(&next.backends).map_err(bad)?;
     let (eff, list, fixed) = {
         let mut layers = state.config.lock_or_recover();
-        let eff = layers
-            .file
-            .settings
-            .overlay(&next.settings)
-            .overlay(&layers.pinned);
-        eff.validate().map_err(bad)?;
-        if let Some(b) = &next.backends {
-            crate::config::validate_backends(b).map_err(bad)?;
-        }
-        layers
-            .store
-            .save(next)
-            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        (eff, layers.backend_list(), layers.backends_from_cli)
+        config_store::save(Path::new(&state.model_config_path), &next).map_err(save_error)?;
+        layers.file = next;
+        (layers.effective(), layers.backend_list(), layers.backends_from_cli)
     };
     settings::apply(state, &eff);
     if !fixed {
@@ -201,8 +193,8 @@ fn commit(state: &Arc<AppState>, next: UiOverlay) -> Result<(), ApiError> {
 
 #[derive(Deserialize)]
 pub struct SettingsPatch {
-    /// Setting name -> new value; `null` drops the UI's value, so the one
-    /// from appconf.yaml (or the default) applies again.
+    /// Setting name -> new value; `null` removes it from `appconf.yaml`, so
+    /// the built-in default (or the CLI/env pin) applies again.
     set: Map<String, Value>,
 }
 
@@ -210,8 +202,8 @@ pub async fn put_settings(
     State(state): State<Arc<AppState>>,
     Json(patch): Json<SettingsPatch>,
 ) -> ApiResult<SettingsView> {
-    let mut next = state.config.lock_or_recover().store.overlay().clone();
-    let mut ui = match serde_json::to_value(&next.settings) {
+    let mut cfg = state.config.lock_or_recover().file.clone();
+    let mut settings = match serde_json::to_value(&cfg.settings) {
         Ok(Value::Object(m)) => m,
         _ => Map::new(),
     };
@@ -229,25 +221,27 @@ pub async fn put_settings(
             }
             match value {
                 Value::Null => {
-                    ui.remove(&key);
+                    settings.remove(&key);
                 }
                 Value::String(s) if SECRET.contains(&key.as_str()) && s == MASK => {}
                 v => {
-                    ui.insert(key, v);
+                    settings.insert(key, v);
                 }
             }
         }
     }
-    next.settings =
-        serde_json::from_value::<Settings>(Value::Object(ui)).map_err(|e| bad(e.to_string()))?;
-    commit(&state, next)?;
+    cfg.settings = serde_json::from_value::<Settings>(Value::Object(settings))
+        .map_err(|e| bad(e.to_string()))?;
+    commit(&state, cfg)?;
     Ok(Json(view(&state)))
 }
 
 pub async fn undo(State(state): State<Arc<AppState>>) -> ApiResult<SettingsView> {
     let (eff, list, fixed) = {
         let mut layers = state.config.lock_or_recover();
-        layers.store.undo().map_err(bad)?;
+        let current = layers.file.clone();
+        layers.file = config_store::undo(Path::new(&state.model_config_path), &current)
+            .map_err(bad)?;
         (
             layers.effective(),
             layers.backend_list(),
@@ -261,8 +255,9 @@ pub async fn undo(State(state): State<Arc<AppState>>) -> ApiResult<SettingsView>
     Ok(Json(view(&state)))
 }
 
-/// The backend list as the UI edits it: the UI's copy, or the file's to start.
-fn editable_backends(state: &AppState) -> Result<(UiOverlay, Vec<Backend>), ApiError> {
+/// The backend list as the UI edits it: the file's (or the fallback it will
+/// be saved from).
+fn editable_backends(state: &AppState) -> Result<(AppConfig, Vec<Backend>), ApiError> {
     let layers = state.config.lock_or_recover();
     if let Some(by) = layers.backends_from_cli.then_some("--backend-urls") {
         return Err(ApiError::new(
@@ -270,7 +265,7 @@ fn editable_backends(state: &AppState) -> Result<(UiOverlay, Vec<Backend>), ApiE
             format!("the backends are set by {by}, which wins over the web UI"),
         ));
     }
-    Ok((layers.store.overlay().clone(), layers.backend_list()))
+    Ok((layers.file.clone(), layers.backend_list()))
 }
 
 #[derive(Deserialize)]
@@ -292,7 +287,7 @@ pub async fn add_backend(
     State(state): State<Arc<AppState>>,
     Json(input): Json<BackendInput>,
 ) -> ApiResult<SettingsView> {
-    let (mut next, mut list) = editable_backends(&state)?;
+    let (mut cfg, mut list) = editable_backends(&state)?;
     let url = normalize_url(&input.url);
     if list.iter().any(|b| normalize_url(&b.url) == url) {
         return Err(bad(format!("{url} is already a backend")));
@@ -304,8 +299,8 @@ pub async fn add_backend(
         token: clean(input.token),
         kind: clean(input.kind),
     });
-    next.backends = Some(list);
-    commit(&state, next)?;
+    cfg.backends = list;
+    commit(&state, cfg)?;
     Ok(Json(view(&state)))
 }
 
@@ -337,7 +332,7 @@ pub async fn update_backend(
     State(state): State<Arc<AppState>>,
     Json(u): Json<BackendUpdate>,
 ) -> ApiResult<SettingsView> {
-    let (mut next, mut list) = editable_backends(&state)?;
+    let (mut cfg, mut list) = editable_backends(&state)?;
     let url = normalize_url(&u.url);
     let b = list
         .iter_mut()
@@ -355,8 +350,8 @@ pub async fn update_backend(
     if let Some(v) = u.disabled {
         b.disabled = v;
     }
-    next.backends = Some(list);
-    commit(&state, next)?;
+    cfg.backends = list;
+    commit(&state, cfg)?;
     Ok(Json(view(&state)))
 }
 
@@ -371,7 +366,7 @@ pub async fn remove_backend(
     State(state): State<Arc<AppState>>,
     Json(r): Json<BackendRef>,
 ) -> ApiResult<SettingsView> {
-    let (mut next, mut list) = editable_backends(&state)?;
+    let (mut cfg, mut list) = editable_backends(&state)?;
     let url = normalize_url(&r.url);
     let before = list.len();
     list.retain(|b| normalize_url(&b.url) != url);
@@ -381,8 +376,8 @@ pub async fn remove_backend(
             format!("no backend {url}"),
         ));
     }
-    next.backends = Some(list);
-    commit(&state, next)?;
+    cfg.backends = list;
+    commit(&state, cfg)?;
     Ok(Json(view(&state)))
 }
 

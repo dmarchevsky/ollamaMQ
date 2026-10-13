@@ -327,12 +327,14 @@ settings:
   request_log_max_bytes: 10485760             # rotate when the file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
   log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
-  clients_file: clients.json   # clients and their API keys, managed from the web UI (default shown)
-  models_file: models.json     # model filter rules, managed from the web UI (default shown)
+  clients_file: clients.yaml   # clients and their API keys, managed from the web UI (default shown)
+  models_file: models.yaml     # model filter rules, managed from the web UI (default shown)
   metrics_token: ""            # bearer token for GET /metrics; empty = open (default)
-  web_ui:                      # web UI at /ui; off unless a password is set (here or in OLLAMA_MQ_UI_PASSWORD)
+  web_ui:                      # web UI at /ui; off unless a password or hash is set (here or in OLLAMA_MQ_UI_PASSWORD)
     username: admin            # sign-in user (default admin)
-    password: change-me        # sign-in password
+    password: change-me        # first-run sign-in password
+    # password_hash: ""        # argon2id hash; the UI's "Change password" writes it here and it
+                               # wins over any plaintext password (delete it to fall back)
 
 # --- Models to load on startup / reload, via the model-control logic
 models:
@@ -394,7 +396,7 @@ The included [`docker-compose.yml`](docker-compose.yml) keeps everything in one 
 ```
 ollamamq/
 ├── docker-compose.yml
-├── config/   → /config   appconf.yaml, .env, clients.json, models.json, settings.json, admin.json
+├── config/   → /config   appconf.yaml, .env, clients.yaml, models.yaml
 └── logs/     → /data     ollamamq-requests.jsonl* (the service log: docker logs ollamamq)
 ```
 
@@ -411,7 +413,9 @@ Set `build.context` to where the source is:
 
 **Moving to another server:** stop the service and copy the folder. The files in `config/` are written by the container as root with mode 600, so copy them with `sudo` (or `docker run --rm -v "$PWD":/s alpine tar …`).
 
-**Where store files go:** relative paths for `clients_file`, `models_file`, `settings_file` and `admin_file` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. Logs (`request_log_path`, and `ollamamq.log` when the TUI runs) stay relative to the working directory.
+**Where store files go:** relative paths for `clients_file` and `models_file` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. Logs (`request_log_path`, and `ollamamq.log` when the TUI runs) stay relative to the working directory.
+
+Older setups also had a `settings.json` (the web UI's overlay) and an `admin.json` (the password changed in the UI). At startup their values are merged into `appconf.yaml` once and both files retire to `.bak`.
 
 Earlier versions kept the store files in the working directory. If such a file exists there and not next to `appconf.yaml`, it keeps being used, and the startup log says so. To switch, move it next to `appconf.yaml`.
 
@@ -434,7 +438,7 @@ The Dockerfile uses a multi-stage build:
 | `OLLAMA_MQ_API_KEY` | Optional API key; enables auth when set | *(unset — auth disabled)* |
 | `OLLAMA_MQ_UI_USER` | Web UI sign-in user (overrides `settings.web_ui.username`) | `admin` |
 | `OLLAMA_MQ_METRICS_TOKEN` | Bearer token required by `GET /metrics` (overrides `settings.metrics_token`) | *(unset — open)* |
-| `OLLAMA_MQ_UI_PASSWORD` | Web UI sign-in password (overrides `settings.web_ui.password`); enables the web UI. A password changed in the UI (`admin.json`) wins over it | *(unset — web UI off)* |
+| `OLLAMA_MQ_UI_PASSWORD` | Web UI sign-in password (overrides `settings.web_ui.password`); enables the web UI. A `settings.web_ui.password_hash` wins over it | *(unset — web UI off)* |
 
 ### 🔒 Security (Optional API-Key Auth)
 
@@ -508,7 +512,7 @@ Numbers cover the chosen window and come from an in-memory history of the last h
 
 #### Backends
 
-The **Backends** page lists the configured backends and edits the backend list while the proxy runs (saved in `settings.json`, same rules as Settings):
+The **Backends** page lists the configured backends and edits the backend list while the proxy runs (saved into `appconf.yaml`, same rules as Settings):
 - **Adding** a backend probes it within 10 s. **Test connection** shows its type, slots and models before you add it.
 - **Disabling** one stops new requests at once; running ones finish.
 - **Removing** one disables it now and drops it from the list at the next restart.
@@ -517,11 +521,11 @@ The **Backends** page lists the configured backends and edits the backend list w
 
 #### Settings
 
-The **Settings** page edits the configuration while the proxy runs. Changes are saved in `settings.json`, next to `appconf.yaml` (path: `settings.settings_file`).
-- **Never rewritten:** `appconf.yaml`. Its comments survive.
-- **Precedence:** command-line flags and environment variables > `settings.json` > `appconf.yaml` > built-in defaults. A value set on the command line or in the environment shows as locked.
-- **Source:** each setting shows where its value comes from, and **Use the appconf.yaml value** drops the UI's value.
-- **Undo last save** restores the previous `settings.json`, kept as `settings.json.bak`.
+The **Settings** page edits `appconf.yaml` itself while the proxy runs.
+- **The file is rewritten on save** — comments and custom formatting do not survive it; the previous version is kept as `appconf.yaml.bak`. The process must be able to write `appconf.yaml`.
+- **Precedence:** command-line flags and environment variables > `appconf.yaml` > built-in defaults. A value set on the command line or in the environment shows as locked.
+- **Source:** each setting shows where its value comes from, and **Use the default value** removes it from the file.
+- **Undo last save** restores the previous `appconf.yaml`, kept as `appconf.yaml.bak` (undo again redoes).
 
 **What applies at once:**
 - **Live:** timeouts, slots and queue limits, model aliases, keyless IP identity, unknown-route proxying, and the metrics token.
@@ -529,14 +533,14 @@ The **Settings** page edits the configuration while the proxy runs. Changes are 
 - **Read-only:** listen address, log files and store paths. Set these in `appconf.yaml`.
 
 **Admin password:**
-- **Change password** stores an argon2id hash in `admin.json` (mode 600, next to `appconf.yaml`; path: `settings.admin_file`).
-- **Precedence:** it wins over `OLLAMA_MQ_UI_PASSWORD` and `settings.web_ui.password`. Those become the first-run password.
+- **Change password** stores an argon2id hash as `settings.web_ui.password_hash` in `appconf.yaml`.
+- **Precedence:** the hash wins over `OLLAMA_MQ_UI_PASSWORD` and `settings.web_ui.password`. Those become the first-run password.
 - **Sessions:** other sessions are signed out.
-- **Forgot it?** Delete `admin.json` and restart; the configured password works again.
+- **Forgot it?** Delete `password_hash` from `appconf.yaml` and restart; the configured password works again.
 
 It also manages **clients and their API keys**. The Clients page lists two kinds of client together (filter with *All / Registered / Unregistered*):
 
-- **Registered clients** are created in the UI and saved in `clients.json`. They authenticate with their API keys and are listed even when idle.
+- **Registered clients** are created in the UI and saved in `clients.yaml`. They authenticate with their API keys and are listed even when idle.
 - **Unregistered ids** are what requests without a key are queued under: their `X-User-ID`, or the IP a front proxy fills in, else `anonymous`. They live in memory and drop off the list after an hour idle. **Register** turns one into a client of the same name and opens the add-key dialog.
 
 - Create a client (its name becomes its queue id), then add keys — **generated** (`omq-…`) or **any string you choose** (8–256 printable characters, unique across clients). A key can be relabelled, moved to another client, or revoked; a client can be renamed, disabled (its keys get `403`) or deleted.
@@ -545,7 +549,7 @@ It also manages **clients and their API keys**. The Clients page lists two kinds
 - **Blocking a registered client disables it** (TUI `x`, web *Block* / *Disable*): its keys get `403` and its queued requests are dropped. That is the client's one block switch, saved with it; a user block on a client name from before this rule is converted to *disabled* at startup. Unregistered ids and IPs are blocked as before (`blocked_items.json`).
 - **VIP and boost on a registered client are saved** with it and restored at startup; on an unregistered id they last until restart.
 - **Renaming a client moves its live state** — queued requests, counters, last IP, fair-share position, VIP/boost — to the new name. Requests already being served finish under the old name. Deleting a client turns its name back into an ordinary id and clears its VIP/boost.
-- Keys are stored in plaintext in `settings.clients_file` (default `clients.json` next to `appconf.yaml`) so they can be looked up again; the file is written owner-only (`0600`). Changes are saved immediately (atomic replace). A clients file that exists but cannot be parsed stops the proxy at startup rather than being overwritten.
+- Keys are stored in plaintext in `settings.clients_file` (default `clients.yaml` next to `appconf.yaml`) so they can be looked up again; the file is written owner-only (`0600`). Changes are saved immediately (atomic replace). A clients file that exists but cannot be parsed stops the proxy at startup rather than being overwritten. The file is hand-editable YAML — a key may be written as just its string (`- omq-…`); ids and timestamps are filled in when the proxy saves it.
 
 #### Model filtering
 
@@ -556,7 +560,7 @@ The **Models** page decides which models the proxy serves. Rules are case-insens
 - Hidden models are left out of the merged `/v1/models` and `/api/tags`, and a request naming one (in the body, or the path of `/v1/models/{id}`) gets **`404 model not found`** at once, in OpenAI or Ollama error shape. Matching follows routing, so `llama3` cannot reach a hidden `llama3:latest`.
 - A rule limited to some backends hides the model there only; requests route to the backends that still serve it.
 - Model load/unload from the TUI or web UI still works on hidden models (to warm one before serving it). `/api/ps` is not filtered.
-- Rules are stored in `settings.models_file` (default `models.json`), written atomically. A file that exists but cannot be parsed stops the proxy at startup rather than serving everything.
+- Rules are stored in `settings.models_file` (default `models.yaml`), written atomically. A file that exists but cannot be parsed stops the proxy at startup rather than serving everything. It is hand-editable YAML — a plain hide rule may be written as just its pattern (`- unsloth/Qwen3.8-27B-GGUF:*`).
 
 ### 📈 Prometheus Metrics
 

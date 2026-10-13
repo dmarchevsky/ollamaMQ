@@ -1,5 +1,5 @@
 //! Clients and their API keys (`settings.clients_file`, default
-//! `clients.json`), managed from the web UI.
+//! `clients.yaml`), managed from the web UI.
 //!
 //! A request carrying a client's key (`Authorization: Bearer <key>` or
 //! `X-Api-Key: <key>`) queues under the client's name, whatever `X-User-ID`
@@ -11,6 +11,7 @@
 //! to a temporary file and renamed over the old one, and the in-memory state
 //! only changes once that write succeeded.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -20,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::constant_time_eq;
 
-pub const DEFAULT_CLIENTS_FILE: &str = "clients.json";
+pub const DEFAULT_CLIENTS_FILE: &str = "clients.yaml";
 
 const MIN_KEY_LEN: usize = 8;
 const MAX_KEY_LEN: usize = 256;
@@ -29,19 +30,53 @@ const MAX_TEXT_LEN: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKey {
+    /// Generated at load when a hand-written file leaves it out.
+    #[serde(default)]
     pub id: String,
     pub key: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
     pub created_at_ms: u64,
+}
+
+/// A key in a hand-written file: the bare key string, or the full form.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeySpec {
+    Bare(String),
+    Full(ApiKey),
+}
+
+fn de_keys<'de, D>(d: D) -> Result<Vec<ApiKey>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let specs = Vec::<KeySpec>::deserialize(d)?;
+    Ok(specs
+        .into_iter()
+        .map(|spec| match spec {
+            KeySpec::Bare(key) => ApiKey {
+                id: String::new(),
+                key,
+                label: String::new(),
+                created_at_ms: 0,
+            },
+            KeySpec::Full(k) => k,
+        })
+        .collect())
+}
+
+pub(crate) fn is_zero_ms(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Client {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
     /// Scheduling priority that survives restarts: at most one client is
     /// VIP and at most one is boosted (mirrors `AppState::vip_user` /
@@ -50,8 +85,9 @@ pub struct Client {
     pub vip: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub boost: bool,
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
     pub created_at_ms: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_keys", skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<ApiKey>,
 }
 
@@ -192,15 +228,17 @@ impl ClientStore {
     /// store would overwrite every key on the first change.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
-        let clients = match fs::read_to_string(&path) {
-            Ok(text) => {
-                serde_json::from_str::<ClientsFile>(&text)
-                    .map_err(|e| format!("cannot parse {}: {e}", path.display()))?
-                    .clients
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        let mut clients = match read_store_or_migrate::<ClientsFile>(&path)? {
+            Some(f) => f.clients,
+            None => Vec::new(),
         };
+        for c in &mut clients {
+            for k in &mut c.keys {
+                if k.id.is_empty() {
+                    k.id = format!("k{}", random_hex(6));
+                }
+            }
+        }
         Ok(Self {
             path: Some(path),
             clients,
@@ -448,7 +486,7 @@ impl ClientStore {
 }
 
 fn write_atomic(path: &Path, clients: &[Client]) -> std::io::Result<()> {
-    write_json_atomic(
+    write_store_atomic(
         path,
         &ClientsFile {
             clients: clients.to_vec(),
@@ -456,11 +494,42 @@ fn write_atomic(path: &Path, clients: &[Client]) -> std::io::Result<()> {
     )
 }
 
-/// Write `value` as pretty JSON to `path`: a temporary file, synced, then
-/// renamed over the old one, so a crash never leaves a half-written file.
-/// Owner-only, since these stores hold credentials and policy.
-pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    let body = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
+/// Read a YAML store; `None` when there is no file at all. When the YAML file
+/// is missing but a `.json` sibling exists (stores were JSON before this
+/// format change), the JSON is parsed, written back as YAML, and renamed to
+/// `.json.bak`. Shared with the model-policy store.
+pub(crate) fn read_store_or_migrate<T: DeserializeOwned + Serialize>(
+    path: &Path,
+) -> Result<Option<T>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            return serde_yaml::from_str::<T>(&text)
+                .map(Some)
+                .map_err(|e| format!("cannot parse {}: {e}", path.display()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    }
+    let is_yaml = matches!(path.extension().and_then(|e| e.to_str()), Some("yaml") | Some("yml"));
+    let json = path.with_extension("json");
+    if !is_yaml || !json.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&json).map_err(|e| format!("cannot read {}: {e}", json.display()))?;
+    let value: T =
+        serde_json::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", json.display()))?;
+    write_store_atomic(path, &value).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    let bak = json.with_extension("json.bak");
+    fs::rename(&json, &bak).map_err(|e| format!("cannot rename {}: {e}", json.display()))?;
+    tracing::info!("Migrated {} to {} (old file kept as {})", json.display(), path.display(), bak.display());
+    Ok(Some(value))
+}
+
+/// Write `value` as YAML to `path`: a temporary file, synced, then renamed
+/// over the old one, so a crash never leaves a half-written file. Owner-only,
+/// since these stores hold credentials and policy.
+pub(crate) fn write_store_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let body = serde_yaml::to_string(value).map_err(std::io::Error::other)?;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -632,7 +701,7 @@ mod tests {
     fn persists_round_trip_and_refuses_corrupt_file() {
         let dir = std::env::temp_dir().join(format!("omq-clients-{}", random_hex(6)));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("clients.json");
+        let path = dir.join("clients.yaml");
 
         let mut s = ClientStore::load(&path).unwrap();
         assert_eq!(s.len(), 0);
@@ -642,7 +711,7 @@ mod tests {
         let mut again = ClientStore::load(&path).unwrap();
         assert_eq!(again.resolve("persisted-key").unwrap().client, "alice");
         assert_eq!(again.list()[0].keys[0].key.label, "laptop");
-        assert!(!dir.join("clients.json.tmp").exists());
+        assert!(!dir.join("clients.yaml.tmp").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -650,8 +719,47 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
 
-        fs::write(&path, "{ not json").unwrap();
+        fs::write(&path, "{ not yaml").unwrap();
         assert!(ClientStore::load(&path).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A hand-written file: bare key strings, no ids or timestamps.
+    #[test]
+    fn hand_written_yaml_gets_usable_ids() {
+        let dir = std::env::temp_dir().join(format!("omq-clients-hw-{}", random_hex(6)));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clients.yaml");
+        fs::write(
+            &path,
+            "clients:\n  - name: dm\n    keys:\n      - omq-handwritten-key\n      - { key: omq-labeled-key, label: laptop }\n  - name: idle\n",
+        )
+        .unwrap();
+        let mut s = ClientStore::load(&path).unwrap();
+        assert_eq!(s.resolve("omq-handwritten-key").unwrap().client, "dm");
+        assert_eq!(s.resolve("omq-labeled-key").unwrap().client, "dm");
+        assert!(s.list()[0].keys.iter().all(|k| !k.key.id.is_empty()));
+        // A change persists the store with full detail; the file still loads.
+        s.add_key("idle", Some("idle-key-1234"), "").unwrap();
+        assert!(ClientStore::load(&path).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An old `clients.json` is converted on first load and kept as `.bak`.
+    #[test]
+    fn legacy_json_migrates_to_yaml() {
+        let dir = std::env::temp_dir().join(format!("omq-clients-mig-{}", random_hex(6)));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("clients.json"),
+            r#"{"clients":[{"name":"old","note":"","disabled":false,"created_at_ms":1,"keys":[{"id":"k1","key":"legacy-key-1","label":"","created_at_ms":1}]}]}"#,
+        )
+        .unwrap();
+        let mut s = ClientStore::load(dir.join("clients.yaml")).unwrap();
+        assert_eq!(s.resolve("legacy-key-1").unwrap().client, "old");
+        assert!(dir.join("clients.yaml").exists());
+        assert!(dir.join("clients.json.bak").exists());
+        assert!(!dir.join("clients.json").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

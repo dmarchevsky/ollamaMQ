@@ -1032,10 +1032,9 @@ const SET_GROUPS = [
 ];
 const STARTUP_LABEL = {
   host: 'Listen address', port: 'Port', request_log_path: 'Request log file', request_log_max_bytes: 'Log file size',
-  request_log_max_files: 'Log files kept', clients_file: 'Clients file', models_file: 'Model rules file', settings_file: 'Settings file',
-  admin_file: 'Admin password file',
+  request_log_max_files: 'Log files kept', clients_file: 'Clients file', models_file: 'Model rules file',
 };
-const SOURCE_LABEL = { default: 'default', file: 'appconf.yaml', ui: 'set here', cli: 'command line', env: 'environment' };
+const SOURCE_LABEL = { default: 'default', file: 'appconf.yaml', cli: 'command line', env: 'environment' };
 
 const setField = key => S.settings?.fields.find(f => f.key === key);
 const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -1094,8 +1093,8 @@ function setControl(f) {
 
 function setRow(f) {
   const m = FIELD_META[f.key];
-  const resettable = !f.locked_by && (f.source === 'ui' || S.draft.has(f.key));
-  const back = f.source === 'ui' && !S.draft.has(f.key) ? `Use the ${SOURCE_LABEL[f.fallback_source]} value` : 'Undo change';
+  const resettable = !f.locked_by && (f.source === 'file' || S.draft.has(f.key));
+  const back = f.source === 'file' && !S.draft.has(f.key) ? 'Use the default value' : 'Undo change';
   return `<div class="set-row ${S.draft.has(f.key) ? 'dirty' : ''}" data-row="${f.key}">
     <div class="set-l"><label for="set-${f.key}">${m.label}</label><div class="set-help">${m.help}</div></div>
     <div class="set-c">${setControl(f)}</div>
@@ -1113,7 +1112,7 @@ function fmtStartup(key, v) {
 function passwordRow() {
   const me = S.me || {};
   const src = me.password_source || '';
-  const from = src.endsWith('.json')
+  const from = me.password_changed_at_ms
     ? `changed here${me.password_changed_at_ms ? ` on ${fmtDate(me.password_changed_at_ms)}` : ''}`
     : `from ${src === 'appconf.yaml' ? 'appconf.yaml' : `the environment (${esc(src)})`}`;
   return `<div class="set-row" data-row="password">
@@ -1160,7 +1159,6 @@ function renderSettings() {
   const names = Object.fromEntries([...set.fields, ...set.startup].map(f => [f.key, FIELD_META[f.key]?.label ?? STARTUP_LABEL[f.key] ?? f.key]));
   setHTML($('#set-banner'), set.restart_pending.length
     ? `<div class="note warn-note"><b>Restart needed.</b> ${set.restart_pending.map(k => esc(names[k])).join(', ')} take${set.restart_pending.length === 1 ? 's' : ''} effect after ollamaMQ restarts.</div>` : '');
-  $('#set-file').textContent = set.startup.find(f => f.key === 'settings_file')?.value ?? 'settings.json';
 }
 
 /** Apply a settings response and redraw the form from it. */

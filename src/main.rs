@@ -17,6 +17,7 @@ mod admin;
 mod auth;
 mod clients;
 mod config;
+mod config_store;
 mod control;
 mod dispatcher;
 mod lock;
@@ -25,7 +26,6 @@ mod model_policy;
 mod reqlog;
 mod session;
 mod settings;
-mod settings_store;
 mod snapshot;
 mod stats;
 mod tui;
@@ -187,6 +187,16 @@ async fn main() {
             config::AppConfig::default()
         }
     };
+    // Old side stores (`settings.json` overlay, `admin.json`) merge into
+    // appconf.yaml once, then retire to `.bak`. Failing loudly beats running
+    // with an overlay or a password silently ignored.
+    let file_cfg = match settings::merge_legacy_stores(&args.model_config, file_cfg) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Values given on the command line or in the environment win over both
     // files; the web UI shows them as locked.
@@ -218,9 +228,9 @@ async fn main() {
         pinned_by.insert("metrics_token", "OLLAMA_MQ_METRICS_TOKEN".to_string());
     }
 
-    // Store files (clients, model rules, UI settings, admin password) live
-    // next to appconf.yaml unless a path says otherwise; logs go to the
-    // working directory. See `settings::store_path`.
+    // Store files (clients, model rules) live next to appconf.yaml unless a
+    // path says otherwise; logs go to the working directory. See
+    // `settings::store_path`.
     let config_dir = settings::config_dir(&args.model_config);
     let mut resolved = std::collections::BTreeMap::new();
     let mut legacy_notes = Vec::new();
@@ -238,20 +248,6 @@ async fn main() {
         path
     };
 
-    // Settings changed in the web UI. Unreadable = fatal, like the client
-    // store: starting without them would quietly undo the operator's changes.
-    let settings_file = store_file(
-        "settings_file",
-        file_cfg.settings.settings_file.clone(),
-        settings_store::DEFAULT_SETTINGS_FILE,
-    );
-    let store = match settings_store::SettingsStore::load(&settings_file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
     let mut layers = settings::Layers {
         file: file_cfg.clone(),
         pinned,
@@ -259,7 +255,6 @@ async fn main() {
         backends_from_cli: args.backend_urls.is_some(),
         fallback_backends: Vec::new(),
         startup: config::Settings::default(),
-        store,
         resolved: Default::default(),
     };
     let eff = layers.effective();
@@ -295,14 +290,17 @@ async fn main() {
     let max_queued_bytes = eff.max_queued_bytes.unwrap_or(512 * 1024 * 1024);
     let clients_file = store_file("clients_file", eff.clients_file.clone(), clients::DEFAULT_CLIENTS_FILE);
     let models_file = store_file("models_file", eff.models_file.clone(), model_policy::DEFAULT_MODELS_FILE);
-    let admin_file = store_file("admin_file", eff.admin_file.clone(), admin::DEFAULT_ADMIN_FILE);
     layers.resolved = resolved;
-    // Web UI credentials: a password changed in the UI (admin.json) wins;
-    // otherwise env vars, then appconf.yaml. No password at all = UI off.
+    // Web UI credentials: a hash in appconf.yaml (`password_hash`, written by
+    // the UI's "Change password") wins; otherwise the env password, then the
+    // plaintext one. Nothing set at all = UI off.
     let web_cfg = file_cfg.settings.web_ui.clone().unwrap_or_default();
     let web_auth = web::WebAuth::resolve(
-        &admin_file,
         env_nonempty("OLLAMA_MQ_UI_USER").or(web_cfg.username.filter(|u| !u.is_empty())),
+        web_cfg
+            .password_hash
+            .filter(|h| !h.is_empty())
+            .map(|h| (h, "appconf.yaml")),
         env_nonempty("OLLAMA_MQ_UI_PASSWORD")
             .map(|p| (p, "OLLAMA_MQ_UI_PASSWORD"))
             .or(web_cfg.password.filter(|p| !p.is_empty()).map(|p| (p, "appconf.yaml"))),
@@ -444,9 +442,6 @@ async fn main() {
     // layer so the web UI can show and change them.
     settings::apply(&state, &eff);
     settings::apply_backends(&state, &backend_list);
-    if *layers.store.overlay() != config::UiOverlay::default() {
-        info!("Settings changed in the web UI loaded from {}", settings_file);
-    }
     if !state.model_aliases.lock_or_recover().is_empty() {
         info!("{} model alias(es) loaded", state.model_aliases.lock_or_recover().len());
     }
