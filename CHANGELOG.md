@@ -3,6 +3,20 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.7.0 — 2026-10-13
+
+### Added
+
+- **Sticky routing (session affinity)**: a conversation is remembered by the backend that
+  served its previous turn and prefers to go back there, so a long multi-turn prompt is not
+  re-prefilled on a backend that has no KV cache for it. `settings.sticky_routing` picks the
+  key — an explicit `X-Session-Id` / `prompt_cache_key`, a fingerprint of the conversation's first turn
+  (default), or the client id; `sticky_ttl`, `sticky_lag` and `sticky_max_entries` bound the
+  memory. It is a preference, not a pin: a busy, offline or no-longer-serving backend loses
+  the conversation and the mapping follows the move. New counter
+  `ollamamq_affinity_decisions_total{result}`; the payoff shows up as lower
+  `ollamamq_prompt_eval_tokens_total` per client.
+
 ## v0.6.0 — 2026-10-12
 
 First tagged release of the fork. Everything below is on top of upstream `v0.5.0`.

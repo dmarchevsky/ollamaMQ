@@ -33,6 +33,38 @@ use std::fs;
 
 pub const DEFAULT_CONFIG_FILE: &str = "appconf.yaml";
 
+/// What identifies a conversation for sticky routing (see
+/// [`Settings::sticky_routing`]). Stored as a small integer on `AppState` so
+/// the scheduler can read it without a lock, like the other live settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StickyMode {
+    /// Today's behavior: every request picks the least-loaded backend.
+    Off,
+    /// Only an explicit session id (`X-Session-Id` header or a body
+    /// `prompt_cache_key`) makes a conversation.
+    Header,
+    /// Plus a fingerprint of the prompt, so chat clients that resend their
+    /// whole history get affinity without sending anything (default).
+    #[default]
+    Prompt,
+    /// Plus the client identity itself: each user gets one home backend. Right
+    /// for one-session-per-user setups, wrong for a client running several
+    /// conversations at once.
+    Identity,
+}
+
+impl StickyMode {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => StickyMode::Off,
+            1 => StickyMode::Header,
+            3 => StickyMode::Identity,
+            _ => StickyMode::Prompt,
+        }
+    }
+}
+
 /// Runtime settings (all optional; CLI flags take precedence).
 ///
 /// The web UI edits these in place: a save rewrites `appconf.yaml` itself
@@ -80,6 +112,27 @@ pub struct Settings {
     /// share the `anonymous` queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip_identity: Option<bool>,
+    /// Keep a conversation on the backend that served its previous turn, so a
+    /// multi-turn prompt is not re-prefilled elsewhere (default `prompt`).
+    /// `off` disables it, `header` honors only an explicit session id, `prompt`
+    /// also fingerprints the conversation's first turn, `identity` pins a whole
+    /// client id to one backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky_routing: Option<StickyMode>,
+    /// How long a conversation may be idle and still keep its backend, in
+    /// seconds (default 1800). Raise it towards `load_keep_alive` when contexts
+    /// are meant to stay resident for hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky_ttl: Option<u64>,
+    /// How many more requests a sticky backend may be running than the
+    /// least-loaded eligible one before the conversation moves anyway
+    /// (default 0: only a backend with free capacity keeps its session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky_lag: Option<u64>,
+    /// Conversations remembered at once; the idlest are dropped past it
+    /// (default 10000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky_max_entries: Option<usize>,
     /// Path of the size-rotated request log file (default
     /// "ollamamq-requests.jsonl" in the working directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,6 +315,7 @@ impl Settings {
         pick!(
             port, host, timeout, load_keep_alive, allow_all_routes, stuck_timeout,
             max_concurrent_per_backend, detect_backend_slots, model_aliases, ip_identity,
+            sticky_routing, sticky_ttl, sticky_lag, sticky_max_entries,
             request_log_path, request_log_max_bytes, request_log_max_files, log_content_limit,
             max_body_bytes, max_queued_bytes, clients_file, models_file,
             metrics_token, web_ui
@@ -280,6 +334,8 @@ impl Settings {
         at_least(self.max_queued_bytes, 1024 * 1024, "max_queued_bytes")?;
         at_least(self.max_body_bytes.map(|v| v as u64), 1024, "max_body_bytes")?;
         at_least(self.log_content_limit.map(|v| v as u64), 1024, "log_content_limit")?;
+        at_least(self.sticky_ttl, 1, "sticky_ttl")?;
+        at_least(self.sticky_max_entries.map(|v| v as u64), 1, "sticky_max_entries")?;
         if self.load_keep_alive.is_some_and(|v| v < -1) {
             return Err("load_keep_alive must be -1 (forever) or more".into());
         }

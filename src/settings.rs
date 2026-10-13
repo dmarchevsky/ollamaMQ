@@ -27,6 +27,10 @@ pub const EDITABLE: &[(&str, bool)] = &[
     ("load_keep_alive", true),
     ("model_aliases", true),
     ("ip_identity", true),
+    ("sticky_routing", true),
+    ("sticky_ttl", true),
+    ("sticky_lag", true),
+    ("sticky_max_entries", true),
     ("allow_all_routes", true),
     ("metrics_token", true),
     ("log_content_limit", true),
@@ -56,6 +60,10 @@ pub fn defaults() -> Settings {
         detect_backend_slots: Some(true),
         model_aliases: Some(BTreeMap::new()),
         ip_identity: Some(true),
+        sticky_routing: Some(crate::config::StickyMode::Prompt),
+        sticky_ttl: Some(1800),
+        sticky_lag: Some(0),
+        sticky_max_entries: Some(10_000),
         request_log_path: Some("ollamamq-requests.jsonl".into()),
         request_log_max_bytes: Some(10 * 1024 * 1024),
         request_log_max_files: Some(5),
@@ -191,6 +199,20 @@ pub fn apply(state: &AppState, eff: &Settings) {
     state
         .ip_identity
         .store(eff.ip_identity.unwrap_or(true), Relaxed);
+    state.sticky_mode.store(
+        *eff.sticky_routing.as_ref().unwrap_or(&Default::default()) as u8,
+        Relaxed,
+    );
+    state.sticky_ttl.store(or(eff.sticky_ttl, d.sticky_ttl), Relaxed);
+    state
+        .sticky_lag
+        .store(eff.sticky_lag.unwrap_or(0), Relaxed);
+    state.sticky_max_entries.store(
+        eff.sticky_max_entries
+            .or(d.sticky_max_entries)
+            .unwrap_or(10_000) as u64,
+        Relaxed,
+    );
     state
         .allow_all_routes
         .store(eff.allow_all_routes.unwrap_or(false), Relaxed);
@@ -389,6 +411,7 @@ pub fn apply_backends(state: &Arc<AppState>, list: &[Backend]) {
         set_disabled(b, true);
     }
     drop(backends);
+    crate::dispatcher::clear_affinity(state);
     state.notify.notify_one();
 }
 

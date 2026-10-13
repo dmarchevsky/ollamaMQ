@@ -54,6 +54,24 @@ settings:
   # model_aliases:             # serve a model under another name (case-insensitive)
   #   codex-auto-review: Qwen3.8-Flash-Next
   ip_identity: true            # no key and no X-User-ID: queue as ip-<address> (default true)
+  # sticky_routing: prompt     # keep a conversation on the backend that served its previous
+                               # turn, so a long multi-turn prompt is not re-prefilled elsewhere:
+                               #   off     today's behavior, least-loaded backend every request
+                               #   header  only an explicit id (X-Session-Id header, or the
+                               #           prompt_cache_key field OpenAI/Ollama clients send)
+                               #   prompt  also a fingerprint of the conversation's first turn
+                               #           (the one part that never changes), so chat clients
+                               #           that resend their history need nothing extra (default)
+                               #   identity one home backend per client id (right for one
+                               #           session per user, wrong for parallel sessions)
+                               # A preference, never a pin: if that backend is busy or gone the
+                               # request goes to the least-loaded one and follows it from there.
+  # sticky_ttl: 1800            # seconds idle before a conversation may move (default 1800).
+                               # Raise it towards load_keep_alive for contexts that stay resident.
+  # sticky_lag: 0               # extra requests its backend may run vs the emptiest one before
+                               # the conversation moves anyway (default 0: only a backend with a
+                               # free slot keeps its session).
+  # sticky_max_entries: 10000   # conversations remembered; the idlest are forgotten (default)
   detect_backend_slots: true   # capacity = slots a backend reports (llama.cpp /props total_slots,
                                # halogen /health slots); unreported backends use max_concurrent_per_backend.
                                # Models without max_concurrent_requests may use all reported slots (default true)

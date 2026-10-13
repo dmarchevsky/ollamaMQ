@@ -88,6 +88,11 @@ pub const PROMPT_EVAL_TOKENS: CounterDef = CounterDef {
     help: "Prompt tokens evaluated (not served from cache), pairs with prompt_seconds_total.",
     labels: &["client", "model", "backend"],
 };
+pub const AFFINITY_DECISIONS: CounterDef = CounterDef {
+    name: "ollamamq_affinity_decisions_total",
+    help: "Sticky routing outcomes: hit = the conversation stayed on its backend, moved = it went elsewhere (no memory, busy, or off).",
+    labels: &["result"],
+};
 pub const CONTROL_OPS: CounterDef = CounterDef {
     name: "ollamamq_model_control_operations_total",
     help: "Model load/unload operations by result.",
@@ -142,6 +147,7 @@ const COUNTERS: &[&CounterDef] = &[
     &GEN_TOKENS,
     &PROMPT_SECONDS,
     &PROMPT_EVAL_TOKENS,
+    &AFFINITY_DECISIONS,
     &CONTROL_OPS,
 ];
 const HISTOGRAMS: &[&HistogramDef] = &[&QUEUE_WAIT, &TTFB, &TTFT, &DURATION, &GEN_SPEED];

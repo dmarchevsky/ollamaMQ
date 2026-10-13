@@ -21,6 +21,7 @@
 - **Per-User Queuing**: Each user (identified by a client API key, else by the `X-User-ID` header, else by address as `ip-<address>`) has their own FIFO queue, capped at 100 waiting requests — beyond that the proxy answers `429` rather than growing the queue.
 - **Bounded Memory**: A queued request holds its whole body until a backend takes it, so bodies are capped two ways: `settings.max_body_bytes` per request (default 64 MiB, `413` beyond it) and `settings.max_queued_bytes` across all queues at once (default 512 MiB, `503` beyond it). A request is always admitted when the queues are empty, so an oversized body can never lock the proxy out of making progress. `/api/blobs/{digest}` keeps a separate 1 GiB allowance for model-layer uploads.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
+- **Sticky Routing (Session Affinity)**: A conversation goes back to the backend that served its previous turn, so a long multi-turn prompt is not re-prefilled on a backend with no KV slot for it. The key is an explicit session id when the client sends one, else a fingerprint of the conversation's first turn (see [Sticky Routing](#-sticky-routing-session-affinity)).
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
@@ -324,6 +325,12 @@ settings:
     codex-auto-review: Qwen3.8-Flash-Next   # the model policy and metrics; reloaded with the config (default none)
   ip_identity: true              # requests with no client key and no X-User-ID queue as ip-<address>;
                                  # false = they all share "anonymous" (default true)
+  sticky_routing: prompt         # keep a conversation on the backend that served its previous turn:
+                                 # off | header | prompt (default) | identity — see Sticky Routing
+  sticky_ttl: 1800               # seconds idle before a conversation may move (default 1800)
+  sticky_lag: 0                  # extra requests its backend may run vs the emptiest eligible one
+                                 # before the conversation moves anyway (default 0)
+  sticky_max_entries: 10000      # conversations remembered; the idlest are forgotten (default 10000)
   detect_backend_slots: true     # use the parallel slots a backend reports (llama.cpp /props total_slots,
                                  # halogen /health slots) as its capacity instead of max_concurrent_per_backend;
                                  # models without max_concurrent_requests may then use all of them (default true)
@@ -599,6 +606,7 @@ scrape_configs:
 | `ollamamq_time_to_first_token_seconds` | histogram | client, model, backend — dispatch to the first generated token (streams), or the backend's prompt time (non-streamed responses that report it) |
 | `ollamamq_generation_seconds_total` / `ollamamq_generation_tokens_total` | counter | client, model, backend — decode time and the tokens generated in it |
 | `ollamamq_prompt_seconds_total` / `ollamamq_prompt_eval_tokens_total` | counter | client, model, backend — prefill time and the prompt tokens evaluated (cache hits excluded) |
+| `ollamamq_affinity_decisions_total` | counter | result — `hit` (a conversation stayed on its backend) / `moved` (it went elsewhere) |
 | `ollamamq_generation_speed_tokens_per_second` | histogram | model, backend — one observation per finished request |
 | `ollamamq_queue_depth`, `ollamamq_queue_oldest_seconds` | gauge | client, model — waiting requests and the age of the oldest |
 | `ollamamq_requests_in_flight`, `ollamamq_client_fair_share_score` | gauge | client |
@@ -626,6 +634,44 @@ sum by (outcome) (rate(ollamamq_requests_total{outcome!="ok"}[5m]))         # fa
 sum by (backend) (rate(ollamamq_generation_tokens_total[5m])) / sum by (backend) (rate(ollamamq_generation_seconds_total[5m]))  # tok/s per stream
 histogram_quantile(0.95, sum by (le, backend) (rate(ollamamq_time_to_first_token_seconds_bucket[5m])))   # TTFT p95
 ```
+
+### 🧲 Sticky Routing (Session Affinity)
+
+Without it, every request independently picks the least-loaded eligible backend, so the
+second turn of a conversation often lands somewhere that has no KV cache for its prompt
+and re-prefills the whole context. With it, the proxy remembers which backend served a
+conversation's previous turn and prefers that one.
+
+**It is a preference, never a pin.** If the remembered backend is offline, no longer serves
+the model, or is running more than `settings.sticky_lag` more requests than the emptiest
+eligible backend, the request goes through normal load-balancing instead and the
+conversation follows it — moving costs one re-prefill, while pinning to a busy backend
+would stall everything else in that user's queue.
+
+What counts as "the same conversation", by `settings.sticky_routing`:
+
+| value | key | use |
+|---|---|---|
+| `off` | — | today's behavior |
+| `header` | `X-Session-Id` header, or the `prompt_cache_key` field OpenAI/Ollama clients send | exact, when you control the client |
+| `prompt` *(default)* | plus a fingerprint of the conversation's **first turn** | chat clients resend the whole history every turn, so untouched clients get affinity for free. The opening turn is the one part that never changes — hashing the whole history (or its tail) would make every turn look like a new conversation. Whitespace, field order and a leading `system` turn do not change it, and at most the first 16 KiB of it is hashed. Two threads that open with the same words share one preference, which costs nothing but a shared backend while both are idle. |
+| `identity` | plus the client id itself | one home backend per client — right for one session per user, wrong for a client running several conversations at once |
+
+A different model is a different conversation (different cache). Only completion routes are
+keyed (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`), and the
+fingerprint needs the request body — so TLS must terminate at ollamaMQ, not in front of it.
+
+Remembered conversations expire after `settings.sticky_ttl` idle seconds (raise it towards
+`load_keep_alive` when contexts stay resident for hours), are capped at
+`settings.sticky_max_entries`, and are all forgotten when the backend list changes.
+
+**Tuning and checking it.** `ollamamq_affinity_decisions_total{result="hit|moved"}` counts
+the outcomes; the payoff shows up as a drop in
+`rate(ollamamq_prompt_eval_tokens_total[5m])` per client once conversations are warm. If
+`moved` dominates while backends are idle, raise `sticky_lag`. If prompt-eval stays high even
+when conversations are hitting their own backend, the problem is not routing: the backend
+cannot hold that many contexts in its cache at once (`OLLAMA_NUM_PARALLEL`, `num_ctx`,
+`load_keep_alive` — or more VRAM), and no routing choice fixes that.
 
 ### Port Configuration
 
