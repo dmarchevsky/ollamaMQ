@@ -71,10 +71,16 @@ cargo install ollamaMQ
 
 #### Using Docker CLI
 
-First build the image from the local Dockerfile:
+Pull the published release image:
 
 ```bash
-docker build -t chlebon/ollamamq .
+docker pull dmarchevsky/ollamamq:latest
+```
+
+Or build the image from the local Dockerfile:
+
+```bash
+docker build -t ollamamq:local .
 ```
 
 Then run the container:
@@ -84,7 +90,7 @@ docker run -d \
   --name ollamamq \
   -p 11435:11435 \
   --restart unless-stopped \
-  chlebon/ollamamq
+  dmarchevsky/ollamamq:latest
 ```
 
 ### API Proxying
@@ -386,6 +392,9 @@ Every proxied request (`IN`) and upstream response (`OUT`) is written as JSON li
 > **Note:** request/response headers are deliberately **not** logged — this keeps API keys out of the file.
 
 ## 🐳 Docker
+
+Release images are published to Docker Hub as [`dmarchevsky/ollamamq`](https://hub.docker.com/r/dmarchevsky/ollamamq)
+(tags: `latest`, `<version>`, `<major>.<minor>`, pushed automatically on every release tag).
 
 ### Docker Compose
 
