@@ -1020,13 +1020,17 @@ const FIELD_META = {
   load_keep_alive: { label: 'Keep loaded models for', unit: 's', min: -1, help: 'Sent with model loads (Ollama); -1 keeps them loaded.' },
   model_aliases: { label: 'Model aliases', kind: 'aliases', help: 'A request for the alias (any letter case) is served by the model.' },
   ip_identity: { label: 'Identify keyless clients by IP', kind: 'bool', help: 'No key and no X-User-ID: queue as ip-&lt;address&gt;. Off: they share the "anonymous" queue.' },
+  sticky_routing: { label: 'Keep a conversation on its backend', kind: 'select', options: [['off', 'Off'], ['header', 'Explicit session id only'], ['prompt', 'Session id or prompt'], ['identity', 'One backend per client']], help: 'Sending a turn to the backend that served the one before avoids re-reading the whole context. The remembered backend only has to be free-ish, never the emptiest.' },
+  sticky_ttl: { label: 'Remember a conversation for', unit: 's', min: 1, help: 'Idle time after which a conversation may move to another backend.' },
+  sticky_lag: { label: 'Slack before a conversation moves', unit: 'requests', min: 0, help: 'How many more requests its backend may run than the emptiest one before the conversation goes elsewhere instead of waiting.' },
+  sticky_max_entries: { label: 'Conversations remembered', min: 1, help: 'The idlest are forgotten past this.' },
   allow_all_routes: { label: 'Proxy unknown routes', kind: 'bool', help: 'Forward paths ollamaMQ does not know to the backends.' },
   metrics_token: { label: 'Metrics token', kind: 'secret', help: 'Bearer token that <code>GET /metrics</code> requires.' },
   log_content_limit: { label: 'Captured text per log record', unit: 'KiB', scale: 1024, min: 1, help: 'Request and response text kept for the Logs page.' },
 };
 const SET_GROUPS = [
   ['Scheduling & limits', ['timeout', 'stuck_timeout', 'max_concurrent_per_backend', 'detect_backend_slots', 'max_queued_bytes', 'max_body_bytes', 'load_keep_alive']],
-  ['Routing', ['model_aliases', 'ip_identity', 'allow_all_routes']],
+  ['Routing', ['model_aliases', 'ip_identity', 'sticky_routing', 'sticky_ttl', 'sticky_lag', 'sticky_max_entries', 'allow_all_routes']],
   ['Security', ['@password', 'metrics_token']],
   ['Logging & server', ['log_content_limit', '@startup']],
 ];
@@ -1065,6 +1069,9 @@ function setControl(f) {
   const dis = f.locked_by ? 'disabled' : '';
   if (m.kind === 'bool') {
     return `<label class="switch"><input type="checkbox" id="set-${f.key}" data-key="${f.key}" ${v ? 'checked' : ''} ${dis}><span></span></label>`;
+  }
+  if (m.kind === 'select') {
+    return `<select id="set-${f.key}" data-key="${f.key}" ${dis}>${m.options.map(([val, text]) => `<option value="${val}" ${v === val ? 'selected' : ''}>${text}</option>`).join('')}</select>`;
   }
   if (m.kind === 'secret') {
     const shown = S.revealToken && S.draft.get(f.key) === S.revealToken;
@@ -1201,6 +1208,7 @@ function onSettingsInput(e) {
   if (!f) return;
   const m = FIELD_META[key];
   if (m.kind === 'bool') { setDraft(key, el.checked); return; }
+  if (m.kind === 'select') { setDraft(key, el.value); return; }
   if (el.value === '') { S.draft.delete(key); el.closest('.set-row')?.classList.remove('dirty'); renderSettingsBar(); return; }
   const n = Number(el.value);
   if (Number.isFinite(n)) setDraft(key, Math.round(n * (m.scale || 1)));

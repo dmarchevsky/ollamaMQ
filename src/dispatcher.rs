@@ -4,6 +4,9 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
 };
+use crate::config::StickyMode;
+use serde::Deserializer as _;
+use std::hash::Hasher;
 use crate::lock::LockExt;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -78,6 +81,10 @@ pub struct Task {
     pub queued_at: std::time::Instant,
     /// Label (or id) of the client API key that sent it, for per-key metrics.
     pub key_label: Option<String>,
+    /// Sticky-routing key for this request (see [`derive_session_key`]): the
+    /// conversation it belongs to, and the backend that should serve it. `None`
+    /// means no affinity — the request is placed by load alone.
+    pub session_key: Option<SessionKey>,
 }
 
 /// Which API flavours a backend speaks — and, on the route side of the
@@ -707,6 +714,18 @@ pub struct AppState {
     pub global_counter: std::sync::atomic::AtomicUsize,
     /// Fair-share scheduling scores, keyed by user. See [`FairShare`].
     pub fair_share: Mutex<HashMap<String, FairShare>>,
+    /// Which backend each conversation was last served by, for sticky routing
+    /// (see [`Affinity`] and `settings.sticky_routing`).
+    pub affinity: Mutex<HashMap<SessionKey, Affinity>>,
+    /// `settings.sticky_routing` as a [`StickyMode`] disc; atomic so the
+    /// scheduler reads it without another lock.
+    pub sticky_mode: std::sync::atomic::AtomicU8,
+    /// `settings.sticky_ttl` (seconds).
+    pub sticky_ttl: std::sync::atomic::AtomicU64,
+    /// `settings.sticky_lag`.
+    pub sticky_lag: std::sync::atomic::AtomicU64,
+    /// `settings.sticky_max_entries`.
+    pub sticky_max_entries: std::sync::atomic::AtomicU64,
     pub notify: Notify,
     pub backend_freed: Notify,
     pub backends: Mutex<Vec<BackendStatus>>,
@@ -862,6 +881,366 @@ impl FairShare {
     }
 }
 
+/// What identifies a conversation for sticky routing. A model is part of the
+/// key because a different model is a different KV cache: moving between models
+/// is not "staying put".
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    pub conversation: String,
+    pub model: String,
+}
+
+/// The backend a conversation was last served by.
+#[derive(Clone, Debug)]
+pub struct Affinity {
+    pub backend_url: String,
+    last_use: std::time::Instant,
+}
+
+/// Bytes of a prompt's canonical form fed into the fingerprint. The leading
+/// turns are what identifies a thread, so a bounded prefix is enough and a
+/// 200k-token body never has to be hashed whole.
+const FINGERPRINT_BYTES: usize = 16 * 1024;
+
+/// True for routes that carry a conversation, the only ones worth fingerprinting.
+pub fn is_conversation_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/chat" | "/api/generate" | "/v1/chat/completions" | "/v1/completions"
+    )
+}
+
+/// The sticky-routing key for a request, or `None` for no affinity.
+///
+/// Explicit session ids always win when present, whatever the mode: a client
+/// that tells us which thread a request belongs to is more reliable than any
+/// guess we can make from the prompt. Otherwise `prompt` mode fingerprints the
+/// conversation (chat clients resend the whole history every turn, so two turns
+/// of one thread share a prefix) and `identity` mode falls back to the client
+/// id, which is right for one-session-per-user setups and wrong for a client
+/// running several conversations at once.
+///
+/// Only completion routes are keyed; a metadata read or a pull has no cache to
+/// stay near.
+pub fn derive_session_key(
+    mode: StickyMode,
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    model: Option<&str>,
+    user: &str,
+) -> Option<SessionKey> {
+    if mode == StickyMode::Off || !is_conversation_path(path) {
+        return None;
+    }
+    let conversation = session_id_header(headers).or_else(|| match mode {
+        // One pass over the body: an explicit `prompt_cache_key` if the client
+        // sent one, else the fingerprint of the prompt.
+        StickyMode::Prompt => {
+            let fp = parse_prompt(body)?;
+            fp.prompt_cache_key
+                .clone()
+                .or_else(|| prompt_fingerprint(&fp).map(|fp| format!("p:{fp:016x}")))
+        }
+        StickyMode::Header => body_cache_key(body),
+        StickyMode::Identity => Some(format!("u:{user}")),
+        StickyMode::Off => None,
+    })?;
+    Some(SessionKey {
+        conversation,
+        model: model.unwrap_or("-").to_string(),
+    })
+}
+
+/// An explicit conversation id: the `X-Session-Id` request header, or
+/// OpenAI / Ollama's own `prompt_cache_key` body field.
+fn session_id_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Run `get` over a JSON object body without buffering fields it never asks
+/// for, mirroring [`extract_requested_model`]'s no-parse-into-Value approach.
+/// Non-object bodies (and any parse error) yield `None`.
+fn json_object_get<T>(body: &[u8], get: impl FnOnce(T) -> Option<String>) -> Option<String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if body
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_none_or(|b| *b != b'{')
+    {
+        return None;
+    }
+    serde_json::from_slice::<T>(body).ok().and_then(get)
+}
+
+/// A client-supplied `prompt_cache_key` in the body, if it has one.
+fn body_cache_key(body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct CacheKey {
+        #[serde(default)]
+        prompt_cache_key: Option<String>,
+    }
+    json_object_get(body, |v: CacheKey| v.prompt_cache_key)
+}
+
+/// The conversation-defining fields of a completion body.
+#[derive(Deserialize)]
+struct Fp {
+    #[serde(default)]
+    prompt_cache_key: Option<String>,
+    #[serde(default)]
+    prompt: Option<serde_json::Value>,
+    #[serde(default)]
+    messages: Option<Vec<serde_json::Value>>,
+}
+
+/// The body as an [`Fp`], or `None` for a body that is not a JSON object.
+fn parse_prompt(body: &[u8]) -> Option<Fp> {
+    // The visitor pulls just the conversation fields out of the object and
+    // ignores the rest (sampling params, tools, the whole tool schema ...).
+    struct FpVisitor;
+    impl<'de> serde::de::Visitor<'de> for FpVisitor {
+        type Value = Fp;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Fp, A::Error> {
+            let mut prompt = None;
+            let mut messages = None;
+            let mut prompt_cache_key = None;
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "prompt" => prompt = Some(map.next_value()?),
+                    "messages" => messages = Some(map.next_value()?),
+                    "prompt_cache_key" => prompt_cache_key = Some(map.next_value()?),
+                    _ => {
+                        let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(Fp {
+                prompt_cache_key,
+                prompt,
+                messages,
+            })
+        }
+    }
+    <serde_json::Deserializer<serde_json::de::SliceRead>>::from_slice(body)
+        .deserialize_any(FpVisitor)
+        .ok()
+}
+
+/// A stable hash of what identifies a conversation: its first non-system turn.
+///
+/// That turn is the one part of the request that never changes — every later turn
+/// appends to the history and rewrites everything after it, so anything derived
+/// from the tail (or from the whole history) gives a different key each turn and
+/// the conversation is treated as new on every request. Hashing the opening turn
+/// instead keeps one thread on one backend for its whole life, whatever its
+/// length. Canonicalised (map keys in sorted order) so whitespace and field order
+/// do not change it, capped at [`FINGERPRINT_BYTES`], and a leading `system` turn
+/// is skipped so the identity comes from the conversation, not the app's
+/// boilerplate. A parse problem means no fingerprint, never a wrong one.
+///
+/// Two threads that open with the same words (say "hello") collide onto one
+/// preference. That is harmless: the key is per client and per model, and a
+/// preference the scheduler may still override, so the worst case is that one
+/// client's conversations queue together — which is what they do anyway.
+///
+/// Cost: one more pass over an already-buffered body per completion request, with
+/// the conversation fields held as a tree while they are hashed. That is
+/// deliberate: a prefix of the raw bytes would break on whitespace and field
+/// order, which is exactly what the fingerprint has to be blind to.
+/// shortcut: those fields are parsed whole even though only the opening turn is
+/// hashed; replace the parse with a streaming visitor that stops at the first
+/// message if chat bodies routinely reach tens of MB.
+fn prompt_fingerprint(fp: &Fp) -> Option<u64> {
+    let mut h = BudgetHasher::default();
+    match (&fp.prompt, &fp.messages) {
+        (_, Some(msgs)) => {
+            let opening = msgs
+                .iter()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))?;
+            write_canonical(opening, &mut h);
+        }
+        (Some(serde_json::Value::String(s)), None) => {
+            h.write(&s.as_bytes()[..s.len().min(FINGERPRINT_BYTES)]);
+        }
+        (Some(v), None) => write_canonical(v, &mut h),
+        (None, None) => return None,
+    }
+    (h.bytes > 0).then(|| h.finish())
+}
+
+/// A hasher that counts the bytes fed to it, so the fingerprint can stop early.
+#[derive(Default)]
+struct BudgetHasher {
+    inner: std::collections::hash_map::DefaultHasher,
+    bytes: usize,
+}
+
+impl std::hash::Hasher for BudgetHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.bytes += bytes.len();
+        self.inner.write(bytes);
+    }
+    fn finish(&self) -> u64 {
+        self.inner.finish()
+    }
+}
+
+/// Hash the canonical form of one JSON value: object keys in sorted order, so
+/// two serializations of the same content hash the same.
+fn write_canonical(v: &serde_json::Value, h: &mut BudgetHasher) {
+    use std::hash::Hash;
+    if h.bytes >= FINGERPRINT_BYTES {
+        return;
+    }
+    match v {
+        serde_json::Value::Null => h.write(b"n"),
+        serde_json::Value::Bool(b) => b.hash(h),
+        serde_json::Value::Number(n) => n.to_string().hash(h),
+        serde_json::Value::String(s) => {
+            h.write(s.as_bytes());
+        }
+        serde_json::Value::Array(xs) => {
+            h.write_u8(b'[');
+            for x in xs {
+                write_canonical(x, h);
+            }
+            h.write_u8(b']');
+        }
+        serde_json::Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            h.write_u8(b'{');
+            for k in keys {
+                h.write(k.as_bytes());
+                h.write_u8(b'=');
+                write_canonical(&m[k], h);
+            }
+            h.write_u8(b'}');
+        }
+    }
+}
+
+/// The backend a conversation should prefer, if any, chosen by the scheduler
+/// BEFORE the usual least-connections pick.
+///
+/// A preference, never a pin: if the remembered backend cannot take the request
+/// now, or is running more than `sticky_lag` more than the lightest eligible
+/// backend, the conversation moves and the mapping follows. A hard pin would
+/// stall the user's own queue — the scheduler takes the first ROUTABLE task per
+/// user, so tasks pinned to a busy backend all sit unroutable while other
+/// backends idle. Moving costs one re-prefill; stalling costs everything behind
+/// it in that queue.
+fn pick_sticky_backend(
+    state: &AppState,
+    key: &SessionKey,
+    eligible: &[usize],
+    backends: &[BackendStatus],
+    min_conns: usize,
+) -> Option<usize> {
+    let ttl = std::time::Duration::from_secs(
+        state
+            .sticky_ttl
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let lag = state
+        .sticky_lag
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let now = std::time::Instant::now();
+    let mut table = state.affinity.lock_or_recover();
+    let idx = table.get(key).and_then(|a| {
+        // Fresh = remembered no longer ago than the TTL.
+        if now.saturating_duration_since(a.last_use) > ttl {
+            return None;
+        }
+        eligible
+            .iter()
+            .copied()
+            .find(|&i| backends[i].url == a.backend_url)
+    })?;
+    if backends[idx].active_requests > min_conns + lag as usize {
+        state
+            .metrics
+            .inc(&crate::metrics::AFFINITY_DECISIONS, &["moved"], 1.0);
+        return None;
+    }
+    table.get_mut(key).unwrap().last_use = now;
+    state
+        .metrics
+        .inc(&crate::metrics::AFFINITY_DECISIONS, &["hit"], 1.0);
+    Some(idx)
+}
+
+/// Remember where a conversation went, so its next turn can come back here.
+fn record_affinity(state: &AppState, key: &SessionKey, backend_url: &str) {
+    let mut table = state.affinity.lock_or_recover();
+    match table.get_mut(key) {
+        Some(a) => {
+            a.backend_url = backend_url.to_string();
+            a.last_use = std::time::Instant::now();
+        }
+        None => {
+            table.insert(
+                key.clone(),
+                Affinity {
+                    backend_url: backend_url.to_string(),
+                    last_use: std::time::Instant::now(),
+                },
+            );
+        }
+    }
+}
+
+/// Drop conversations idle for longer than `sticky_ttl`, then the idlest past
+/// `sticky_max_entries`, plus anything pointing at a backend the proxy no longer
+/// has. Runs from the same loop that prunes idle users.
+fn prune_affinity(state: &AppState) {
+    let ttl = std::time::Duration::from_secs(
+        state
+            .sticky_ttl
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let max = state
+        .sticky_max_entries
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let now = std::time::Instant::now();
+    let urls: HashSet<String> = state
+        .backends
+        .lock_or_recover()
+        .iter()
+        .map(|b| b.url.clone())
+        .collect();
+    let mut table = state.affinity.lock_or_recover();
+    table.retain(|_, a| {
+        now.saturating_duration_since(a.last_use) < ttl && urls.contains(&a.backend_url)
+    });
+    if table.len() > max {
+        let mut idle: Vec<(SessionKey, std::time::Instant)> = table
+            .iter()
+            .map(|(k, a)| (k.clone(), a.last_use))
+            .collect();
+        idle.sort_by_key(|(_, seen)| *seen);
+        for (k, _) in idle.into_iter().take(table.len() - max) {
+            table.remove(&k);
+        }
+    }
+}
+
+/// Backends come and go: forget every remembered placement.
+pub fn clear_affinity(state: &AppState) {
+    state.affinity.lock_or_recover().clear();
+}
+
 /// Longest a user with nothing queued and nothing in flight is kept in the
 /// per-user bookkeeping.
 const USER_RETENTION: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -932,6 +1311,13 @@ impl AppState {
             boost_user: Mutex::new(None),
             global_counter: std::sync::atomic::AtomicUsize::new(0),
             fair_share: Mutex::new(HashMap::new()),
+            affinity: Mutex::new(HashMap::new()),
+            sticky_mode: std::sync::atomic::AtomicU8::new(
+                crate::config::StickyMode::default() as u8,
+            ),
+            sticky_ttl: std::sync::atomic::AtomicU64::new(1800),
+            sticky_lag: std::sync::atomic::AtomicU64::new(0),
+            sticky_max_entries: std::sync::atomic::AtomicU64::new(10_000),
             notify: Notify::new(),
             backend_freed: Notify::new(),
             backends: Mutex::new(backends),
@@ -2021,6 +2407,7 @@ pub async fn run_worker(state: Arc<AppState>) {
         loop {
             tokio::time::sleep(USER_PRUNE_INTERVAL).await;
             prune_idle_users(&prune_state, USER_RETENTION);
+            prune_affinity(&prune_state);
         }
     });
 
@@ -2135,6 +2522,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                             Some(t) => t,
                             None => continue,
                         };
+                        // Cloned before the task is removed below: `task_ref`
+                        // borrows `queues` and cannot outlive the removal.
+                        let pending_session_key = task_ref.session_key.clone();
                         let route_families =
                             families_for_route(&task_ref.method, &task_ref.path);
                         // Metadata reads are cheap and don't use the model
@@ -2469,6 +2859,18 @@ pub async fn run_worker(state: Arc<AppState>) {
                             .map(|&i| backends[i].active_requests)
                             .min()
                             .unwrap();
+                        // Sticky routing: keep a conversation on the backend that
+                        // served its previous turn when that backend can take it
+                        // at reasonable load. See [`pick_sticky_backend`].
+                        let sticky = pending_session_key.as_ref().and_then(|key| {
+                            pick_sticky_backend(
+                                state.as_ref(),
+                                key,
+                                &eligible_indices,
+                                &backends,
+                                min_conns,
+                            )
+                        });
                         let candidates_backends: Vec<usize> = eligible_indices
                             .iter()
                             .cloned()
@@ -2478,7 +2880,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                             .iter()
                             .position(|&i| i > last_idx)
                             .unwrap_or(0);
-                        let selected_backend_idx = candidates_backends[candidate_pos];
+                        let selected_backend_idx =
+                            sticky.unwrap_or(candidates_backends[candidate_pos]);
 
                         last_idx = selected_backend_idx;
                         state
@@ -2505,6 +2908,13 @@ pub async fn run_worker(state: Arc<AppState>) {
                             backends[selected_backend_idx].token.clone(),
                             metadata,
                         ));
+                        if let Some(key) = pending_session_key {
+                            record_affinity(
+                                state.as_ref(),
+                                &key,
+                                &backends[selected_backend_idx].url,
+                            );
+                        }
                         break 'users;
                     }
                 }
@@ -3113,6 +3523,21 @@ pub async fn proxy_handler(
     }
 
     let task_method = method.as_str().to_string();
+    // Sticky routing needs to know which conversation this request belongs to,
+    // and that can only be answered while the body is here (see
+    // [`derive_session_key`]).
+    let session_key = derive_session_key(
+        StickyMode::from_u8(
+            state
+                .sticky_mode
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        &path,
+        &headers,
+        &body,
+        requested_model.as_deref(),
+        &user_id,
+    );
     // Before the queues lock below: this takes the backends lock.
     let model_label = state.model_label(requested_model.as_deref());
     // Request-log content is captured before `body` moves into the Task.
@@ -3135,6 +3560,7 @@ pub async fn proxy_handler(
                 c.key_label.clone()
             }
         }),
+        session_key,
     };
 
     {
@@ -3313,6 +3739,7 @@ pub async fn proxy_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StickyMode;
 
     fn set(items: &[&str]) -> HashSet<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -4008,6 +4435,7 @@ mod tests {
                 stuck_warned: false,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
+                session_key: None,
             });
         }
 
@@ -4094,6 +4522,7 @@ mod tests {
                 stuck_warned: false,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
+                session_key: None,
             });
         rx
     }
@@ -4376,6 +4805,7 @@ mod tests {
             stuck_warned: false,
             queued_at: std::time::Instant::now(),
             key_label: None,
+            session_key: None,
         });
         state.processed_counts.lock_or_recover().insert("old".into(), 7);
         state.toggle_boost("old");
@@ -4998,6 +5428,7 @@ mod tests {
                 stuck_warned: false,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
+                session_key: None,
             });
         rx
     }
@@ -5350,6 +5781,7 @@ mod tests {
                     stuck_warned: false,
                     queued_at: std::time::Instant::now(),
                     key_label: None,
+                    session_key: None,
                 });
             }
         }
@@ -5378,6 +5810,394 @@ mod tests {
             Some(1)
         );
         drop(keep_alive);
+    }
+
+    // -- Sticky routing (session affinity) ------------------------------------
+    //
+    // A conversation is remembered by the backend that served its previous turn
+    // and prefers to go back there, so a long multi-turn prompt is not re-prefilled
+    // somewhere that has no KV slot for it. A preference, never a pin.
+
+    /// Turns sticky routing on with explicit settings (see `settings.apply`).
+    fn sticky_on(state: &Arc<AppState>, mode: StickyMode, lag: u64) {
+        state
+            .sticky_mode
+            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+        state
+            .sticky_lag
+            .store(lag, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn key(id: &str, model: &str) -> SessionKey {
+        SessionKey {
+            conversation: id.to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    /// True once the conversation is remembered on `url` — polled, because the
+    /// mapping is rewritten when the response finishes, not at dispatch.
+    async fn affinity_is(state: &Arc<AppState>, k: &SessionKey, url: &str) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let hit = state
+                    .affinity
+                    .lock_or_recover()
+                    .get(k)
+                    .is_some_and(|a| a.backend_url == url);
+                if hit {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// The conversation id used by the routing tests below, as the scheduler
+    /// would derive it from the request's body.
+    fn body_key(body: &str, model: &str) -> Option<SessionKey> {
+        derive_session_key(
+            StickyMode::Prompt,
+            "/v1/chat/completions",
+            &HeaderMap::new(),
+            body.as_bytes(),
+            Some(model),
+            "tester",
+        )
+    }
+
+    /// Enqueues `body` under user "tester" with the session key the proxy would
+    /// have derived from it.
+    fn enqueue_chat_with_key(
+        state: &Arc<AppState>,
+        model: &str,
+        body: String,
+        session_key: Option<SessionKey>,
+    ) -> mpsc::Receiver<ResponsePart> {
+        let (tx, rx) = mpsc::channel(32);
+        let body = Bytes::from(body);
+        state
+            .queued_bytes
+            .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        state
+            .queues
+            .lock_or_recover()
+            .entry("tester".to_string())
+            .or_default()
+            .push_back(Task {
+                method: Method::POST,
+                user: "127.0.0.1:41000".to_string(),
+                path: "/v1/chat/completions".into(),
+                headers: HeaderMap::new(),
+                body,
+                responder: tx,
+                requested_model: Some(model.to_string()),
+                stuck_warned: false,
+                queued_at: std::time::Instant::now(),
+                key_label: None,
+                session_key,
+            });
+        rx
+    }
+
+    #[test]
+    fn session_key_prefers_explicit_ids_and_fingerprints_the_prompt() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+
+        // Off: no affinity at all, whatever the request looks like.
+        assert!(
+            derive_session_key(
+                StickyMode::Off,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                body.as_bytes(),
+                Some("m"),
+                "tester",
+            )
+            .is_none()
+        );
+
+        // An explicit id (header or body) wins over the fingerprint in every
+        // mode that looks at the body at all.
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", "thread-7".parse().unwrap());
+        let k = derive_session_key(
+            StickyMode::Prompt,
+            "/v1/chat/completions",
+            &headers,
+            body.as_bytes(),
+            Some("m"),
+            "tester",
+        )
+        .unwrap();
+        assert_eq!(k.conversation, "thread-7");
+        assert_eq!(k.model, "m");
+        let k = derive_session_key(
+            StickyMode::Header,
+            "/v1/chat/completions",
+            &HeaderMap::new(),
+            br#"{"model":"m","prompt_cache_key":"pc-1","prompt":"x"}"#,
+            Some("m"),
+            "tester",
+        )
+        .unwrap();
+        assert_eq!(k.conversation, "pc-1");
+
+        // `header` mode does not guess from the prompt, `prompt` mode does.
+        assert!(
+            derive_session_key(
+                StickyMode::Header,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                body.as_bytes(),
+                Some("m"),
+                "tester",
+            )
+            .is_none()
+        );
+        let fp = derive_session_key(
+            StickyMode::Prompt,
+            "/v1/chat/completions",
+            &HeaderMap::new(),
+            body.as_bytes(),
+            Some("m"),
+            "tester",
+        )
+        .unwrap();
+        assert!(fp.conversation.starts_with("p:"));
+
+        // Identity mode pins a whole client id, and `identity` is not `prompt`.
+        assert_eq!(
+            derive_session_key(
+                StickyMode::Identity,
+                "/api/chat",
+                &HeaderMap::new(),
+                body.as_bytes(),
+                Some("m"),
+                "tester",
+            )
+            .unwrap()
+            .conversation,
+            "u:tester"
+        );
+
+        // Routes without a conversation to keep warm are never keyed.
+        assert!(
+            derive_session_key(
+                StickyMode::Prompt,
+                "/v1/embeddings",
+                &headers,
+                body.as_bytes(),
+                Some("m"),
+                "tester",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn prompt_fingerprint_ignores_formatting_and_leading_system_turn() {
+        let mk = |body: String| body_key(&body, "m").unwrap();
+        let base = mk(
+            r#"{"model":"m","messages":[{"role":"user","content":"first question"},{"role":"assistant","content":"answer"}]}"#.into(),
+        );
+        // Same conversation, different serialization: whitespace and the order
+        // the fields appear in must not change the key.
+        let same = mk(
+            r#"{  "messages" : [ { "content" : "first question", "role" : "user" },
+                  {"role": "assistant", "content": "answer"} ], "model": "m" }"#.into(),
+        );
+        assert_eq!(base, same);
+
+        // A boilerplate system turn in front is not part of the identity.
+        let with_system = mk(
+            r#"{"model":"m","messages":[{"role":"system","content":"You are helpful"},{"role":"user","content":"first question"},{"role":"assistant","content":"answer"}]}"#.into(),
+        );
+        assert_eq!(base, with_system);
+
+        // The same thread two turns later — the reply and the new question are
+        // appended, and the key must not move with them. This is the property the
+        // whole feature rests on: hash anything that grows and every turn looks
+        // like a new conversation.
+        let turn2 = mk(
+            r#"{"model":"m","messages":[{"role":"user","content":"first question"},{"role":"assistant","content":"answer"},{"role":"user","content":"and then?"}]}"#.into(),
+        );
+        assert_eq!(base, turn2);
+
+        // Another conversation, another key; so is another model.
+        assert_ne!(
+            base,
+            mk(r#"{"model":"m","messages":[{"role":"user","content":"totally different"}]}"#.into())
+        );
+
+
+        // Nothing to fingerprint: no key rather than a guess.
+        assert!(body_key(r#"{"model":"m","stream":true}"#, "m").is_none());
+        assert!(body_key("not json at all", "m").is_none());
+    }
+
+    #[test]
+    fn affinity_prune_drops_stale_entries_and_backends_that_are_gone() {
+        let state = new_test_state(vec!["http://127.0.0.1:11434".into()]);
+        state
+            .sticky_ttl
+            .store(1800, std::sync::atomic::Ordering::Relaxed);
+        state
+            .sticky_max_entries
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut table = state.affinity.lock_or_recover();
+            // Already past the TTL.
+            table.insert(
+                key("stale", "m"),
+                Affinity {
+                    backend_url: "http://127.0.0.1:11434".into(),
+                    last_use: std::time::Instant::now()
+                        - std::time::Duration::from_secs(1900),
+                },
+            );
+            // Points at a backend the proxy no longer has.
+            table.insert(
+                key("ghost", "m"),
+                Affinity {
+                    backend_url: "http://127.0.0.1:9".into(),
+                    last_use: std::time::Instant::now(),
+                },
+            );
+            for id in ["fresh-b", "fresh-a"] {
+                table.insert(
+                    key(id, "m"),
+                    Affinity {
+                        backend_url: "http://127.0.0.1:11434".into(),
+                        last_use: std::time::Instant::now(),
+                    },
+                );
+            }
+        }
+        prune_affinity(&state);
+        let table = state.affinity.lock_or_recover();
+        assert_eq!(table.len(), 2, "past the cap the idlest entries go first");
+        assert!(table.contains_key(&key("fresh-b", "m")));
+        assert!(table.contains_key(&key("fresh-a", "m")));
+    }
+
+    /// The remembered backend keeps the conversation even though the other one
+    /// is just as free — the whole point: reprefilling a 200k context costs far
+    /// more than leaving capacity unused.
+    #[tokio::test]
+    async fn sticky_routing_keeps_a_conversation_on_its_backend() {
+        let home = spawn_mock_backend(M_V1_MODELS, None).await; // A: remembered
+        let peer = spawn_mock_backend(M_V1_MODELS, None).await; // B: equally free
+        let state = new_test_state(vec![home.0.clone(), peer.0.clone()]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            openai_backend_state(&mut backends[0], &["m"]);
+            openai_backend_state(&mut backends[1], &["m"]);
+        }
+        sticky_on(&state, StickyMode::Prompt, 0);
+
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"long story"}]}"#.to_string();
+        let k = body_key(&body, "m").unwrap();
+        state.affinity.lock_or_recover().insert(
+            k.clone(),
+            Affinity {
+                backend_url: home.0.clone(),
+                last_use: std::time::Instant::now(),
+            },
+        );
+
+        let _rx = enqueue_chat_with_key(&state, "m", body, Some(k));
+        let worker = tokio::spawn(run_worker(state.clone()));
+        let picked = wait_for_picked_backend(&state)
+            .await
+            .expect("no backend picked up the request within 10s");
+        // Round-robin from last_backend_idx = 0 would have chosen backend 1.
+        assert_eq!(picked, 0);
+        wait_for_completion(&state, picked).await;
+        assert_eq!(state.backends.lock_or_recover()[1].processed_count, 0);
+
+        worker.abort();
+        home.1.abort();
+        peer.1.abort();
+    }
+
+    /// A remembered backend that cannot take the request now (or is running
+    /// more than `sticky_lag` more than the lightest eligible one) loses the
+    /// conversation, and the mapping follows the move so the turn after it does
+    /// not move twice. Busy backends are stated as counters here, which is what
+    /// the picker reads; the end-to-end test above covers the live path.
+    #[test]
+    fn a_busy_sticky_backend_loses_the_conversation() {
+        let state = new_test_state(vec![
+            "http://127.0.0.1:11434".into(),
+            "http://127.0.0.1:11435".into(),
+        ]);
+        state
+            .sticky_ttl
+            .store(1800, std::sync::atomic::Ordering::Relaxed);
+        let k = key("thread", "m");
+        state.affinity.lock_or_recover().insert(
+            k.clone(),
+            Affinity {
+                backend_url: "http://127.0.0.1:11434".into(),
+                last_use: std::time::Instant::now(),
+            },
+        );
+        let backends: Vec<BackendStatus> = state.backends.lock_or_recover().clone();
+        let eligible: Vec<usize> = vec![0, 1];
+
+        // No slack allowed and the remembered backend is the busiest: move.
+        state
+            .sticky_lag
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut busy = backends.clone();
+        busy[0].active_requests = 1;
+        assert_eq!(
+            pick_sticky_backend(&state, &k, &eligible, &busy, 0),
+            None
+        );
+
+        // One slot of slack, same load: it stays home.
+        state
+            .sticky_lag
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            pick_sticky_backend(&state, &k, &eligible, &busy, 0),
+            Some(0)
+        );
+
+        // The remembered backend no longer serves the model: not eligible.
+        state
+            .sticky_lag
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pick_sticky_backend(&state, &k, &[1], &backends, 0), None);
+
+        // Remembered for longer than the TTL: forgotten.
+        state
+            .sticky_ttl
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        state
+            .affinity
+            .lock_or_recover()
+            .get_mut(&k)
+            .unwrap()
+            .last_use = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        assert_eq!(
+            pick_sticky_backend(&state, &k, &eligible, &backends, 0),
+            None
+        );
+
+        // And a move is remembered: the next turn comes back to the new backend.
+        record_affinity(&state, &k, "http://127.0.0.1:11435");
+        state
+            .sticky_ttl
+            .store(1800, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            pick_sticky_backend(&state, &k, &eligible, &backends, 0),
+            Some(1)
+        );
     }
 
     #[tokio::test]
@@ -5498,6 +6318,7 @@ mod tests {
                     stuck_warned: false,
                     queued_at: now,
                     key_label: None,
+                    session_key: None,
                 });
         }
 
@@ -5885,6 +6706,7 @@ mod tests {
                 stuck_warned: false,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
+                session_key: None,
             });
 
         let worker = tokio::spawn(run_worker(state.clone()));
@@ -6045,6 +6867,7 @@ mod tests {
                 stuck_warned: false,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
+                session_key: None,
             });
         rx
     }
