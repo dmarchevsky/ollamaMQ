@@ -3,9 +3,9 @@
 # Three sections: backends (what to connect to), settings (runtime options)
 # and models (what to load where via the model-control load/unload logic).
 #
-# The web UI's Settings page saves its changes in settings.json (next to
-# this file) and never rewrites this file; a value set there wins over the
-# one here. CLI flags and environment variables win over both.
+# The web UI's Settings page edits this file in place (the previous version
+# is kept as appconf.yaml.bak), so a save here rewrites it and comments do
+# not survive that save. CLI flags and environment variables win over it.
 #
 # CLI flags always win when explicitly given:
 #   --backend-urls overrides `backends`
@@ -71,14 +71,14 @@ settings:
   # Files the web UI writes. A relative path is resolved from the folder
   # holding this file, so by default they sit next to it (logs above stay
   # relative to the working directory). Defaults shown.
-  clients_file: clients.json                  # clients and their API keys
-  models_file: models.json                    # model filter rules
-  settings_file: settings.json                # settings changed in the web UI
-  admin_file: admin.json                      # web UI password changed in the UI (hashed)
+  clients_file: clients.yaml                  # clients and their API keys
+  models_file: models.yaml                    # model filter rules
   # metrics_token: ""                         # bearer token for GET /metrics; unset = open (default)
-  # web_ui:                    # web UI at /ui behind basic auth; off unless a password is set here
+  # web_ui:                    # web UI at /ui behind basic auth; off unless a password or hash is set here
   #   username: admin          # or in OLLAMA_MQ_UI_PASSWORD (env vars OLLAMA_MQ_UI_USER /
   #   password: change-me      # OLLAMA_MQ_UI_PASSWORD override these)
+  #   password_hash: ""        # argon2id hash; the UI's "Change password" writes it into this
+  #                            # file and it wins over any plaintext password (delete it to fall back)
 
 # --- Models to load onto backends -------------------------------------------
 # Fields per model:

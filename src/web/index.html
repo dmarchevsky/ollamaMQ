@@ -144,7 +144,7 @@
         <h1>Settings</h1>
         <div class="page-tools" id="set-tools"></div>
       </div>
-      <p class="hint">Changes are saved in <code id="set-file">settings.json</code> and win over <code>appconf.yaml</code>, which is never rewritten.
+      <p class="hint">Changes are saved into <code>appconf.yaml</code> itself; the previous version is kept as <code>appconf.yaml.bak</code> for “Undo last save”. Saving rewrites the file, so its comments do not survive it.
         Most apply at once; the ones marked <span class="badge warn">restart</span> wait for a restart.
         Backends are managed on the <a href="#backends">Backends page</a>.</p>
       <div id="set-banner"></div>
@@ -263,7 +263,7 @@
     <h3>Change admin password</h3>
     <label>Current password <input name="current" type="password" required autocomplete="current-password"></label>
     <label>New password <input name="new" type="password" required minlength="12" autocomplete="new-password"></label>
-    <p class="field-hint">At least 12 characters. Stored as a hash in <code>admin.json</code>; it replaces the password from the environment or appconf.yaml.</p>
+    <p class="field-hint">At least 12 characters. Stored as an argon2id hash in <code>appconf.yaml</code>; it replaces the password from the environment or appconf.yaml (delete the hash and restart to get it back).</p>
     <label>Repeat new password <input name="repeat" type="password" required minlength="12" autocomplete="new-password"></label>
     <label class="check"><input type="checkbox" name="others" checked> Sign out all other sessions</label>
     <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary">Change password</button></div>

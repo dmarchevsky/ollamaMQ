@@ -303,9 +303,8 @@
     startup: [
       F('host', '0.0.0.0', 'file', false), F('port', 11435, 'file', false),
       F('request_log_path', '/data/ollamamq-requests.jsonl', 'file', false), F('request_log_max_bytes', 10 * MiB, 'default', false),
-      F('request_log_max_files', 5, 'default', false), F('clients_file', '/config/clients.json', 'default', false),
-      F('models_file', '/config/models.json', 'default', false), F('settings_file', '/config/settings.json', 'default', false),
-      F('admin_file', '/config/admin.json', 'default', false),
+      F('request_log_max_files', 5, 'default', false), F('clients_file', '/config/clients.yaml', 'default', false),
+      F('models_file', '/config/models.yaml', 'default', false),
     ],
     restart_pending: [],
     can_undo: false,

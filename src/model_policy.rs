@@ -1,5 +1,5 @@
 //! Which models the proxy serves (`settings.models_file`, default
-//! `models.json`), managed from the web UI's Models page.
+//! `models.yaml`), managed from the web UI's Models page.
 //!
 //! A rule is a case-insensitive glob (`*` = any run of characters, `?` = one
 //! character) matched against the model names backends list, optionally
@@ -17,13 +17,12 @@
 //! and a request naming it is answered `404` at once (see the dispatcher).
 
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::clients::{StoreError, now_ms, random_hex, write_json_atomic};
+use crate::clients::{StoreError, now_ms, random_hex, read_store_or_migrate, write_store_atomic};
 
-pub const DEFAULT_MODELS_FILE: &str = "models.json";
+pub const DEFAULT_MODELS_FILE: &str = "models.yaml";
 
 const MAX_PATTERN_LEN: usize = 200;
 
@@ -47,16 +46,49 @@ pub enum Action {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
+    /// Generated at load when a hand-written file leaves it out.
+    #[serde(default)]
     pub id: String,
     pub pattern: String,
     pub action: Action,
     /// Backend URLs the rule is limited to; empty = every backend.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<String>,
     /// Created by a model's on/off switch (an exact name) rather than typed.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub from_toggle: bool,
+    #[serde(default, skip_serializing_if = "crate::clients::is_zero_ms")]
     pub created_at_ms: u64,
+}
+
+/// A rule in a hand-written file: just the pattern (hide, every backend), or
+/// the full form.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RuleSpec {
+    Pattern(String),
+    Full(Rule),
+}
+
+fn de_rules<'de, D>(d: D) -> Result<Vec<Rule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let specs = Vec::<RuleSpec>::deserialize(d)?;
+    Ok(specs
+        .into_iter()
+        .map(|spec| match spec {
+            RuleSpec::Pattern(pattern) => Rule {
+                id: String::new(),
+                pattern,
+                action: Action::Hide,
+                backends: Vec::new(),
+                from_toggle: true,
+                created_at_ms: 0,
+            },
+            RuleSpec::Full(r) => r,
+        })
+        .collect())
 }
 
 impl Rule {
@@ -79,7 +111,7 @@ impl Rule {
 pub struct Policy {
     #[serde(default)]
     pub mode: Mode,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_rules")]
     pub rules: Vec<Rule>,
 }
 
@@ -157,12 +189,15 @@ impl ModelPolicyStore {
     /// model the operator meant to hide.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
-        let policy = match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str::<Policy>(&text)
-                .map_err(|e| format!("cannot parse {}: {e}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Policy::default(),
-            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        let mut policy = match read_store_or_migrate::<Policy>(&path)? {
+            Some(p) => p,
+            None => Policy::default(),
         };
+        for r in &mut policy.rules {
+            if r.id.is_empty() {
+                r.id = format!("m{}", random_hex(6));
+            }
+        }
         Ok(Self {
             path: Some(path),
             policy: Arc::new(policy),
@@ -284,7 +319,7 @@ impl ModelPolicyStore {
             return Ok(());
         }
         if let Some(path) = &self.path {
-            write_json_atomic(path, &next)
+            write_store_atomic(path, &next)
                 .map_err(|e| StoreError::Io(format!("cannot save {}: {e}", path.display())))?;
         }
         self.policy = Arc::new(next);
@@ -295,6 +330,7 @@ impl ModelPolicyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     const A: &str = "http://a:1";
     const B: &str = "http://b:2";
@@ -383,7 +419,7 @@ mod tests {
     fn persists_and_refuses_corrupt_file() {
         let dir = std::env::temp_dir().join(format!("omq-models-{}", random_hex(6)));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("models.json");
+        let path = dir.join("models.yaml");
         let mut s = ModelPolicyStore::load(&path).unwrap();
         s.set_mode(Mode::Allow).unwrap();
         s.add_rule("gemma*", Action::Allow, vec![]).unwrap();
@@ -391,6 +427,36 @@ mod tests {
         assert_eq!(again.snapshot(), s.snapshot());
         fs::write(&path, "nope").unwrap();
         assert!(ModelPolicyStore::load(&path).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A hand-written file: bare hide patterns, no ids or timestamps; an old
+    /// JSON file migrates on first load.
+    #[test]
+    fn hand_written_yaml_and_json_migration() {
+        let dir = std::env::temp_dir().join(format!("omq-models-hw-{}", random_hex(6)));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("models.yaml"),
+            "mode: deny\nrules:\n  - unsloth/Qwen3.8-27B-GGUF:Q4_K_XL\n  - pattern: keep-me*\n    action: allow\n",
+        )
+        .unwrap();
+        let s = ModelPolicyStore::load(dir.join("models.yaml")).unwrap();
+        let p = s.snapshot();
+        assert!(!p.served("unsloth/Qwen3.8-27B-GGUF:Q4_K_XL", A));
+        assert!(p.rules.iter().all(|r| !r.id.is_empty()));
+        assert!(p.rules.iter().any(|r| r.action == Action::Allow));
+
+        fs::remove_file(dir.join("models.yaml")).unwrap();
+        fs::write(
+            dir.join("models.json"),
+            r#"{"mode":"deny","rules":[{"id":"m1","pattern":"legacy*","action":"hide","backends":[],"from_toggle":false,"created_at_ms":1}]}"#,
+        )
+        .unwrap();
+        let s = ModelPolicyStore::load(dir.join("models.yaml")).unwrap();
+        assert!(!s.snapshot().served("legacy-x", A));
+        assert!(dir.join("models.yaml").exists());
+        assert!(dir.join("models.json.bak").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

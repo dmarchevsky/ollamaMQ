@@ -70,7 +70,7 @@ const CSP: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; \
 enum Secret {
     /// From `OLLAMA_MQ_UI_PASSWORD` or `settings.web_ui.password`.
     Plain(String),
-    /// argon2id hash from `admin.json` (set in the UI).
+    /// argon2id hash from `settings.web_ui.password_hash` (written by the UI).
     Hash(String),
 }
 
@@ -79,53 +79,49 @@ enum Secret {
 pub struct WebAuth {
     pub username: String,
     secret: Secret,
-    /// Where the password comes from: `admin.json`, `OLLAMA_MQ_UI_PASSWORD`
-    /// or `appconf.yaml`.
+    /// Where the password comes from: `appconf.yaml` or `OLLAMA_MQ_UI_PASSWORD`.
     pub source: String,
     changed_at_ms: Option<u64>,
-    /// Where a password changed in the UI is saved.
-    admin_file: String,
 }
 
 impl WebAuth {
-    /// The password set in the UI when there is one, else the configured
-    /// one; `None` (web UI off) when neither exists. A damaged `admin.json`
-    /// stops the proxy rather than falling back to the old password.
+    /// The strongest secret available: a hash (from `appconf.yaml`) wins,
+    /// else the env or file plaintext password; `None` (web UI off) when
+    /// neither exists. A malformed hash stops the proxy rather than
+    /// silently falling back to the weaker password.
     pub fn resolve(
-        admin_file: &str,
         username: Option<String>,
+        hash: Option<(String, &str)>,
         password: Option<(String, &str)>,
     ) -> Option<Self> {
-        match crate::admin::load(admin_file) {
-            Ok(Some(f)) => Some(Self {
-                username: f.username,
-                secret: Secret::Hash(f.password_hash),
-                source: admin_file.to_string(),
-                changed_at_ms: Some(f.changed_at_ms),
-                admin_file: admin_file.to_string(),
-            }),
-            Ok(None) => password.map(|(p, source)| Self {
-                username: username.unwrap_or_else(|| "admin".to_string()),
-                secret: Secret::Plain(p),
-                source: source.to_string(),
-                changed_at_ms: None,
-                admin_file: admin_file.to_string(),
-            }),
-            Err(e) => {
-                eprintln!("Error: {e}");
+        let username = username.unwrap_or_else(|| "admin".to_string());
+        if let Some((h, source)) = hash {
+            if !crate::admin::valid_hash(&h) {
+                eprintln!("Error: settings.web_ui.password_hash is not a valid password hash");
                 std::process::exit(1);
             }
+            return Some(Self {
+                username,
+                secret: Secret::Hash(h),
+                source: source.to_string(),
+                changed_at_ms: None,
+            });
         }
+        password.map(|(p, source)| Self {
+            username,
+            secret: Secret::Plain(p),
+            source: source.to_string(),
+            changed_at_ms: None,
+        })
     }
 
     #[cfg(test)]
-    pub fn plain(username: &str, password: &str, admin_file: &str) -> Self {
+    pub fn plain(username: &str, password: &str) -> Self {
         Self {
             username: username.into(),
             secret: Secret::Plain(password.into()),
             source: "test".into(),
             changed_at_ms: None,
-            admin_file: admin_file.into(),
         }
     }
 
@@ -1008,8 +1004,9 @@ fn yes() -> bool {
     true
 }
 
-/// Change the web UI password. The new one is stored hashed in `admin.json`
-/// and takes effect at once; other sessions end unless asked not to.
+/// Change the web UI password. The new hash is written to
+/// `settings.web_ui.password_hash` in `appconf.yaml` and takes effect at
+/// once; other sessions end unless asked not to.
 async fn change_password(
     axum::Extension(auth): axum::Extension<Arc<AuthState>>,
     State(state): State<Arc<AppState>>,
@@ -1040,18 +1037,22 @@ async fn change_password(
     }
     let password_hash = crate::admin::hash(&body.new)
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let file = crate::admin::AdminFile {
-        username: creds.username.clone(),
-        password_hash: password_hash.clone(),
-        changed_at_ms: crate::stats::now_ms(),
-    };
-    crate::admin::save(&creds.admin_file, &file)
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let changed_at_ms = crate::stats::now_ms();
+    {
+        let mut layers = state.config.lock_or_recover();
+        let mut cfg = layers.file.clone();
+        let web = cfg.settings.web_ui.get_or_insert_with(Default::default);
+        web.username = Some(creds.username.clone());
+        web.password_hash = Some(password_hash.clone());
+        crate::config_store::save(std::path::Path::new(&state.model_config_path), &cfg)
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        layers.file = cfg;
+    }
     *auth.creds.lock_or_recover() = WebAuth {
+        username: creds.username.clone(),
         secret: Secret::Hash(password_hash),
-        source: creds.admin_file.clone(),
-        changed_at_ms: Some(file.changed_at_ms),
-        ..creds
+        source: state.model_config_path.clone(),
+        changed_at_ms: Some(changed_at_ms),
     };
     if body.sign_out_others {
         let mine = headers
@@ -1064,13 +1065,13 @@ async fn change_password(
     state.log_event(crate::dispatcher::LogEvent {
         at: std::time::SystemTime::now(),
         dir: "CTL",
-        user: file.username,
+        user: creds.username.clone(),
         model: None,
         backend: None,
         info: "web UI password changed".into(),
         content: None,
     });
-    Ok(Json(json!({ "changed_at_ms": file.changed_at_ms })))
+    Ok(Json(json!({ "changed_at_ms": changed_at_ms })))
 }
 
 // ------------------------------------------------------------ model policy
@@ -1214,13 +1215,16 @@ mod tests {
     use crate::dispatcher::LogEvent;
 
     fn test_state() -> Arc<AppState> {
+        // A temp-dir config path: the password-change test saves appconf.yaml
+        // (and its .bak) there, never into the checkout.
+        let conf = std::env::temp_dir().join(format!("omq-web-conf-{}.yaml", std::process::id()));
         Arc::new(AppState::new(
             vec![("http://127.0.0.1:9".to_string(), None)],
             5,
             86400,
             1,
             1,
-            "appconf.yaml".into(),
+            conf.to_string_lossy().into_owned(),
             Vec::new(),
             crate::reqlog::RequestLogger::disabled(),
             65_536,
@@ -1229,15 +1233,7 @@ mod tests {
     }
 
     async fn serve(state: Arc<AppState>) -> String {
-        // A fresh admin.json path per server, so password tests never meet.
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let admin = std::env::temp_dir().join(format!(
-            "omq-web-admin-{}-{}.json",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_file(&admin);
-        let app = router(WebAuth::plain("admin", "pw", admin.to_str().unwrap())).with_state(state);
+        let app = router(WebAuth::plain("admin", "pw")).with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
@@ -1773,7 +1769,32 @@ mod tests {
         assert_eq!(with_cookie(&other).await.unwrap().status(), StatusCode::UNAUTHORIZED);
         let me: serde_json::Value = c.get(format!("{base}/ui/api/me")).header(header::COOKIE, &mine)
             .send().await.unwrap().json().await.unwrap();
-        assert!(me["password_source"].as_str().unwrap().ends_with(".json"));
+        assert!(me["password_source"].as_str().unwrap().ends_with(".yaml"));
         assert!(me["password_changed_at_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn hash_secret_beats_plaintext() {
+        let h = crate::admin::hash("hashed-secret").unwrap();
+        // A hash wins over any plaintext password, whichever set the name.
+        let a = WebAuth::resolve(
+            None,
+            Some((h.clone(), "appconf.yaml")),
+            Some(("plain-secret".to_string(), "OLLAMA_MQ_UI_PASSWORD")),
+        )
+        .unwrap();
+        assert_eq!(a.username, "admin");
+        assert!(a.check("admin", "hashed-secret"));
+        assert!(!a.check("admin", "plain-secret"));
+        // No hash: the env plaintext applies with its user name.
+        let b = WebAuth::resolve(
+            Some("operator".into()),
+            None,
+            Some(("plain-secret".to_string(), "OLLAMA_MQ_UI_PASSWORD")),
+        )
+        .unwrap();
+        assert!(b.check("operator", "plain-secret") && !b.check("admin", "plain-secret"));
+        // Nothing at all: web UI off.
+        assert!(WebAuth::resolve(None, None, None).is_none());
     }
 }

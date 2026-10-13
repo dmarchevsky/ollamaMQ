@@ -1,8 +1,9 @@
 //! Effective settings: where each value comes from, and applying a change
 //! while the proxy runs.
 //!
-//! Precedence, highest first: CLI flags and environment variables, the web
-//! UI's overlay (`settings.json`), `appconf.yaml`, built-in defaults.
+//! Precedence, highest first: CLI flags and environment variables,
+//! `appconf.yaml`, built-in defaults. The web UI edits `appconf.yaml`
+//! itself (see [`crate::config_store`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,7 +15,6 @@ use tracing::info;
 use crate::config::{AppConfig, Backend, Settings};
 use crate::dispatcher::{AppState, BackendStatus};
 use crate::lock::LockExt;
-use crate::settings_store::SettingsStore;
 
 /// Settings the web UI can change, and whether a change applies at once.
 pub const EDITABLE: &[(&str, bool)] = &[
@@ -41,8 +41,6 @@ pub const STARTUP_ONLY: &[&str] = &[
     "request_log_max_files",
     "clients_file",
     "models_file",
-    "settings_file",
-    "admin_file",
 ];
 
 /// The value each setting has when nothing sets it.
@@ -66,16 +64,15 @@ pub fn defaults() -> Settings {
         max_queued_bytes: Some(512 * 1024 * 1024),
         clients_file: Some(crate::clients::DEFAULT_CLIENTS_FILE.into()),
         models_file: Some(crate::model_policy::DEFAULT_MODELS_FILE.into()),
-        settings_file: Some(crate::settings_store::DEFAULT_SETTINGS_FILE.into()),
-        admin_file: Some(crate::admin::DEFAULT_ADMIN_FILE.into()),
         metrics_token: None,
         web_ui: None,
     }
 }
 
-/// Every source of settings, kept so the UI can show where a value comes from.
+/// Every source of settings, kept so the UI can show where a value comes
+/// from.
 pub struct Layers {
-    /// `appconf.yaml` as last read.
+    /// `appconf.yaml` as last read or saved.
     pub file: AppConfig,
     /// Values given as CLI flags or environment variables.
     pub pinned: Settings,
@@ -83,13 +80,12 @@ pub struct Layers {
     pub pinned_by: BTreeMap<&'static str, String>,
     /// True when `--backend-urls` chose the backends (the list is then fixed).
     pub backends_from_cli: bool,
-    /// Backends used when neither the UI nor the file lists any (the
-    /// built-in `localhost:11434`), so the first UI edit starts from them.
+    /// Backends used when the file lists none (the built-in
+    /// `localhost:11434`), so the first UI edit starts from them.
     pub fallback_backends: Vec<Backend>,
     /// Effective settings when the proxy started, to tell which startup-only
     /// changes are still waiting for a restart.
     pub startup: Settings,
-    pub store: SettingsStore,
     /// Where each store file was found (setting name -> path), for display.
     pub resolved: BTreeMap<&'static str, String>,
 }
@@ -103,35 +99,31 @@ impl Default for Layers {
             backends_from_cli: false,
             fallback_backends: Vec::new(),
             startup: Settings::default(),
-            store: SettingsStore::in_memory(),
             resolved: BTreeMap::new(),
         }
     }
 }
 
 impl Layers {
-    /// File, then UI, then CLI/env (unset values stay `None`).
+    /// The file, then CLI/env on top (unset values stay `None`).
     pub fn effective(&self) -> Settings {
-        self.file
-            .settings
-            .overlay(&self.store.overlay().settings)
-            .overlay(&self.pinned)
+        self.file.settings.overlay(&self.pinned)
     }
 
     /// The configured backend list: `--backend-urls` when given, else the
-    /// UI's once edited there, else the file's, else the built-in fallback.
+    /// file's, else the built-in fallback.
     pub fn backend_list(&self) -> Vec<Backend> {
         if self.backends_from_cli {
             return self.fallback_backends.clone();
         }
-        match &self.store.overlay().backends {
-            Some(list) => list.clone(),
-            None if !self.file.backends.is_empty() => self.file.backends.clone(),
-            None => self.fallback_backends.clone(),
+        if !self.file.backends.is_empty() {
+            self.file.backends.clone()
+        } else {
+            self.fallback_backends.clone()
         }
     }
 
-    /// Where `key` gets its value: `cli`/`env` (with a label), `ui`, `file` or `default`.
+    /// Where `key` gets its value: `cli`/`env` (with a label), `file` or `default`.
     pub fn source(&self, key: &str) -> (&'static str, Option<String>) {
         if let Some(label) = self.pinned_by.get(key) {
             let kind = if label.starts_with("--") {
@@ -142,9 +134,7 @@ impl Layers {
             return (kind, Some(label.clone()));
         }
         let set = |s: &Settings| field(s, key).is_some_and(|v| !v.is_null());
-        if set(&self.store.overlay().settings) {
-            ("ui", None)
-        } else if set(&self.file.settings) {
+        if set(&self.file.settings) {
             ("file", None)
         } else {
             ("default", None)
@@ -241,8 +231,8 @@ pub fn reload(state: &Arc<AppState>) -> Result<usize, String> {
     Ok(n)
 }
 
-/// Where a store file named in the settings (`clients_file`, `models_file`,
-/// `settings_file`, `admin_file`) lives.
+/// Where a store file named in the settings (`clients_file`, `models_file`)
+/// lives.
 ///
 /// An absolute path is used as given. A relative one is resolved from
 /// `config_dir`, the folder holding `appconf.yaml`, so the whole
@@ -270,6 +260,79 @@ pub fn config_dir(config_file: &str) -> PathBuf {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => PathBuf::from("."),
     }
+}
+
+/// One-time upgrade from the old side stores: a leftover `settings.json`
+/// (the web UI's overlay) and `admin.json` (password changed in the UI) are
+/// merged into `appconf.yaml` — the overlay outranks the file, as before —
+/// written back (the original kept as `appconf.yaml.bak`) and renamed to
+/// `.bak`. Does nothing when the config file itself does not exist.
+pub fn merge_legacy_stores(config_file: &str, mut cfg: AppConfig) -> Result<AppConfig, String> {
+    if !Path::new(config_file).exists() {
+        return Ok(cfg);
+    }
+    let dir = config_dir(config_file);
+    let mut merged = false;
+
+    if let Some(path) = legacy_store(&dir, "settings.json") {
+        #[derive(serde::Deserialize)]
+        struct OldOverlay {
+            #[serde(default)]
+            settings: Settings,
+            #[serde(default)]
+            backends: Option<Vec<Backend>>,
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let old: OldOverlay = serde_json::from_str(&text)
+            .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+        cfg.settings = cfg.settings.overlay(&old.settings);
+        if let Some(backends) = old.backends {
+            cfg.backends = backends;
+        }
+        retire(&path)?;
+        merged = true;
+        info!("Migrated {} into {config_file}", path.display());
+    }
+    if let Some(path) = legacy_store(&dir, "admin.json") {
+        #[derive(serde::Deserialize)]
+        struct OldAdmin {
+            username: String,
+            password_hash: String,
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let old: OldAdmin = serde_json::from_str(&text)
+            .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+        let web = cfg.settings.web_ui.get_or_insert_with(Default::default);
+        web.username = Some(old.username);
+        web.password_hash = Some(old.password_hash);
+        retire(&path)?;
+        merged = true;
+        info!("Migrated {} into {config_file}", path.display());
+    }
+
+    if merged {
+        // An old overlay could hold values that never passed today's checks;
+        // failing loudly beats running on quietly broken settings.
+        cfg.settings.validate().map_err(|e| format!("merged config is invalid: {e}"))?;
+        crate::config_store::save(Path::new(config_file), &cfg)?;
+    }
+    Ok(cfg)
+}
+
+/// A legacy store file, resolved like every store file (config folder first,
+/// then the working directory).
+fn legacy_store(config_dir: &Path, name: &str) -> Option<PathBuf> {
+    let (path, _) = store_path(name, config_dir, Path::new(""));
+    path.exists().then_some(path)
+}
+
+fn retire(path: &Path) -> Result<(), String> {
+    let mut bak = path.as_os_str().to_owned();
+    bak.push(".bak");
+    std::fs::rename(path, PathBuf::from(bak))
+        .map_err(|e| format!("cannot rename {}: {e}", path.display()))
 }
 
 /// `http://host:port`, no trailing slash; `http://` added when missing.
@@ -344,24 +407,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn precedence_is_cli_then_ui_then_file() {
+    fn precedence_is_cli_then_file() {
         let mut l = Layers::default();
         l.file.settings.timeout = Some(100);
         l.file.settings.stuck_timeout = Some(30);
         l.file.settings.port = Some(9000);
-        let mut ui = crate::config::UiOverlay::default();
-        ui.settings.timeout = Some(200);
-        ui.settings.ip_identity = Some(false);
-        l.store.save(ui).unwrap();
         l.pinned.port = Some(9100);
         l.pinned_by.insert("port", "--port".into());
 
         let e = l.effective();
-        assert_eq!(e.timeout, Some(200));
+        assert_eq!(e.timeout, Some(100));
         assert_eq!(e.stuck_timeout, Some(30));
         assert_eq!(e.port, Some(9100));
-        assert_eq!(e.ip_identity, Some(false));
-        assert_eq!(l.source("timeout"), ("ui", None));
+        assert_eq!(l.source("timeout"), ("file", None));
         assert_eq!(l.source("stuck_timeout"), ("file", None));
         assert_eq!(l.source("port"), ("cli", Some("--port".into())));
         assert_eq!(l.source("max_queued_bytes"), ("default", None));
@@ -371,10 +429,8 @@ mod tests {
     fn restart_pending_lists_only_startup_settings() {
         let mut l = Layers::default();
         l.startup = l.effective();
-        let mut ui = crate::config::UiOverlay::default();
-        ui.settings.timeout = Some(5);
-        ui.settings.max_body_bytes = Some(2048);
-        l.store.save(ui).unwrap();
+        l.file.settings.timeout = Some(5);
+        l.file.settings.max_body_bytes = Some(2048);
         assert_eq!(l.restart_pending(), vec!["max_body_bytes"]);
     }
 
@@ -418,6 +474,49 @@ mod tests {
         assert_eq!(config_dir("/config/appconf.yaml"), PathBuf::from("/config"));
         assert_eq!(config_dir("appconf.yaml"), PathBuf::from("."));
         assert_eq!(config_dir("conf/app.yaml"), PathBuf::from("conf"));
+    }
+
+    #[test]
+    fn legacy_stores_merge_into_appconf() {
+        let root = std::env::temp_dir().join(format!("omq-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let conf = root.join("appconf.yaml");
+        std::fs::write(
+            &conf,
+            "settings:\n  timeout: 300\nbackends:\n  - http://a:1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"settings":{"timeout":100,"allow_all_routes":true},"backends":[{"url":"http://b:2","name":"B"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("admin.json"),
+            r#"{"username":"boss","password_hash":"$argon2id$v=19$m=1,t=1,p=1$c2FsdA$hash","changed_at_ms":1}"#,
+        )
+        .unwrap();
+
+        let cfg = merge_legacy_stores(conf.to_str().unwrap(), crate::config::load_config(conf.to_str().unwrap()).unwrap())
+            .unwrap();
+        // The old overlay outranked the file, so its values survive.
+        assert_eq!(cfg.settings.timeout, Some(100));
+        assert_eq!(cfg.settings.allow_all_routes, Some(true));
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(cfg.backends[0].url, "http://b:2");
+        let web = cfg.settings.web_ui.clone().unwrap();
+        assert_eq!(web.username.as_deref(), Some("boss"));
+        assert!(web.password_hash.is_some());
+
+        // The merged result is on disk, the originals retired, the original
+        // file kept as the undo backup.
+        let on_disk = crate::config::load_config(conf.to_str().unwrap()).unwrap();
+        assert_eq!(on_disk.settings.timeout, Some(100));
+        assert!(!root.join("settings.json").exists() && root.join("settings.json.bak").exists());
+        assert!(!root.join("admin.json").exists() && root.join("admin.json.bak").exists());
+        assert!(root.join("appconf.yaml.bak").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
