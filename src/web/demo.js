@@ -57,7 +57,7 @@
   ];
 
   const state = {
-    version: '0.5.0',
+    version: '0.8.0',
     vip: 'openwebui',
     boost: null,
     blocked: { users: ['ip-192.168.6.77'], ips: ['192.168.6.77', '10.8.0.14'], clients: ['old-intern'] },
