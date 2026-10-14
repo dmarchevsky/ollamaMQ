@@ -917,6 +917,12 @@ pub struct Run {
     /// Generated tokens so far, estimated from the stream (see
     /// [`estimate_stream_tokens`]).
     pub tokens: u64,
+    /// Prompt tokens the request probably carries, estimated from the request
+    /// body size (bytes ÷ 4) at dispatch — the real count only arrives with
+    /// the response usage. Used to size capacity segments.
+    pub est_prompt_tokens: u64,
+    /// Conversation tag for the session views (see [`crate::dispatcher::SessionKey::tag`]).
+    pub session: Option<String>,
 }
 
 /// Requests in progress, for the live views (`/metrics` gauges, the web
@@ -937,6 +943,8 @@ impl Runs {
         model: &str,
         backend: &str,
         waited_secs: f64,
+        est_prompt_tokens: u64,
+        session: Option<&str>,
     ) -> RunGuard<'_> {
         let id = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.lock_or_recover().insert(
@@ -951,6 +959,8 @@ impl Runs {
                 first_byte: None,
                 first_token: None,
                 tokens: 0,
+                est_prompt_tokens,
+                session: session.map(str::to_string),
             },
         );
         RunGuard { runs: self, id }
@@ -1097,7 +1107,7 @@ mod tests {
     fn runs_clear_on_drop_and_show_as_gauges() {
         let runs = Runs::default();
         {
-            let g = runs.start("dm", "laptop", "qwen", "b:1", 0.5);
+            let g = runs.start("dm", "laptop", "qwen", "b:1", 0.5, 1_000, None);
             g.update(|r| r.tokens += 5);
             let l = runs.list();
             assert_eq!((l.len(), l[0].tokens), (1, 5));

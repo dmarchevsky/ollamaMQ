@@ -404,6 +404,10 @@ struct RunView {
     tokens: u64,
     /// Generation speed since the first token.
     tokens_per_sec: Option<f64>,
+    /// Prompt tokens estimated from the request body (bytes ÷ 4) at dispatch.
+    est_prompt_tokens: u64,
+    /// Conversation tag for the session views; `None` when there is none.
+    session: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -595,6 +599,8 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
                         .filter(|s| *s >= 1.0 && r.tokens > 0)
                         .map(|s| r.tokens as f64 / s),
                     tokens: r.tokens,
+                    est_prompt_tokens: r.est_prompt_tokens,
+                    session: r.session,
                     client: r.client,
                     key: r.key,
                     model: r.model,

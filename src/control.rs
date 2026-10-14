@@ -137,6 +137,10 @@ pub struct BackendProbe {
     /// Parallel request slots the server reports (llama.cpp `/props`
     /// `total_slots`, halogen `/health` `slots`); `None` when it doesn't say.
     pub slots: Option<u32>,
+    /// Percent of the KV cache still free (0–100), from the llama.cpp `/metrics`
+    /// gauge `llamacpp:kv_cache_usage`; `None` for servers without it
+    /// (Ollama, LM Studio, llama.cpp started without `--metrics`).
+    pub kv_free_pct: Option<u8>,
 }
 
 /// Per-request timeout for health probes.
@@ -496,6 +500,27 @@ pub async fn probe_backend(
         }
     }
 
+    // KV cache pressure: a llama.cpp server started with `--metrics` exposes
+    // `llamacpp:kv_cache_usage` (0..1) at `/metrics`. Ollama and LM Studio
+    // publish nothing of the kind; their 404 is remembered like any other
+    // rejected endpoint, so each backend is asked at most once per re-probe.
+    let mut kv_free_pct: Option<u8> = None;
+    if is_online && !skip.contains("/metrics") {
+        match authed(client.get(format!("{url}/metrics")).timeout(timeout))
+            .send()
+            .await
+        {
+            Ok(res) if res.status().is_success() => {
+                good_endpoints.insert("/metrics".to_string());
+                kv_free_pct = res.text().await.ok().as_deref().and_then(parse_kv_free_pct);
+            }
+            Ok(res) if res.status() == reqwest::StatusCode::NOT_FOUND => {
+                bad_endpoints.insert("/metrics".to_string());
+            }
+            _ => {}
+        }
+    }
+
     BackendProbe {
         is_online,
         api_type: detected_type,
@@ -507,7 +532,28 @@ pub async fn probe_backend(
         bad_endpoints,
         good_endpoints,
         slots,
+        kv_free_pct,
     }
+}
+
+/// Percent of KV cache free from a llama.cpp server's Prometheus text.
+/// Understands `llamacpp:kv_cache_usage <0..1>`, with or without labels.
+/// Kept tiny on purpose: one gauge, and everything else means "unknown".
+fn parse_kv_free_pct(body: &str) -> Option<u8> {
+    for line in body.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let (Some(name), Some(value)) = (it.next(), it.next()) else { continue };
+        if name.split('{').next() == Some("llamacpp:kv_cache_usage") {
+            let used: f64 = value.parse().ok()?;
+            return (0.0..=1.0)
+                .contains(&used)
+                .then(|| ((1.0 - used) * 100.0).round() as u8);
+        }
+    }
+    None
 }
 
 /// Merge a fresh probe result into backend state, including endpoint memory:
@@ -551,6 +597,7 @@ pub fn apply_probe(b: &mut BackendStatus, probe: BackendProbe) {
     // the same server, and capacity does not matter while it is down.
     if probe.is_online {
         b.detected_slots = probe.slots;
+        b.kv_free_pct = probe.kv_free_pct;
     }
     for e in &probe.good_endpoints {
         b.known_bad_endpoints.remove(e);
@@ -1788,6 +1835,7 @@ mod tests {
             forced_api: BackendApiType::EMPTY,
             declared_models: Vec::new(),
             detected_slots: None,
+            kv_free_pct: None,
             name: None,
             disabled: false,
         }
@@ -2288,6 +2336,7 @@ mod tests {
                 bad_endpoints: HashSet::new(),
                 good_endpoints: ["/v1/models".to_string()].into_iter().collect(),
                 slots: None,
+                kv_free_pct: None,
             },
         );
         assert!(!b.known_bad_endpoints.contains("/v1/models"));
@@ -2306,6 +2355,7 @@ mod tests {
                 bad_endpoints: ["/api/ps".to_string()].into_iter().collect(),
                 good_endpoints: HashSet::new(),
                 slots: None,
+                kv_free_pct: None,
             },
         );
         assert!(b.known_bad_endpoints.contains("/api/ps"));
@@ -2368,6 +2418,17 @@ mod tests {
         assert!(p.bad_endpoints.contains("/props"), "404 remembered");
     }
 
+    #[test]
+    fn kv_free_pct_parses_the_llama_gauge() {
+        let body = "# TYPE llamacpp:kv_cache_usage gauge\nllamacpp:kv_cache_usage{model=\"m\"} 0.58\nllamacpp:predicted_per_second 12\n";
+        assert_eq!(parse_kv_free_pct(body), Some(42));
+        assert_eq!(parse_kv_free_pct("llamacpp:kv_cache_usage 0"), Some(100));
+        assert_eq!(parse_kv_free_pct("llamacpp:kv_cache_usage 1"), Some(0));
+        assert_eq!(parse_kv_free_pct("llamacpp:kv_cache_usage 1.4"), None);
+        assert_eq!(parse_kv_free_pct("llamacpp:other_usage 0.5"), None);
+        assert_eq!(parse_kv_free_pct(""), None);
+    }
+
     fn probe_claiming(api_type: BackendApiType) -> BackendProbe {
         BackendProbe {
             is_online: true,
@@ -2380,6 +2441,7 @@ mod tests {
             bad_endpoints: HashSet::new(),
             good_endpoints: HashSet::new(),
             slots: None,
+            kv_free_pct: None,
         }
     }
 
