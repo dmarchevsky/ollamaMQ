@@ -3,6 +3,14 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.8.1 — 2026-10-13
+
+### Changed
+
+- `docker-compose.yml` runs the published Docker Hub image (tracking `latest`) instead of
+  building the checkout locally: `docker compose pull && docker compose up -d` upgrades to
+  the newest release; pin a version tag to make upgrades deliberate again.
+
 ## v0.8.0 — 2026-10-13
 
 ### Changed

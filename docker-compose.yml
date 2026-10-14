@@ -11,13 +11,12 @@
 # it, i.e. in config/.
 services:
   ollamamq:
-    # In a checkout of this repo: build it. In a server folder, point this
-    # at a clone inside the folder (`context: ./src`), or build straight from
-    # GitHub (only pushed commits): context: https://github.com/dmarchevsky/ollamaMQ.git#master
-    build:
-      context: .
-    image: ollamamq:local
-    pull_policy: build
+    # Published image, tagged by CI from the release tag (see
+    # .github/workflows/docker-release.yml). `latest` tracks the newest release:
+    # `docker compose pull && docker compose up -d` upgrades. Pin a version
+    # (e.g. dmarchevsky/ollamamq:0.7.0) if you want upgrades to be deliberate.
+    image: dmarchevsky/ollamamq:latest
+    pull_policy: always
     container_name: ollamamq
     ports:
       - "8081:11435"
