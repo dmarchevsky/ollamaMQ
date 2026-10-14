@@ -3,6 +3,28 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.8.0 — 2026-10-13
+
+### Changed
+
+- **Overview redesign.** The KPI cards and Recent requests panel are gone. Capacity bars now
+  size to each backend's slots with clearly visible free space; waiting rows share the bar's
+  token scale so a queue that outgrows a backend is shown as overflow, not a hidden number.
+  Activity became a per-backend swimlane of stacked, per-client histograms; buckets are aligned
+  to the wall clock and show the busiest instant in the bucket, so a bar never exceeds the slot
+  count and closed buckets never re-height.
+- The window selector moved to the top bar. There **Done** and **Drop** count the selected window
+  (completed / dropped), mirroring the lifetime counters they replace; Queue and Running stay live.
+- The Requests table shows prefill as `size · s.s` (one decimal, ≈ while estimated), a new Gen
+  time column, first token, and prefix-cache use for finished requests.
+
+### Added
+
+- **Request grouping.** Requests carry a short session tag — the client's `X-Session-Id`, its
+  `prompt_cache_key`, or a fingerprint of the conversation — and the Requests table groups by it:
+  *Ungrouped* (newest first), *Threads* (a header per session with its turns under a dotted lane),
+  or *Chain* (Ungrouped's order with a git-graph-style lane threaded through it).
+
 ## v0.7.0 — 2026-10-13
 
 ### Added

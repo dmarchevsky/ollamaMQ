@@ -515,13 +515,12 @@ It covers everything the TUI does:
 
 The **Overview** page shows:
 - a one-line health summary
-- tiles with sparklines: slots in use, waiting requests, throughput and error rate, output tok/s, time to first token, generation speed
-- a **Capacity** board with one square per backend slot, coloured by the client using it; waiting requests join their row as dim dashed squares in the waiting client's colour
-- an **Activity** chart of running and waiting requests, with errors and timeouts marked
-- **Requests now**: every running and waiting request in one table
+- a **Capacity** board: one proportional bar per backend — solid client-coloured segments for the running requests (width ∝ the request's estimated size) and clearly visible free slots; waiting requests get a slim row under the bar on the same token scale, so a backlog visibly passes the backend's end. Where a backend reports its KV cache (a llama.cpp server started with `--metrics`), the free space is sized by it; elsewhere free slots split the remainder equally
+- an **Activity** board with one swimlane per backend that had activity in the window: stacked histograms with the client's colour for running and the same colour striped for waiting, plus the free-slot count per lane; errors and timeouts are marked
+- **Requests**: the running and waiting requests, or **All** to also list recently finished ones — with wait, prefill size and time, prefix-cache use, first token, generation time, and generation speed. **Group** puts one conversation's rows together: *Threads* draws a header per session, *Chain* keeps the plain order and threads a dotted lane through it. Sessions come from sticky routing: the client's `X-Session-Id` header, its `prompt_cache_key`, or a fingerprint of the conversation (see [Sticky Routing](#-sticky-routing-session-affinity))
 - **Backends** and **Clients** tables with requests, errors, first-token p50/p95, generation and prefill speed, and token totals
 
-Numbers cover the chosen window and come from an in-memory history of the last hour (finished requests, plus a 5-second activity sample). The history starts empty on every restart.
+Numbers cover the chosen window and come from an in-memory history of the last hour (finished requests, plus what is running or queued right now). The history starts empty on every restart. Request sizes are estimated as one token per four body bytes while queued or running — the exact prompt count only arrives with the finished response.
 - *First token* is measured from dispatch to the first generated token for streams, or is the prompt time the backend reports for non-streamed responses.
 - *Generation speed* is per stream (median).
 - *Share of slot time* is each client's part of the backend time used in the window, which is what fair scheduling divides.

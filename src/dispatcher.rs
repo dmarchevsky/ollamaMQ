@@ -662,6 +662,9 @@ pub struct BackendStatus {
     pub declared_models: Vec<String>,
     /// Parallel request slots the server reports (see `BackendProbe::slots`).
     pub detected_slots: Option<u32>,
+    /// Percent of the KV cache free (0–100), when the server reports it (see
+    /// `BackendProbe::kv_free_pct`). Sizes the free capacity on the Overview.
+    pub kv_free_pct: Option<u8>,
     /// Display name (`backends[].name`), shown instead of `host:port`.
     pub name: Option<String>,
     /// Turned off in the settings: never probed, kept offline, never routed to.
@@ -692,6 +695,7 @@ impl BackendStatus {
             forced_api: ApiSet::EMPTY,
             declared_models,
             detected_slots: None,
+            kv_free_pct: None,
             name: None,
             disabled: false,
         }
@@ -888,6 +892,18 @@ impl FairShare {
 pub struct SessionKey {
     pub conversation: String,
     pub model: String,
+}
+
+impl SessionKey {
+    /// Stable short tag for the UI's session views: six hex digits of the
+    /// conversation. Collision across sessions at 16M in 24 bits is ~0%
+    /// for any realistic number of live conversations.
+    pub fn tag(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.conversation.hash(&mut h);
+        format!("{:06x}", h.finish() & 0x00ff_ffff)
+    }
 }
 
 /// The backend a conversation was last served by.
@@ -2756,6 +2772,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     model,
                                     backend: None,
                                     outcome: "timeout",
+                                    session: dropped.session_key.as_ref().map(SessionKey::tag),
                                     queue_wait: Some(dropped.queued_at.elapsed().as_secs_f64()),
                                     timing: Default::default(),
                                 });
@@ -2941,9 +2958,6 @@ pub async fn run_worker(state: Arc<AppState>) {
                     // Tokens go to the per-request counter and, for requests
                     // sent with a client key, the per-key one.
                     let count_tokens = |kind: &str, n: u64| {
-                        if kind == "completion" {
-                            state_clone.stats.add_out_tokens(n);
-                        }
                         metrics.inc(
                             &crate::metrics::TOKENS,
                             &[&user_id, &m_model, &m_backend, kind],
@@ -2954,6 +2968,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                         }
                     };
                     let queue_wait = task.queued_at.elapsed().as_secs_f64();
+                    let session_tag = task.session_key.as_ref().map(SessionKey::tag);
                     // Counted for Prometheus and kept for the Overview.
                     let outcome = |o: &'static str, timing: crate::stats::Timing| {
                         metrics.inc(
@@ -2967,6 +2982,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             model: m_model.clone(),
                             backend: Some(m_backend.clone()),
                             outcome: o,
+                            session: session_tag.clone(),
                             queue_wait: Some(queue_wait),
                             timing,
                         });
@@ -3049,12 +3065,17 @@ pub async fn run_worker(state: Arc<AppState>) {
                         let path_str = task.path.clone();
 
                         // Shown as running until this block ends, on any path.
+                        // The real prompt count arrives with the response usage;
+                        // this rough estimate is what capacity can size by now.
+                        let est_prompt_tokens = (task.body.len() / 4) as u64;
                         let run = state_clone.runs.start(
                             &user_id,
                             m_key.as_deref().unwrap_or("none"),
                             &m_model,
                             &m_backend,
                             queue_wait,
+                            est_prompt_tokens,
+                            session_tag.as_deref(),
                         );
                         // Completion tokens already counted from the stream.
                         let mut live_tokens: u64 = 0;
@@ -3540,6 +3561,8 @@ pub async fn proxy_handler(
     );
     // Before the queues lock below: this takes the backends lock.
     let model_label = state.model_label(requested_model.as_deref());
+    // Kept copy of the conversation tag: `session_key` moves into the task.
+    let session_tag = session_key.as_ref().map(SessionKey::tag);
     // Request-log content is captured before `body` moves into the Task.
     let body_len = body.len() as u64;
     let content = Arc::new(crate::reqlog::truncate_utf8(&body, state.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)));
@@ -3599,6 +3622,7 @@ pub async fn proxy_handler(
                 model: model_label.clone(),
                 backend: None,
                 outcome: "queue_full",
+                session: session_tag.clone(),
                 queue_wait: None,
                 timing: Default::default(),
             });
@@ -3650,6 +3674,7 @@ pub async fn proxy_handler(
                 model: model_label.clone(),
                 backend: None,
                 outcome: "overloaded",
+                session: session_tag.clone(),
                 queue_wait: None,
                 timing: Default::default(),
             });
@@ -3888,6 +3913,7 @@ mod tests {
             forced_api: BackendApiType::EMPTY,
             declared_models: Vec::new(),
             detected_slots: None,
+            kv_free_pct: None,
             name: None,
             disabled: false,
         }
@@ -5833,6 +5859,17 @@ mod tests {
             conversation: id.to_string(),
             model: model.to_string(),
         }
+    }
+
+    #[test]
+    fn session_tag_is_short_stable_and_distinct() {
+        let a = key("p:abc123", "m");
+        assert_eq!(a.tag(), a.tag(), "stable across calls");
+        assert_eq!(a.tag().len(), 6, "six hex digits");
+        assert!(a.tag().bytes().all(|b| b.is_ascii_hexdigit()));
+        // The tag identifies the conversation, not the model or the whole key.
+        assert_eq!(key("p:abc123", "other").tag(), a.tag());
+        assert_ne!(key("p:zzz999", "m").tag(), a.tag(), "different conversation");
     }
 
     /// True once the conversation is remembered on `url` — polled, because the

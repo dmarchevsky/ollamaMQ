@@ -57,7 +57,7 @@
   ];
 
   const state = {
-    version: '0.5.0',
+    version: '0.8.0',
     vip: 'openwebui',
     boost: null,
     blocked: { users: ['ip-192.168.6.77'], ips: ['192.168.6.77', '10.8.0.14'], clients: ['old-intern'] },
@@ -158,16 +158,17 @@
 
   // Runs in progress: tokens grow with time like a streaming backend.
   const demoRuns = [
-    { client: 'codex-laptop', key: 'laptop', model: 'Qwen3.8-Flash-Next', backend: '192.168.6.11:8731', started: now - 94_000, ttfb: 2.4, rate: 38.5, waited: 0.4 },
-    { client: 'openwebui', key: 'webui', model: 'Qwen3.8-27B', backend: '192.168.255.224:8000', started: now - 21_000, ttfb: 6.8, rate: 11.2, waited: 2.1 },
-    { client: 'n8n-agents', key: 'prod', model: 'llama3.3:70b', backend: 'gpu-box.lan:11434', started: now - 3_000, ttfb: null, rate: 0, waited: 12.6 },
+    { client: 'codex-laptop', key: 'laptop', model: 'Qwen3.8-Flash-Next', backend: '192.168.6.11:8731', started: now - 94_000, ttfb: 2.4, rate: 38.5, waited: 0.4, est: 21_000, session: 'a3f19c' },
+    { client: 'openwebui', key: 'webui', model: 'Qwen3.8-27B', backend: '192.168.255.224:8000', started: now - 21_000, ttfb: 6.8, rate: 11.2, waited: 2.1, est: 44_000, session: '7e04d2' },
+    { client: 'n8n-agents', key: 'prod', model: 'llama3.3:70b', backend: 'gpu-box.lan:11434', started: now - 3_000, ttfb: null, rate: 0, waited: 12.6, est: 3_200, session: null },
   ];
   const runView = () => demoRuns.map(r => {
     const elapsed = (Date.now() - r.started) / 1000;
     const gen = r.ttfb == null ? 0 : Math.max(0, elapsed - r.ttfb);
     return { client: r.client, key: r.key, model: r.model, backend: r.backend, elapsed_secs: elapsed,
       state: r.ttfb != null && elapsed >= r.ttfb ? 'generating' : 'prefill', waited_secs: r.waited,
-      ttfb_secs: r.ttfb, ttft_secs: r.ttfb, tokens: Math.floor(gen * r.rate), tokens_per_sec: gen >= 1 ? r.rate : null };
+      ttfb_secs: r.ttfb, ttft_secs: r.ttfb, tokens: Math.floor(gen * r.rate), tokens_per_sec: gen >= 1 ? r.rate : null,
+      est_prompt_tokens: r.est, session: r.session };
   });
 
   function snapshot() {
@@ -186,13 +187,13 @@
   const noise = n => { const x = Math.sin(n * 12.9898) * 43758.5453; return x - Math.floor(x); };
   // `backends`: indexes of the backends that can serve the model.
   const demoQueue = [
-    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 38_000, pos: 1, backends: [0] },
-    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 21_000, pos: 2, backends: [0] },
-    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 4_000, pos: 3, backends: [0] },
-    { client: 'openwebui', model: 'Qwen3.8-27B', since: now - 9_000, pos: 1, backends: [1] },
-    { client: 'grafana-alerts', model: 'Gemma-4-E4B', since: now - 2_000, pos: 1, backends: [2] },
-    { client: 'n8n-agents', model: 'BGE-M3', since: now - 17_000, pos: 1, backends: [3] },
-    { client: 'anonymous', model: 'unknown', since: now - 6_000, pos: 1, backends: [] },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 38_000, pos: 1, backends: [0], est: 18_000, session: 'a3f19c' },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 21_000, pos: 2, backends: [0], est: 9_500, session: 'a3f19c' },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 4_000, pos: 3, backends: [0], est: 2_400, session: 'a3f19c' },
+    { client: 'openwebui', model: 'Qwen3.8-27B', since: now - 9_000, pos: 1, backends: [1], est: 40_000, session: '7e04d2' },
+    { client: 'grafana-alerts', model: 'Gemma-4-E4B', since: now - 2_000, pos: 1, backends: [2], est: 800 },
+    { client: 'n8n-agents', model: 'BGE-M3', since: now - 17_000, pos: 1, backends: [3], est: 5_000 },
+    { client: 'anonymous', model: 'unknown', since: now - 6_000, pos: 1, backends: [], est: 1_200 },
   ];
   // Per backend over 15 minutes: requests, errors, first token p50/p95, gen tok/s, prefill tok/s.
   const BACKEND_STATS = {
@@ -218,31 +219,24 @@
     const t = Date.now(), from = t - secs * 1000;
     const online = backends.filter(b => b.online);
     const capacity = online.reduce((a, b) => a + b.max, 0);
-    const timeline = [];
-    for (let at = Math.ceil(from / 5000) * 5000; at <= t; at += 5000) {
-      const k = at / 5000;
-      const wave = Math.sin(at / 170_000) + 0.5 * Math.sin(at / 47_000);
-      const running = Math.max(0, Math.min(capacity, Math.round(3 + 1.6 * wave + noise(k) - 0.5)));
-      const queued = Math.max(0, Math.round(2.4 * Math.sin(at / 240_000 + 1) + 2 * noise(k + 0.5) - 1));
-      timeline.push({ at_ms: at, running, queued, capacity, free: capacity - running, out_tokens: Math.round(running * (24 + 16 * noise(k + 0.25)) * 5) });
-    }
-    const spark = f => Array.from({ length: 30 }, (_, i) => {
-      const a = from + i * secs * 1000 / 30, b = a + secs * 1000 / 30;
-      const v = timeline.filter(p => p.at_ms >= a && p.at_ms < b);
-      return v.length ? f(v, i) : null;
-    });
-    const avg = (v, f) => v.reduce((a, p) => a + f(p), 0) / v.length;
-    const queue = demoQueue.map(q => ({ client: q.client, model: q.model, pos: q.pos, backends: q.backends, waited_secs: (t - q.since) / 1000 }));
     const loadingOf = b => b.active_op && { backend: hostOf(b.url), verb: b.active_op.verb, model: b.active_op.model };
+    // Free KV share per backend (see the capacity panel): one llama.cpp box
+    // with --metrics; the rest report nothing.
+    const KV = { '192.168.255.224:8000': 42 };
+    const queue = demoQueue.map(q => ({
+      client: q.client, model: q.model, pos: q.pos, backends: q.backends, session: q.session,
+      waited_secs: (t - q.since) / 1000, est_prompt_tokens: q.est,
+    }));
     const be = backends.map(b => {
       const label = hostOf(b.url);
       const [requests, errors, ttft_p50, ttft_p95, gen_p50, prefill_tps] = BACKEND_STATS[label] || [0, 0, null, null, null, null];
       return {
         idx: b.idx, label, online: b.online, api_type: b.api_type, running: b.active, max: b.max,
         free: b.online && !b.active_op ? Math.max(0, b.max - b.active) : 0, loading: loadingOf(b),
+        kv_free_pct: KV[label] ?? null,
         requests: Math.round(requests * scale), errors: Math.round(errors * scale), ttft_p50, ttft_p95, gen_p50, wait_p95: null,
         prefill_tps, prompt_tokens: 0, completion_tokens: 0, busy_secs: 0,
-        spark: b.online ? spark((v, i) => (gen_p50 || 0) * (0.6 + 0.6 * noise(i + label.length)) * (b.max)) : Array(30).fill(0),
+        spark: b.online ? Array.from({ length: 30 }, (_, i) => (gen_p50 || 0) * (0.6 + 0.6 * noise(i + label.length)) * b.max) : Array(30).fill(0),
       };
     });
     const totalBusy = Object.values(CLIENT_STATS).reduce((a, c) => a + c[7], 0);
@@ -259,32 +253,80 @@
     });
     const requests = be.reduce((a, b) => a + b.requests, 0);
     const errors = be.reduce((a, b) => a + b.errors, 0);
-    const markers = [7, 12, 13.5, 41].map(m => t - m * min).filter(at => at >= from).map((at, i) => ({
-      at_ms: at, outcome: i % 2 ? 'timeout' : 'backend_error', client: i % 2 ? 'n8n-agents' : 'codex-laptop',
-      model: i % 2 ? 'BGE-M3' : 'Qwen3.8-Flash-Next', backend: null }));
+
+    // Swimlanes: running/waiting per client per bucket, from noise waves that
+    // keep their shape between polls (noise hashes its input).
+    const LANE_W = { 300: 10, 3600: 60 }[secs] ?? 30; // seconds, as in overview.rs
+    const LANE_N = Math.round(secs / LANE_W);
+    const LANE_CLIENTS = {
+      '192.168.6.11:8731': ['codex-laptop', 'openwebui'],
+      '192.168.255.224:8000': ['openwebui', 'n8n-agents'],
+      '192.168.255.224:8001': ['grafana-alerts'],
+      'gpu-box.lan:11434': ['n8n-agents'],
+    };
+    const lanes = [];
+    for (const r of be) {
+      const clients = LANE_CLIENTS[r.label] || [];
+      if (!r.requests && !queue.some(q => q.backends.length === 1 && q.backends[0] === r.idx)) continue;
+      const buckets = Array.from({ length: LANE_N }, (_, i) => {
+        const wave = Math.max(0, Math.sin(i / LANE_N * Math.PI * 1.2 - 0.4));
+        const segs = [];
+        clients.forEach((c, ci) => {
+          const run = Math.min(r.max, Math.round(wave * (0.8 + 1.4 * ci) + noise(i * 7 + ci * 31 + r.idx) * 1.1));
+          const wt = i > LANE_N - 7 ? Math.round(noise(i + 4 * ci + r.idx)) : 0;
+          if (run || wt) segs.push({ client: c, running: run, waiting: wt });
+        });
+        return segs;
+      });
+      // What waits right now lands on the last bucket.
+      for (const q of queue.filter(q => q.backends.length === 1 && q.backends[0] === r.idx)) {
+        const last = buckets.at(-1);
+        let s = last.find(s => s.client === q.client);
+        if (!s) { s = { client: q.client, running: 0, waiting: 0 }; last.push(s); }
+        s.waiting += 1;
+      }
+      const peak_run = Math.max(0, ...buckets.map(bs => bs.reduce((a, s) => a + s.running, 0)));
+      const peak_wait = Math.max(0, ...buckets.map(bs => bs.reduce((a, s) => a + s.waiting, 0)));
+      const markers = [];
+      if (r.errors > 1) markers.push({ at_ms: from + 0.31 * secs * 1000, outcome: 'backend_error', status: 500, client: clients[0] || 'anon', model: '—' });
+      if (r.errors > 3) markers.push({ at_ms: from + 0.62 * secs * 1000, outcome: 'timeout', status: null, client: clients[0] || 'anon', model: '—' });
+      lanes.push({ idx: r.idx, label: r.label, online: r.online, free: r.free, max: r.max, requests: r.requests, peak_run, peak_wait, buckets, markers });
+    }
+
+    // Finished requests, newest first, spread over the window.
+    const recent = Array.from({ length: 9 }, (_, i) => {
+      const err = i === 2 || i === 6;
+      const prompt = 4000 + Math.round(noise(i + 3) * 26000);
+      const cache = err ? null : Math.round(noise(i + 11) * 92);
+      const prefillTok = err ? null : Math.round(prompt * (1 - (cache ?? 0) / 100));
+      const prefill = err ? null : prefillTok / 2900;
+      const completion = err ? 0 : Math.round(40 + noise(i + 5) * 900);
+      return {
+        at_ms: t - (30 + i * (secs / 10)) * 1000,
+        client: ['codex-laptop', 'openwebui', 'n8n-agents', 'dm-desktop'][i % 4],
+        model: ['Qwen3.8-Flash-Next', 'Qwen3.8-27B', 'BGE-M3', 'llama3.3:70b'][i % 4],
+        backend: ['192.168.6.11:8731', '192.168.255.224:8000', 'gpu-box.lan:11434'][i % 3],
+        outcome: err ? 'backend_error' : 'ok', error: err, status: err ? 500 : 200,
+        waited_secs: noise(i + 9) * 3,
+        session: i % 4 === 0 ? 'a3f19c' : i % 4 === 1 ? '7e04d2' : null,
+        prompt_tokens: err ? 0 : prompt, prefill_secs: prefill, prefill_tokens: prefillTok, cache_pct: cache,
+        ttft_secs: err ? null : prefill + 0.2,
+        completion_tokens: completion, gen_tps: err ? null : 20 + noise(i + 7) * 40,
+        gen_secs: err ? null : completion / (20 + noise(i + 7) * 40),
+      };
+    });
+
     return {
-      window_secs: secs, now_ms: t,
+      window_secs: secs, now_ms: t, lane_from_ms: from, lane_span_ms: secs * 1000,
       status: {
         backends_total: backends.length, backends_online: online.length, capacity,
         running: demoRuns.length, free: be.reduce((a, b) => a + b.free, 0), queued: queue.length,
         oldest_wait_secs: Math.max(...queue.map(q => q.waited_secs)),
         loading: backends.filter(b => b.active_op).map(loadingOf),
+        errors, error_pct: requests ? errors * 100 / requests : null,
+        done: recent.filter(r => r.outcome === 'ok').length, dropped: recent.filter(r => r.outcome === 'backend_error').length,
       },
-      kpis: {
-        requests, errors, ttft_p50: 0.8, ttft_p95: 3.9, gen_p50: 41.2, wait_p95: 12.0, prefill_tps: 1820,
-        prompt_tokens: 0, completion_tokens: 0, busy_secs: 0,
-        req_per_min: requests / (secs / 60), error_pct: requests ? errors * 100 / requests : null,
-        out_tps: avg(timeline, p => p.out_tokens) / 5,
-        spark: {
-          running: spark(v => avg(v, p => p.running)),
-          queued: spark(v => Math.max(...v.map(p => p.queued))),
-          req_per_min: spark((v, i) => 20 + 8 * noise(i)),
-          out_tps: spark(v => avg(v, p => p.out_tokens) / 5),
-          ttft: spark((v, i) => 0.6 + 0.5 * noise(i + 3) + (i === 22 ? 2.5 : 0)),
-          gen_tps: spark((v, i) => 36 + 10 * noise(i + 7)),
-        },
-      },
-      timeline, markers, backends: be, clients: clientRows, queue,
+      backends: be, clients: clientRows, queue, lanes, recent,
     };
   }
 

@@ -2,12 +2,11 @@
 //!
 //! [`crate::metrics`] gives Prometheus cumulative counters and histograms;
 //! the Overview needs "the last 15 minutes" without a Prometheus server. This
-//! keeps the last hour in memory: one record per finished request and one
-//! activity sample every [`SAMPLE_EVERY`]. Nothing here survives a restart.
+//! keeps the last hour in memory: one record per finished request. Nothing
+//! here survives a restart.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -18,9 +17,6 @@ use crate::lock::LockExt;
 pub const HISTORY: Duration = Duration::from_secs(3600);
 /// Cap on finished-request records, whatever their age.
 const MAX_FINISHED: usize = 20_000;
-/// Interval between activity samples.
-pub const SAMPLE_EVERY: Duration = Duration::from_secs(5);
-const MAX_SAMPLES: usize = (HISTORY.as_secs() / SAMPLE_EVERY.as_secs()) as usize;
 /// Points in each sparkline.
 pub const SPARK_BUCKETS: usize = 30;
 
@@ -53,6 +49,10 @@ pub struct Finished {
     pub backend: Option<String>,
     /// The `outcome` label of `ollamamq_requests_total`.
     pub outcome: &'static str,
+    /// Short tag of the conversation this request belongs to (see
+    /// [`crate::dispatcher::SessionKey::tag`]); `None` for non-chat requests
+    /// and sticky-less traffic.
+    pub session: Option<String>,
     /// Seconds it waited in the queue; `None` when refused before queuing.
     pub queue_wait: Option<f64>,
     pub timing: Timing,
@@ -77,28 +77,9 @@ impl Finished {
     }
 }
 
-/// Proxy activity at one moment.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
-pub struct Sample {
-    pub at_ms: u64,
-    pub running: u32,
-    pub queued: u32,
-    /// Slots of the online backends.
-    pub capacity: u32,
-    /// Slots that could start a request now.
-    pub free: u32,
-    /// Tokens generated since the previous sample (running streams included).
-    pub out_tokens: u64,
-}
-
 #[derive(Default)]
 pub struct Stats {
     finished: Mutex<VecDeque<Finished>>,
-    samples: Mutex<VecDeque<Sample>>,
-    /// Generated tokens since start, counted as they stream.
-    out_tokens: AtomicU64,
-    /// `out_tokens` when the last sample was taken.
-    sampled_tokens: AtomicU64,
 }
 
 impl Stats {
@@ -111,65 +92,12 @@ impl Stats {
         q.push_back(f);
     }
 
-    pub fn add_out_tokens(&self, n: u64) {
-        self.out_tokens.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Store an activity sample; its `out_tokens` is filled in here.
-    pub fn sample(&self, mut s: Sample) {
-        let total = self.out_tokens.load(Ordering::Relaxed);
-        s.out_tokens = total.saturating_sub(self.sampled_tokens.swap(total, Ordering::Relaxed));
-        let mut q = self.samples.lock_or_recover();
-        if q.len() >= MAX_SAMPLES {
-            q.pop_front();
-        }
-        q.push_back(s);
-    }
-
     /// Requests finished at or after `from_ms`, oldest first.
     pub fn finished_since(&self, from_ms: u64) -> Vec<Finished> {
         let q = self.finished.lock_or_recover();
         let start = q.partition_point(|f| f.at_ms < from_ms);
         q.range(start..).cloned().collect()
     }
-
-    /// Samples taken at or after `from_ms`, oldest first.
-    pub fn samples_since(&self, from_ms: u64) -> Vec<Sample> {
-        let q = self.samples.lock_or_recover();
-        let start = q.partition_point(|s| s.at_ms < from_ms);
-        q.range(start..).copied().collect()
-    }
-}
-
-/// Take one activity sample every [`SAMPLE_EVERY`], for as long as the proxy runs.
-pub async fn run_sampler(state: std::sync::Arc<crate::dispatcher::AppState>) {
-    let mut tick = tokio::time::interval(SAMPLE_EVERY);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tick.tick().await;
-        state.stats.sample(current(&state));
-    }
-}
-
-/// Running and queued requests and slot counts right now. Each lock is
-/// taken on its own.
-fn current(state: &crate::dispatcher::AppState) -> Sample {
-    let queued: usize = state.queues.lock_or_recover().values().map(VecDeque::len).sum();
-    let running: usize = state.processing_counts.lock_or_recover().values().sum();
-    let busy: std::collections::HashSet<usize> =
-        state.control_ops.lock_or_recover().keys().copied().collect();
-    let backends = state.backends.lock_or_recover();
-    let mut sample = Sample {
-        at_ms: now_ms(),
-        running: running as u32,
-        queued: queued as u32,
-        ..Default::default()
-    };
-    for (idx, b) in backends.iter().enumerate().filter(|(_, b)| b.is_online) {
-        sample.capacity += state.backend_capacity(b).0;
-        sample.free += state.free_slots(b, busy.contains(&idx)) as u32;
-    }
-    sample
 }
 
 pub fn now_ms() -> u64 {
@@ -293,6 +221,7 @@ mod tests {
             model: "llama3".into(),
             backend: Some(backend.into()),
             outcome,
+            session: None,
             queue_wait: Some(1.0),
             timing,
         }
@@ -319,18 +248,6 @@ mod tests {
         let all = s.finished_since(0);
         assert_eq!(all.iter().map(|f| f.at_ms).collect::<Vec<_>>(), vec![2_000, 1_500 + hour]);
         assert_eq!(s.finished_since(2_001).len(), 1);
-    }
-
-    #[test]
-    fn samples_carry_tokens_generated_since_the_previous_one() {
-        let s = Stats::default();
-        s.add_out_tokens(40);
-        s.sample(Sample { at_ms: 5_000, ..Default::default() });
-        s.add_out_tokens(2);
-        s.sample(Sample { at_ms: 10_000, ..Default::default() });
-        let got: Vec<u64> = s.samples_since(0).iter().map(|x| x.out_tokens).collect();
-        assert_eq!(got, vec![40, 2]);
-        assert_eq!(s.samples_since(6_000).len(), 1);
     }
 
     #[test]

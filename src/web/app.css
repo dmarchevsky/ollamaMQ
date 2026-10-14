@@ -134,13 +134,6 @@ main { min-width: 0; }
 .more { font-size: 12.5px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .grid2 > .panel { margin-bottom: 0; } .grid2 { margin-bottom: 18px; }
-.cards { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; margin-bottom: 18px; }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; box-shadow: var(--shadow); min-width: 0; }
-.card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
-.card .v { font-size: 24px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.card .v.small { font-size: 16px; padding-top: 6px; }
-.card.q .v { color: var(--warn); } .card.ok .v { color: var(--ok); } .card.bad .v { color: var(--bad); } .card.vip .v { color: var(--vip); }
-.card .sub { color: var(--faint); font-size: 12px; }
 
 /* Tables */
 table { width: 100%; border-collapse: collapse; }
@@ -252,6 +245,10 @@ dialog p { color: var(--muted); margin: 0 0 14px; }
 .field-hint { font-size: 12px; margin: -6px 0 12px !important; color: var(--faint) !important; }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; padding: 2px; margin-bottom: 14px; background: var(--surface-2); }
+/* In the top bar the segment sits on the Reload button's line: no legacy
+   header margin, same height as the button (32px). */
+.topbar .seg { margin-bottom: 0; }
+.topbar .seg span { padding: 4px 14px; }
 .seg label { margin: 0 !important; color: var(--text) !important; }
 .seg input { display: none !important; }
 .seg span { display: block; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
@@ -284,7 +281,6 @@ pre.content {
 @keyframes slide { from { transform: translateY(8px); opacity: 0; } }
 
 @media (max-width: 1100px) {
-  .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .grid2, .split { grid-template-columns: 1fr; }
 }
 /* Phone-only chrome: hidden on wider screens. */
@@ -329,9 +325,6 @@ pre.content {
   .page h1 { display: none; }
   .page-h { justify-content: flex-end; margin-bottom: 12px; }
   .hint { margin: 0 4px 12px; font-size: 13px; }
-  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
-  .card { padding: 12px 14px; }
-  .card .v { font-size: 20px; }
   .grid2 { gap: 12px; margin-bottom: 12px; }
   .panel { margin-bottom: 12px; padding: 14px; }
   .split { grid-template-columns: minmax(0, 1fr); gap: 12px; }
@@ -480,15 +473,11 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 .ov-status .lvl.ok { color: var(--ok); } .ov-status .lvl.ok .sdot { background: var(--ok); }
 .ov-status .lvl.warn { color: var(--warn); } .ov-status .lvl.warn .sdot { background: var(--warn); }
 .ov-status .lvl.bad { color: var(--bad); } .ov-status .lvl.bad .sdot { background: var(--bad); }
-.kpi { display: flex; flex-direction: column; }
-.kpi .v .of { font-size: 13px; font-weight: 500; color: var(--muted); }
-.kpi .sub { margin-bottom: 8px; }
 .spark { position: relative; height: 28px; margin-top: auto; }
 .spark svg { display: block; width: 100%; height: 100%; overflow: visible; }
 .spark .a { fill: var(--accent-soft); }
 .spark .l { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round; }
 .spark .end { position: absolute; width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 2px var(--surface); }
-.kpi.q .spark .a { fill: var(--warn-soft); } .kpi.q .spark .l { stroke: var(--warn); } .kpi.q .spark .end { background: var(--warn); }
 .sparkcell { width: 130px; min-width: 100px; }
 /* Inset so the end dot stays inside the cell (it overflowed the table by a
    few pixels and drew a scrollbar). */
@@ -498,8 +487,9 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 .c5 { --c: var(--c5); } .c6 { --c: var(--c6); } .c7 { --c: var(--c7); } .c8 { --c: var(--c8); }
 .cother { --c: var(--c-other); }
 .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; background: var(--c, var(--c-other)); margin-right: 7px; vertical-align: -1px; }
-.sw.free { background: none; border: 1.5px solid var(--border); }
-.sw.loading, .slot.loading { background: repeating-linear-gradient(135deg, var(--warn) 0 2px, transparent 2px 5px); }
+.sw.free { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); border: 1.5px solid color-mix(in srgb, var(--accent) 48%, transparent); }
+.sw.q2 { background: color-mix(in srgb, var(--c, var(--c-other)) 40%, transparent); border: 1.5px dashed var(--c, var(--c-other)); }
+.sw.loading { background: repeating-linear-gradient(135deg, var(--warn) 0 2px, transparent 2px 5px); }
 .sw.run { background: var(--accent); } .sw.que { background: var(--warn); }
 .sw.capl { height: 0; border-top: 2px dashed var(--muted); border-radius: 0; vertical-align: 3px; background: none; }
 .sw.mk { background: var(--bad); clip-path: polygon(50% 0, 100% 100%, 0 100%); border-radius: 0; }
@@ -509,46 +499,72 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 .cap-name { white-space: nowrap; }
 .cap-shared { color: var(--muted); font-size: 12.5px; padding-left: 16px; }
 .cap-note { text-align: right; color: var(--muted); font-size: 13px; white-space: nowrap; }
-.slots { display: flex; flex-wrap: wrap; gap: 4px; }
-.slot { width: 22px; height: 22px; border-radius: 5px; background: var(--c, var(--c-other)); }
-.slot.free { background: none; border: 1.5px dashed var(--border); }
-.slot.busy { background: var(--c-other); }
-.slot.loading { border: 1.5px solid var(--warn); }
-/* Waiting request: the client's hue at 55% with a dashed client border —
-   hue says whose, dim+dashed says not running yet (vs solid running). */
-.slot.q, .sw.q { background: color-mix(in srgb, var(--c) 55%, transparent); border: 2px dashed var(--c); }
-.slot-gap { width: 1px; align-self: stretch; background: var(--border); margin: 0 4px; }
+.cap-note.kv { color: var(--muted); }
+/* Capacity: proportional segments sized by estimated request tokens; the
+   waiting row under the bar shares the bar's scale, so a backlog passes
+   the end of the capacity. */
+.q2-bar { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.cap-bar { display: flex; gap: 4px; min-height: 22px; align-items: stretch; min-width: 0; }
+.cap-bar .seg { border-radius: 5px; min-width: 18px; }
+.cap-bar .seg.run { background: var(--c, var(--c-other)); max-width: 42%; }
+.cap-bar .seg.q { background: color-mix(in srgb, var(--c) 42%, transparent); border: 2px dashed var(--c); max-width: 260px; }
+.cap-bar .seg.load { background: repeating-linear-gradient(135deg, var(--warn) 0 2px, transparent 2px 5px); border: 1.5px solid var(--warn); }
+/* The free slot, visible on purpose: tinted box with a solid accent border,
+   stronger in dark where an outline-only slot used to vanish. */
+.cap-bar .seg.free { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); border: 1.5px solid color-mix(in srgb, var(--accent) 48%, transparent); }
+.q-track { display: flex; gap: 4px; height: 14px; }
+.q-track:empty { display: none; }
+.q-track .seg { border-radius: 4px; min-width: 10px; }
+.q-track .seg.q { background: color-mix(in srgb, var(--c) 42%, transparent); border: 2px dashed var(--c); }
+.bar-gap { width: 1px; align-self: stretch; background: var(--border); margin: 0 4px; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 12px; font-size: 12px; color: var(--muted); }
 .legend span { display: inline-flex; align-items: center; }
 
-.chart { position: relative; overflow: hidden; }
-.chart svg.act { display: block; width: 100%; height: auto; }
-.act .g { stroke: var(--border); stroke-width: 1; }
-.act .ax { fill: var(--faint); font: 11px var(--sans); font-variant-numeric: tabular-nums; }
-.act .run { fill: color-mix(in srgb, var(--accent) 70%, transparent); }
-.act .que { fill: color-mix(in srgb, var(--warn) 60%, transparent); }
-.act .cap { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 4 4; }
-.act .mk { fill: var(--bad); }
-.act .cross { stroke: var(--text); stroke-width: 1; opacity: .5; }
-.chart .tip {
-  position: absolute; top: 8px; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
-  border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.12); padding: 7px 10px; font-size: 12px; line-height: 1.5;
-  white-space: nowrap; font-variant-numeric: tabular-nums;
+/* Activity swimlanes. */
+.lanes { display: flex; flex-direction: column; gap: 4px; }
+.lane { padding: 8px 0 4px; border-top: 1px solid var(--border); }
+.lane:first-child { border-top: none; }
+.lane-h { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+.lane-sub { font-size: 12px; }
+.lane-chart svg { display: block; width: 100%; height: auto; }
+.lane .ax { fill: var(--faint); font: 11px var(--sans); font-variant-numeric: tabular-nums; }
+.lane .capl { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 4; }
+.lane .base { stroke: var(--border); stroke-width: 1; }
+.lane .mk { fill: var(--bad); }
+.lanes-foot { margin-top: 4px; font-size: 12px; }
+.free-chip {
+  font-size: 11.5px; font-weight: 650; padding: 2px 9px; border-radius: 9px;
+  color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--accent) 48%, transparent);
 }
+@media (prefers-color-scheme: dark) {
+  .cap-bar .seg.free { background: color-mix(in srgb, var(--accent) 22%, transparent); border-color: color-mix(in srgb, var(--accent) 72%, transparent); }
+  .sw.free { background: color-mix(in srgb, var(--accent) 22%, transparent); border-color: color-mix(in srgb, var(--accent) 72%, transparent); }
+  .free-chip { background: color-mix(in srgb, var(--accent) 22%, transparent); border-color: color-mix(in srgb, var(--accent) 72%, transparent); }
+}
+
+/* Requests table: divider before the finished block in "All" mode. */
+.req-div td { background: var(--surface-2); color: var(--faint); font-size: 11.5px;
+  text-transform: uppercase; letter-spacing: .5px; padding: 5px 14px; }
+.panel:not(.flush) .req-div td { background: none; padding-left: 0; }
+
+/* Requests session views: a dotted lane per conversation in the left gutter,
+   with a hollow node on the rows of that session (Chain and Threads). */
+#ov-now td.g { width: 46px; padding: 0 !important; position: relative; }
+#ov-now .dl { position: absolute; top: 0; bottom: 0; left: var(--x); border-left: 2px dotted var(--c); }
+#ov-now .node { position: absolute; top: 50%; left: calc(var(--x) - 4px); width: 7px; height: 7px;
+  border-radius: 50%; background: var(--surface); border: 2.5px solid var(--c); transform: translateY(-50%); }
+#ov-now td.sess-hd { background: color-mix(in srgb, var(--c) 7%, var(--surface)); font-size: 12.5px; }
+#ov-now td.sess-hd .mono { color: var(--text); }
 
 .share { display: inline-block; width: 70px; height: 8px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); vertical-align: middle; overflow: hidden; margin-right: 6px; }
 .share > i { display: block; height: 100%; background: var(--c, var(--c-other)); }
 
-@media (max-width: 1100px) {
-  .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-}
 @media (max-width: 720px) {
-  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .ov-status { margin: 0 4px 12px; gap: 2px 12px; }
   .ov-status .lvl { flex-basis: 100%; }
   .caps { grid-template-columns: minmax(0, 1fr) max-content; }
   .cap-name { grid-column: 1 / -1; margin-bottom: -4px; }
-  .slot { width: 20px; height: 20px; }
   .sparkcell { width: auto; }
   .sparkcell .spark { width: 120px; margin-left: auto; }
   #page-overview .tscroll { overflow: visible; }
