@@ -3,6 +3,47 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.9.0 — 2026-10-17
+
+### Added
+
+- **Client filter on the Overview.** A chip row under the top bar lists every client seen in the
+  selected window; picking one scopes the counters, Capacity, the timeline and both request lists to
+  that client alone (`GET /ui/api/overview?client=<id>`). Free slots, backend health and the slots
+  themselves stay backend-wide — they belong to the backend, not to the client. The choice is
+  remembered per browser.
+- **One Activity panel with a per-conversation timeline.** The old Activity swimlanes and the
+  Requests panel merged into a single panel. The graph draws one row per conversation, grouped under
+  the backend it ran on: each request paints one block per stage — waiting, prefill, decode — placed
+  where that stage began and as wide as it ran, so durations are readable as length and not only as
+  numbers. Stage colours are fixed (they match the legend); client identity is the swatch by the name.
+  Rows step down with the axis by session start, cap at 12 per backend with `+n older sessions
+  hidden`, and a stage cut off by a window edge is clipped and marked `‹`.
+- **Details view.** Under the graph, `List | Details` replaces the old grouping. Details threads each
+  conversation: one line per stage event with its own timestamp and numbers (prompt size, prefill
+  time, `cache 48%` for a warm prompt, tokens, seconds, tok/s), a `waiting` line with its own start
+  for a queued request, an `idle` line where a conversation sat quiet for over 30s, and one line for
+  a request that ended without serving (`client gone`, `blocked`). Clicking a timeline row opens
+  Details at that conversation.
+- **A readable Overview on a phone.** Request rows become three-line cards — client, `model → backend`,
+  counts, timing — the panel header keeps its title and both switches on one line, and a
+  client/session-keyed colour scheme keeps conversations distinguishable at 390px.
+- **Version in Settings.** The Settings page prints the running ollamaMQ version, so a board and a
+  bug report can be matched without shell access.
+
+### Changed
+
+- The top bar no longer shows **Drop** / **LogDrop**; dropped requests stay in the per-client table,
+  the TUI and `/metrics`. The window selector's counters are Queue / Running / Done.
+- `Active n | All n` carries the counts that used to be a sentence above the list, and the divider
+  between running and finished rows is a hairline rather than a label.
+
+### Fixed
+
+- Stage timings on the graph were anchored from the wrong zero point: `ttft_secs`, `gen_secs` and
+  `elapsed_secs` are measured from *dispatch*, while `waited_secs` happened before it, so a request
+  that had queued was drawn in the wrong place. Stages now rebuild as
+  `arrival = finish − waited − prefill − decode`.
 ## v0.8.1 — 2026-10-13
 
 ### Changed
