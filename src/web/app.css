@@ -633,13 +633,15 @@ tr.is-off td { color: var(--muted); }
   .clbar .lbl { display: none; }
 }
 
-/* --- Activity panel header on a phone: title, then both controls on one line
-   (Active/All carry the counts the sentence used to spell out). --- */
+/* --- Activity panel header on a phone fits the title and both switches on one
+   line (Active/All carry the counts the sentence used to spell out); the
+   switches drop to a second line only when the viewport cannot hold them. --- */
 @media (max-width: 720px) {
-  #page-overview .panel-h { flex-wrap: wrap; row-gap: 6px; }
-  #page-overview .panel-h .page-tools { flex: 1 1 100%; width: auto; justify-content: flex-start; gap: 8px; }
+  #page-overview .panel-h { flex-wrap: wrap; row-gap: 6px; column-gap: 8px; }
+  #page-overview .panel-h h2 { margin: 0; flex: 0 0 auto; }
+  #page-overview .panel-h .page-tools { gap: 6px; margin-left: auto; }
   #page-overview .page-tools .seg { margin-bottom: 0; }
-  #page-overview .page-tools .seg span { padding: 4px 9px; font-size: 12px; }
+  #page-overview .page-tools .seg span { padding: 4px 8px; font-size: 12px; }
   #page-overview .page-tools .seg span b { color: var(--text); font-variant-numeric: tabular-nums; }
 }
 
@@ -651,13 +653,14 @@ tr.is-off td { color: var(--muted); }
 #ov-now .rq:last-child { border-bottom: none; }
 .rq-1 { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 12.5px; }
 .rq-1 .sw { margin-right: 0; }
-.rq-1 .who { font-weight: 600; }
+.rq-1 .who { font-weight: 600; white-space: nowrap; }
 .rq-1 .t { font: 12px var(--mono); color: var(--muted); }
-.rq-1 .bk { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
-.rq-1 .n { margin-left: auto; font: 12px var(--mono); color: var(--muted); }
-.rq-2 { display: flex; align-items: baseline; gap: 10px; margin-top: 2px; font: 12px var(--mono); }
-.rq-2 .m { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rq-2 .n { margin-left: auto; color: var(--muted); white-space: nowrap; }
+/* model → backend share the first line with the client; the model is what gives
+   way first, so the backend is always readable. */
+.rq-1 .mb { margin-left: auto; display: flex; align-items: baseline; gap: 5px; min-width: 0;
+  color: var(--muted); font-size: 12px; white-space: nowrap; }
+.rq-1 .mb .mo { color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.rq-2 { margin-top: 2px; font: 12px var(--mono); color: var(--muted); }
 .rq-m { margin-top: 2px; font: 11px var(--mono); color: var(--muted); }
 #ov-now .req-div-p::before { content: ''; display: block; height: 1px; margin: 9px 0 6px;
   background: linear-gradient(90deg, var(--border) 55%, transparent); }
@@ -746,7 +749,7 @@ tr.is-off td { color: var(--muted); }
 @media (max-width: 720px) {
   .tl { --tl-lab: 0px; }
   .det-h { flex-wrap: wrap; }
-  .det-h .sub { flex: 1 1 100%; }
+  .det-h .sub { flex: 1 1 auto; min-width: 0; }
   /* one line per stage event, so the columns stay tight on a narrow screen */
   .det-row { font-size: 10.5px; gap: 7px; }
   .det-row .when { flex-basis: 46px; }

@@ -742,7 +742,7 @@ function renderDetails(rows) {
       title="${shut ? 'expand' : 'collapse'} this conversation">
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(head.o.client)}</span>
       ${head.s ? `<span class="who">#${esc(head.s)}</span>` : ''}
-      <span class="sub">${esc(head.o.model)}${bk}</span>
+      <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
       <span class="sum">${unit.length} req · ${fmtTok(unit.reduce((a, x) => a + rowTokens(x), 0))} tok · ${fmtTime(asc[0].plan.at)}→${last >= now - 1500 ? 'now' : fmtTime(last)}</span></button>`);
     if (shut) continue;
     const lines = [];
@@ -854,18 +854,16 @@ function phoneParts(row, ov) {
   };
 }
 
-/** Three-line phone card. A turn inside a thread drops identity and model — its
- *  header says them once. */
-function cardPhone(row, ov, opts = {}) {
-  const who = opts.who !== false, model = opts.model !== false;
+/** Phone card: the first line names the conversation *and* where it ran — model
+ *  and backend belong together, so the model gives way (ellipsis) before the
+ *  backend does. Then the counts, then the timing. */
+function cardPhone(row, ov) {
   const p = phoneParts(row, ov);
-  const l1 = who
-    ? `<div class="rq-1">${p.head}${swatch(row.o.client)}<span class="who">${esc(row.o.client)}</span><span class="bk">${esc(p.bk)}</span></div>`
-    : `<div class="rq-1">${p.head}<span class="n">${p.nums}</span></div>`;
-  const l2 = model
-    ? `<div class="rq-2"><span class="m">${esc(row.o.model)}</span>${who ? `<span class="n">${p.nums}</span>` : ''}</div>`
-    : '';
-  return `<div class="rq${who ? '' : ' rq-turn'}">${l1}${l2}${p.timing ? `<div class="rq-m">${p.timing}</div>` : ''}</div>`;
+  return `<div class="rq"><div class="rq-1">${p.head}${swatch(row.o.client)}`
+    + `<span class="who">${esc(row.o.client)}</span>`
+    + `<span class="mb"><span class="mo">${esc(row.o.model)}</span><span class="ar">→</span>${esc(p.bk)}</span></div>`
+    + `<div class="rq-2">${p.nums}</div>`
+    + (p.timing ? `<div class="rq-m">${p.timing}</div>` : '') + '</div>';
 }
 
 /** Phone layout of the List: cards instead of the reflowed table. */
