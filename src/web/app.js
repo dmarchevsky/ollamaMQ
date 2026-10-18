@@ -26,8 +26,10 @@ const S = {
   modelQuery: "",
   overview: null,            // api/overview for the chosen window
   window: storedWindow(),    // 5m | 15m | 1h
-  reqShow: storedReqShow(),  // Requests table: active | all
-  reqGroup: storedReqGroup(),  // Requests table grouping: off | threads | chain
+  reqShow: storedReqShow(),  // List under the graph: active | all
+  reqView: storedReqView(),  // List under the graph: list | details
+  client: storedClient(),      // Overview client filter (null = every client)
+  collapsed: storedCollapsed(),// conversation headers the operator folded shut
   colorOf: new Map(),        // client id -> colour slot 1..4
   settings: null,            // api/settings
   draft: new Map(),          // unsaved settings: name -> value (null = reset)
@@ -54,13 +56,27 @@ function storedReqShow() {
   return 'active';
 }
 
-/** The Requests grouping from the last visit: none is the default. */
-function storedReqGroup() {
+/** The list view from the last visit; a folded Thread becomes Details. */
+function storedReqView() {
   try {
-    const v = localStorage.getItem('omq.reqGroup');
-    if (v === 'threads' || v === 'chain') return v;
+    const v = localStorage.getItem('omq.reqView');
+    if (v === 'details') return 'details';
+    if (v === 'list') return 'list';
+    if (localStorage.getItem('omq.reqGroup') === 'threads') return 'details';
   } catch { /* storage blocked */ }
-  return 'off';
+  return 'list';
+}
+
+/** The Overview client filter from the last visit (null = every client). */
+function storedClient() {
+  try { return localStorage.getItem('omq.client') || null; } catch { /* storage blocked */ }
+  return null;
+}
+
+/** Session tags folded shut in Threads, per browser. */
+function storedCollapsed() {
+  try { return new Set(JSON.parse(localStorage.getItem('omq.collapsed') || '[]')); } catch { /* storage blocked */ }
+  return new Set();
 }
 
 // ---------------------------------------------------------------- utilities
@@ -225,6 +241,11 @@ async function act(method, path, body, okText) {
   }
 }
 
+/** The Overview request, scoped to the selected window and client. */
+function overviewPath() {
+  return `overview?window=${S.window}${S.client ? `&client=${encodeURIComponent(S.client)}` : ''}`;
+}
+
 // ------------------------------------------------------------------ polling
 
 async function poll() {
@@ -239,7 +260,7 @@ async function poll() {
       needLogs && !$('#log-pause').checked ? api('GET', `logs?limit=${LOG_LIMIT}`) : null,
       needClients ? api('GET', 'clients') : null,
       needModels ? api('GET', 'models') : null,
-      needOverview ? api('GET', `overview?window=${S.window}`) : null,
+      needOverview ? api('GET', overviewPath()) : null,
       needSettings ? api('GET', 'settings') : null,
       needSettings && !S.me ? api('GET', 'me') : null,
     ]);
@@ -264,8 +285,12 @@ function render() {
   $('#live').lastChild.textContent = S.online ? 'live' : 'disconnected';
   const st = S.state;
   if (!st) return;
-  $('#version').textContent = st.version ? 'v' + st.version : '';
+  const ver = st.version ? 'v' + st.version : '';
+  $('#version').textContent = ver;
+  // The sidebar brand is off-canvas on a phone, so Settings repeats the version.
+  $('#set-version').textContent = ver ? `Running ollamaMQ ${ver}` : '';
   renderStats(st);
+  renderClientBar(st);
   renderNav(st);
   ({
     overview: renderOverview,
@@ -280,17 +305,49 @@ function render() {
 
 function renderStats(st) {
   const s = st.stats;
-  // On the Overview, Done and Drop count only the selected window (which the
-  // top-bar selector picks); Queue and Running are live gauges either way.
+  // On the Overview, Done counts only the selected window (which the top-bar
+  // selector picks); Queue and Running are live gauges either way. Drops are not
+  // shown here: they are on the Clients table and in /metrics.
   const w = S.page === 'overview' ? S.overview?.status : null;
+  // With a client picked, Queue/Running come from the scoped Overview too, so
+  // the header tells the same story as the page under it.
+  const scoped = w && S.client;
   setHTML($('#stats'), `
-    <span class="stat q">Queue <b>${fmtNum(s.queued + s.processing)}</b></span>
-    <span class="stat">Running <b>${fmtNum(s.processing)}</b></span>
+    <span class="stat q">Queue <b>${fmtNum(scoped ? w.queued : s.queued + s.processing)}</b></span>
+    <span class="stat">Running <b>${fmtNum(scoped ? w.running : s.processing)}</b></span>
     <span class="stat ok"${w ? ' title="requests that completed in the selected window"' : ''}>Done <b>${fmtNum(w ? w.done : s.done)}</b></span>
-    <span class="stat bad"${w ? ' title="dropped in the selected window: timeout, blocked, client gone or backend error"' : ''}>Drop <b>${fmtNum(w ? w.dropped : s.dropped)}</b></span>
-    <span class="stat bad" title="dropped request-log records since start (the counter has no time dimension)">LogDrop <b>${fmtNum(s.log_dropped)}</b></span>
     <span class="stat vip">VIP <b>${esc(st.vip ?? '—')}</b></span>
     <span class="stat q">Boost <b>${esc(st.boost ?? '—')}</b></span>`);
+}
+
+/** Every client the dashboard knows: the live roster plus registered names.
+ *  Never filtered, so the chip row keeps the whole list while one is picked. */
+function clientIds(st) {
+  return [...new Set([...st.users.map(u => u.id), ...S.clients.map(c => c.name)])]
+    .sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * The client filter chips, pinned in the header with the stats. The number on a
+ * chip is that client's live outstanding work (queue + running); clicking picks
+ * a client — every panel below is refetched with ?client= — and clicking the
+ * same chip again, or clear, goes back to everyone.
+ */
+function renderClientBar(st) {
+  const bar = $('#clbar');
+  if (S.page !== 'overview') {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const chips = clientIds(st).map(id => {
+    const u = st.users.find(x => x.id === id);
+    const n = u ? u.queued + u.processing : 0;
+    return `<button class="clchip ${colorClass(id)}" data-client="${esc(id)}" aria-pressed="${S.client === id}"
+      title="show only ${esc(id)}">${swatch(id)}${esc(id)}${n ? ` <span class="n">${n}</span>` : ''}</button>`;
+  }).join('');
+  setHTML(bar, `<span class="lbl">Clients</span><div class="clwrap">
+    <button class="clchip all" data-client="" aria-pressed="${!S.client}">All</button>${chips}</div>`);
 }
 
 function renderNav(st) {
@@ -371,7 +428,12 @@ const WINDOW_LABEL = { '5m': '5 min', '15m': '15 min', '1h': '1 hour' };
 function renderOverview(st) {
   const ov = S.overview;
   if (!ov) return;
-  assignColors(ov.clients.map(c => c.id));
+  // The payload is already scoped by ?client=; /state is not, so the live runs
+  // are scoped here — Capacity, Requests and their colour all read this copy.
+  const vis = S.client
+    ? { ...st, runs: (st.runs || []).filter(r => r.client === S.client) }
+    : st;
+  assignColors(clientIds(st));
   const s = ov.status;
 
   // Status line: the one sentence an operator reads first.
@@ -388,11 +450,11 @@ function renderOverview(st) {
   if (s.errors) parts.push(`${s.errors} error${s.errors === 1 ? '' : 's'} in the last ${WINDOW_LABEL[S.window]}`);
   setHTML($('#ov-status'), `<span class="lvl ${level}"><span class="sdot"></span>${word}</span>${parts.map(p => `<span>${p}</span>`).join('')}`);
 
-  renderCapacity(st, ov);
-  renderActivity(ov);
-  renderRequests(st, ov);
+  renderCapacity(vis, ov);
+  renderTimeline(vis, ov);
+  renderRequests(vis, ov);
   renderBackendStats(ov);
-  renderClientStats(st, ov);
+  renderClientStats(vis, ov);
 }
 
 /**
@@ -466,102 +528,413 @@ function renderCapacity(st, ov) {
 }
 
 /**
- * Activity swimlanes: one lane per backend that did anything in the window.
- * Stacked histogram bars per time bucket — solid client hue for running,
- * striped same hue for waiting; the dashed line is the backend's slot count
- * and the chip next to the name is its current free slots.
+ * One row per conversation, grouped under the backend it ran on. A request
+ * paints one chip per stage — waiting, prefill, decode — as wide as that
+ * stage ran, so a 40s decode reads as forty seconds next to a 1s prefill. A
+ * stage too short to draw is floored to a few pixels rather than disappearing;
+ * the exact numbers are in the chip tooltip and the Details lines below.
+ * A backend with nothing in the window takes no row.
  */
-function renderActivity(ov) {
-  const el = $('#ov-activity');
-  const lanes = ov.lanes || [];
-  const idle = ov.backends.filter(b => !lanes.some(l => l.idx === b.idx));
-  $('#ov-act-sum').textContent = `last ${WINDOW_LABEL[S.window]} · ${lanes.length} of ${ov.backends.length} backends with activity`;
-  if (!lanes.length) {
-    setHTML(el, `<div class="empty">No requests in the last ${WINDOW_LABEL[S.window]}</div>`);
+const TL_ROWS = 12;          // sessions per backend before the oldest fold away
+const STAGE = { w: 'waiting', p: 'prefill', g: 'decode', e: 'error' };
+const TL_LEGEND = '<div class="tl-legend"><span><i class="sw w"></i>waiting</span>'
+  + '<span><i class="sw p"></i>prefill</span><span><i class="sw g"></i>decode</span>'
+  + '<span><i class="sw e"></i>error</span></div>';
+
+function renderTimeline(st, ov) {
+  const el = $('#ov-timeline');
+  const now = ov.now_ms;
+  const span = ov.window_secs * 1000;
+  const pctOf = ms => Math.max(0, Math.min(100, (ms - (now - span)) / span * 100));
+  pctOf.start = now - span;
+  const { rows } = reqRows(st, ov, true);   // the graph is a window: it shows all of it
+  if (!rows.length) {
+    setHTML(el, `<div class="empty">Nothing in the last ${WINDOW_LABEL[S.window]}</div>`);
     return;
   }
-  const from = ov.lane_from_ms;
-  const span = ov.lane_span_ms;
-  const W = 1160, H = 76, padT = 8, padB = 16, plotH = H - padT - padB;
-  const cvar = cls => cls === 'cother' ? 'c-other' : cls;
-  const html = lanes.map(l => {
-    const nb = l.buckets.length, bw = W / nb;
-    const ymax = Math.max(l.max, l.peak_run + l.peak_wait, 1);
-    const y = n => padT + plotH - (n / ymax) * plotH;
-    const striped = new Set();
-    let rects = '';
-    l.buckets.forEach((segs, i) => {
-      let acc = 0;
-      const x = (i * bw + 1).toFixed(1), w = Math.max(2, bw - 2).toFixed(1);
-      for (const sg of segs) {
-        const cls = colorClass(sg.client);
-        if (sg.running > 0) {
-          rects += `<rect x="${x}" y="${y(acc + sg.running).toFixed(1)}" width="${w}" height="${(sg.running / ymax * plotH).toFixed(1)}" rx="2" fill="var(--${cvar(cls)})" fill-opacity=".92"><title>${esc(sg.client)} — ${sg.running} running</title></rect>`;
-          acc += sg.running;
-        }
-        if (sg.waiting > 0) {
-          striped.add(cls);
-          rects += `<rect x="${x}" y="${y(acc + sg.waiting).toFixed(1)}" width="${w}" height="${(sg.waiting / ymax * plotH).toFixed(1)}" rx="2" fill="url(#st${l.idx}-${cls})" stroke="var(--${cvar(cls)})" stroke-width="1" stroke-dasharray="3 2"><title>${esc(sg.client)} — ${sg.waiting} waiting</title></rect>`;
-          acc += sg.waiting;
+  for (const r of rows) r.plan = stagePlan(r, now);
+  const laneOf = new Map((ov.lanes || []).map(l => [l.idx, l]));
+  const groups = new Map();
+  for (const r of rows) {
+    const bk = rowBackend(r, ov);
+    if (!groups.has(bk.k)) groups.set(bk.k, { ...bk, last: 0, reqs: 0, run: 0, wait: 0, sess: new Map() });
+    const g = groups.get(bk.k);
+    g.reqs++;
+    g.last = Math.max(g.last, r.plan.end);
+    if (r.kind === 'run') g.run++;
+    if (r.kind === 'wait') g.wait++;
+    if (!g.sess.has(r.key)) g.sess.set(r.key, []);
+    g.sess.get(r.key).push(r);
+  }
+  const tick = f => `<span style="left:${(f * 100).toFixed(1)}%">−${Math.round(ov.window_secs / 60 * (1 - f))}m</span>`;
+  const axis = `<div class="tl-axis">${[0, 1 / 3, 2 / 3].map(tick).join('')}<span style="left:100%">now</span></div>`;
+  let hidden = 0;
+  const body = [...groups.values()]
+    .sort((a, b) => (a.pseudo - b.pseudo) || (b.last - a.last))
+    .map(g => {
+      // Rows step down with the axis: the session that started first in the
+      // window is the top row. The cap keeps the most recent starts.
+      const sess = [...g.sess.entries()]
+        .map(([key, rs]) => ({ key, rs, at: Math.min(...rs.map(x => x.plan.at)) }))
+        .sort((a, b) => a.at - b.at);
+      const shown = sess.slice(-TL_ROWS);
+      hidden += sess.length - shown.length;
+      const lane = g.idx != null ? laneOf.get(g.idx) : null;
+      // Nothing but the name stands on the canvas — what the backend is doing
+      // now rides on the header's tooltip, next to the time it is read against.
+      const tip = [`${shown.length} session${shown.length === 1 ? '' : 's'}`, `${g.reqs} req`]
+        .concat(g.run ? [`${g.run} running`] : [], g.wait ? [`${g.wait} waiting`] : [],
+          lane ? [`peak ${lane.peak_run}/${lane.max}`] : [],
+          g.free != null ? [`${g.free} free`] : []).join(' · ');
+      return `<div class="tl-grp" title="${esc(tip)}">`
+        + `<span class="sdot ${g.online ? 'on' : 'off'}"></span><span class="bk-name">${esc(g.name)}</span>`
+        + (g.online ? '' : '<span class="off-tag">offline</span>') + '</div>'
+        + shown.map(s => tlRow(s.rs, pctOf, span)).join('');
+    }).join('');
+  const foot = hidden ? `+${hidden} older session${hidden === 1 ? '' : 's'} hidden` : '';
+  setHTML(el, `<div class="tl">${axis}${body}${TL_LEGEND}${foot ? `<div class="tl-foot">${foot}</div>` : ''}</div>`);
+  wireTimeline();
+}
+
+/** One session's row: its stages laid along the track at their own times. */
+function tlRow(rows, pctOf, span) {
+  const head = rows[0];
+  // Each stage is placed in the track by itself: left = when it began, width =
+  // how long it ran. A stage that runs off either edge is clipped there and the
+  // row gets a `‹` so its left edge is not read as the request's beginning.
+  let cut = '';
+  const segs = rows.flatMap(r => {
+    if (r.plan.at < pctOf.start) cut = '<b class="cut"></b>';
+    return r.plan.events.map(e => `<i class="sg ${e.k}" style="left:${pctOf(e.at).toFixed(3)}%;`
+      + `width:${Math.max(0, e.dur * 1000 / span * 100).toFixed(3)}%" title="${esc(stageTip(e))}"></i>`);
+  }).join('');
+  return `<div class="tl-row" data-key="${esc(head.key)}">`
+    + `<div class="tl-lab">${swatch(head.o.client)}<b>${esc(head.o.client)}</b>${head.s ? ` #${esc(head.s)}` : ''}</div>`
+    + `<div class="tl-track">${cut}${segs}<span class="now"></span></div></div>`;
+}
+
+/** A chip's own tooltip: when the stage began and what it is worth. */
+const stageTip = e => `${fmtTime(e.at)} · ${STAGE[e.k]} ${stripTags(e.line)}`;
+
+/**
+ * Which group a row belongs to: its backend, or a named bucket when it has
+ * none. Live rows carry a backend index, finished ones a label — both resolve
+ * to the same handle so a backend is one group, not two.
+ */
+function rowBackend(r, ov) {
+  // pseudo buckets (no backend to hang the row on) sort after the real ones.
+  const of = (k, idx, name, online, free, pseudo = idx != null ? 1 : 2) => ({ k, idx, name, online, free, pseudo });
+  if (r.kind === 'wait') {
+    const i = r.o.backends.length === 1 ? r.o.backends[0] : null;
+    const b = i != null ? ov.backends[i] : null;
+    return b ? of('b' + i, i, b.name || b.label, b.online, b.free)
+      : of('any', null, 'no free backend', true, null, 3);
+  }
+  if (!r.o.backend) return of('none', null, 'never dispatched', false, null, 2);
+  const i = ov.backends.findIndex(b => b.label === r.o.backend || b.name === r.o.backend);
+  return i >= 0 ? of('b' + i, i, ov.backends[i].name || ov.backends[i].label, ov.backends[i].online, ov.backends[i].free)
+    : of('n' + r.o.backend, null, r.o.backend, true, null);
+}
+
+/** Clicking a row opens Details and jumps to that conversation. */
+function wireTimeline() {
+  $$('#ov-timeline .tl-row').forEach(row => {
+    row.onclick = () => {
+      if (S.reqView !== 'details') {
+        S.reqView = 'details';
+        try { localStorage.setItem('omq.reqView', S.reqView); } catch { /* storage blocked */ }
+        $('#ov-req-view input[value="details"]').checked = true;
+        render();
+      }
+      const head = $$('#ov-now .det-h').find(b => b.dataset.key === row.dataset.key);
+      if (!head) return;
+      head.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      head.classList.add('flash');
+      setTimeout(() => head.classList.remove('flash'), 1200);
+    };
+  });
+}
+
+/**
+ * The stage events of one request: when each began and what it is worth.
+ * Every duration in the payload is measured from *dispatch* (`ttft_secs`,
+ * `gen_secs`, and `elapsed_secs` for a live run); the queue wait happened
+ * before dispatch. So a finished request is rebuilt backwards from the moment
+ * it left the proxy — arrival = finish − waited − prefill − generation — and a
+ * run grows forward from `now − elapsed`, which is its dispatch. `ttft_secs` is
+ * dispatch to first token, i.e. the prefill itself, wherever `prefill_secs` is
+ * absent. A stage too short to matter is left out rather than drawn as 0.0s.
+ */
+function stagePlan(row, now) {
+  const o = row.o;
+  // dur = how long the stage ran, so its chip can be as long as it was.
+  const ev = (k, at, dur, line, live) => ({ k, at, dur, line, live: !!live });
+  const done = (events, at, end) => ({
+    events, at, end,
+    // The tooltip opens with when the request arrived, so a cluster can be
+    // checked against the Details lines without leaving the graph.
+    tip: `${fmtTime(at)} · ` + events.map(e => `${STAGE[e.k]} ${stripTags(e.line)}`).join(' · '),
+  });
+  if (row.kind === 'wait') {
+    const at = now - o.waited_secs * 1000;
+    return done([ev('w', at, o.waited_secs, `${fmtDur(o.waited_secs)} · prompt ${fmtTok(o.est_prompt_tokens)} tok · queue #${o.pos}`, true)], at, now);
+  }
+  if (row.kind === 'run') {
+    const dispatch = now - o.elapsed_secs * 1000;
+    const w = o.waited_secs || 0;
+    const out = [];
+    if (w >= .05) out.push(ev('w', dispatch - w * 1000, w, `${fmtDur(w)} · prompt ${fmtTok(o.est_prompt_tokens)} tok`));
+    if (o.ttft_secs == null) {
+      out.push(ev('p', dispatch, o.elapsed_secs, `≈${fmtTok(o.est_prompt_tokens)} tok · ${fmtDur(o.elapsed_secs)} prefilling`, true));
+    } else {
+      if (o.ttft_secs >= .05) out.push(ev('p', dispatch, o.ttft_secs, `${fmtTok(o.est_prompt_tokens)} tok · ${fmtSec1(o.ttft_secs)}`));
+      out.push(ev('g', dispatch + o.ttft_secs * 1000, Math.max(0, o.elapsed_secs - o.ttft_secs),
+        `${fmtNum(o.tokens)} tok · ${fmtDur(Math.max(0, o.elapsed_secs - o.ttft_secs))} · `
+        + `${o.tokens_per_sec == null ? '…' : o.tokens_per_sec.toFixed(1)} t/s<span class="more"> · <b>now</b></span>`, true));
+    }
+    return done(out, dispatch - w * 1000, now);
+  }
+  const finish = row.t;
+  const w = o.waited_secs || 0;
+  const gen = o.gen_secs || 0;
+  const pre = o.prefill_secs ?? o.ttft_secs ?? 0;
+  const dispatch = finish - (pre + gen) * 1000;
+  const at = dispatch - w * 1000;
+  if (o.error) {
+    const out = [];
+    if (w >= .05) out.push(ev('w', at, w, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
+    out.push(ev('e', finish, 0, `${outcomePhrase(o)}${o.backend ? '' : '<span class="more"> · never dispatched</span>'}`));
+    return done(out, at, finish);
+  }
+  const out = [];
+  // A request that left without an error and without serving cleanly (the
+  // client hung up, the queue refused it) still has to say so here.
+  if (o.outcome && o.outcome !== 'ok') out.push(ev('e', finish, 0, outcomePhrase(o)));
+  if (w >= .05) out.push(ev('w', at, w, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
+  if (pre >= .05) {
+    out.push(ev('p', dispatch, pre, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(pre)}`
+      + (o.cache_pct != null ? ` · cache ${o.cache_pct}%` : '')
+      + (o.prefill_secs && o.prompt_tokens ? `<span class="more"> · ${fmtRate(o.prompt_tokens / o.prefill_secs)}</span>` : '')));
+  }
+  if (gen > 0) {
+    out.push(ev('g', finish - gen * 1000, gen,
+      `${fmtTok(o.completion_tokens)} tok · ${fmtSec1(gen)} · ${(o.gen_tps ?? 0).toFixed(1)} t/s`));
+  }
+  return done(out, at, finish);
+}
+
+const stripTags = s => s.replace(/<[^>]*>/g, '');
+
+/** `outcome` as an operator reads it, with the HTTP status when there is one. */
+const outcomePhrase = o => (o.status && o.status >= 500 ? `HTTP ${o.status} · ` : '')
+  + String(o.outcome || 'failed').replace(/_/g, ' ');
+
+/**
+ * Details: one collapsible block per conversation, its stage events merged onto
+ * one timeline and printed newest first, each line with its own timestamp and
+ * numbers. A gap over 30s between two requests becomes its own `idle` line —
+ * that quiet stretch is what a conversation looks like.
+ */
+function renderDetails(rows) {
+  const now = S.overview ? S.overview.now_ms : Date.now();
+  const out = [];
+  for (const unit of threadUnits(rows)) {
+    const head = unit[0];
+    const c = cvar(colorClass(head.o.client));
+    const shut = S.collapsed.has(head.key);
+    const asc = [...unit].sort((a, b) => a.plan.at - b.plan.at);
+    const last = Math.max(...unit.map(x => x.plan.end));
+    const bk = head.o.backend ? ` → ${esc(bkName(head.o.backend))}` : '';
+    out.push(`<button class="det-h" style="--c:var(--${c})" data-key="${esc(head.key)}" aria-expanded="${!shut}"
+      title="${shut ? 'expand' : 'collapse'} this conversation">
+      <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(head.o.client)}</span>
+      ${head.s ? `<span class="who">#${esc(head.s)}</span>` : ''}
+      <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
+      <span class="sum">${unit.length} req · ${fmtTok(unit.reduce((a, x) => a + rowTokens(x), 0))} tok · ${fmtTime(asc[0].plan.at)}→${last >= now - 1500 ? 'now' : fmtTime(last)}</span></button>`);
+    if (shut) continue;
+    const lines = [];
+    for (let i = 0; i < asc.length; i++) {
+      if (i > 0) {
+        const gap = (asc[i].plan.at - asc[i - 1].plan.end) / 1000;
+        // Just before the newer request it separates the two from.
+        if (gap > 30) {
+          lines.push({ t: asc[i].plan.at - 1, html: `<div class="det-row dim"><span class="when">${fmtTime(asc[i - 1].plan.end)}</span>`
+            + '<span class="st i">idle</span><span class="val">' + fmtDur(gap) + '</span></div>' });
         }
       }
-    });
-    const defs = [...striped].map(cls => `<pattern id="st${l.idx}-${cls}" width="6" height="6" patternTransform="rotate(45)" patternUnits="userSpaceOnUse"><rect width="6" height="6" fill="var(--${cvar(cls)})" fill-opacity="0.25"/><line x1="0" y1="0" x2="0" y2="6" stroke="var(--${cvar(cls)})" stroke-width="2.2" stroke-opacity="0.65"/></pattern>`).join('');
-    const marks = l.markers.map(m => `<path class="mk" d="M${Math.max(4, (m.at_ms - from) / span * W).toFixed(1)},${H - padB + 1}l4,7h-8z"><title>${esc(`${fmtTime(m.at_ms)} ${m.status ? `HTTP ${m.status}` : m.outcome.replace('_', ' ')} · ${m.client} · ${m.model}`)}</title></path>`).join('');
-    return `<div class="lane">
-      <div class="lane-h"><span class="sdot ${l.online ? 'on' : 'off'}"></span>${bkCell(l.label, true)}
-        ${l.online ? `<span class="free-chip">${l.free} free</span>` : ''}
-        <span class="dim lane-sub">${fmtNum(l.requests)} requests · peak ${l.peak_run} of ${l.max} slots${l.peak_wait ? ` · ${l.peak_wait} queued` : ''}</span></div>
-      <div class="lane-chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(bkName(l.label))} activity over the window">
-        <defs>${defs}</defs>
-        ${l.max ? `<line class="capl" x1="0" x2="${W}" y1="${y(l.max).toFixed(1)}" y2="${y(l.max).toFixed(1)}"/>` : ''}
-        <line class="base" x1="0" x2="${W}" y1="${y(0).toFixed(1)}" y2="${y(0).toFixed(1)}"/>
-        ${rects}${marks}
-        <text class="ax" x="0" y="${H - 3}">−${Math.round(ov.window_secs / 60)}m</text>
-        <text class="ax" x="${W}" y="${H - 3}" text-anchor="end">now</text>
-        <text class="ax" x="2" y="${(y(l.max) + 9).toFixed(1)}">${l.max}</text>
-      </svg></div></div>`;
-  }).join('');
-  const legend = `<div class="legend"><span><i class="sw run" style="background:var(--c1)"></i><i class="sw run" style="background:var(--c2);margin-left:-4px"></i>running · per client</span>`
-    + '<span><i class="sw q2 c1"></i>waiting · per client, striped</span>'
-    + '<span><i class="sw capl"></i>capacity</span>'
-    + (lanes.some(l => l.markers.length) ? '<span><i class="sw mk"></i>error or timeout</span>' : '') + '</div>';
-  const foot = idle.length ? `<div class="dim lanes-foot">${esc(idle.map(b => bkName(b.label)).join(' · '))} — no activity in the window</div>` : '';
-  setHTML(el, `<div class="lanes">${html}</div>${legend}${foot}`);
+      for (const e of asc[i].plan.events) {
+        lines.push({ t: e.at, html: `<div class="det-row"><span class="when">${fmtTime(e.at)}</span>`
+          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span></div>` });
+      }
+    }
+    lines.sort((a, b) => b.t - a.t);
+    out.push(`<div class="det-body" style="--c:var(--${c})">${lines.map(l => l.html).join('')}</div>`);
+  }
+  return out.join('') || '<div class="empty">Nothing running or waiting</div>';
 }
 
 /** Seconds, always one decimal — the Requests table's time format. */
 const fmtSec1 = s => s == null ? null : s.toFixed(1) + 's';
 
+/** Put a count inside a segmented control's label (`Active 3`, `All 12`). */
+function segCount(sel, i, n) {
+  const span = $$(sel + ' label span')[i];
+  if (span) span.innerHTML = `${span.textContent.replace(/\s*[\d.,]+\s*$/, '')} <b>${fmtNum(n)}</b>`;
+}
+
+/** `--c1`…`--c8` name of a client's hue slot. */
+const cvar = cls => cls === 'cother' ? 'c-other' : cls;
+
+/** Generated tokens of a row, however the row is shaped. */
+const rowTokens = row => row.kind === 'done' ? row.o.completion_tokens : row.kind === 'run' ? row.o.tokens : 0;
+
+/** Conversations, newest activity first; a request without a session stands alone. */
+function threadUnits(rows) {
+  const groups = new Map();
+  for (const r of rows) {
+    if (!groups.has(r.key)) groups.set(r.key, []);
+    groups.get(r.key).push(r);
+  }
+  return [...groups.values()].sort((a, b) => Math.max(...b.map(x => x.t)) - Math.max(...a.map(x => x.t)));
+}
+
+/** Fold handlers for the Details conversation headers (state lives in
+ *  S.collapsed, because the list is rebuilt on every poll). */
+function wireFold() {
+  $$('#ov-now .det-h').forEach(b => {
+    b.onclick = () => {
+      const k = b.dataset.key;
+      if (S.collapsed.has(k)) S.collapsed.delete(k); else S.collapsed.add(k);
+      try { localStorage.setItem('omq.collapsed', JSON.stringify([...S.collapsed])); } catch { /* storage blocked */ }
+      render();
+    };
+  });
+}
+
+
 /**
- * The Requests table. Show: Active = running + waiting; All also lists recently
- * finished below a divider. Group: Ungrouped = newest first; Threads = one
- * header per session with its turns under a dotted lane; Chain = Ungrouped's
- * order with a dotted lane per session drawn through it (git-graph style) —
- * the lane crosses rows of other sessions; hovering a row dims the other
- * lanes. Prefill is size · seconds (≈ while estimated), Gen time the
+ * What a phone row says about one request: its status, its own numbers, one
+ * timing line. Field names live in the tooltips — the desktop table has columns
+ * for them — and Gen time is left out, since tokens and tok/s give it away.
+ */
+function phoneParts(row, ov) {
+  const o = row.o;
+  if (row.kind === 'run') {
+    return {
+      head: o.state === 'generating' ? '<span class="badge ok">generating</span>'
+        : `<span class="badge accent" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(o.elapsed_secs)}</span>`,
+      nums: `${fmtNum(o.tokens)} tok · ${o.tokens_per_sec == null ? '…' : o.tokens_per_sec.toFixed(1)} t/s`,
+      timing: `<span title="prompt size, estimated">pre ≈${fmtTok(o.est_prompt_tokens)}</span>`
+        + (o.ttft_secs != null ? ` · <span title="time to the first token">ttft ${fmtSec1(o.ttft_secs)}</span>` : ''),
+      bk: bkName(o.backend),
+    };
+  }
+  if (row.kind === 'wait') {
+    return {
+      head: `<span class="badge warn" title="Position in this client's own queue">waiting #${o.pos}</span>`,
+      nums: `<span class="dim">≈${fmtTok(o.est_prompt_tokens)} tok</span>`,
+      timing: `<span title="waiting for a free slot">wait ${fmtDur(o.waited_secs)}</span>`,
+      bk: o.backends.length === 1 ? bkName(ov.backends[o.backends[0]]?.label) : 'any',
+    };
+  }
+  if (o.error) {
+    return {
+      head: `<span class="badge bad" title="${esc(o.outcome)}">${esc(o.status && o.status >= 500 ? `HTTP ${o.status}` : o.outcome.replace(/_/g, ' '))}</span>`,
+      nums: `<span class="st-bad">${esc(o.outcome.replace(/_/g, ' '))}</span>`,
+      timing: o.backend ? '' : '<span class="dim">never dispatched</span>',
+      bk: o.backend ? bkName(o.backend) : '—',
+    };
+  }
+  const timing = [
+    o.waited_secs > 0 ? `<span title="waiting for a free slot">wait ${fmtDur(o.waited_secs)}</span>` : '',
+    o.prefill_tokens != null || o.prefill_secs != null
+      ? `<span title="prompt size · prefill time">pre ${fmtTok(o.prompt_tokens)}${o.prefill_secs != null ? ` · ${fmtSec1(o.prefill_secs)}` : ''}</span>` : '',
+    o.cache_pct != null ? `<span title="prefix-cache hit">cache ${o.cache_pct}%</span>` : '',
+    o.ttft_secs != null ? `<span title="time to the first token">ttft ${fmtSec1(o.ttft_secs)}</span>` : '',
+  ].filter(Boolean).join(' · ');
+  return {
+    head: o.outcome === 'ok' ? `<span class="t">${fmtTime(row.t)}</span>`
+      : `<span class="badge">${esc(o.outcome.replace(/_/g, ' '))}</span>`,
+    nums: `${fmtTok(o.completion_tokens)} tok · ${o.gen_tps == null ? '—' : o.gen_tps.toFixed(1)} t/s`,
+    timing,
+    bk: o.backend ? bkName(o.backend) : '—',
+  };
+}
+
+/** Phone card: the first line names the conversation *and* where it ran — model
+ *  and backend belong together, so the model gives way (ellipsis) before the
+ *  backend does. Then the counts, then the timing. */
+function cardPhone(row, ov) {
+  const p = phoneParts(row, ov);
+  return `<div class="rq"><div class="rq-1">${p.head}${swatch(row.o.client)}`
+    + `<span class="who">${esc(row.o.client)}</span>`
+    + `<span class="mb"><span class="mo">${esc(row.o.model)}</span><span class="ar">→</span>${esc(p.bk)}</span></div>`
+    + `<div class="rq-2">${p.nums}</div>`
+    + (p.timing ? `<div class="rq-m">${p.timing}</div>` : '') + '</div>';
+}
+
+/** Phone layout of the List: cards instead of the reflowed table. */
+function requestsPhone(rows, ov, activeN) {
+  if (!rows.length) return '<div class="empty">Nothing running or waiting</div>';
+  const divider = '<div class="req-div-p"></div>';
+  const items = rows.map(r => ({ r }));
+  if (S.reqShow === 'all' && ov.recent.length) items.splice(activeN, 0, { div: true });
+  return items.map(e => e.div ? divider : cardPhone(e.r, ov)).join('');
+}
+
+
+/**
+ * The rows the Overview draws: live runs, the queue and — when Show is All — the
+ * finished log. `key` names the conversation: the session tag when the request
+ * carries one, otherwise the request itself, so a session-less client's requests
+ * each get a line of their own. /state is not scoped by ?client=, so its rows are
+ * scoped here.
+ */
+function reqRows(st, ov, all) {
+  const now = ov.now_ms;
+  const keyOf = (o, fallback) => o.session ? `${o.client}#${o.session}` : `${o.client}·${o.model}·${fallback}`;
+  const rows = [
+    ...(st.runs || []).filter(r => !S.client || r.client === S.client)
+      .map(r => ({ kind: 'run', t: now, s: r.session || null, o: r, key: keyOf(r, 'live') })),
+    ...ov.queue.map(w => ({ kind: 'wait', t: now - w.waited_secs * 1000, s: w.session || null, o: w, key: keyOf(w, 'queue') })),
+  ];
+  const activeN = rows.length;
+  if (all) for (const x of ov.recent) rows.push({ kind: 'done', t: x.at_ms, s: x.session || null, o: x, key: keyOf(x, x.at_ms) });
+  return { rows, activeN };
+}
+
+/**
+ * The List under the timeline. Show: Active = running + waiting; All also lists
+ * recently finished below a divider. View: List = newest first (cards on a
+ * phone, a table here); Details = one block per conversation with a line per
+ * stage event. Prefill is size · seconds (≈ while estimated), Gen time the
  * generation seconds (for running: since the first token), Cache the
  * prefix-cache share of finished prompts.
  */
 function renderRequests(st, ov) {
-  const mode = S.reqGroup;
   const dash = '<span class="dim">—</span>';
   const now = ov.now_ms;
-  const cvar = cls => cls === 'cother' ? 'c-other' : cls;
+  const { rows, activeN } = reqRows(st, ov, S.reqShow === 'all');
+  // The counts that used to be a sentence above the table sit in the toggle —
+  // the All count is the whole window even while Active is selected.
+  segCount('#ov-req-show', 0, activeN);
+  segCount('#ov-req-show', 1, activeN + ov.recent.length);
+
+  const el = $('#ov-now');
+  if (S.reqView === 'details') {
+    for (const r of rows) r.plan = stagePlan(r, now);
+    setHTML(el, renderDetails(rows));
+    wireFold();
+    return;
+  }
   const pill = r => r.state === 'generating'
     ? '<span class="badge ok">generating</span>'
     : `<span class="badge accent" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(r.elapsed_secs)}</span>`;
-
-  // Row model shared by all views: t = newest-first time, s = session tag.
-  const rows = [
-    ...(st.runs || []).map(r => ({ kind: 'run', t: now, s: r.session || null, o: r })),
-    ...ov.queue.map(w => ({ kind: 'wait', t: now - w.waited_secs * 1000, s: w.session || null, o: w })),
-  ];
-  const activeN = rows.length;
-  if (S.reqShow === 'all') for (const x of ov.recent) rows.push({ kind: 'done', t: x.at_ms, s: x.session || null, o: x });
+  // A phone gets cards, not a reflowed table: three tight lines per request.
+  if (isPhone()) { setHTML(el, requestsPhone(rows, ov, activeN)); return; }
 
   const clientOf = row => row.o.client;
-  const tokensOf = row => row.kind === 'done' ? row.o.completion_tokens : row.kind === 'run' ? row.o.tokens : 0;
+
   const backendCell = row => row.kind === 'run' ? `<td>${bkCell(row.o.backend)}</td>`
     : row.kind === 'wait'
       ? `<td class="dim ph-hide">${row.o.backends.length === 1 ? bkName(ov.backends[row.o.backends[0]]?.label) : 'any'}</td>`
@@ -607,69 +980,16 @@ function renderRequests(st, ov) {
       <td class="num">${x.gen_tps == null ? dash : x.gen_tps.toFixed(1)}</td>`;
   };
 
-  // One gutter slot per session, first-appearance order, cycling four slots.
-  // `first`/`last` are indexes into the rendered list; the dotted lane spans
-  // everything between them, crossing other sessions' rows.
-  const laneMap = new Map();
-  const buildLanes = list => {
-    let n = 0;
-    list.forEach((e, i) => {
-      const s = e.r?.s;
-      if (!s) return;
-      // shortcut: a fifth concurrent session shares a lane's x slot; widen the gutter if boards ever juggle more.
-      if (!laneMap.has(s)) laneMap.set(s, { s, x: 8 + (n++ % 4) * 9, first: i, last: i, c: colorClass(e.r.o.client) });
-      else laneMap.get(s).last = i;
-    });
-  };
-  const gCell = (idx, own) => mode === 'off' ? '' : `<td class="g">${laneSpans(idx, own)}${own ? laneNode(own) : ''}</td>`;
-  const laneSpans = (idx, own) => [...laneMap.values()].filter(L => L.first <= idx && idx <= L.last)
-    .map(L => `<i class="dl" data-s="${L.s}" data-b="${L.s === own ? 0.9 : 0.22}" style="--x:${L.x}px;--c:var(--${cvar(L.c)});opacity:${L.s === own ? 0.9 : 0.22}"></i>`).join('');
-  const laneNode = s => { const L = laneMap.get(s); return L ? `<i class="node" style="--x:${L.x}px;--c:var(--${cvar(L.c)})"></i>` : ''; };
+  const items = rows.map(r => ({ r }));
+  if (S.reqShow === 'all' && ov.recent.length) items.splice(activeN, 0, { div: true });
+  const body = items.map(e => e.div
+    ? '<tr class="req-div"><td colspan="11"></td></tr>'
+    : `<tr>${tds(e.r)}</tr>`).join('');
 
-  const entries = rows.map(r => ({ r }));
-  if (S.reqShow === 'all' && ov.recent.length) entries.splice(activeN, 0, { div: true });
-  if (mode === 'chain') buildLanes(entries);
-
-  const body = [];
-  if (mode === 'threads') {
-    laneMap.clear();
-    const groups = new Map(), solo = [];
-    rows.forEach(r => { if (r.s) (groups.get(r.s) || groups.set(r.s, []).get(r.s)).push(r); else solo.push([r]); });
-    const units = [...groups.values(), ...solo].sort((a, b) => Math.max(...b.map(x => x.t)) - Math.max(...a.map(x => x.t)));
-    for (const u of units) {
-      if (u.length === 1) { body.push(`<tr>${mode === 'off' ? '' : '<td class="g"></td>'}${tds(u[0])}</tr>`); continue; }
-      const s = u[0].s, c = colorClass(clientOf(u[0]));
-      const first = Math.min(...u.map(x => x.t)), last = Math.max(...u.map(x => x.t));
-      const tok = u.reduce((a, x) => a + tokensOf(x), 0);
-      body.push(`<tr><td class="g"><i class="dl" data-s="${s}" data-b="0.9" style="--x:8px;--c:var(--${cvar(c)});opacity:.9"></i></td>
-        <td colspan="11" class="sess-hd" style="--c:var(--${cvar(c)})"><span class="mono">${esc(clientOf(u[0]))}</span> · ${esc(u[0].o.model)}${u[0].o.backend ? ` → <span class="bk-name">${esc(bkName(u[0].o.backend))}</span>` : ''} · ${u.length} requests · ${fmtTime(first)} → ${last >= now - 1500 ? 'now' : fmtTime(last)} · ${fmtTok(tok)} tok out</td></tr>`);
-      for (const r of u) body.push(`<tr data-s="${s}"><td class="g"><i class="dl" data-s="${s}" data-b="0.9" style="--x:8px;--c:var(--${cvar(c)});opacity:.9"></i><i class="node" style="--x:8px;--c:var(--${cvar(c)})"></i></td>${tds(r)}</tr>`);
-    }
-  } else {
-    entries.forEach((e, i) => {
-      if (e.div) {
-        body.push(`<tr class="req-div">${mode === 'off' ? '' : `<td class="g">${laneSpans(i, null)}</td>`}<td colspan="${mode === 'off' ? 11 : 11}">finished in the last ${WINDOW_LABEL[S.window]}</td></tr>`);
-        return;
-      }
-      body.push(`<tr${e.r.s ? ` data-s="${e.r.s}"` : ''}>${gCell(i, e.r.s)}${tds(e.r)}</tr>`);
-    });
-  }
-
-  const gutterTh = mode === 'off' ? '' : '<th style="width:46px"></th>';
-  const head = `<tr>${gutterTh}<th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
-  $('#ov-now-count').textContent = S.reqShow === 'all'
-    ? `${activeN} active · ${ov.recent.length} finished in the last ${WINDOW_LABEL[S.window]}`
-    : `${(st.runs || []).length} running · ${ov.queue.length} waiting`;
-  const el = $('#ov-now');
-  setHTML(el, rows.length ? `<table>${head}${body.join('')}</table>` : '<div class="empty">Nothing running or waiting</div>');
-
-  // Hovering a keyed row dims the other session lanes (Chain and Threads).
-  if (mode === 'off') { el.onmouseleave = null; return; }
-  el.querySelectorAll('tr[data-s]').forEach(tr => {
-    tr.onmouseenter = () => el.querySelectorAll('.dl').forEach(d => { d.style.opacity = d.dataset.s === tr.dataset.s ? '.9' : '.1'; });
-  });
-  el.onmouseleave = () => el.querySelectorAll('.dl').forEach(d => { d.style.opacity = d.dataset.b; });
+  const head = `<tr><th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
+  setHTML(el, rows.length ? `<table>${head}${body}</table>` : '<div class="empty">Nothing running or waiting</div>');
 }
+
 
 function renderBackendStats(ov) {
   setHTML($('#ov-backends'), ov.backends.length ? `<table>
@@ -1685,7 +2005,7 @@ $('#model-show').addEventListener('change', e => { S.modelShow = e.target.value;
 $('#model-mode').addEventListener('change', e => setModelMode(e.target.value));
 $(`#ov-window input[value="${S.window}"]`).checked = true;
 $(`#ov-req-show input[value="${S.reqShow}"]`).checked = true;
-$(`#ov-req-group input[value="${S.reqGroup}"]`).checked = true;
+$(`#ov-req-view input[value="${S.reqView}"]`).checked = true;
 ['input', 'change'].forEach(t => $('#set-form').addEventListener(t, onSettingsInput));
 // Leaving with unsaved settings: the browser asks first.
 window.addEventListener('beforeunload', e => { if (S.draft.size) e.preventDefault(); });
@@ -1700,11 +2020,26 @@ $('#ov-req-show').addEventListener('change', e => {
   try { localStorage.setItem('omq.reqShow', S.reqShow); } catch { /* storage blocked */ }
   render();
 });
-$('#ov-req-group').addEventListener('change', e => {
-  S.reqGroup = e.target.value;
-  try { localStorage.setItem('omq.reqGroup', S.reqGroup); } catch { /* storage blocked */ }
+$('#ov-req-view').addEventListener('change', e => {
+  S.reqView = e.target.value;
+  try { localStorage.setItem('omq.reqView', S.reqView); } catch { /* storage blocked */ }
   render();
 });
+// Client filter chips: pick one, click it again (or clear) to show everyone.
+$('#clbar').addEventListener('click', e => {
+  const chip = e.target.closest('[data-client]');
+  if (!chip) return;
+  const id = chip.dataset.client;
+  S.client = !id || S.client === id ? null : id;
+  try {
+    if (S.client) localStorage.setItem('omq.client', S.client);
+    else localStorage.removeItem('omq.client');
+  } catch { /* storage blocked */ }
+  S.overview = null;
+  poll();
+});
+// Cards on a phone, table on a desktop: repaint when the viewport crosses over.
+matchMedia('(max-width: 720px)').addEventListener('change', () => render());
 // A model's switch: serve or hide it on every backend. On failure (e.g. a
 // pattern rule still hides it) the re-render puts the switch back.
 $('#model-list').addEventListener('change', e => {
