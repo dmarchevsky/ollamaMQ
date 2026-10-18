@@ -140,7 +140,7 @@ table { width: 100%; border-collapse: collapse; }
 th { text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); font-weight: 600; padding: 10px 14px; background: var(--surface-2); border-bottom: 1px solid var(--border); white-space: nowrap; }
 td { padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 tr:last-child > td { border-bottom: none; }
-td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.actions { text-align: right; white-space: nowrap; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover > td { background: var(--surface-2); }
@@ -529,10 +529,11 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
   .free-chip { background: color-mix(in srgb, var(--accent) 22%, transparent); border-color: color-mix(in srgb, var(--accent) 72%, transparent); }
 }
 
-/* Requests table: divider before the finished block in "All" mode. */
-.req-div td { background: var(--surface-2); color: var(--faint); font-size: 11.5px;
-  text-transform: uppercase; letter-spacing: .5px; padding: 5px 14px; }
-.panel:not(.flush) .req-div td { background: none; padding-left: 0; }
+/* Table divider between the active rows and the finished ones in "All" mode:
+   a hairline, no sentence — `Active n | All n` in the header already counts. */
+.req-div td { padding: 0; }
+.req-div td::before { content: ''; display: block; height: 1px; margin: 9px 0 6px;
+  background: linear-gradient(90deg, var(--border) 55%, transparent); }
 
 /* Requests session views: a dotted lane per conversation in the left gutter,
    with a hollow node on the rows of that session (Chain and Threads). */
@@ -658,10 +659,8 @@ tr.is-off td { color: var(--muted); }
 .rq-2 .m { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rq-2 .n { margin-left: auto; color: var(--muted); white-space: nowrap; }
 .rq-m { margin-top: 2px; font: 11px var(--mono); color: var(--muted); }
-#ov-now .req-div-p {
-  padding: 9px 0 3px; color: var(--faint); font-size: 11.5px;
-  text-transform: uppercase; letter-spacing: .5px;
-}
+#ov-now .req-div-p::before { content: ''; display: block; height: 1px; margin: 9px 0 6px;
+  background: linear-gradient(90deg, var(--border) 55%, transparent); }
 /* --- Merged Activity panel: the session timeline and the Details list.
    One panel: a session-per-row timeline on top, the request list below.
    Bars are positioned in % of the window (no SVG scaling tricks), so a row
@@ -676,9 +675,7 @@ tr.is-off td { color: var(--muted); }
   border-top: 1px solid var(--border); margin-top: 4px; }
 .tl-grp:first-of-type { border-top: none; margin-top: 0; }
 .tl-grp .bk-name { font-weight: 650; }
-.tl-grp .bk-addr { font: 11px var(--mono); color: var(--faint); }
-.tl-grp .sum { margin-left: auto; font-size: 11.5px; color: var(--muted);
-  font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tl-grp .off-tag { font-size: 11px; color: var(--bad); }
 .tl-row { display: flex; align-items: center; gap: 8px; height: 19px; }
 .tl-row:hover .tl-lab { color: var(--text); }
 .tl-lab { flex: 0 0 var(--tl-lab, 132px); display: flex; align-items: center; gap: 5px;
@@ -694,11 +691,13 @@ tr.is-off td { color: var(--muted); }
    stage reads as clearly as any other no matter how short it was, and the row
    stays flat. Durations live in the tooltip and the Details lines. */
 .tl-track .req { position: absolute; top: 2px; display: flex; gap: 2px; }
+/* the window cut the start of this request off; ‹ marks what it lost */
+.tl-track .req.pre::before { content: '\2039'; color: var(--faint); font: 11px/10px var(--mono); margin-right: 1px; }
 .tl-track .sg { flex: 0 0 var(--tl-chip, 8px); width: var(--tl-chip, 8px); height: 10px;
-  border-radius: 2px; background: var(--c, var(--c1)); }
+  background: var(--c, var(--c1)); } /* square on purpose: a rounded end blurs where a stage stops */
 .tl-track .sg.w { background: var(--accent-soft); border: 1px solid var(--accent); }
 .tl-track .sg.p { background: var(--warn); }
-.tl-track .sg.err { background: var(--bad); }
+.tl-track .sg.e { background: var(--bad); }
 .tl-track .sg.live { background-image: repeating-linear-gradient(115deg,
   rgba(255,255,255,.45) 0 3px, transparent 3px 7px); }
 .tl-track .now { position: absolute; right: 0; top: -1px; bottom: -1px;
@@ -707,10 +706,10 @@ tr.is-off td { color: var(--muted); }
 .tl-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 8px 0 0;
   font-size: 11.5px; color: var(--muted); }
 .tl-legend .sw { margin-right: 4px; }
+.tl-legend .sw { border-radius: 0; }
 .tl-legend .sw.w { background: var(--accent-soft); border: 1px solid var(--accent); }
 .tl-legend .sw.p { background: var(--warn); }
 .tl-legend .sw.g { background: var(--c2); }
-.tl-legend .sw.i { background: none; border-top: 2px dotted var(--faint); height: 0; border-radius: 0; }
 .tl-legend .sw.e { background: var(--bad); }
 .tl-legend .sw.live { background: repeating-linear-gradient(115deg, var(--c2) 0 3px, var(--surface) 3px 7px); }
 /* Details: one collapsible block per session. */
@@ -757,8 +756,7 @@ tr.is-off td { color: var(--muted); }
   .tl-row { flex-wrap: wrap; height: auto; gap: 1px 6px; padding: 3px 0; }
   .tl-lab { flex: 1 1 auto; font-size: 11px; }
   .tl-track { flex: 1 1 100%; height: 12px; }
-  .tl-grp { flex-wrap: wrap; }
-  .tl-grp .sum { flex-basis: 100%; margin-left: 0; }
+  .tl-grp { gap: 6px; }
 }
 /* A timeline row is clickable: it opens Details at that conversation. */
 .tl-row { cursor: pointer; }

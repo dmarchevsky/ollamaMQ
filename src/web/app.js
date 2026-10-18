@@ -538,8 +538,7 @@ const TL_ROWS = 12;          // sessions per backend before the oldest fold away
 const STAGE = { w: 'waiting', p: 'prefill', g: 'processing', e: 'error' };
 const TL_LEGEND = '<div class="tl-legend"><span><i class="sw w"></i>waiting</span>'
   + '<span><i class="sw p"></i>prefill</span><span><i class="sw g"></i>processing</span>'
-  + '<span><i class="sw e"></i>error</span><span><i class="sw i"></i>idle</span>'
-  + '<span><i class="sw live"></i>in flight</span></div>';
+  + '<span><i class="sw e"></i>error</span><span><i class="sw live"></i>in flight</span></div>';
 
 function renderTimeline(st, ov) {
   const el = $('#ov-timeline');
@@ -576,15 +575,18 @@ function renderTimeline(st, ov) {
       const shown = sess.slice(0, TL_ROWS);
       hidden += sess.length - shown.length;
       const lane = g.idx != null ? laneOf.get(g.idx) : null;
-      const tail = [`${g.reqs} req${lane ? ` · peak ${lane.peak_run}/${lane.max}` : ''}`]
-        .concat(g.run ? [`${g.run} running`] : [], g.wait ? [`${g.wait} waiting`] : []).join(' · ');
-      return `<div class="tl-grp">${g.head}<span class="sum">${shown.length} session${shown.length === 1 ? '' : 's'} · ${tail}</span></div>`
+      // Nothing but the name stands on the canvas — what the backend is doing
+      // now rides on the header's tooltip, next to the time it is read against.
+      const tip = [`${shown.length} session${shown.length === 1 ? '' : 's'}`, `${g.reqs} req`]
+        .concat(g.run ? [`${g.run} running`] : [], g.wait ? [`${g.wait} waiting`] : [],
+          lane ? [`peak ${lane.peak_run}/${lane.max}`] : [],
+          g.free != null ? [`${g.free} free`] : []).join(' · ');
+      return `<div class="tl-grp" title="${esc(tip)}">`
+        + `<span class="sdot ${g.online ? 'on' : 'off'}"></span><span class="bk-name">${esc(g.name)}</span>`
+        + (g.online ? '' : '<span class="off-tag">offline</span>') + '</div>'
         + shown.map(([, rs]) => tlRow(rs, pctOf)).join('');
     }).join('');
-  const idle = ov.backends.filter(b => !groups.has('b' + b.idx) && !groups.has('n' + (b.name || b.label)));
-  const foot = [idle.length ? `${esc(idle.map(b => bkName(b.label)).join(' · '))} — no activity in the window` : '',
-    hidden ? `+${hidden} older session${hidden === 1 ? '' : 'es'} hidden` : '',
-    'click a row for its stages'].filter(Boolean).join(' · ');
+  const foot = hidden ? `+${hidden} older session${hidden === 1 ? '' : 's'} hidden` : '';
   setHTML(el, `<div class="tl">${axis}${body}${TL_LEGEND}${foot ? `<div class="tl-foot">${foot}</div>` : ''}</div>`);
   wireTimeline();
 }
@@ -595,9 +597,11 @@ function tlRow(rows, pctOf) {
   const c = cvar(colorClass(head.o.client));
   const clusters = rows.map(r => {
     const at = pctOf(r.plan.at);
-    // A request that is still running must not hang off the right edge: anchor it there.
-    const pos = at > 93 ? 'right:0' : `left:${at.toFixed(2)}%`;
-    return `<span class="req" style="${pos}" title="${esc(r.plan.tip)}">`
+    // A request that arrived before the window (a long queue wait) or that is
+    // still running cannot fit: pin it to that edge and mark the stages the
+    // window cut off, so the cluster is not read as the whole request.
+    const pos = at < 1 ? 'left:0' : at > 93 ? 'right:0' : `left:${at.toFixed(2)}%`;
+    return `<span class="req${at < 1 ? ' pre' : ''}" style="${pos}" title="${esc(r.plan.tip)}">`
       + r.plan.events.map(e => `<i class="sg ${e.k}${e.live ? ' live' : ''}"></i>`).join('') + '</span>';
   }).join('');
   return `<div class="tl-row" data-key="${esc(head.key)}">`
@@ -605,21 +609,23 @@ function tlRow(rows, pctOf) {
     + `<div class="tl-track" style="--c:var(--${c})">${clusters}<span class="now"></span></div></div>`;
 }
 
-/** Which group a row belongs to: its backend, or a named bucket when it has none. */
+/**
+ * Which group a row belongs to: its backend, or a named bucket when it has
+ * none. Live rows carry a backend index, finished ones a label — both resolve
+ * to the same handle so a backend is one group, not two.
+ */
 function rowBackend(r, ov) {
-  const head = (b, label) => b
-    ? `<span class="sdot ${b.online ? 'on' : 'off'}"></span>${bkCell(b.name || b.label, true)}`
-      + (b.online ? `<span class="free-chip">${b.free} free</span>` : '')
-    : `<span class="bk-name">${esc(label)}</span>`;
+  const of = (k, idx, name, online, free) => ({ k, idx, name, online, free, pseudo: idx != null ? 1 : 2 });
   if (r.kind === 'wait') {
-    if (r.o.backends.length !== 1) return { k: 'any', idx: null, pseudo: 3, head: head(null, 'no free backend') };
-    const i = r.o.backends[0];
-    return { k: 'b' + i, idx: i, pseudo: 1, head: head(ov.backends[i]) };
+    const i = r.o.backends.length === 1 ? r.o.backends[0] : null;
+    const b = i != null ? ov.backends[i] : null;
+    return b ? of('b' + i, i, b.name || b.label, b.online, b.free)
+      : of('any', null, 'no free backend', true, null, 3);
   }
-  if (!r.o.backend) return { k: 'none', idx: null, pseudo: 2, head: head(null, 'never dispatched') };
+  if (!r.o.backend) return of('none', null, 'never dispatched', false, null, 2);
   const i = ov.backends.findIndex(b => b.label === r.o.backend || b.name === r.o.backend);
-  return { k: i >= 0 ? 'b' + i : 'n' + r.o.backend, idx: i >= 0 ? i : null, pseudo: 1,
-    head: head(i >= 0 ? ov.backends[i] : null, r.o.backend) };
+  return i >= 0 ? of('b' + i, i, ov.backends[i].name || ov.backends[i].label, ov.backends[i].online, ov.backends[i].free)
+    : of('n' + r.o.backend, null, r.o.backend, true, null);
 }
 
 /** Clicking a row opens Details and jumps to that conversation. */
@@ -643,56 +649,62 @@ function wireTimeline() {
 
 /**
  * The stage events of one request: when each began and what it is worth.
- * A finished record keeps an end time plus durations, so the stages are rebuilt
- * backwards from the finish; `ttft_secs` runs from arrival, which makes prefill
- * `ttft − waited` wherever prefill_secs is absent. Short enough to be noise is
- * left out rather than drawn as a 0.0s line.
+ * Every duration in the payload is measured from *dispatch* (`ttft_secs`,
+ * `gen_secs`, and `elapsed_secs` for a live run); the queue wait happened
+ * before dispatch. So a finished request is rebuilt backwards from the moment
+ * it left the proxy — arrival = finish − waited − prefill − generation — and a
+ * run grows forward from `now − elapsed`, which is its dispatch. `ttft_secs` is
+ * dispatch to first token, i.e. the prefill itself, wherever `prefill_secs` is
+ * absent. A stage too short to matter is left out rather than drawn as 0.0s.
  */
 function stagePlan(row, now) {
   const o = row.o;
   const ev = (k, at, line, live) => ({ k, at, line, live: !!live });
   const done = (events, at, end) => ({
     events, at, end,
-    tip: events.map(e => `${STAGE[e.k]} ${stripTags(e.line)}`).join(' · '),
+    // The tooltip opens with when the request arrived, so a cluster can be
+    // checked against the Details lines without leaving the graph.
+    tip: `${fmtTime(at)} · ` + events.map(e => `${STAGE[e.k]} ${stripTags(e.line)}`).join(' · '),
   });
   if (row.kind === 'wait') {
     const at = now - o.waited_secs * 1000;
     return done([ev('w', at, `${fmtDur(o.waited_secs)} · prompt ${fmtTok(o.est_prompt_tokens)} tok · queue #${o.pos}`, true)], at, now);
   }
   if (row.kind === 'run') {
-    const at = now - o.elapsed_secs * 1000;
+    const dispatch = now - o.elapsed_secs * 1000;
     const w = o.waited_secs || 0;
     const out = [];
-    if (w >= .05) out.push(ev('w', at, `${fmtDur(w)} · prompt ${fmtTok(o.est_prompt_tokens)} tok`));
+    if (w >= .05) out.push(ev('w', dispatch - w * 1000, `${fmtDur(w)} · prompt ${fmtTok(o.est_prompt_tokens)} tok`));
     if (o.ttft_secs == null) {
-      out.push(ev('p', at + w * 1000, `≈${fmtTok(o.est_prompt_tokens)} tok · ${fmtDur(Math.max(0, o.elapsed_secs - w))} prefilling`, true));
+      out.push(ev('p', dispatch, `≈${fmtTok(o.est_prompt_tokens)} tok · ${fmtDur(o.elapsed_secs)} prefilling`, true));
     } else {
-      out.push(ev('p', at + w * 1000, `${fmtTok(o.est_prompt_tokens)} tok · ${fmtSec1(Math.max(0, o.ttft_secs - w))}`));
-      out.push(ev('g', at + o.ttft_secs * 1000, `${fmtNum(o.tokens)} tok · ${fmtDur(Math.max(0, o.elapsed_secs - o.ttft_secs))} · `
+      if (o.ttft_secs >= .05) out.push(ev('p', dispatch, `${fmtTok(o.est_prompt_tokens)} tok · ${fmtSec1(o.ttft_secs)}`));
+      out.push(ev('g', dispatch + o.ttft_secs * 1000, `${fmtNum(o.tokens)} tok · ${fmtDur(Math.max(0, o.elapsed_secs - o.ttft_secs))} · `
         + `${o.tokens_per_sec == null ? '…' : o.tokens_per_sec.toFixed(1)} t/s<span class="more"> · <b>now</b></span>`, true));
     }
-    return done(out, at, now);
+    return done(out, dispatch - w * 1000, now);
   }
   const finish = row.t;
   const w = o.waited_secs || 0;
   const gen = o.gen_secs || 0;
-  const pre = o.prefill_secs != null ? o.prefill_secs : Math.max(0, (o.ttft_secs ?? w) - w);
-  const at = finish - (w + pre + gen) * 1000;
+  const pre = o.prefill_secs ?? o.ttft_secs ?? 0;
+  const dispatch = finish - (pre + gen) * 1000;
+  const at = dispatch - w * 1000;
   if (o.error) {
     const out = [];
     if (w >= .05) out.push(ev('w', at, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
-    out.push(ev('e', finish - gen * 1000, `${outcomePhrase(o)}${o.backend ? '' : '<span class="more"> · never dispatched</span>'}`));
+    out.push(ev('e', finish, `${outcomePhrase(o)}${o.backend ? '' : '<span class="more"> · never dispatched</span>'}`));
     return done(out, at, finish);
   }
   const out = [];
   if (w >= .05) out.push(ev('w', at, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
   if (pre >= .05) {
-    out.push(ev('p', at + w * 1000, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(pre)}`
+    out.push(ev('p', dispatch, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(pre)}`
       + (o.cache_pct != null ? ` · cache ${o.cache_pct}%` : '')
       + (o.prefill_secs && o.prompt_tokens ? `<span class="more"> · ${fmtRate(o.prompt_tokens / o.prefill_secs)}</span>` : '')));
   }
   if (gen > 0) {
-    out.push(ev('g', at + (w + pre) * 1000,
+    out.push(ev('g', finish - gen * 1000,
       `${fmtTok(o.completion_tokens)} tok · ${fmtSec1(gen)} · ${(o.gen_tps ?? 0).toFixed(1)} t/s`));
   }
   return done(out, at, finish);
@@ -851,7 +863,7 @@ function cardPhone(row, ov, opts = {}) {
 /** Phone layout of the List: cards instead of the reflowed table. */
 function requestsPhone(rows, ov, activeN) {
   if (!rows.length) return '<div class="empty">Nothing running or waiting</div>';
-  const divider = `<div class="req-div-p">finished in the last ${WINDOW_LABEL[S.window]}</div>`;
+  const divider = '<div class="req-div-p"></div>';
   const items = rows.map(r => ({ r }));
   if (S.reqShow === 'all' && ov.recent.length) items.splice(activeN, 0, { div: true });
   return items.map(e => e.div ? divider : cardPhone(e.r, ov)).join('');
@@ -958,7 +970,7 @@ function renderRequests(st, ov) {
   const items = rows.map(r => ({ r }));
   if (S.reqShow === 'all' && ov.recent.length) items.splice(activeN, 0, { div: true });
   const body = items.map(e => e.div
-    ? `<tr class="req-div"><td colspan="11">finished in the last ${WINDOW_LABEL[S.window]}</td></tr>`
+    ? '<tr class="req-div"><td colspan="11"></td></tr>'
     : `<tr>${tds(e.r)}</tr>`).join('');
 
   const head = `<tr><th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
