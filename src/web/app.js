@@ -529,16 +529,16 @@ function renderCapacity(st, ov) {
 
 /**
  * One row per conversation, grouped under the backend it ran on. A request
- * paints one chip per stage — waiting, prefill, processing — as wide as that
+ * paints one chip per stage — waiting, prefill, decode — as wide as that
  * stage ran, so a 40s decode reads as forty seconds next to a 1s prefill. A
  * stage too short to draw is floored to a few pixels rather than disappearing;
  * the exact numbers are in the chip tooltip and the Details lines below.
  * A backend with nothing in the window takes no row.
  */
 const TL_ROWS = 12;          // sessions per backend before the oldest fold away
-const STAGE = { w: 'waiting', p: 'prefill', g: 'processing', e: 'error' };
+const STAGE = { w: 'waiting', p: 'prefill', g: 'decode', e: 'error' };
 const TL_LEGEND = '<div class="tl-legend"><span><i class="sw w"></i>waiting</span>'
-  + '<span><i class="sw p"></i>prefill</span><span><i class="sw g"></i>processing</span>'
+  + '<span><i class="sw p"></i>prefill</span><span><i class="sw g"></i>decode</span>'
   + '<span><i class="sw e"></i>error</span></div>';
 
 function renderTimeline(st, ov) {
