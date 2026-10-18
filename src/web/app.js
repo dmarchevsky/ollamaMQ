@@ -539,13 +539,14 @@ const TL_ROWS = 12;          // sessions per backend before the oldest fold away
 const STAGE = { w: 'waiting', p: 'prefill', g: 'processing', e: 'error' };
 const TL_LEGEND = '<div class="tl-legend"><span><i class="sw w"></i>waiting</span>'
   + '<span><i class="sw p"></i>prefill</span><span><i class="sw g"></i>processing</span>'
-  + '<span><i class="sw e"></i>error</span><span><i class="sw live"></i>in flight</span></div>';
+  + '<span><i class="sw e"></i>error</span></div>';
 
 function renderTimeline(st, ov) {
   const el = $('#ov-timeline');
   const now = ov.now_ms;
   const span = ov.window_secs * 1000;
   const pctOf = ms => Math.max(0, Math.min(100, (ms - (now - span)) / span * 100));
+  pctOf.start = now - span;
   const { rows } = reqRows(st, ov, true);   // the graph is a window: it shows all of it
   if (!rows.length) {
     setHTML(el, `<div class="empty">Nothing in the last ${WINDOW_LABEL[S.window]}</div>`);
@@ -571,9 +572,12 @@ function renderTimeline(st, ov) {
   const body = [...groups.values()]
     .sort((a, b) => (a.pseudo - b.pseudo) || (b.last - a.last))
     .map(g => {
-      const sess = [...g.sess.entries()].sort((a, b) =>
-        Math.max(...b[1].map(x => x.plan.end)) - Math.max(...a[1].map(x => x.plan.end)));
-      const shown = sess.slice(0, TL_ROWS);
+      // Rows step down with the axis: the session that started first in the
+      // window is the top row. The cap keeps the most recent starts.
+      const sess = [...g.sess.entries()]
+        .map(([key, rs]) => ({ key, rs, at: Math.min(...rs.map(x => x.plan.at)) }))
+        .sort((a, b) => a.at - b.at);
+      const shown = sess.slice(-TL_ROWS);
       hidden += sess.length - shown.length;
       const lane = g.idx != null ? laneOf.get(g.idx) : null;
       // Nothing but the name stands on the canvas — what the backend is doing
@@ -585,7 +589,7 @@ function renderTimeline(st, ov) {
       return `<div class="tl-grp" title="${esc(tip)}">`
         + `<span class="sdot ${g.online ? 'on' : 'off'}"></span><span class="bk-name">${esc(g.name)}</span>`
         + (g.online ? '' : '<span class="off-tag">offline</span>') + '</div>'
-        + shown.map(([, rs]) => tlRow(rs, pctOf, span)).join('');
+        + shown.map(s => tlRow(s.rs, pctOf, span)).join('');
     }).join('');
   const foot = hidden ? `+${hidden} older session${hidden === 1 ? '' : 's'} hidden` : '';
   setHTML(el, `<div class="tl">${axis}${body}${TL_LEGEND}${foot ? `<div class="tl-foot">${foot}</div>` : ''}</div>`);
@@ -595,23 +599,22 @@ function renderTimeline(st, ov) {
 /** One session's row: a chip cluster per request, anchored at its arrival. */
 function tlRow(rows, pctOf, span) {
   const head = rows[0];
-  const c = cvar(colorClass(head.o.client));
-  const clusters = rows.map(r => {
-    const at = pctOf(r.plan.at);
-    const wide = (r.plan.end - r.plan.at) / span * 100;
-    // A request that arrived before the window (a long queue wait), or whose
-    // stages run past the right edge, cannot fit: pin it to that edge and mark
-    // the stages the window cut off, so the cluster is not read as the whole
-    // request. A live one always ends now, so it is pinned right.
-    const pos = at < 1 ? 'left:0' : at + wide > 100 ? 'right:0' : `left:${at.toFixed(2)}%`;
-    return `<span class="req${at < 1 ? ' pre' : ''}" style="${pos}" title="${esc(r.plan.tip)}">`
-      + r.plan.events.map(e => `<i class="sg ${e.k}${e.live ? ' live' : ''}"`
-        + ` style="--w:${Math.max(0, e.dur / span * 100).toFixed(3)}%"></i>`).join('') + '</span>';
+  // Each stage is placed in the track by itself: left = when it began, width =
+  // how long it ran. A stage that runs off either edge is clipped there and the
+  // row gets a `‹` so its left edge is not read as the request's beginning.
+  let cut = '';
+  const segs = rows.flatMap(r => {
+    if (r.plan.at < pctOf.start) cut = '<b class="cut"></b>';
+    return r.plan.events.map(e => `<i class="sg ${e.k}" style="left:${pctOf(e.at).toFixed(3)}%;`
+      + `width:${Math.max(0, e.dur * 1000 / span * 100).toFixed(3)}%" title="${esc(stageTip(e))}"></i>`);
   }).join('');
   return `<div class="tl-row" data-key="${esc(head.key)}">`
     + `<div class="tl-lab">${swatch(head.o.client)}<b>${esc(head.o.client)}</b>${head.s ? ` #${esc(head.s)}` : ''}</div>`
-    + `<div class="tl-track" style="--c:var(--${c})">${clusters}<span class="now"></span></div></div>`;
+    + `<div class="tl-track">${cut}${segs}<span class="now"></span></div></div>`;
 }
+
+/** A chip's own tooltip: when the stage began and what it is worth. */
+const stageTip = e => `${fmtTime(e.at)} · ${STAGE[e.k]} ${stripTags(e.line)}`;
 
 /**
  * Which group a row belongs to: its backend, or a named bucket when it has
