@@ -1081,7 +1081,7 @@ checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
 
 [[package]]
 name = "ollamaMQ"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "argon2",
  "axum",

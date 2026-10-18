@@ -491,8 +491,6 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 .sw.q2 { background: color-mix(in srgb, var(--c, var(--c-other)) 40%, transparent); border: 1.5px dashed var(--c, var(--c-other)); }
 .sw.loading { background: repeating-linear-gradient(135deg, var(--warn) 0 2px, transparent 2px 5px); }
 .sw.run { background: var(--accent); } .sw.que { background: var(--warn); }
-.sw.capl { height: 0; border-top: 2px dashed var(--muted); border-radius: 0; vertical-align: 3px; background: none; }
-.sw.mk { background: var(--bad); clip-path: polygon(50% 0, 100% 100%, 0 100%); border-radius: 0; }
 
 .caps { display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content; gap: 8px 16px; align-items: center; }
 .cap-row { display: contents; }
@@ -520,18 +518,6 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 12px; font-size: 12px; color: var(--muted); }
 .legend span { display: inline-flex; align-items: center; }
 
-/* Activity swimlanes. */
-.lanes { display: flex; flex-direction: column; gap: 4px; }
-.lane { padding: 8px 0 4px; border-top: 1px solid var(--border); }
-.lane:first-child { border-top: none; }
-.lane-h { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
-.lane-sub { font-size: 12px; }
-.lane-chart svg { display: block; width: 100%; height: auto; }
-.lane .ax { fill: var(--faint); font: 11px var(--sans); font-variant-numeric: tabular-nums; }
-.lane .capl { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 4; }
-.lane .base { stroke: var(--border); stroke-width: 1; }
-.lane .mk { fill: var(--bad); }
-.lanes-foot { margin-top: 4px; font-size: 12px; }
 .free-chip {
   font-size: 11.5px; font-weight: 650; padding: 2px 9px; border-radius: 9px;
   color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--surface));
@@ -550,12 +536,6 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 
 /* Requests session views: a dotted lane per conversation in the left gutter,
    with a hollow node on the rows of that session (Chain and Threads). */
-#ov-now td.g { width: 46px; padding: 0 !important; position: relative; }
-#ov-now .dl { position: absolute; top: 0; bottom: 0; left: var(--x); border-left: 2px dotted var(--c); }
-#ov-now .node { position: absolute; top: 50%; left: calc(var(--x) - 4px); width: 7px; height: 7px;
-  border-radius: 50%; background: var(--surface); border: 2.5px solid var(--c); transform: translateY(-50%); }
-#ov-now td.sess-hd { background: color-mix(in srgb, var(--c) 7%, var(--surface)); font-size: 12.5px; }
-#ov-now td.sess-hd .mono { color: var(--text); }
 
 .share { display: inline-block; width: 70px; height: 8px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); vertical-align: middle; overflow: hidden; margin-right: 6px; }
 .share > i { display: block; height: 100%; background: var(--c, var(--c-other)); }
@@ -605,3 +585,186 @@ tr.is-off td { color: var(--muted); }
   .startup-kv { grid-column: auto; }
   .set-row.dirty { margin: 0 -14px; padding-left: 14px; padding-right: 14px; }
 }
+
+/* ================================================================ Overview:
+   client filter, phone layout (see .dev-flow/overview-mobile-ui/plan). */
+
+/* --- Client filter chips, inside the sticky header so they pin with it. On a
+   phone the row takes its own line and scrolls sideways, so a fleet of clients
+   costs one row of height; on desktop it joins the stats line and wraps only
+   when the client list outgrows it. --- */
+.topbar { flex-wrap: wrap; row-gap: 8px; }
+.clbar { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.clbar .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--faint); flex: 0 0 auto; }
+.clwrap { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; flex: 1 1 0; min-width: 0; padding: 1px 0 2px; }
+.clwrap::-webkit-scrollbar { display: none; }
+@media (min-width: 721px) {
+  /* The stats never break internally on a desktop: when the header runs out of
+     room the chip row shrinks (it scrolls) instead of pushing VIP/Boost down. */
+  .stats { flex-wrap: nowrap; }
+  .clbar { flex: 1 1 auto; }
+}
+.clchip {
+  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  font: inherit; font-size: 12px; color: var(--muted); background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px;
+  cursor: pointer; white-space: nowrap;
+}
+.clchip:hover { color: var(--text); border-color: var(--faint); }
+.clchip .sw { margin-right: 0; }
+.clchip .n { color: var(--faint); font-variant-numeric: tabular-nums; }
+.clchip[aria-pressed="true"] {
+  color: var(--text); border-color: var(--c, var(--accent));
+  background: color-mix(in srgb, var(--c, var(--accent)) 16%, var(--surface));
+}
+.clchip.all[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+/* Last chip is cut off where the row scrolls: fade it out instead of slicing a
+   chip in half. Clearing the filter is the `All` chip, always first in the row. */
+.clbar .clwrap {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
+}
+@media (max-width: 720px) {
+  .topbar { gap: 8px 10px; padding: 8px 12px 8px; }
+  .clbar { flex-basis: 100%; order: 4; margin: 0 -12px; padding: 0 12px; }
+  .clwrap { margin-right: -12px; padding-right: 12px; }
+  .clchip { padding: 4px 10px; }
+  .clbar .lbl { display: none; }
+}
+
+/* --- Activity panel header on a phone: title, then both controls on one line
+   (Active/All carry the counts the sentence used to spell out). --- */
+@media (max-width: 720px) {
+  #page-overview .panel-h { flex-wrap: wrap; row-gap: 6px; }
+  #page-overview .panel-h .page-tools { flex: 1 1 100%; width: auto; justify-content: flex-start; gap: 8px; }
+  #page-overview .page-tools .seg { margin-bottom: 0; }
+  #page-overview .page-tools .seg span { padding: 4px 9px; font-size: 12px; }
+  #page-overview .page-tools .seg span b { color: var(--text); font-variant-numeric: tabular-nums; }
+}
+
+/* --- Request cards (phone). Replaces the table-reflow for #ov-now: three tight
+   lines, no repeated field labels (their names stay in title= tooltips, and the
+   desktop table keeps them as columns). Gen time is left out — tokens and tok/s
+   on line 2 give it. --- */
+#ov-now .rq { padding: 9px 0; border-bottom: 1px solid var(--border); }
+#ov-now .rq:last-child { border-bottom: none; }
+.rq-1 { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 12.5px; }
+.rq-1 .sw { margin-right: 0; }
+.rq-1 .who { font-weight: 600; }
+.rq-1 .t { font: 12px var(--mono); color: var(--muted); }
+.rq-1 .bk { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.rq-1 .n { margin-left: auto; font: 12px var(--mono); color: var(--muted); }
+.rq-2 { display: flex; align-items: baseline; gap: 10px; margin-top: 2px; font: 12px var(--mono); }
+.rq-2 .m { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rq-2 .n { margin-left: auto; color: var(--muted); white-space: nowrap; }
+.rq-m { margin-top: 2px; font: 11px var(--mono); color: var(--muted); }
+#ov-now .req-div-p {
+  padding: 9px 0 3px; color: var(--faint); font-size: 11.5px;
+  text-transform: uppercase; letter-spacing: .5px;
+}
+/* --- Merged Activity panel: the session timeline and the Details list.
+   One panel: a session-per-row timeline on top, the request list below.
+   Bars are positioned in % of the window (no SVG scaling tricks), so a row
+   stays aligned with the axis and a tooltip is a plain title attribute. */
+.tl { --tl-lab: 156px; padding: 4px 0 2px; }
+.tl-axis { position: relative; height: 15px; margin-left: var(--tl-lab, 132px);
+  font: 11px var(--mono); color: var(--faint); }
+.tl-axis span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+.tl-axis span:first-child { transform: none; }
+.tl-axis span:last-child { transform: translateX(-100%); }
+.tl-grp { display: flex; align-items: baseline; gap: 7px; padding: 9px 0 3px;
+  border-top: 1px solid var(--border); margin-top: 4px; }
+.tl-grp:first-of-type { border-top: none; margin-top: 0; }
+.tl-grp .bk-name { font-weight: 650; }
+.tl-grp .bk-addr { font: 11px var(--mono); color: var(--faint); }
+.tl-grp .sum { margin-left: auto; font-size: 11.5px; color: var(--muted);
+  font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tl-row { display: flex; align-items: center; gap: 8px; height: 19px; }
+.tl-row:hover .tl-lab { color: var(--text); }
+.tl-lab { flex: 0 0 var(--tl-lab, 132px); display: flex; align-items: center; gap: 5px;
+  font: 11.5px var(--mono); color: var(--muted); min-width: 0; overflow: hidden;
+  white-space: nowrap; }
+.tl-lab b { color: var(--text); font-weight: 600; }
+.tl-lab .sw { margin: 0; flex: 0 0 auto; }
+.tl-track { position: relative; flex: 1 1 auto; height: 14px; overflow: hidden; }
+/* the dotted baseline is what makes a gap read as idle rather than missing */
+.tl-track::before { content: ''; position: absolute; left: 0; right: 0; top: 50%;
+  border-top: 1px dotted var(--border); }
+/* One request is a cluster of equal-size chips anchored at its arrival: every
+   stage reads as clearly as any other no matter how short it was, and the row
+   stays flat. Durations live in the tooltip and the Details lines. */
+.tl-track .req { position: absolute; top: 2px; display: flex; gap: 2px; }
+.tl-track .sg { flex: 0 0 var(--tl-chip, 8px); width: var(--tl-chip, 8px); height: 10px;
+  border-radius: 2px; background: var(--c, var(--c1)); }
+.tl-track .sg.w { background: var(--accent-soft); border: 1px solid var(--accent); }
+.tl-track .sg.p { background: var(--warn); }
+.tl-track .sg.err { background: var(--bad); }
+.tl-track .sg.live { background-image: repeating-linear-gradient(115deg,
+  rgba(255,255,255,.45) 0 3px, transparent 3px 7px); }
+.tl-track .now { position: absolute; right: 0; top: -1px; bottom: -1px;
+  border-left: 1px solid var(--muted); }
+.tl-foot { padding: 7px 0 0; font-size: 11.5px; color: var(--faint); }
+.tl-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 8px 0 0;
+  font-size: 11.5px; color: var(--muted); }
+.tl-legend .sw { margin-right: 4px; }
+.tl-legend .sw.w { background: var(--accent-soft); border: 1px solid var(--accent); }
+.tl-legend .sw.p { background: var(--warn); }
+.tl-legend .sw.g { background: var(--c2); }
+.tl-legend .sw.i { background: none; border-top: 2px dotted var(--faint); height: 0; border-radius: 0; }
+.tl-legend .sw.e { background: var(--bad); }
+.tl-legend .sw.live { background: repeating-linear-gradient(115deg, var(--c2) 0 3px, var(--surface) 3px 7px); }
+/* Details: one collapsible block per session. */
+.det-h { display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left;
+  background: color-mix(in srgb, var(--c, var(--accent)) 7%, var(--surface));
+  border: none; border-left: 3px solid var(--c, var(--accent)); border-radius: 5px;
+  padding: 6px 9px; margin: 6px 0 0; cursor: pointer; font: inherit; color: var(--text); }
+.det-h .chev { color: var(--faint); font-size: 9px; }
+.det-h .who { font-weight: 650; }
+.det-h .sub { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.det-h .sum { margin-left: auto; font-size: 11.5px; color: var(--muted);
+  font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Details: every stage is its own event line with its
+   own timestamp, threaded down the left by the session colour. */
+.det-body { border-left: 2px dotted color-mix(in srgb, var(--c, var(--accent)) 45%, var(--border));
+  margin: 2px 0 6px 7px; padding-left: 10px; }
+.det-row { display: flex; align-items: baseline; gap: 9px; padding: 3px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  font: 12px var(--mono); }
+.det-row:last-child { border-bottom: none; }
+.det-row .when { color: var(--muted); flex: 0 0 58px; }
+.det-row .st { flex: 0 0 94px; color: var(--text); white-space: nowrap; }
+.det-row .st::before { content: ''; display: inline-block; width: 7px; height: 7px;
+  border-radius: 2px; margin-right: 5px; background: var(--c, var(--c1)); }
+.det-row .st.w::before { background: var(--accent-soft); border: 1px solid var(--accent); }
+.det-row .st.p::before { background: var(--warn); }
+.det-row .st.e::before { background: var(--bad); }
+.det-row .st.i::before { background: none; border: 1px dotted var(--faint); }
+.det-row .val { color: var(--muted); min-width: 0; }
+.det-row.dim .st, .det-row.dim .val { color: var(--faint); }
+@media (max-width: 720px) {
+  .tl { --tl-lab: 0px; }
+  .det-h { flex-wrap: wrap; }
+  .det-h .sub { flex: 1 1 100%; }
+  /* one line per stage event, so the columns stay tight on a narrow screen */
+  .det-row { font-size: 10.5px; gap: 7px; }
+  .det-row .when { flex-basis: 46px; }
+  .det-row .st { flex-basis: 72px; }
+  .det-body { margin-left: 5px; padding-left: 8px; }
+  .det-row .val .more { display: none; }
+  .panel-h { gap: 8px; }
+  .panel-h .page-tools { flex-wrap: nowrap; }
+  .tl-axis { margin-left: 0; }
+  .tl-row { flex-wrap: wrap; height: auto; gap: 1px 6px; padding: 3px 0; }
+  .tl-lab { flex: 1 1 auto; font-size: 11px; }
+  .tl-track { flex: 1 1 100%; height: 12px; }
+  .tl-grp { flex-wrap: wrap; }
+  .tl-grp .sum { flex-basis: 100%; margin-left: 0; }
+}
+/* A timeline row is clickable: it opens Details at that conversation. */
+.tl-row { cursor: pointer; }
+.det-h.flash { animation: detflash 1.2s ease-out; }
+@keyframes detflash {
+  from { box-shadow: 0 0 0 2px var(--c, var(--accent)); }
+  to { box-shadow: 0 0 0 2px transparent; }
+}
+@media (prefers-reduced-motion: reduce) { .det-h.flash { animation: none; } }

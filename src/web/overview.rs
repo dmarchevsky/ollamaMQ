@@ -35,6 +35,9 @@ fn lane_bucket_secs(window_secs: u64) -> u64 {
 #[derive(Deserialize)]
 pub struct OverviewQuery {
     window: Option<String>,
+    /// Keep only this client's traffic — the Overview client filter. Absent or
+    /// empty means every client.
+    client: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -197,6 +200,17 @@ struct Recent {
     gen_tps: Option<f64>,
 }
 
+/// One source of the Overview, narrowed to the selected client: `client`'s
+/// items only, or everything when no client is selected. Backend-wide gauges
+/// (free slots, online state) never filter — they are the backend's, not the
+/// client's.
+fn keep<T>(items: Vec<T>, client: Option<&str>, client_of: impl Fn(&T) -> &str) -> Vec<T> {
+    match client {
+        Some(c) => items.into_iter().filter(|it| client_of(it) == c).collect(),
+        None => items,
+    }
+}
+
 fn window_secs(w: Option<&str>) -> u64 {
     match w {
         Some("5m") => 300,
@@ -321,6 +335,7 @@ pub async fn get_overview(
     Query(q): Query<OverviewQuery>,
 ) -> Json<OverviewView> {
     let window = window_secs(q.window.as_deref());
+    let client = q.client.as_deref().filter(|c| !c.is_empty());
     let now = stats::now_ms();
     let from = now.saturating_sub(window * 1000);
     let bucket_secs = window as f64 / SPARK_BUCKETS as f64;
@@ -329,9 +344,13 @@ pub async fn get_overview(
     let w_ms = lane_bucket_secs(window) * 1000;
     let n = (window * 1000 / w_ms) as usize;
     let lane_from = now / w_ms * w_ms - (n as u64 - 1) * w_ms;
-    let finished = state.stats.finished_since(from);
-    let snap = snapshot::capture(&state, 0);
-    let runs = state.runs.list();
+    let finished = keep(state.stats.finished_since(from), client, |f| &f.client);
+    let mut snap = snapshot::capture(&state, 0);
+    // The per-user rows carry the live Queue/Running gauges, so they filter too.
+    if let Some(c) = client {
+        snap.users.retain(|u| u.id == c);
+    }
+    let runs = keep(state.runs.list(), client, |r| &r.client);
 
     // Waiting requests, copied out under the queues lock and labelled
     // afterwards (that takes the backends lock).
@@ -339,6 +358,7 @@ pub async fn get_overview(
         .queues
         .lock_or_recover()
         .iter()
+        .filter(|(id, _)| client.is_none_or(|c| *id == c))
         .flat_map(|(client, q)| {
             q.iter().enumerate().map(move |(i, t)| {
                 (
@@ -414,7 +434,12 @@ pub async fn get_overview(
                 name: b.name.clone(),
                 online: b.is_online,
                 api_type: b.api_type.display(),
-                running: b.active_requests,
+                // Backend-wide when unfiltered; the client's own requests when
+                // the filter is on (free slots stay the backend's).
+                running: match client {
+                    Some(_) => runs.iter().filter(|r| r.backend == label).count(),
+                    None => b.active_requests,
+                },
                 max: state.backend_capacity(b).0,
                 free: state.free_slots(b, loading_at(idx).is_some()),
                 kv_free_pct: b.kv_free_pct,
@@ -731,5 +756,74 @@ mod tests {
         assert_eq!(cache_pct(100, Some(150)), Some(0)); // clamped, never negative
         assert_eq!(cache_pct(0, Some(0)), None);
         assert_eq!(cache_pct(100, None), None);
+    }
+
+    /// One backend, one finished request per client, all inside the window.
+    fn state_with(clients: &[&str]) -> Arc<AppState> {
+        let conf = std::env::temp_dir().join(format!("omq-overview-{}.yaml", std::process::id()));
+        let url = "http://127.0.0.1:9";
+        let state = Arc::new(AppState::new(
+            vec![(url.to_string(), None)],
+            5,
+            86400,
+            1,
+            1,
+            conf.to_string_lossy().into_owned(),
+            Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        ));
+        let label = backend_label(url);
+        for client in clients {
+            state.stats.record(crate::stats::Finished {
+                at_ms: stats::now_ms(),
+                client: (*client).to_string(),
+                model: "m".into(),
+                backend: Some(label.clone()),
+                outcome: "ok",
+                session: None,
+                queue_wait: Some(0.0),
+                timing: crate::stats::Timing {
+                    duration: Some(1.0),
+                    completion_tokens: 10,
+                    ..Default::default()
+                },
+            });
+        }
+        state
+    }
+
+    async fn overview(state: &Arc<AppState>, client: Option<&str>) -> OverviewView {
+        get_overview(
+            State(state.clone()),
+            Query(OverviewQuery { window: None, client: client.map(str::to_string) }),
+        )
+        .await
+        .0
+    }
+
+    #[tokio::test]
+    async fn client_filter_narrows_every_source() {
+        let state = state_with(&["alice", "bob", "alice"]);
+
+        let all = overview(&state, None).await;
+        assert_eq!(all.recent.len(), 3);
+        assert_eq!(all.status.done, 3);
+        assert_eq!(all.clients.len(), 2);
+
+        let alice = overview(&state, Some("alice")).await;
+        assert!(alice.recent.iter().all(|r| r.client == "alice"));
+        assert_eq!(alice.recent.len(), 2);
+        assert_eq!(alice.status.done, 2);
+        assert_eq!(alice.clients.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["alice"]);
+        // The swimlanes carry her occupancy only, not Bob's.
+        assert!(alice.lanes.iter().flat_map(|l| l.buckets.iter().flatten()).all(|s| s.client == "alice"));
+        assert!(alice.lanes.iter().all(|l| l.requests == 2));
+
+        // An unknown client is an empty Overview, never a full one.
+        let nobody = overview(&state, Some("nobody")).await;
+        assert!(nobody.recent.is_empty() && nobody.clients.is_empty() && nobody.status.done == 0);
+        assert!(nobody.lanes.iter().all(|l| l.requests == 0));
     }
 }

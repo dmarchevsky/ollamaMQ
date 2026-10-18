@@ -213,7 +213,10 @@
   };
 
   function overviewView(path) {
-    const w = new URLSearchParams(path.split('?')[1] || '').get('window');
+    const q = new URLSearchParams(path.split('?')[1] || '');
+    const w = q.get('window');
+    // The Overview client filter, mirrored from overview.rs.
+    const only = q.get('client') || null;
     const secs = { '5m': 300, '1h': 3600 }[w] || 900;
     const scale = secs / 900;
     const t = Date.now(), from = t - secs * 1000;
@@ -316,7 +319,7 @@
       };
     });
 
-    return {
+    const view = {
       window_secs: secs, now_ms: t, lane_from_ms: from, lane_span_ms: secs * 1000,
       status: {
         backends_total: backends.length, backends_online: online.length, capacity,
@@ -328,6 +331,16 @@
       },
       backends: be, clients: clientRows, queue, lanes, recent,
     };
+    if (only) {
+      view.recent = recent.filter(r => r.client === only);
+      view.queue = queue.filter(x => x.client === only);
+      view.clients = clientRows.filter(c => c.id === only);
+      for (const l of lanes) l.buckets = l.buckets.map(bs => bs.filter(s => s.client === only));
+      view.status.running = demoRuns.filter(r => r.client === only).length;
+      view.status.queued = view.queue.length;
+      view.status.done = view.recent.filter(r => r.outcome === 'ok').length;
+    }
+    return view;
   }
 
   // Settings page: fields as /ui/api/settings returns them.

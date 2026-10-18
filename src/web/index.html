@@ -41,6 +41,9 @@
         <label><input type="radio" name="ov-window" value="1h"><span>1 hour</span></label>
       </div>
       <button class="btn reload" data-action="reload-config" title="Re-read appconf.yaml and apply it (TUI: r)" aria-label="Reload config">⟳<span class="reload-label"> Reload config</span></button>
+      <!-- Client filter: pinned with the header, so it stays on screen while the
+           page scrolls. Only the Overview uses it, so only Overview shows it. -->
+      <div class="clbar" id="clbar" hidden></div>
     </header>
 
     <section class="page" id="page-overview">
@@ -49,20 +52,18 @@
       </div>
       <div class="ov-status" id="ov-status"></div>
       <div class="panel"><div class="panel-h"><h2>Capacity</h2></div><div id="ov-capacity"></div></div>
-      <div class="panel"><div class="panel-h"><h2>Activity</h2><span class="dim" id="ov-act-sum"></span></div><div id="ov-activity"></div></div>
-      <div class="panel"><div class="panel-h"><h2>Requests</h2>
-        <div class="page-tools"><span class="dim" id="ov-now-count"></span>
+      <div class="panel"><div class="panel-h"><h2>Activity</h2>
+        <div class="page-tools">
           <div class="seg" id="ov-req-show" role="radiogroup" aria-label="Requests shown">
             <label><input type="radio" name="req-show" value="active" checked><span>Active</span></label>
             <label><input type="radio" name="req-show" value="all"><span>All</span></label>
           </div>
-          <div class="seg" id="ov-req-group" role="radiogroup" aria-label="Group by session">
-            <label><input type="radio" name="req-group" value="off" checked><span>Ungrouped</span></label>
-            <label><input type="radio" name="req-group" value="threads"><span>Threads</span></label>
-            <label><input type="radio" name="req-group" value="chain"><span>Chain</span></label>
+          <div class="seg" id="ov-req-view" role="radiogroup" aria-label="List under the graph">
+            <label><input type="radio" name="req-view" value="list" checked><span>List</span></label>
+            <label><input type="radio" name="req-view" value="details"><span>Details</span></label>
           </div>
         </div>
-      </div><div id="ov-now"></div></div>
+      </div><div id="ov-timeline"></div><div id="ov-now"></div></div>
       <div class="panel"><div class="panel-h"><h2>Backends</h2><a href="#backends" class="more">Manage →</a></div><div class="tscroll" id="ov-backends"></div></div>
       <div class="panel"><div class="panel-h"><h2>Clients</h2><a href="#clients" class="more">All clients →</a></div><div class="tscroll" id="ov-clients"></div></div>
     </section>
@@ -157,6 +158,7 @@
         Backends are managed on the <a href="#backends">Backends page</a>.</p>
       <div id="set-banner"></div>
       <div id="set-form"></div>
+      <p class="hint" id="set-version"></p>
       <datalist id="dl-set-models"></datalist>
     </section>
   </main>
