@@ -529,10 +529,11 @@ function renderCapacity(st, ov) {
 
 /**
  * One row per conversation, grouped under the backend it ran on. A request
- * paints equal-size chips where its stages began — waiting, prefill, processing
- * — so a 0.2s wait reads as clearly as a 22s decode. Position carries time;
- * the durations live in the chip tooltip and in the Details list under the
- * graph. A backend with nothing in the window takes no row and is named below.
+ * paints one chip per stage — waiting, prefill, processing — as wide as that
+ * stage ran, so a 40s decode reads as forty seconds next to a 1s prefill. A
+ * stage too short to draw is floored to a few pixels rather than disappearing;
+ * the exact numbers are in the chip tooltip and the Details lines below.
+ * A backend with nothing in the window takes no row.
  */
 const TL_ROWS = 12;          // sessions per backend before the oldest fold away
 const STAGE = { w: 'waiting', p: 'prefill', g: 'processing', e: 'error' };
@@ -584,7 +585,7 @@ function renderTimeline(st, ov) {
       return `<div class="tl-grp" title="${esc(tip)}">`
         + `<span class="sdot ${g.online ? 'on' : 'off'}"></span><span class="bk-name">${esc(g.name)}</span>`
         + (g.online ? '' : '<span class="off-tag">offline</span>') + '</div>'
-        + shown.map(([, rs]) => tlRow(rs, pctOf)).join('');
+        + shown.map(([, rs]) => tlRow(rs, pctOf, span)).join('');
     }).join('');
   const foot = hidden ? `+${hidden} older session${hidden === 1 ? '' : 's'} hidden` : '';
   setHTML(el, `<div class="tl">${axis}${body}${TL_LEGEND}${foot ? `<div class="tl-foot">${foot}</div>` : ''}</div>`);
@@ -592,17 +593,20 @@ function renderTimeline(st, ov) {
 }
 
 /** One session's row: a chip cluster per request, anchored at its arrival. */
-function tlRow(rows, pctOf) {
+function tlRow(rows, pctOf, span) {
   const head = rows[0];
   const c = cvar(colorClass(head.o.client));
   const clusters = rows.map(r => {
     const at = pctOf(r.plan.at);
-    // A request that arrived before the window (a long queue wait) or that is
-    // still running cannot fit: pin it to that edge and mark the stages the
-    // window cut off, so the cluster is not read as the whole request.
-    const pos = at < 1 ? 'left:0' : at > 93 ? 'right:0' : `left:${at.toFixed(2)}%`;
+    const wide = (r.plan.end - r.plan.at) / span * 100;
+    // A request that arrived before the window (a long queue wait), or whose
+    // stages run past the right edge, cannot fit: pin it to that edge and mark
+    // the stages the window cut off, so the cluster is not read as the whole
+    // request. A live one always ends now, so it is pinned right.
+    const pos = at < 1 ? 'left:0' : at + wide > 100 ? 'right:0' : `left:${at.toFixed(2)}%`;
     return `<span class="req${at < 1 ? ' pre' : ''}" style="${pos}" title="${esc(r.plan.tip)}">`
-      + r.plan.events.map(e => `<i class="sg ${e.k}${e.live ? ' live' : ''}"></i>`).join('') + '</span>';
+      + r.plan.events.map(e => `<i class="sg ${e.k}${e.live ? ' live' : ''}"`
+        + ` style="--w:${Math.max(0, e.dur / span * 100).toFixed(3)}%"></i>`).join('') + '</span>';
   }).join('');
   return `<div class="tl-row" data-key="${esc(head.key)}">`
     + `<div class="tl-lab">${swatch(head.o.client)}<b>${esc(head.o.client)}</b>${head.s ? ` #${esc(head.s)}` : ''}</div>`
@@ -659,7 +663,8 @@ function wireTimeline() {
  */
 function stagePlan(row, now) {
   const o = row.o;
-  const ev = (k, at, line, live) => ({ k, at, line, live: !!live });
+  // dur = how long the stage ran, so its chip can be as long as it was.
+  const ev = (k, at, dur, line, live) => ({ k, at, dur, line, live: !!live });
   const done = (events, at, end) => ({
     events, at, end,
     // The tooltip opens with when the request arrived, so a cluster can be
@@ -668,18 +673,19 @@ function stagePlan(row, now) {
   });
   if (row.kind === 'wait') {
     const at = now - o.waited_secs * 1000;
-    return done([ev('w', at, `${fmtDur(o.waited_secs)} · prompt ${fmtTok(o.est_prompt_tokens)} tok · queue #${o.pos}`, true)], at, now);
+    return done([ev('w', at, o.waited_secs, `${fmtDur(o.waited_secs)} · prompt ${fmtTok(o.est_prompt_tokens)} tok · queue #${o.pos}`, true)], at, now);
   }
   if (row.kind === 'run') {
     const dispatch = now - o.elapsed_secs * 1000;
     const w = o.waited_secs || 0;
     const out = [];
-    if (w >= .05) out.push(ev('w', dispatch - w * 1000, `${fmtDur(w)} · prompt ${fmtTok(o.est_prompt_tokens)} tok`));
+    if (w >= .05) out.push(ev('w', dispatch - w * 1000, w, `${fmtDur(w)} · prompt ${fmtTok(o.est_prompt_tokens)} tok`));
     if (o.ttft_secs == null) {
-      out.push(ev('p', dispatch, `≈${fmtTok(o.est_prompt_tokens)} tok · ${fmtDur(o.elapsed_secs)} prefilling`, true));
+      out.push(ev('p', dispatch, o.elapsed_secs, `≈${fmtTok(o.est_prompt_tokens)} tok · ${fmtDur(o.elapsed_secs)} prefilling`, true));
     } else {
-      if (o.ttft_secs >= .05) out.push(ev('p', dispatch, `${fmtTok(o.est_prompt_tokens)} tok · ${fmtSec1(o.ttft_secs)}`));
-      out.push(ev('g', dispatch + o.ttft_secs * 1000, `${fmtNum(o.tokens)} tok · ${fmtDur(Math.max(0, o.elapsed_secs - o.ttft_secs))} · `
+      if (o.ttft_secs >= .05) out.push(ev('p', dispatch, o.ttft_secs, `${fmtTok(o.est_prompt_tokens)} tok · ${fmtSec1(o.ttft_secs)}`));
+      out.push(ev('g', dispatch + o.ttft_secs * 1000, Math.max(0, o.elapsed_secs - o.ttft_secs),
+        `${fmtNum(o.tokens)} tok · ${fmtDur(Math.max(0, o.elapsed_secs - o.ttft_secs))} · `
         + `${o.tokens_per_sec == null ? '…' : o.tokens_per_sec.toFixed(1)} t/s<span class="more"> · <b>now</b></span>`, true));
     }
     return done(out, dispatch - w * 1000, now);
@@ -692,19 +698,19 @@ function stagePlan(row, now) {
   const at = dispatch - w * 1000;
   if (o.error) {
     const out = [];
-    if (w >= .05) out.push(ev('w', at, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
-    out.push(ev('e', finish, `${outcomePhrase(o)}${o.backend ? '' : '<span class="more"> · never dispatched</span>'}`));
+    if (w >= .05) out.push(ev('w', at, w, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
+    out.push(ev('e', finish, 0, `${outcomePhrase(o)}${o.backend ? '' : '<span class="more"> · never dispatched</span>'}`));
     return done(out, at, finish);
   }
   const out = [];
-  if (w >= .05) out.push(ev('w', at, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
+  if (w >= .05) out.push(ev('w', at, w, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
   if (pre >= .05) {
-    out.push(ev('p', dispatch, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(pre)}`
+    out.push(ev('p', dispatch, pre, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(pre)}`
       + (o.cache_pct != null ? ` · cache ${o.cache_pct}%` : '')
       + (o.prefill_secs && o.prompt_tokens ? `<span class="more"> · ${fmtRate(o.prompt_tokens / o.prefill_secs)}</span>` : '')));
   }
   if (gen > 0) {
-    out.push(ev('g', finish - gen * 1000,
+    out.push(ev('g', finish - gen * 1000, gen,
       `${fmtTok(o.completion_tokens)} tok · ${fmtSec1(gen)} · ${(o.gen_tps ?? 0).toFixed(1)} t/s`));
   }
   return done(out, at, finish);
@@ -717,10 +723,10 @@ const outcomePhrase = o => (o.status && o.status >= 500 ? `HTTP ${o.status} · `
   + String(o.outcome || 'failed').replace(/_/g, ' ');
 
 /**
- * Details: one collapsible block per conversation, newest request first, and
- * inside a request one line per stage event with its own timestamp and numbers.
- * A gap over 30s between two requests becomes its own `idle` line — that quiet
- * stretch is what a conversation looks like.
+ * Details: one collapsible block per conversation, its stage events merged onto
+ * one timeline and printed newest first, each line with its own timestamp and
+ * numbers. A gap over 30s between two requests becomes its own `idle` line —
+ * that quiet stretch is what a conversation looks like.
  */
 function renderDetails(rows) {
   const now = S.overview ? S.overview.now_ms : Date.now();
@@ -740,20 +746,22 @@ function renderDetails(rows) {
       <span class="sum">${unit.length} req · ${fmtTok(unit.reduce((a, x) => a + rowTokens(x), 0))} tok · ${fmtTime(asc[0].plan.at)}→${last >= now - 1500 ? 'now' : fmtTime(last)}</span></button>`);
     if (shut) continue;
     const lines = [];
-    for (let i = asc.length - 1; i >= 0; i--) {
-      if (i < asc.length - 1) {
-        const gap = (asc[i + 1].plan.at - asc[i].plan.end) / 1000;
+    for (let i = 0; i < asc.length; i++) {
+      if (i > 0) {
+        const gap = (asc[i].plan.at - asc[i - 1].plan.end) / 1000;
+        // Just before the newer request it separates the two from.
         if (gap > 30) {
-          lines.push(`<div class="det-row dim"><span class="when">${fmtTime(asc[i].plan.end)}</span>`
-            + '<span class="st i">idle</span><span class="val">' + fmtDur(gap) + '</span></div>');
+          lines.push({ t: asc[i].plan.at - 1, html: `<div class="det-row dim"><span class="when">${fmtTime(asc[i - 1].plan.end)}</span>`
+            + '<span class="st i">idle</span><span class="val">' + fmtDur(gap) + '</span></div>' });
         }
       }
       for (const e of asc[i].plan.events) {
-        lines.push(`<div class="det-row"><span class="when">${fmtTime(e.at)}</span>`
-          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span></div>`);
+        lines.push({ t: e.at, html: `<div class="det-row"><span class="when">${fmtTime(e.at)}</span>`
+          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span></div>` });
       }
     }
-    out.push(`<div class="det-body" style="--c:var(--${c})">${lines.join('')}</div>`);
+    lines.sort((a, b) => b.t - a.t);
+    out.push(`<div class="det-body" style="--c:var(--${c})">${lines.map(l => l.html).join('')}</div>`);
   }
   return out.join('') || '<div class="empty">Nothing running or waiting</div>';
 }

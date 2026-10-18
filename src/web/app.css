@@ -690,11 +690,14 @@ tr.is-off td { color: var(--muted); }
 /* One request is a cluster of equal-size chips anchored at its arrival: every
    stage reads as clearly as any other no matter how short it was, and the row
    stays flat. Durations live in the tooltip and the Details lines. */
-.tl-track .req { position: absolute; top: 2px; display: flex; gap: 2px; }
+.tl-track .req { position: absolute; top: 2px; display: flex; }
 /* the window cut the start of this request off; ‹ marks what it lost */
 .tl-track .req.pre::before { content: '\2039'; color: var(--faint); font: 11px/10px var(--mono); margin-right: 1px; }
-.tl-track .sg { flex: 0 0 var(--tl-chip, 8px); width: var(--tl-chip, 8px); height: 10px;
-  background: var(--c, var(--c1)); } /* square on purpose: a rounded end blurs where a stage stops */
+/* One chip per stage, as wide as that stage ran. The floor keeps a 0.2s wait
+   readable next to a 40s decode; the exact number is in the tooltip. Square on
+   purpose: a rounded end blurs where a stage stops. */
+.tl-track .sg { flex: 0 0 auto; width: var(--w, 6px); min-width: 4px; height: 10px;
+  background: var(--c, var(--c1)); }
 .tl-track .sg.w { background: var(--accent-soft); border: 1px solid var(--accent); }
 .tl-track .sg.p { background: var(--warn); }
 .tl-track .sg.e { background: var(--bad); }
