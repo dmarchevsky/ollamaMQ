@@ -75,7 +75,7 @@ cargo install ollamaMQ
 Pull the published release image:
 
 ```bash
-docker pull dmarchevsky/ollamamq:latest
+docker pull ghcr.io/dmarchevsky/ollamamq:latest
 ```
 
 Or build the image from the local Dockerfile:
@@ -91,7 +91,7 @@ docker run -d \
   --name ollamamq \
   -p 11435:11435 \
   --restart unless-stopped \
-  dmarchevsky/ollamamq:latest
+  ghcr.io/dmarchevsky/ollamamq:latest
 ```
 
 ### API Proxying
@@ -402,8 +402,11 @@ Every proxied request (`IN`) and upstream response (`OUT`) is written as JSON li
 
 ## 🐳 Docker
 
-Release images are published to Docker Hub as [`dmarchevsky/ollamamq`](https://hub.docker.com/r/dmarchevsky/ollamamq)
+Release images are published to GHCR as
+[`ghcr.io/dmarchevsky/ollamamq`](https://github.com/dmarchevsky/ollamaMQ/pkgs/container/ollamamq)
 (tags: `latest`, `<version>`, `<major>.<minor>`, pushed automatically on every release tag).
+The same tags also go to Docker Hub as [`dmarchevsky/ollamamq`](https://hub.docker.com/r/dmarchevsky/ollamamq),
+so installs created before GHCR keep updating.
 
 ### Docker Compose
 
@@ -489,7 +492,7 @@ In Docker, just pass the variable through — the binary reads it directly from 
 ```bash
 docker run -d --name ollamamq -p 11435:11435 \
   -e OLLAMA_MQ_API_KEY=supersecret \
-  chlebon/ollamamq
+  ghcr.io/dmarchevsky/ollamamq
 ```
 
 ### 🖥️ Web UI, Clients & API Keys
@@ -684,36 +687,8 @@ docker run -d \
   --name ollamamq \
   -p 8080:8080 \
   -e PORT=8080 \
-  chlebon/ollamamq
+  ghcr.io/dmarchevsky/ollamamq
 ```
-
-## 📦 Publishing to Docker Hub
-
-To publish a new version of `ollamaMQ` to Docker Hub, follow these steps:
-
-1. **Update Version**: Update the version number in `Cargo.toml`.
-2. **Build and Tag**:
-
-   ```bash
-   # Build the image for the current version
-   docker build -t chlebon/ollamamq:v0.2.4 .
-   
-   # Tag it as latest
-   docker tag chlebon/ollamamq:v0.2.4 chlebon/ollamamq:latest
-   ```
-
-3. **Push to Hub**:
-
-   ```bash
-   # Log in to Docker Hub (if not already logged in)
-   docker login
-   
-   # Push the versioned tag
-   docker push chlebon/ollamamq:v0.2.4
-   
-   # Push the latest tag
-   docker push chlebon/ollamamq:latest
-   ```
 
 ## 🧪 Development
 

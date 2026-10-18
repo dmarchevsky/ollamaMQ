@@ -14,8 +14,9 @@ services:
     # Published image, tagged by CI from the release tag (see
     # .github/workflows/docker-release.yml). `latest` tracks the newest release:
     # `docker compose pull && docker compose up -d` upgrades. Pin a version
-    # (e.g. dmarchevsky/ollamamq:0.7.0) if you want upgrades to be deliberate.
-    image: dmarchevsky/ollamamq:latest
+    # (e.g. ghcr.io/dmarchevsky/ollamamq:0.7.0) if you want upgrades to be deliberate.
+    # The same tags also go to Docker Hub as dmarchevsky/ollamamq.
+    image: ghcr.io/dmarchevsky/ollamamq:latest
     pull_policy: always
     container_name: ollamamq
     ports:
