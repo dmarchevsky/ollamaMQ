@@ -596,7 +596,7 @@ function renderTimeline(st, ov) {
   wireTimeline();
 }
 
-/** One session's row: a chip cluster per request, anchored at its arrival. */
+/** One session's row: its stages laid along the track at their own times. */
 function tlRow(rows, pctOf, span) {
   const head = rows[0];
   // Each stage is placed in the track by itself: left = when it began, width =
@@ -622,7 +622,8 @@ const stageTip = e => `${fmtTime(e.at)} · ${STAGE[e.k]} ${stripTags(e.line)}`;
  * to the same handle so a backend is one group, not two.
  */
 function rowBackend(r, ov) {
-  const of = (k, idx, name, online, free) => ({ k, idx, name, online, free, pseudo: idx != null ? 1 : 2 });
+  // pseudo buckets (no backend to hang the row on) sort after the real ones.
+  const of = (k, idx, name, online, free, pseudo = idx != null ? 1 : 2) => ({ k, idx, name, online, free, pseudo });
   if (r.kind === 'wait') {
     const i = r.o.backends.length === 1 ? r.o.backends[0] : null;
     const b = i != null ? ov.backends[i] : null;
@@ -706,6 +707,9 @@ function stagePlan(row, now) {
     return done(out, at, finish);
   }
   const out = [];
+  // A request that left without an error and without serving cleanly (the
+  // client hung up, the queue refused it) still has to say so here.
+  if (o.outcome && o.outcome !== 'ok') out.push(ev('e', finish, 0, outcomePhrase(o)));
   if (w >= .05) out.push(ev('w', at, w, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
   if (pre >= .05) {
     out.push(ev('p', dispatch, pre, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(pre)}`
