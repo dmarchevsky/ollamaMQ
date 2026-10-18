@@ -3,6 +3,22 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.9.1 — 2026-10-18
+
+### Changed
+
+- **Release images now live on GHCR: `ghcr.io/dmarchevsky/ollamamq`.** Same tags as before
+  (`latest`, `<version>`, `<major>.<minor>`), published by the same tag-triggered workflow. GHCR
+  needs no registry secrets (the workflow's own `GITHUB_TOKEN` logs in) and public packages there
+  carry no anonymous pull limit — Docker Hub caps anonymous pulls at ~100 per 6 h per IP, which
+  bites shared homelab and CI addresses. The shipped `docker-compose.yml` pulls from GHCR now.
+- **Docker Hub keeps getting every tag** as `dmarchevsky/ollamamq`, so installs created before this
+  release keep updating. New installs should use the GHCR name; the Hub mirror goes away once GHCR
+  has shipped a release or two.
+- Two `docker run` examples pointed at `chlebon/ollamamq`, an upstream namespace that never published
+  this fork — they now name the GHCR image. The manual *Publishing to Docker Hub* section is gone:
+  publishing happens by pushing a release tag, the workflow is the documentation.
+
 ## v0.9.0 — 2026-10-17
 
 ### Added
