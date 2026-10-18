@@ -3,6 +3,18 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.9.2 — 2026-10-18
+
+### Changed
+
+- **Docker Hub is no longer published to.** GHCR (`ghcr.io/dmarchevsky/ollamamq`) is the only
+  registry: the release workflow lost its Docker Hub login, and the `DOCKERHUB_USERNAME` /
+  `DOCKERHUB_TOKEN` secrets with it. The Hub image stays as it is, frozen at `0.9.1` — an install
+  that still pulls it has to switch to the GHCR name.
+- `release-done` proves a release against GHCR now
+  (`docker buildx imagetools inspect ghcr.io/dmarchevsky/ollamamq:{version}`) instead of the
+  Docker Hub tag API.
+
 ## v0.9.1 — 2026-10-18
 
 ### Changed
