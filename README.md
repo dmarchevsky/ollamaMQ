@@ -405,8 +405,8 @@ Every proxied request (`IN`) and upstream response (`OUT`) is written as JSON li
 Release images are published to GHCR as
 [`ghcr.io/dmarchevsky/ollamamq`](https://github.com/dmarchevsky/ollamaMQ/pkgs/container/ollamamq)
 (tags: `latest`, `<version>`, `<major>.<minor>`, pushed automatically on every release tag).
-The same tags also go to Docker Hub as [`dmarchevsky/ollamamq`](https://hub.docker.com/r/dmarchevsky/ollamamq),
-so installs created before GHCR keep updating.
+The old Docker Hub image (`dmarchevsky/ollamamq`) stopped receiving builds at `0.9.1` — installs
+that still pull it need to switch to the GHCR name.
 
 ### Docker Compose
 

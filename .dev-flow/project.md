@@ -2,7 +2,7 @@
 
 ```flow
 defaultBranch = master
-release.artifact = curl -fs "https://hub.docker.com/v2/repositories/dmarchevsky/ollamamq/tags/{version}/" -o /dev/null
+release.artifact = docker buildx imagetools inspect ghcr.io/dmarchevsky/ollamamq:{version}
 ```
 
 ## plan
@@ -31,10 +31,11 @@ kill $pid; exit $rc
 
 Semver: minor for user-facing features, patch for chores/fixes. The version-bump commit must
 include the refreshed `Cargo.lock` — a release commit that leaves the lock stale is incomplete.
-Docker Hub images are published by the tag-triggered workflow; `release-done`'s artifact probe
-is the proof — never claim "published" before it passes. Production runs from the deploy
+Release images are published to GHCR (`ghcr.io/dmarchevsky/ollamamq`) by the tag-triggered
+workflow; `release-done`'s artifact probe is the proof — never claim "published" before it
+passes. Production runs from the deploy
 checkout: `docker compose pull && docker compose up -d`, because compose tracks
-`dmarchevsky/ollamamq:latest`, which CI publishes from the release tag.
+`ghcr.io/dmarchevsky/ollamamq:latest`, which CI publishes from the release tag.
 
 ```flow
 versionFile = Cargo.toml

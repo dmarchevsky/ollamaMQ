@@ -1,7 +1,6 @@
-# Publishes ghcr.io/dmarchevsky/ollamamq (primary) and dmarchevsky/ollamamq on
-# Docker Hub (transitional mirror for installs that still pull from there) for
-# every release tag (v*). The tag is created in the dev-flow release stage from
-# the Cargo.toml version, so image tags always match the release version.
+# Publishes ghcr.io/dmarchevsky/ollamamq for every release tag (v*). The tag is
+# created in the dev-flow release stage from the Cargo.toml version, so image
+# tags always match the release version.
 name: docker-release
 
 on:
@@ -24,18 +23,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # Docker Hub is still published so existing installs keep updating; drop this
-      # step (and its two secrets) once GHCR has shipped a release or two.
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: |
-            ghcr.io/dmarchevsky/ollamamq
-            dmarchevsky/ollamamq
+          images: ghcr.io/dmarchevsky/ollamamq
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
