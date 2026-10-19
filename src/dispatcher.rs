@@ -79,6 +79,9 @@ pub struct Task {
     /// When the request was queued; used to fail fast (503) when no backend
     /// can ever serve it instead of letting the client hang forever.
     pub queued_at: std::time::Instant,
+    /// How many cache-hot dispatches this request was held behind by
+    /// [`cold_hold`]; bounds the hold-back's delay.
+    pub cache_passes: u8,
     /// Label (or id) of the client API key that sent it, for per-key metrics.
     pub key_label: Option<String>,
     /// Sticky-routing key for this request (see [`derive_session_key`]): the
@@ -916,24 +919,30 @@ pub struct Affinity {
     last_use: std::time::Instant,
 }
 
-/// A backend reporting less than this percent of its KV cache free is short of
-/// headroom: a conversation whose prefix is not resident there pays a full
-/// re-prefill and evicts somebody else. Enables [`cold_hold`].
-const KV_PRESSURE_FREE_PCT: u8 = 25;
+/// A conversation the backend served this many times more recently than its
+/// last own service is treated as cache-resident and never held back: those
+/// are the turns the cache still holds.
+const CACHE_GRACE: usize = 2;
+
+/// A cache-cold front request yields at most this many cache-hot dispatches
+/// before it goes regardless — the fairness bound on [`cold_hold`].
+const CACHE_HOLD_PASSES: u8 = 16;
 
 /// The last measured prefill hit at or above this keeps a conversation in
 /// front: its prefix is resident and its next turn is nearly free.
 const CACHE_HOT_HIT_PCT: u8 = 50;
 
-/// Longest a cache-cold front request waits behind the cache-hot users. The
-/// hold is re-decided every selection pass, so past this the request is
-/// dispatched whatever its cache state — the fairness backstop.
-const CACHE_HOLD_VALVE: std::time::Duration = std::time::Duration::from_secs(90);
-
-/// How long a measured cache hit is trusted. Older than this the conversation
+/// The longest a measured cache hit is trusted. Older than this the conversation
 /// is simply unknown (an idle eviction may have flushed it), and unknown is
 /// never treated as cold.
 const CACHE_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a conversation's row (hit measurement + turn history) is kept
+/// before prune drops it. Longer than [`CACHE_STATE_TTL`] on purpose: under
+/// saturation a conversation may only get served every few minutes, and the
+/// turn count — the evidence that a miss is cache contention rather than a
+/// first turn — must survive that.
+const CACHE_HISTORY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
 
 /// The last measured prefix-cache hit of one conversation on one backend,
 /// taken from the backend's own usage stats. This is what tells the scheduler
@@ -942,6 +951,10 @@ const CACHE_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(300)
 pub struct ConvCache {
     hit_pct: u8,
     at: std::time::Instant,
+    /// Completed turns of this conversation on this backend. A first-turn
+    /// miss is not evidence of cache contention — the context was simply
+    /// never there — so it never holds.
+    turns: u32,
 }
 
 /// The share of a prompt the backend served from its prefix cache, percent
@@ -957,33 +970,40 @@ fn cache_hit_pct(prompt: u64, evaluated: Option<u64>) -> Option<u8> {
 
 /// Remember how much of this conversation's prompt the backend skipped.
 fn record_conv_cache(state: &AppState, key: &SessionKey, backend_url: &str, hit_pct: u8) {
-    state.conv_cache.lock_or_recover().insert(
-        (key.clone(), backend_url.to_string()),
-        ConvCache {
-            hit_pct,
-            at: std::time::Instant::now(),
-        },
-    );
+    let mut table = state.conv_cache.lock_or_recover();
+    let entry = table.entry((key.clone(), backend_url.to_string())).or_insert(ConvCache {
+        hit_pct: 0,
+        at: std::time::Instant::now(),
+        turns: 0,
+    });
+    entry.turns = entry.turns.saturating_add(1);
+    entry.hit_pct = hit_pct;
+    entry.at = std::time::Instant::now();
 }
 
-/// Decide whether a user's front request should wait this selection round:
-/// its conversation last MISSED the prefix cache on the backend that last
-/// served it, that backend reports less than [`KV_PRESSURE_FREE_PCT`] of its
-/// KV free — so dispatching it now would evict somebody's resident context —
-/// and the request has not yet reached [`CACHE_HOLD_VALVE`].
+/// Decide whether a user's front request should wait this selection round.
+/// Its conversation last MISSED the prefix cache on the backend that last
+/// served it, that backend reports its KV cache (halogen with metrics — a
+/// plain Ollama reports nothing and is never held) and is not fully free,
+/// more recently served conversations may still own that cache (the grace
+/// window), and the request has not yet spent [`CACHE_HOLD_PASSES`] yields.
+///
+/// Why a yield budget instead of a wait bound: under a saturated backlog every
+/// request has already waited longer than any sane time valve, so a time bound
+/// disarms exactly when the hold-back matters; a per-request yield budget
+/// bounds the hold itself whatever the queue depth.
 ///
 /// Every unknown counts as not cold: no session identity, no fresh
-/// measurement, or a backend that reports no KV usage (plain Ollama). Those
-/// keep the plain fair-share order.
+/// measurement, or a backend that reports no KV usage.
 fn cold_hold(
     session_key: Option<&SessionKey>,
-    waited: std::time::Duration,
+    passes: u8,
     affinity: &HashMap<SessionKey, Affinity>,
     conv_cache: &HashMap<(SessionKey, String), ConvCache>,
     backends: &[BackendStatus],
     now: std::time::Instant,
 ) -> bool {
-    if waited >= CACHE_HOLD_VALVE {
+    if passes >= CACHE_HOLD_PASSES {
         return false;
     }
     let Some(key) = session_key else {
@@ -998,10 +1018,26 @@ fn cold_hold(
     if now.saturating_duration_since(entry.at) >= CACHE_STATE_TTL {
         return false;
     }
-    entry.hit_pct < CACHE_HOT_HIT_PCT
-        && backends
-            .iter()
-            .any(|b| b.url == aff.backend_url && b.kv_free_pct.is_some_and(|f| f < KV_PRESSURE_FREE_PCT))
+    if entry.hit_pct >= CACHE_HOT_HIT_PCT || entry.turns < 2 {
+        return false;
+    }
+    // The conversations served most recently still own the cache: their turns
+    // are the cheap ones; this one would only evict them.
+    let fresher = conv_cache
+        .iter()
+        .filter(|((k, url), c)| {
+            url == &aff.backend_url
+                && k != key
+                && now.saturating_duration_since(c.at) < CACHE_STATE_TTL
+                && c.at > entry.at
+        })
+        .count();
+    if fresher < CACHE_GRACE {
+        return false;
+    }
+    backends
+        .iter()
+        .any(|b| b.url == aff.backend_url && b.kv_free_pct.is_some_and(|f| f < 100))
 }
 
 /// Bytes of a prompt's canonical form fed into the fingerprint. The leading
@@ -1343,7 +1379,7 @@ fn prune_affinity(state: &AppState) {
     }
 }
 
-/// Forget cache measurements older than [`CACHE_STATE_TTL`], the idlest past
+/// Forget cache measurements idle for [`CACHE_HISTORY_MAX_AGE`], the idlest past
 /// `sticky_max_entries` (the table tracks the same live conversations as the
 /// affinity table does), and anything pointing at a removed backend.
 fn prune_conv_cache(state: &AppState) {
@@ -1359,7 +1395,7 @@ fn prune_conv_cache(state: &AppState) {
         .collect();
     let mut table = state.conv_cache.lock_or_recover();
     table.retain(|(_, url), c| {
-        now.saturating_duration_since(c.at) < CACHE_STATE_TTL && urls.contains(url)
+        now.saturating_duration_since(c.at) < CACHE_HISTORY_MAX_AGE && urls.contains(url)
     });
     if table.len() > max {
         let mut idle: Vec<((SessionKey, String), std::time::Instant)> = table
@@ -2555,6 +2591,7 @@ pub async fn run_worker(state: Arc<AppState>) {
         // `cold_hold` and the ordering block below).
         let mut cold_present = false;
         let mut first_hot_user: Option<String> = None;
+        let mut cold_users: Vec<String> = Vec::new();
         let selection_opt = {
             // Snapshot the model config once, before the queues lock, so the
             // per-task pin lookup below never takes model_config (lock order:
@@ -2650,12 +2687,13 @@ pub async fn run_worker(state: Arc<AppState>) {
                         .copied()
                         .chain(rest[..start].iter().copied())
                         .collect();
-                    // Cache-aware hold-back: while the backend that last
-                    // served a conversation is short of KV headroom, a
-                    // conversation whose last prefill missed that cache lines
-                    // up behind the hot ones instead of forcing a context
-                    // switch every round (see `cold_hold`). When the signal is
-                    // absent this is the plain fair order, unchanged.
+                    // Cache-aware hold-back: a conversation whose last
+                    // prefill missed the cache of the backend that last
+                    // served it lines up behind the recently served (likely
+                    // still resident) ones, instead of forcing a context
+                    // switch and a full re-prefill every round (see
+                    // `cold_hold`). Where the signal is absent this is the
+                    // plain fair order, unchanged.
                     let now = std::time::Instant::now();
                     let affinity = state.affinity.lock_or_recover();
                     let conv_cache = state.conv_cache.lock_or_recover();
@@ -2666,7 +2704,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             .is_some_and(|t| {
                                 cold_hold(
                                     t.session_key.as_ref(),
-                                    now.saturating_duration_since(t.queued_at),
+                                    t.cache_passes,
                                     &affinity,
                                     &conv_cache,
                                     &backends,
@@ -2678,6 +2716,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                         rotated.into_iter().partition(|&ui| !is_cold(ui));
                     cold_present = !cold.is_empty();
                     first_hot_user = hot.first().map(|&ui| active_users[ui].clone());
+                    cold_users = cold.iter().map(|&ui| active_users[ui].clone()).collect();
                     order.extend(hot);
                     order.extend(cold);
                 }
@@ -3013,6 +3052,18 @@ pub async fn run_worker(state: Arc<AppState>) {
                         }
 
                         let task = queues.get_mut(user_id).unwrap().remove(pos).unwrap();
+                        // A cache-hot turn went ahead of the held
+                        // conversations: charge each of them a yield, so
+                        // being held back stays bounded (see `cold_hold`).
+                        if !cold_users.is_empty() && !cold_users.contains(user_id) {
+                            for cu in &cold_users {
+                                if let Some(front) =
+                                    queues.get_mut(cu).and_then(|q| q.front_mut())
+                                {
+                                    front.cache_passes = front.cache_passes.saturating_add(1);
+                                }
+                            }
+                        }
                         release_queued_bytes(&state, task.body.len() as u64);
                         state
                             .global_counter
@@ -3755,6 +3806,7 @@ pub async fn proxy_handler(
         body,
         requested_model: requested_model.clone(),
         stuck_warned: false,
+        cache_passes: 0,
         queued_at: std::time::Instant::now(),
         key_label: client.as_ref().map(|c| {
             if c.key_label.is_empty() {
@@ -4639,6 +4691,7 @@ mod tests {
                 responder: tx,
                 requested_model: Some("no-such-model-xyz".to_string()),
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
@@ -4726,6 +4779,7 @@ mod tests {
                 responder: tx,
                 requested_model: Some("llama3".to_string()),
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
@@ -5009,6 +5063,7 @@ mod tests {
             responder: tx,
             requested_model: None,
             stuck_warned: false,
+            cache_passes: 0,
             queued_at: std::time::Instant::now(),
             key_label: None,
             session_key: None,
@@ -5632,6 +5687,7 @@ mod tests {
                 responder: tx,
                 requested_model: Some("qwen3.8-27b".to_string()),
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
@@ -5960,12 +6016,6 @@ mod tests {
             b.kv_free_pct = free;
             vec![b]
         };
-        let memory = |hit: u8, at: std::time::Instant| {
-            HashMap::from([(
-                (k.clone(), url.to_string()),
-                ConvCache { hit_pct: hit, at },
-            )])
-        };
         let aff = HashMap::from([(
             k.clone(),
             Affinity {
@@ -5974,23 +6024,45 @@ mod tests {
             },
         )]);
         let empty_aff: HashMap<SessionKey, Affinity> = HashMap::new();
+        // The candidate (fresh miss `hit`% at `at_cold`) plus `n_fresher`
+        // conversations this backend served more recently.
+        let memory = |hit: u8, at_cold: std::time::Instant, n_fresher: usize| {
+            let mut m = HashMap::from([(
+                (k.clone(), url.to_string()),
+                ConvCache { hit_pct: hit, at: at_cold, turns: 3 },
+            )]);
+            for i in 0..n_fresher {
+                m.insert(
+                    (
+                        key(&format!("other-{i}"), "m"),
+                        url.to_string(),
+                    ),
+                    ConvCache {
+                        hit_pct: 100,
+                        at: now - std::time::Duration::from_secs(1 + i as u64 / 10),
+                        turns: 5,
+                    },
+                );
+            }
+            m
+        };
+        let fresh = |hit: u8| memory(hit, ago(3), 2);
         let empty_mem: HashMap<(SessionKey, String), ConvCache> = HashMap::new();
-        let waited = std::time::Duration::from_secs(5);
 
-        // A fresh miss on a backend short of KV headroom: hold.
+        // A fresh miss with two hotter conversations served since: hold.
         assert!(cold_hold(
             Some(&k),
-            waited,
+            0,
             &aff,
-            &memory(10, ago(1)),
+            &fresh(10),
             &backends(Some(5)),
             now
         ));
         // No session identity, no memory, no affinity: nothing to hold.
-        assert!(!cold_hold(None, waited, &aff, &empty_mem, &backends(Some(5)), now));
+        assert!(!cold_hold(None, 0, &aff, &fresh(10), &backends(Some(5)), now));
         assert!(!cold_hold(
             Some(&k),
-            waited,
+            0,
             &aff,
             &empty_mem,
             &backends(Some(5)),
@@ -5998,54 +6070,70 @@ mod tests {
         ));
         assert!(!cold_hold(
             Some(&k),
-            waited,
+            0,
             &empty_aff,
-            &memory(10, ago(1)),
+            &fresh(10),
             &backends(Some(5)),
             now
         ));
         // Cache-hot conversation: it is the one the hold protects.
         assert!(!cold_hold(
             Some(&k),
-            waited,
+            0,
             &aff,
-            &memory(90, ago(1)),
+            &memory(90, ago(3), 2),
             &backends(Some(5)),
             now
         ));
-        // Plenty of free KV: the miss evicts nobody, no reason to hold.
+        // A first- or second-turn miss proves nothing about contention: no hold.
+        {
+            let mut m = fresh(10);
+            m.get_mut(&(k.clone(), url.to_string())).unwrap().turns = 1;
+            assert!(!cold_hold(Some(&k), 0, &aff, &m, &backends(Some(5)), now));
+        }
+        // Inside the grace window (fewer than CACHE_GRACE newer services): the
+        // cache may still hold this conversation's context; never hold it.
         assert!(!cold_hold(
             Some(&k),
-            waited,
+            0,
             &aff,
-            &memory(10, ago(1)),
-            &backends(Some(60)),
+            &memory(10, ago(3), 1),
+            &backends(Some(5)),
             now
         ));
         // No KV telemetry (plain Ollama): the pathology is unobservable.
         assert!(!cold_hold(
             Some(&k),
-            waited,
+            0,
             &aff,
-            &memory(10, ago(1)),
+            &fresh(10),
             &backends(None),
+            now
+        ));
+        // A fully free cache reports itself as such: room for this turn anyway.
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &fresh(10),
+            &backends(Some(100)),
             now
         ));
         // A stale measurement describes an unknown cache: never cold.
         assert!(!cold_hold(
             Some(&k),
-            waited,
+            0,
             &aff,
-            &memory(10, ago(600)),
+            &memory(10, ago(600), 2),
             &backends(Some(5)),
             now
         ));
-        // The valve bounds starvation: past it the miss is dispatched.
+        // The yield budget bounds starvation: spent, the miss is dispatched.
         assert!(!cold_hold(
             Some(&k),
-            CACHE_HOLD_VALVE,
+            CACHE_HOLD_PASSES,
             &aff,
-            &memory(10, ago(1)),
+            &fresh(10),
             &backends(Some(5)),
             now
         ));
@@ -6054,13 +6142,13 @@ mod tests {
         gone[0].url = "http://elsewhere".into();
         assert!(!cold_hold(
             Some(&k),
-            waited,
+            0,
             &aff,
-            &memory(10, ago(1)),
+            &fresh(10),
             &gone,
             now
         ));
-    }
+        }
 
     /// A served conversation's prefix-cache hit is recorded per
     /// (session, backend) from the server's own usage/timings, and a
@@ -6188,6 +6276,7 @@ mod tests {
                     responder: tx,
                     requested_model: None,
                     stuck_warned: false,
+                    cache_passes: 0,
                     queued_at: std::time::Instant::now(),
                     key_label: None,
                     session_key: None,
@@ -6315,6 +6404,7 @@ mod tests {
                 responder: tx,
                 requested_model: Some(model.to_string()),
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key,
@@ -6736,6 +6826,7 @@ mod tests {
                     responder: tx,
                     requested_model: None,
                     stuck_warned: false,
+                    cache_passes: 0,
                     queued_at: now,
                     key_label: None,
                     session_key: None,
@@ -7124,6 +7215,7 @@ mod tests {
                 responder: tx,
                 requested_model: None,
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
@@ -7285,6 +7377,7 @@ mod tests {
                 responder: tx,
                 requested_model: Some(model.to_string()),
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
