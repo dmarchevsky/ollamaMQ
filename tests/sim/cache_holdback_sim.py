@@ -26,6 +26,7 @@ HL        = 300.0    # fair-share half-life, s
 HOT_PCT   = 50
 PASSES    = 16       # a cold front task yields at most this many hot dispatches
 GRACE     = 2        # last N services may still hold cache (LRU grace window)
+RES       = 5.0      # slot reservation: measured client tool time (p100 4.3s)
 MEM_TTL   = 300.0
 
 
@@ -129,7 +130,7 @@ def simulate(conns, C, policy, pre_tps=1750.0, dyn_gap=None):
             continue  # back to top: absorb new arrivals at the advanced time
         ready.sort(key=lambda u: (score(u, now), u))
         colds = set()
-        if policy == 'B':
+        if policy in ('B', 'C'):
             recency = [u for u in reversed(served_order)]
             def cold(u):
                 t = queues[u][0]
@@ -146,8 +147,13 @@ def simulate(conns, C, policy, pre_tps=1750.0, dyn_gap=None):
             hot = [u for u in ready if not cold(u)]
             colds = set(u for u in ready if cold(u))
             ready = hot + [u for u in ready if u in colds]
+        if policy == 'C':
+            # slot reservation: a session that finished within RES keeps the
+            # head of the queue for its own follow-up
+            res = [u for u in ready if u in touch and now - touch[u] <= RES]
+            ready = res + [u for u in ready if u not in res]
         u = ready[0]
-        if policy == 'B' and colds and u not in colds:
+        if policy in ('B', 'C') and colds and u not in colds:
             for c in colds:
                 if queues[c]:
                     queues[c][0][6] += 1
@@ -217,7 +223,7 @@ def simulate(conns, C, policy, pre_tps=1750.0, dyn_gap=None):
     )
 
 
-def synthetic(n=4, tok=145000, grow=700, turns=15, gap=5.0):
+def synthetic(n=4, tok=145000, grow=700, turns=15, gap=0.5):
     """The screenshot incident, reconstructed: n agent sessions with ~145k
     token contexts, each continuing 5 s after its previous answer (decode
     ~350 tok), all serialized on one backend."""
@@ -241,7 +247,7 @@ def main():
     if pat == 'synthetic':
         conns = synthetic()
         real = [1.0]
-        dyn = 5.0
+        dyn = 0.5
     else:
         conns, real = load(pat)
         dyn = None
@@ -274,16 +280,17 @@ def main():
     C = C_kb * 1024
     a = simulate(conns, C, 'A', pre, dyn)
     b = simulate(conns, C, 'B', pre, dyn)
-    for n, r in (('A before', a), ('B after ', b)):
+    c = simulate(conns, C, 'C', pre, dyn)
+    for n, r in (('A before', a), ('B after ', b), ('C +reserve', c)):
         print('%s: prefill %7.1fM tok (%5.0f s GPU) waste %6.1fM tok (%4.0f s GPU) '
               're-prefills %3d | wait mean %5.1fs p90 %6.1fs | dur med %5.1f p90 %6.1f max %6.0f' %
               (n, r['prefill_tok'] / 1e6, r['gpu_prefill_s'], r['waste_tok'] / 1e6,
                r['waste_gpu_s'], r['misses'], r['mean_wait'], r['p90_wait'],
                r['dur_med'], r['dur_p90'], r['dur_max']))
-    dp = 100 * (1 - b['prefill_tok'] / a['prefill_tok'])
-    dw = 100 * (1 - b['waste_gpu_s'] / a['waste_gpu_s']) if a['waste_gpu_s'] else 0
-    print('prefill -%.1f%%, avoidable-waste -%.1f%% (%.0f GPU s saved), waits %.1fs -> %.1fs mean' %
-          (dp, dw, a['waste_gpu_s'] - b['waste_gpu_s'], a['mean_wait'], b['mean_wait']))
+    dp = 100 * (1 - c['prefill_tok'] / a['prefill_tok'])
+    dw = 100 * (1 - c['waste_gpu_s'] / a['waste_gpu_s']) if a['waste_gpu_s'] else 0
+    print('C vs A: prefill -%.1f%%, avoidable-waste -%.1f%% (%.0f GPU s saved), waits %.1fs -> %.1fs mean'
+          % (dp, dw, a['waste_gpu_s'] - c['waste_gpu_s'], a['mean_wait'], c['mean_wait']))
 
 
 if __name__ == '__main__':
