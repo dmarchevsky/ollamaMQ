@@ -14,6 +14,8 @@
   --warn-soft: #fdf1dc;
   --bad: #c9302c;
   --bad-soft: #fbe7e6;
+  /* One "live" colour: running or waiting requests, wherever they are listed. */
+  --live: #eab308;
   --vip: #8a3ffc;
   --vip-soft: #f1e8ff;
   --nav-bg: #161a22;
@@ -52,6 +54,7 @@
     --warn-soft: #2e2412;
     --bad: #ff6b66;
     --bad-soft: #321716;
+    --live: #e3b341;
     --vip: #b48cff;
     --vip-soft: #261b3d;
     --nav-bg: #0b0d12;
@@ -160,6 +163,8 @@ tr.selected > td { background: var(--accent-soft); }
 .badge.bad { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
 .badge.vip { background: var(--vip-soft); color: var(--vip); border-color: transparent; }
 .badge.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+/* queued: the outlined twin of the graph's hollow waiting chip */
+.badge.q { background: transparent; color: var(--accent); border-color: var(--accent); }
 .sdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-right: 8px; vertical-align: 1px; }
 .sdot.on { background: var(--ok); } .sdot.off { background: var(--bad); }
 .dir { font-family: var(--mono); font-size: 11.5px; font-weight: 700; }
@@ -529,12 +534,6 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
   .free-chip { background: color-mix(in srgb, var(--accent) 22%, transparent); border-color: color-mix(in srgb, var(--accent) 72%, transparent); }
 }
 
-/* Table divider between the active rows and the finished ones in "All" mode:
-   a hairline, no sentence — `Active n | All n` in the header already counts. */
-.req-div td { padding: 0; }
-.req-div td::before { content: ''; display: block; height: 1px; margin: 9px 0 6px;
-  background: linear-gradient(90deg, var(--border) 55%, transparent); }
-
 /* Requests session views: a dotted lane per conversation in the left gutter,
    with a hollow node on the rows of that session (Chain and Threads). */
 
@@ -662,8 +661,6 @@ tr.is-off td { color: var(--muted); }
 .rq-1 .mb .mo { color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .rq-2 { margin-top: 2px; font: 12px var(--mono); color: var(--muted); }
 .rq-m { margin-top: 2px; font: 11px var(--mono); color: var(--muted); }
-#ov-now .req-div-p::before { content: ''; display: block; height: 1px; margin: 9px 0 6px;
-  background: linear-gradient(90deg, var(--border) 55%, transparent); }
 /* --- Merged Activity panel: the session timeline and the Details list.
    One panel: a session-per-row timeline on top, the request list below.
    Bars are positioned in % of the window (no SVG scaling tricks), so a row
@@ -701,8 +698,8 @@ tr.is-off td { color: var(--muted); }
    nothing else — the swatch by the client name is where identity lives, so every
    chip matches the legend. */
 .tl-track .sg.w { background: var(--accent-soft); border: 1px solid var(--accent); }
-.tl-track .sg.p { background: var(--warn); }
-.tl-track .sg.g { background: var(--c2); }
+.tl-track .sg.p { background: var(--accent); }
+.tl-track .sg.g { background: var(--ok); }
 .tl-track .sg.e { background: var(--bad); }
 .tl-track .now { position: absolute; right: 0; top: -1px; bottom: -1px;
   border-left: 1px solid var(--muted); }
@@ -712,8 +709,8 @@ tr.is-off td { color: var(--muted); }
 .tl-legend .sw { margin-right: 4px; }
 .tl-legend .sw { border-radius: 0; }
 .tl-legend .sw.w { background: var(--accent-soft); border: 1px solid var(--accent); }
-.tl-legend .sw.p { background: var(--warn); }
-.tl-legend .sw.g { background: var(--c2); }
+.tl-legend .sw.p { background: var(--accent); }
+.tl-legend .sw.g { background: var(--ok); }
 .tl-legend .sw.e { background: var(--bad); }
 /* Details: one collapsible block per session. */
 .det-h { display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left;
@@ -724,7 +721,17 @@ tr.is-off td { color: var(--muted); }
 .det-h .who { font-weight: 650; }
 .det-h .sub { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .det-h .sum { margin-left: auto; font-size: 11.5px; color: var(--muted);
-  font-variant-numeric: tabular-nums; white-space: nowrap; }
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+  display: flex; gap: 10px; }
+/* three right-aligned columns so the numbers line up across headers */
+.det-h .sum i { font-style: normal; min-width: 52px; text-align: right; }
+.det-h .sum i:nth-child(2) { min-width: 66px; }
+.det-h .sum i:last-child { min-width: 0; }
+/* Live rows — List table, phone cards, Details stage lines — share one
+   yellow tint; the header keeps its client hue untouched. */
+#ov-now tr.is-live > td { background: color-mix(in srgb, var(--live) 14%, transparent); }
+#ov-now .rq.is-live { background: color-mix(in srgb, var(--live) 14%, transparent); border-radius: 6px; }
+#ov-now .det-row.live { background: color-mix(in srgb, var(--live) 18%, transparent); border-radius: 4px; }
 /* Details: every stage is its own event line with its
    own timestamp, threaded down the left by the session colour. */
 .det-body { border-left: 2px dotted color-mix(in srgb, var(--c, var(--accent)) 45%, var(--border));
@@ -738,8 +745,8 @@ tr.is-off td { color: var(--muted); }
 .det-row .st::before { content: ''; display: inline-block; width: 7px; height: 7px;
   border-radius: 2px; margin-right: 5px; background: var(--c, var(--c1)); }
 .det-row .st.w::before { background: var(--accent-soft); border: 1px solid var(--accent); }
-.det-row .st.p::before { background: var(--warn); }
-.det-row .st.g::before { background: var(--c2); }
+.det-row .st.p::before { background: var(--accent); }
+.det-row .st.g::before { background: var(--ok); }
 .det-row .st.e::before { background: var(--bad); }
 .det-row .st.i::before { background: none; border: 1px dotted var(--faint); }
 .det-row .val { color: var(--muted); min-width: 0; }
@@ -748,6 +755,8 @@ tr.is-off td { color: var(--muted); }
   .tl { --tl-lab: 0px; }
   .det-h { flex-wrap: wrap; }
   .det-h .sub { flex: 1 1 auto; min-width: 0; }
+  .det-h .sum { margin-left: 0; }
+  .det-h .sum i { min-width: 0; }
   /* one line per stage event, so the columns stay tight on a narrow screen */
   .det-row { font-size: 10.5px; gap: 7px; }
   .det-row .when { flex-basis: 46px; }
@@ -762,11 +771,16 @@ tr.is-off td { color: var(--muted); }
   .tl-track { flex: 1 1 100%; height: 12px; }
   .tl-grp { gap: 6px; }
 }
-/* A timeline row is clickable: it opens Details at that conversation. */
+/* A timeline row is clickable: it focuses that conversation in the list below. */
 .tl-row { cursor: pointer; }
 .det-h.flash { animation: detflash 1.2s ease-out; }
+#ov-now tr.flash, #ov-now .rq.flash { animation: rowflash 1.2s ease-out; }
+@keyframes rowflash {
+  from { outline: 2px solid var(--accent); }
+  to { outline: 2px solid transparent; }
+}
 @keyframes detflash {
   from { box-shadow: 0 0 0 2px var(--c, var(--accent)); }
   to { box-shadow: 0 0 0 2px transparent; }
 }
-@media (prefers-reduced-motion: reduce) { .det-h.flash { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .det-h.flash, #ov-now tr.flash, #ov-now .rq.flash { animation: none; } }
