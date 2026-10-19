@@ -21,7 +21,7 @@
 - **Per-User Queuing**: Each user (identified by a client API key, else by the `X-User-ID` header, else by address as `ip-<address>`) has their own FIFO queue, capped at 100 waiting requests — beyond that the proxy answers `429` rather than growing the queue.
 - **Bounded Memory**: A queued request holds its whole body until a backend takes it, so bodies are capped two ways: `settings.max_body_bytes` per request (default 64 MiB, `413` beyond it) and `settings.max_queued_bytes` across all queues at once (default 512 MiB, `503` beyond it). A request is always admitted when the queues are empty, so an oversized body can never lock the proxy out of making progress. `/api/blobs/{digest}` keeps a separate 1 GiB allowance for model-layer uploads.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
-- **Cache-Aware Hold-Back**: On a backend that reports KV-cache telemetry (llama.cpp/halogen with `--metrics`), a conversation whose last turn mostly *missed* that cache lines up behind the conversations served most recently — the ones whose contexts are still resident — instead of forcing a context switch and a full re-prefill every round. A session that just finished a turn also keeps queue priority for its follow-up for 5 s (measured client tool turnaround: median 0.5 s, max 4.3 s), so an agent runs its whole cycle on its backend undisturbed. Each held request yields at most 16 hot turns, so the hold itself can never starve it; plain Ollama (no telemetry) keeps the plain fair order.
+- **Cache-Aware Hold-Back**: On a backend that reports KV-cache telemetry (llama.cpp/halogen with `--metrics`), a conversation whose last turn mostly *missed* that cache — and whose estimated next-turn prefill does not fit the free KV — lines up behind the conversations served most recently instead of forcing a context switch and a full re-prefill every round. A session that just finished a turn also keeps queue priority for its follow-up for ~5 s (adaptive: 1.5x the session's own worst recent pause, 2–30 s), so an agent runs its whole cycle on its backend undisturbed; at most 64 reserved wins in a row, and any held request yields at most 16 times, so neither mechanism can starve anyone. Plain Ollama (no telemetry) keeps the plain fair order.
 - **Sticky Routing (Session Affinity)**: A conversation goes back to the backend that served its previous turn, so a long multi-turn prompt is not re-prefilled on a backend with no KV slot for it. The key is an explicit session id when the client sends one, else a fingerprint of the conversation's first turn (see [Sticky Routing](#-sticky-routing-session-affinity)).
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
@@ -610,7 +610,7 @@ scrape_configs:
 | `ollamamq_generation_seconds_total` / `ollamamq_generation_tokens_total` | counter | client, model, backend — decode time and the tokens generated in it |
 | `ollamamq_prompt_seconds_total` / `ollamamq_prompt_eval_tokens_total` | counter | client, model, backend — prefill time and the prompt tokens evaluated (cache hits excluded) |
 | `ollamamq_affinity_decisions_total` | counter | result — `hit` (a conversation stayed on its backend) / `moved` (it went elsewhere) |
-| `ollamamq_cache_scheduling_total` | counter | action — `held_back` (a KV-cache-cold user gave its turn to a cache-hot one on a starved backend) |
+| `ollamamq_cache_scheduling_total` | counter | action — `held_back` (a KV-cache-cold conversation gave its turn to a cache-hot one) or `reserved_first` (a session's follow-up went ahead of other waiting users inside its slot reservation) |
 | `ollamamq_generation_speed_tokens_per_second` | histogram | model, backend — one observation per finished request |
 | `ollamamq_queue_depth`, `ollamamq_queue_oldest_seconds` | gauge | client, model — waiting requests and the age of the oldest |
 | `ollamamq_requests_in_flight`, `ollamamq_client_fair_share_score` | gauge | client |
@@ -684,20 +684,28 @@ round-robin is the worst ordering for it: every turn hands the GPU to a conversa
 context the previous turn just evicted, and each switch is billed as a full re-prefill.
 Where the backend exposes the two signals — llama.cpp/halogen do (`kv_cache_usage` with
 `--metrics`, per-request `prompt_n` timings) — ollamaMQ reads them: a conversation whose
-last prefill on a backend hit below 50% queues behind the conversations that backend
-served most recently (the two whose contexts the cache still holds), so the resident pair
-keeps hitting instead of trading misses one request at a time. A held request yields at
-most 16 such turns — a per-request budget, not a queue-time bound, because in a saturated
-queue every request has already "waited too long" — and anything unmeasured (new
-conversation, backend without telemetry) is never held, so an uninstrumented fleet
-schedules exactly as before. On top of that, a session that finished a turn
-within 5 s keeps queue priority for its own follow-up: the turnaround between an
-answer and the next request is the client running its tool (median 0.5 s, max
-4.3 s in the reference logs), so the priority expires exactly when the session
-has gone quiet, and a whole agent cycle runs on one warm cache.
-`ollamamq_cache_scheduling_total{action="held_back"}` counts
-the rounds where a cold conversation actually gave way; `kv % free` on the backend card is
-the pressure signal itself. Replays of a saturated Brainiac hour: see `tests/sim/`.
+last prefill on a backend hit below 50%, and whose estimated next-turn increment (what the
+backend evaluated and decoded last turn) does not fit the free KV the backend reports,
+queues behind the conversations that backend served most recently (the two whose contexts
+the cache still holds), so the resident pair keeps hitting instead of trading misses one
+request at a time. A held request yields at most 16 such turns — a per-request budget, not
+a queue-time bound, because in a saturated queue every request has already "waited too
+long" — and anything unmeasured (new conversation, backend without telemetry, backend that
+cannot size its cache) falls back to the coarser signals or the plain fair order, so an
+uninstrumented fleet schedules exactly as before.
+
+On top of that, a session that finished a turn keeps queue priority for its own follow-up:
+the turnaround between an answer and the next request is the client running its tool
+(median 0.5 s, max 4.3 s in the reference logs), so the window adapts per session — 1.5x
+its own worst recent pause, clamped 2–30 s — and expires exactly when the session has gone
+quiet, letting a whole agent cycle run on one warm cache. A session wins at most 64
+reserved dispatches in a row before it stands one ordinary fair round, so a never-quiet
+agent cannot monopolise the queue.
+
+`ollamamq_cache_scheduling_total` counts both mechanisms: `held_back` = a cold
+conversation gave way to a hot one, `reserved_first` = a session's follow-up went ahead of
+other waiting users; `kv % free` on the backend card is the pressure signal itself.
+Replays of a saturated Brainiac hour: see `tests/sim/`.
 
 ### Port Configuration
 

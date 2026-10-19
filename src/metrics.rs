@@ -100,7 +100,7 @@ pub const CONTROL_OPS: CounterDef = CounterDef {
 };
 pub const CACHE_SCHEDULING: CounterDef = CounterDef {
     name: "ollamamq_cache_scheduling_total",
-    help: "Cache-aware dispatch decisions: held_back = a conversation that recently missed the KV prefix cache gave way to a cache-hot one (bounded by a per-request yield budget).",
+    help: "Cache-aware dispatch decisions: held_back = a conversation that recently missed the KV prefix cache gave way to a cache-hot one (bounded by a per-request yield budget); reserved_first = a session's own follow-up went ahead of other waiting users inside its slot-reservation window.",
     labels: &["action"],
 };
 

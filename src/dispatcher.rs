@@ -729,7 +729,7 @@ pub struct AppState {
     pub conv_cache: Mutex<HashMap<(SessionKey, String), ConvCache>>,
     /// When each session last finished a turn — the slot-reservation window
     /// for its follow-up request. See [`SLOT_RESERVE`].
-    pub slot_reserve: Mutex<HashMap<SessionKey, std::time::Instant>>,
+    pub slot_reserve: Mutex<HashMap<SessionKey, SlotReserve>>,
     /// `settings.sticky_routing` as a [`StickyMode`] disc; atomic so the
     /// scheduler reads it without another lock.
     pub sticky_mode: std::sync::atomic::AtomicU8,
@@ -947,15 +947,55 @@ const CACHE_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(300)
 /// first turn — must survive that.
 const CACHE_HISTORY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
 
-/// How long a session's follow-up request outranks every other user's queue:
-/// the client's local tool time between receiving an answer and sending the
-/// next request. Measured on the reference deployment's request log — median
-/// 0.5 s, p99 4.1 s, max 4.3 s over 595 turn-to-turn continuations — so 5 s
-/// keeps a running agent on its slot for a whole cycle without anyone else
-/// touching the backend mid-cycle. It costs nothing when the session does not
+/// How long a session's follow-up request outranks every other user's queue
+/// when nothing is measured about that session yet: the client's local tool
+/// time between receiving an answer and sending the next request. Measured on
+/// the reference deployment's request log — median 0.5 s, p99 4.1 s, max 4.3 s
+/// over 595 turn-to-turn continuations. See [`reserve_window`] for how the
+/// window adapts to each session. It costs nothing when the session does not
 /// come back (no queued task, no reorder) and at most one turn per bystander
 /// when it does.
 const SLOT_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bounds on the adaptive reservation window (see [`reserve_window`]).
+const SLOT_RESERVE_MIN: std::time::Duration = std::time::Duration::from_secs(2);
+const SLOT_RESERVE_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many consecutive dispatches a session may win on its reservation
+/// before it must stand in the ordinary fair order for one round. Without it
+/// a never-quiet agent keeps the slot indefinitely — fine for its cache, not
+/// for the queue behind it.
+const SLOT_RESERVE_CHAIN: u16 = 64;
+
+/// A follow-up observed this far after the previous completion is a new
+/// engagement, not a tool turnaround: it never feeds the gap average.
+const SLOT_GAP_IGNORE: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// What the reservation knows about one session: when its last turn
+/// completed, the session's recent worst turn-to-turn turnaround (ms, decay
+/// 2% per later observation; 0 = nothing measured yet), and how many reserved
+/// dispatches it has won in a row.
+#[derive(Clone, Copy, Debug)]
+pub struct SlotReserve {
+    at: std::time::Instant,
+    gap_max_ms: f64,
+    chain: u16,
+}
+
+/// The reservation window for a session: 1.5x its recent worst turnaround —
+/// a session keeps its slot at least as long as it ever hesitated, so a fleet
+/// with slow tools (sandbox spins, package installs) is not scheduled by one
+/// deployment's median — clamped to [`SLOT_RESERVE_MIN`]..=[`SLOT_RESERVE_MAX`].
+fn reserve_window(gap_max_ms: f64) -> std::time::Duration {
+    if gap_max_ms <= 0.0 {
+        return SLOT_RESERVE;
+    }
+    let ms = (1.5 * gap_max_ms).clamp(
+        SLOT_RESERVE_MIN.as_secs_f64() * 1000.0,
+        SLOT_RESERVE_MAX.as_secs_f64() * 1000.0,
+    );
+    std::time::Duration::from_secs_f64(ms / 1000.0)
+}
 
 /// The last measured prefix-cache hit of one conversation on one backend,
 /// taken from the backend's own usage stats. This is what tells the scheduler
@@ -968,6 +1008,10 @@ pub struct ConvCache {
     /// miss is not evidence of cache contention — the context was simply
     /// never there — so it never holds.
     turns: u32,
+    /// Tokens the backend evaluated last turn plus what it decoded since —
+    /// the estimated incremental prefill work of the next turn if the cache
+    /// kept everything else. `None` for servers that report no `prompt_eval`.
+    inc_tok: Option<u64>,
 }
 
 /// The share of a prompt the backend served from its prefix cache, percent
@@ -982,33 +1026,81 @@ fn cache_hit_pct(prompt: u64, evaluated: Option<u64>) -> Option<u8> {
 }
 
 /// Remember how much of this conversation's prompt the backend skipped.
-fn record_conv_cache(state: &AppState, key: &SessionKey, backend_url: &str, hit_pct: u8) {
+fn record_conv_cache(
+    state: &AppState,
+    key: &SessionKey,
+    backend_url: &str,
+    hit_pct: u8,
+    inc_tok: Option<u64>,
+) {
     let mut table = state.conv_cache.lock_or_recover();
     let entry = table.entry((key.clone(), backend_url.to_string())).or_insert(ConvCache {
         hit_pct: 0,
         at: std::time::Instant::now(),
         turns: 0,
+        inc_tok: None,
     });
     entry.turns = entry.turns.saturating_add(1);
     entry.hit_pct = hit_pct;
+    entry.inc_tok = inc_tok;
     entry.at = std::time::Instant::now();
 }
 
 /// Note a finished turn so the session's follow-up can keep priority for
 /// [`SLOT_RESERVE`] (see [`slot_reserved`]).
 fn reserve_slot(state: &AppState, key: &SessionKey) {
-    state
-        .slot_reserve
-        .lock_or_recover()
-        .insert(key.clone(), std::time::Instant::now());
+    let mut table = state.slot_reserve.lock_or_recover();
+    let entry = table.entry(key.clone()).or_insert(SlotReserve {
+        at: std::time::Instant::now(),
+        gap_max_ms: 0.0,
+        chain: 0,
+    });
+    entry.at = std::time::Instant::now();
+}
+
+/// Feed the observed client turnaround of a dispatching follow-up into the
+/// session's reservation: `arrived` is when the request entered the queue, so
+/// the gap since the last completion is exactly the tool time the reservation
+/// exists to cover. Also tracks the chain of consecutive reserved wins: a win
+/// at the cap resets it, forcing exactly one ordinary fair round every
+/// [`SLOT_RESERVE_CHAIN`] turns, and any dispatch that came in outside the
+/// window resets it too.
+fn note_follow_up(state: &AppState, key: &SessionKey, arrived: std::time::Instant) {
+    let mut table = state.slot_reserve.lock_or_recover();
+    let Some(entry) = table.get_mut(key) else {
+        return;
+    };
+    let Some(gap) = arrived.checked_duration_since(entry.at) else {
+        entry.chain = 0; // queued during its own previous turn: not a turnaround
+        return;
+    };
+    if gap >= SLOT_GAP_IGNORE {
+        entry.chain = 0; // a new engagement, not a running cycle
+        return;
+    }
+    let gap_ms = gap.as_secs_f64() * 1000.0;
+    entry.chain = if gap < reserve_window(entry.gap_max_ms) {
+        if entry.chain >= SLOT_RESERVE_CHAIN {
+            0
+        } else {
+            entry.chain.saturating_add(1)
+        }
+    } else {
+        0
+    };
+    // Decaying max: the window covers this session's worst recent pause, and
+    // a fleet-wide slowdown is followed within a few turns.
+    entry.gap_max_ms = gap_ms.max(entry.gap_max_ms * 0.98);
 }
 
 /// Decide whether a user's front request should wait this selection round.
 /// Its conversation last MISSED the prefix cache on the backend that last
 /// served it, that backend reports its KV cache (halogen with metrics — a
-/// plain Ollama reports nothing and is never held) and is not fully free,
-/// more recently served conversations may still own that cache (the grace
-/// window), and the request has not yet spent [`CACHE_HOLD_PASSES`] yields.
+/// plain Ollama reports nothing and is never held) and the conversation's
+/// estimated next-turn increment does not fit the free KV (or the backend
+/// cannot size it and the cache is simply not empty), more recently served
+/// conversations may still own that cache (the grace window), and the request
+/// has not yet spent [`CACHE_HOLD_PASSES`] yields.
 ///
 /// Why a yield budget instead of a wait bound: under a saturated backlog every
 /// request has already waited longer than any sane time valve, so a time bound
@@ -1057,23 +1149,40 @@ fn cold_hold(
     if fresher < CACHE_GRACE {
         return false;
     }
-    backends
-        .iter()
-        .any(|b| b.url == aff.backend_url && b.kv_free_pct.is_some_and(|f| f < 100))
+    // The budget rule, when both sides are measured: the next turn's
+    // incremental prefill (what the backend evaluated and decoded last turn)
+    // against the free KV it reports. A conversation whose increment does not
+    // fit evicts the resident set however it is ordered: send it to the back.
+    // When either side is unmeasured (no `prompt_eval`, no reported context
+    // size) fall back to the pressure signal alone: a not-empty cache means
+    // somebody could be evicted.
+    let Some(b) = backends.iter().find(|b| b.url == aff.backend_url) else {
+        return false;
+    };
+    match (entry.inc_tok, b.kv_free_pct, b.loaded_ctx.values().sum::<u64>()) {
+        (Some(inc), Some(free_pct), total) if total > 0 && free_pct < 100 => {
+            inc > total.saturating_mul(free_pct as u64) / 100
+        }
+        (_, Some(free_pct), _) => free_pct < 100,
+        _ => false,
+    }
 }
 
 /// Whether this session finished a turn recently enough that its queued
-/// follow-up goes first this round (see [`SLOT_RESERVE`]). Fail-open: an
-/// unknown session or no reservation is never privileged.
+/// follow-up goes first this round: inside its adaptive reservation window
+/// (see [`reserve_window`]) and under the consecutive-win cap
+/// ([`SLOT_RESERVE_CHAIN`]). Fail-open: an unknown session or no reservation
+/// is never privileged.
 fn slot_reserved(
     session_key: Option<&SessionKey>,
-    reserved: &HashMap<SessionKey, std::time::Instant>,
+    reserved: &HashMap<SessionKey, SlotReserve>,
     now: std::time::Instant,
 ) -> bool {
     session_key.is_some_and(|key| {
-        reserved
-            .get(key)
-            .is_some_and(|at| now.saturating_duration_since(*at) < SLOT_RESERVE)
+        reserved.get(key).is_some_and(|e| {
+            e.chain < SLOT_RESERVE_CHAIN
+                && now.saturating_duration_since(e.at) < reserve_window(e.gap_max_ms)
+        })
     })
 }
 
@@ -1448,7 +1557,7 @@ fn prune_conv_cache(state: &AppState) {
     state
         .slot_reserve
         .lock_or_recover()
-        .retain(|_, at| now.saturating_duration_since(*at) < SLOT_RESERVE);
+        .retain(|_, e| now.saturating_duration_since(e.at) < SLOT_RESERVE_MAX);
 }
 
 /// Backends come and go: forget every remembered placement.
@@ -2634,6 +2743,7 @@ pub async fn run_worker(state: Arc<AppState>) {
         // `cold_hold` and the ordering block below).
         let mut cold_present = false;
         let mut first_hot_user: Option<String> = None;
+        let mut first_reserved_user: Option<String> = None;
         let mut cold_users: Vec<String> = Vec::new();
         let selection_opt = {
             // Snapshot the model config once, before the queues lock, so the
@@ -2779,6 +2889,13 @@ pub async fn run_worker(state: Arc<AppState>) {
                         .first()
                         .or(hot.first())
                         .map(|&ui| active_users[ui].clone());
+                    first_reserved_user = if order.len() + reserved.len() + hot.len() + cold.len()
+                        > 1
+                    {
+                        reserved.first().map(|&ui| active_users[ui].clone())
+                    } else {
+                        None
+                    };
                     cold_users = cold.iter().map(|&ui| active_users[ui].clone()).collect();
                     order.extend(reserved);
                     order.extend(hot);
@@ -3116,6 +3233,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                         }
 
                         let task = queues.get_mut(user_id).unwrap().remove(pos).unwrap();
+                        // Observe this follow-up's client turnaround to adapt
+                        // the session's reservation window and chain (see
+                        // [`note_follow_up`]).
+                        if let Some(key) = task.session_key.as_ref() {
+                            note_follow_up(state.as_ref(), key, task.queued_at);
+                        }
                         // A cache-hot turn went ahead of the held
                         // conversations: charge each of them a yield, so
                         // being held back stays bounded (see `cold_hold`).
@@ -3224,6 +3347,11 @@ pub async fn run_worker(state: Arc<AppState>) {
                     state
                         .metrics
                         .inc(&crate::metrics::CACHE_SCHEDULING, &["held_back"], 1.0);
+                }
+                if first_reserved_user.as_deref() == Some(user_id.as_str()) {
+                    state
+                        .metrics
+                        .inc(&crate::metrics::CACHE_SCHEDULING, &["reserved_first"], 1.0);
                 }
                 let state_clone = state.clone();
                 let client_clone = client.clone();
@@ -3511,7 +3639,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         if let Some(hit) =
                                             usage.and_then(|u| cache_hit_pct(u.prompt, u.prompt_eval))
                                         {
-                                            record_conv_cache(&state_clone, key, &backend_url, hit);
+                                            // What the next turn must re-feed
+                                            // if the cache keeps nothing of
+                                            // this one: what was evaluated
+                                            // plus what was decoded.
+                                            let inc = usage
+                                                .and_then(|u| u.prompt_eval)
+                                                .map(|pe| pe.saturating_add(usage.map_or(0, |u| u.completion)));
+                                            record_conv_cache(
+                                                &state_clone, key, &backend_url, hit, inc,
+                                            );
                                         }
                                     }
                                     if let Some(u) = usage {
@@ -6065,15 +6202,18 @@ mod tests {
         assert_eq!(v.last_seen(), half);
     }
 
-    #[test]
+        #[test]
     fn slot_reserve_privileges_only_a_recent_session() {
         let k = key("thread", "m");
         let other = key("other", "m");
         let now = std::time::Instant::now();
-        let reserved = HashMap::from([(
-            k.clone(),
-            now - std::time::Duration::from_secs(3),
-        )]);
+        let entry = |at: std::time::Instant, gap_max: f64, chain: u16| SlotReserve {
+            at,
+            gap_max_ms: gap_max,
+            chain,
+        };
+        let reserved =
+            HashMap::from([(k.clone(), entry(now - std::time::Duration::from_secs(3), 0.0, 0))]);
         // A session that finished a turn inside the window goes first.
         assert!(slot_reserved(Some(&k), &reserved, now));
         // Everything else is ordinary traffic.
@@ -6085,6 +6225,35 @@ mod tests {
             &reserved,
             now + std::time::Duration::from_secs(5)
         ));
+        // A session whose worst recent pause was 20 s stays privileged 12 s
+        // after its last turn (window 30 s); the unmeasured default is 5 s.
+        let slow = HashMap::from([(
+            k.clone(),
+            entry(now - std::time::Duration::from_secs(12), 20_000.0, 0),
+        )]);
+        assert!(slot_reserved(Some(&k), &slow, now));
+        // ... and a snappy one (worst pause 0.1 s -> 2 s floor) is not.
+        let fast = HashMap::from([(
+            k.clone(),
+            entry(now - std::time::Duration::from_secs(3), 100.0, 0),
+        )]);
+        assert!(!slot_reserved(Some(&k), &fast, now));
+        // The consecutive-win cap forces an ordinary round at the limit.
+        let chained = HashMap::from([(
+            k.clone(),
+            entry(now - std::time::Duration::from_secs(1), 0.0, SLOT_RESERVE_CHAIN),
+        )]);
+        assert!(!slot_reserved(Some(&k), &chained, now));
+    }
+
+    #[test]
+    fn reserve_window_tracks_the_sessions_own_turnaround() {
+        // Nothing measured: the reference-fleet default.
+        assert_eq!(reserve_window(0.0), SLOT_RESERVE);
+        // 1.5x the decaying worst gap, clamped to the bounds.
+        assert_eq!(reserve_window(2_000.0), std::time::Duration::from_secs(3));
+        assert_eq!(reserve_window(1.0), SLOT_RESERVE_MIN);
+        assert_eq!(reserve_window(60_000.0), SLOT_RESERVE_MAX);
     }
 
     #[test]
@@ -6121,7 +6290,12 @@ mod tests {
         let memory = |hit: u8, at_cold: std::time::Instant, n_fresher: usize| {
             let mut m = HashMap::from([(
                 (k.clone(), url.to_string()),
-                ConvCache { hit_pct: hit, at: at_cold, turns: 3 },
+                ConvCache {
+                    hit_pct: hit,
+                    at: at_cold,
+                    turns: 3,
+                    inc_tok: None,
+                },
             )]);
             for i in 0..n_fresher {
                 m.insert(
@@ -6133,6 +6307,7 @@ mod tests {
                         hit_pct: 100,
                         at: now - std::time::Duration::from_secs(1 + i as u64 / 10),
                         turns: 5,
+                        inc_tok: None,
                     },
                 );
             }
@@ -6240,7 +6415,46 @@ mod tests {
             &gone,
             now
         ));
-        }
+        // KV budget: the backend can size its cache (200k tokens, 5% free =
+        // 10k) and the conversation's measured increment decides, not just
+        // "the cache is not empty".
+        let mut budgeted = backends(Some(5));
+        budgeted[0].loaded_ctx.insert("m".to_string(), 200_000);
+        let with_inc = |inc: Option<u64>| {
+            let mut m = fresh(10);
+            m.get_mut(&(k.clone(), url.to_string())).unwrap().inc_tok = inc;
+            m
+        };
+        // 30k to refeed > 10k free: it would evict the resident set, hold.
+        assert!(cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &with_inc(Some(30_000)),
+            &budgeted,
+            now
+        ));
+        // 5k < 10k free: it fits without eviction, no reason to hold even
+        // though the cache is 95% full.
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &with_inc(Some(5_000)),
+            &budgeted,
+            now
+        ));
+        // Unknown increment (server without prompt_eval): the pressure
+        // fallback applies again.
+        assert!(cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &with_inc(None),
+            &budgeted,
+            now
+        ));
+    }
 
     /// A served conversation's prefix-cache hit is recorded per
     /// (session, backend) from the server's own usage/timings, and a

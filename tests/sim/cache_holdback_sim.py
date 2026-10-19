@@ -90,7 +90,8 @@ def simulate(conns, C, policy, pre_tps=1750.0, dyn_gap=None):
         ti = 0
         first_t_map = {u: first[u][2] for u in conns}
 
-    resident, touch, memory = {}, {}, {}
+    resident, touch, memory, gapmax = {}, {}, {}, {}
+    clamp = lambda v, lo, hi: min(max(v, lo), hi)
     last_served = [None]
     served_order = []  # conversation recency, newest last
     charges = collections.defaultdict(list)
@@ -132,6 +133,9 @@ def simulate(conns, C, policy, pre_tps=1750.0, dyn_gap=None):
         colds = set()
         if policy in ('B', 'C'):
             recency = [u for u in reversed(served_order)]
+            resident_b = sum(resident.values())
+            free_b = C - resident_b
+
             def cold(u):
                 t = queues[u][0]
                 if t[6] >= PASSES:
@@ -142,15 +146,23 @@ def simulate(conns, C, policy, pre_tps=1750.0, dyn_gap=None):
                 # hold only a conversation that has completed >1 turn here and
                 # whose last prefill here missed (a first-turn miss proves
                 # nothing about cache contention)
-                return (bool(m) and now - m[1] <= MEM_TTL and m[0] < HOT_PCT
-                        and m[2] >= 2)
+                if not (m and now - m[1] <= MEM_TTL and m[0] < HOT_PCT and m[2] >= 2):
+                    return False
+                # budget rule: hold when the estimated next-turn increment
+                # (what this backend evaluated + decoded last turn) does not
+                # fit the free KV — it would evict the resident set anyway
+                return m[3] > free_b
             hot = [u for u in ready if not cold(u)]
             colds = set(u for u in ready if cold(u))
             ready = hot + [u for u in ready if u in colds]
         if policy == 'C':
-            # slot reservation: a session that finished within RES keeps the
-            # head of the queue for its own follow-up
-            res = [u for u in ready if u in touch and now - touch[u] <= RES]
+            # slot reservation: a session keeps the head of the queue for its
+            # own follow-up for 1.5x its recent worst turnaround (floor 2 s,
+            # ceiling 30 s, default 5 s unmeasured)
+            def win(u):
+                g = gapmax.get(u)
+                return clamp(1.5 * g if g else RES, 2.0, 30.0)
+            res = [u for u in ready if u in touch and now - touch[u] < win(u)]
             ready = res + [u for u in ready if u not in res]
         u = ready[0]
         if policy in ('B', 'C') and colds and u not in colds:
@@ -159,6 +171,11 @@ def simulate(conns, C, policy, pre_tps=1750.0, dyn_gap=None):
                     queues[c][0][6] += 1
         _, k, t_arr, pb, ob, prev, _passes = queues[u].popleft()
         wait = now - t_arr
+        if policy == 'C' and u in touch:
+            # observe the client turnaround: queueing time is not part of it
+            gap = t_arr - touch[u]
+            if 0 <= gap < 900:
+                gapmax[u] = max(gap, gapmax.get(u, 0.0) * 0.98)
         hit = u in resident
         prefill_b = (pb - prev) if (hit and pb >= prev) else pb
         total_prefill_b += prefill_b
@@ -181,9 +198,11 @@ def simulate(conns, C, policy, pre_tps=1750.0, dyn_gap=None):
         served_order[:] = [x for x in served_order[-8:]]
         prev_mem = memory.get(u)
         # turns carry across idle gaps (history, not freshness — mirrors
-        # CACHE_HISTORY_MAX_AGE in the dispatcher)
+        # CACHE_HISTORY_MAX_AGE in the dispatcher); inc = the tokens the
+        # backend evaluated + decoded this turn, priced back to bytes
         memory[u] = (round(100 * (1 - prefill_b / pb)) if pb else 100, finish,
-                     (prev_mem[2] if prev_mem else 0) + 1)
+                     (prev_mem[2] if prev_mem else 0) + 1,
+                     prefill_b + ob * BPT / 251.0)
         tot = sum(resident.values())
         while tot > C:
             victims = sorted((t, w) for w, t in touch.items() if w != u)

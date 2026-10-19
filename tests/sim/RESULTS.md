@@ -10,11 +10,18 @@ prefix residency) and compares:
   KV usage, (c) at least `CACHE_GRACE=2` other conversations were served more
   recently, and (d) it has yielded fewer than `CACHE_HOLD_PASSES=16` times.
   First/second-turn conversations are never held (a fresh miss proves nothing).
-- **C — shipped**: B plus the **slot reservation**: a session that finished a
-  turn within `SLOT_RESERVE=5 s` keeps queue priority for its own follow-up,
-  so an agent runs its whole cycle on its backend without another session
-  interrupting. The 5 s is measured, not guessed: client turnaround in the
-  request log is median 0.5 s, p99 4.1 s, max 4.3 s over 595 continuations.
+- **C — shipped**: B plus the **slot reservation**: a session that finished a turn
+  keeps queue priority for its own follow-up for an adaptive window — 1.5x the
+  session's decaying worst turnaround, clamped 2–30 s (default 5 s unmeasured)
+  — so an agent runs its whole cycle on its backend without another session
+  interrupting. Turnarounds are measured from queue arrival minus previous
+  completion, so queueing never inflates them; 64 reserved wins in a row force
+  one ordinary fair round. B's hold additionally uses the **KV budget**: the
+  hold triggers when the measured increment (evaluated + decoded last turn)
+  does not fit the free KV, falling back to "cache not empty" only when the
+  backend cannot size it. The window default is measured, not guessed: client
+  turnaround in the request log is median 0.5 s, p99 4.1 s, max 4.3 s over 595
+  continuations.
 
 `simulate(..., dyn_gap)` models agent conversations whose next turn arrives a
 fixed gap after their own response (the observed behaviour); otherwise arrivals
