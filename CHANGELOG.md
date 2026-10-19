@@ -3,6 +3,31 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.10.0 — 2026-10-19
+
+### Added
+
+- **Activity: one session order, live at a glance.** The graph and Details now list
+  conversations by most recent activity — same order everywhere. Running and waiting
+  requests carry a single yellow tint instead of the old active/finished divider: live
+  rows in the List, live stage lines in Details, and a current-state chip on every
+  conversation header (`decode` / `prefill` / `waiting`, none when idle). Details
+  headers also align their `req / tok / time` summary in right-aligned columns.
+- **Graph click-to-focus.** Clicking a conversation in the graph focuses it wherever you
+  are looking: a folded Details block unfolds, a conversation hidden behind "Active" is
+  revealed, then the row scrolls into view and flashes.
+
+### Changed
+
+- **Status-consistent colours.** Prefill is accent blue in the graph, the badge and the
+  Details square (was amber); decode uses the app's green; the waiting badge is an
+  outlined blue matching its graph chip; one new `--live` yellow marks everything
+  active. Client identity colours were re-picked (cyan, pink, orange, orchid, lime,
+  sand, terracotta, berry/rose) to avoid every status hue — no swatch can be misread as
+  a stage any more.
+- Activity panel header: title, Active/All and List/Details now share one line on
+  phones (wrapping back to two lines only below ~360px).
+
 ## v0.9.3 — 2026-10-18
 
 ### Added

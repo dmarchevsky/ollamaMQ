@@ -646,6 +646,11 @@ tr.is-off td { color: var(--muted); }
   #page-overview .page-tools .seg span { padding: 4px 7px; font-size: 11.5px; white-space: nowrap; }
   #page-overview .page-tools .seg span b { color: var(--text); font-variant-numeric: tabular-nums; }
 }
+/* Below the tight type the header still cannot hold one line (very narrow
+   phones): wrapping beats a sideways scrollbar. */
+@media (max-width: 359px) {
+  #page-overview .panel-h { flex-wrap: wrap; }
+}
 
 /* --- Request cards (phone). Replaces the table-reflow for #ov-now: three tight
    lines, no repeated field labels (their names stay in title= tooltips, and the
