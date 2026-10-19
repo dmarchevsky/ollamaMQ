@@ -728,7 +728,10 @@ function stagePlan(row, now) {
   if (pre >= .05) {
     out.push(ev('p', dispatch, pre, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(pre)}`
       + (o.cache_pct != null ? ` · cache ${o.cache_pct}%` : '')
-      + (o.prefill_secs && o.prompt_tokens ? `<span class="more"> · ${fmtRate(o.prompt_tokens / o.prefill_secs)}</span>` : '')));
+      // The rate divides the tokens actually evaluated (cache-excluded), like
+      // the Backends table — dividing the whole prompt by the short time of a
+      // cached prefill invented impossible speeds.
+      + (o.prefill_secs && o.prefill_tokens ? `<span class="more"> · ${fmtRate(o.prefill_tokens / o.prefill_secs)}</span>` : '')));
   }
   if (gen > 0) {
     out.push(ev('g', finish - gen * 1000, gen,
