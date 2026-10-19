@@ -8,3 +8,7 @@ ollamamq-requests.jsonl
 /logs/
 __pycache__/
 *.pyc
+
+# local analysis inputs (raw request logs; never commit server logs)
+logs.tar.gz
+logs-remote/
