@@ -27,6 +27,13 @@ kill $pid; exit $rc
 - [ ] (ui) visual pass in light **and** dark at 390px and 1280px: no overflows, no stray scrollbars, legible contrast
 - [ ] app runs locally against real backends (not `?demo`); primary views walked with live data
 
+Visual-pass recipe (headless shell): screenshotting the *served* app crashes the shell
+(zygote socket errors) — render the static bundle instead: `file://<worktree>/src/web/index.html?demo`.
+Seed UI state (List/Details, Active/All) via `localStorage` on a `--user-data-dir` profile
+(open a tiny `localStorage.setItem('omq.reqView','details');…` page once, then the demo).
+Dark mode: copy `app.css` and rewrite `prefers-color-scheme: dark` to `all` —
+`--force-dark-mode` does nothing on a page that supports dark itself.
+
 ## release
 
 Semver: minor for user-facing features, patch for chores/fixes. The version-bump commit must
