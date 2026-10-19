@@ -3,6 +3,16 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.10.1 — 2026-10-19
+
+### Fixed
+
+- **Prefill speed is now honest on cache hits.** The Details prefill line divided the
+  whole prompt by the prefill time, so a 100% prefix-cache hit — most of the prompt
+  skipped, a tiny measured time — printed rates like `200,121` tok/s. It now divides
+  the tokens actually evaluated (the cache-excluded count the Backends table already
+  uses), and shows no rate when that telemetry is missing.
+
 ## v0.10.0 — 2026-10-19
 
 ### Added
