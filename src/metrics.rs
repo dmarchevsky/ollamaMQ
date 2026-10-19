@@ -98,6 +98,11 @@ pub const CONTROL_OPS: CounterDef = CounterDef {
     help: "Model load/unload operations by result.",
     labels: &["backend", "model", "action", "result"],
 };
+pub const CACHE_SCHEDULING: CounterDef = CounterDef {
+    name: "ollamamq_cache_scheduling_total",
+    help: "Cache-aware dispatch decisions: held_back = a conversation that recently missed the KV prefix cache went behind the cache-hot users because its backend was short of KV headroom (bounded by a 90 s wait valve).",
+    labels: &["action"],
+};
 
 pub const QUEUE_WAIT: HistogramDef = HistogramDef {
     name: "ollamamq_queue_wait_seconds",
@@ -149,6 +154,7 @@ const COUNTERS: &[&CounterDef] = &[
     &PROMPT_EVAL_TOKENS,
     &AFFINITY_DECISIONS,
     &CONTROL_OPS,
+    &CACHE_SCHEDULING,
 ];
 const HISTOGRAMS: &[&HistogramDef] = &[&QUEUE_WAIT, &TTFB, &TTFT, &DURATION, &GEN_SPEED];
 
