@@ -632,15 +632,16 @@ tr.is-off td { color: var(--muted); }
   .clbar .lbl { display: none; }
 }
 
-/* --- Activity panel header on a phone fits the title and both switches on one
-   line (Active/All carry the counts the sentence used to spell out); the
-   switches drop to a second line only when the viewport cannot hold them. --- */
+/* --- Activity panel header on a phone: title and both switches stay on ONE
+   line — the panel header is the only place the Show/View toggles live, so
+   wrapping them below the title makes them feel like content. Tighter type
+   sizes make "Activity" + `Active n / All n` + `List / Details` fit 390px. --- */
 @media (max-width: 720px) {
-  #page-overview .panel-h { flex-wrap: wrap; row-gap: 6px; column-gap: 8px; }
-  #page-overview .panel-h h2 { margin: 0; flex: 0 0 auto; }
-  #page-overview .panel-h .page-tools { gap: 6px; margin-left: auto; }
+  #page-overview .panel-h { flex-wrap: nowrap; row-gap: 6px; column-gap: 8px; }
+  #page-overview .panel-h h2 { margin: 0; flex: 0 0 auto; font-size: 15px; white-space: nowrap; }
+  #page-overview .panel-h .page-tools { gap: 5px; margin-left: auto; min-width: 0; }
   #page-overview .page-tools .seg { margin-bottom: 0; }
-  #page-overview .page-tools .seg span { padding: 4px 8px; font-size: 12px; }
+  #page-overview .page-tools .seg span { padding: 4px 7px; font-size: 11.5px; white-space: nowrap; }
   #page-overview .page-tools .seg span b { color: var(--text); font-variant-numeric: tabular-nums; }
 }
 
