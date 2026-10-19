@@ -21,6 +21,7 @@
 - **Per-User Queuing**: Each user (identified by a client API key, else by the `X-User-ID` header, else by address as `ip-<address>`) has their own FIFO queue, capped at 100 waiting requests — beyond that the proxy answers `429` rather than growing the queue.
 - **Bounded Memory**: A queued request holds its whole body until a backend takes it, so bodies are capped two ways: `settings.max_body_bytes` per request (default 64 MiB, `413` beyond it) and `settings.max_queued_bytes` across all queues at once (default 512 MiB, `503` beyond it). A request is always admitted when the queues are empty, so an oversized body can never lock the proxy out of making progress. `/api/blobs/{digest}` keeps a separate 1 GiB allowance for model-layer uploads.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
+- **Cache-Aware Hold-Back**: On a backend whose KV cache reports less than 25% free, a conversation whose last prefill mostly missed that cache waits (max 90 s) behind the conversations that are hitting it, instead of forcing a context switch — and a full re-prefill — every round. Needs a backend that reports both signals: llama.cpp/halogen (`kv_cache_usage` via `--metrics`, per-request `timings`); plain Ollama keeps the plain fair order.
 - **Sticky Routing (Session Affinity)**: A conversation goes back to the backend that served its previous turn, so a long multi-turn prompt is not re-prefilled on a backend with no KV slot for it. The key is an explicit session id when the client sends one, else a fingerprint of the conversation's first turn (see [Sticky Routing](#-sticky-routing-session-affinity)).
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
@@ -609,6 +610,7 @@ scrape_configs:
 | `ollamamq_generation_seconds_total` / `ollamamq_generation_tokens_total` | counter | client, model, backend — decode time and the tokens generated in it |
 | `ollamamq_prompt_seconds_total` / `ollamamq_prompt_eval_tokens_total` | counter | client, model, backend — prefill time and the prompt tokens evaluated (cache hits excluded) |
 | `ollamamq_affinity_decisions_total` | counter | result — `hit` (a conversation stayed on its backend) / `moved` (it went elsewhere) |
+| `ollamamq_cache_scheduling_total` | counter | action — `held_back` (a KV-cache-cold user gave its turn to a cache-hot one on a starved backend) |
 | `ollamamq_generation_speed_tokens_per_second` | histogram | model, backend — one observation per finished request |
 | `ollamamq_queue_depth`, `ollamamq_queue_oldest_seconds` | gauge | client, model — waiting requests and the age of the oldest |
 | `ollamamq_requests_in_flight`, `ollamamq_client_fair_share_score` | gauge | client |
@@ -674,6 +676,21 @@ the outcomes; the payoff shows up as a drop in
 when conversations are hitting their own backend, the problem is not routing: the backend
 cannot hold that many contexts in its cache at once (`OLLAMA_NUM_PARALLEL`, `num_ctx`,
 `load_keep_alive` — or more VRAM), and no routing choice fixes that.
+
+### Cache-Aware Hold-Back
+
+When a backend's KV cache cannot hold every active conversation, plain per-request
+round-robin is the worst ordering for it: every turn hands the GPU to a conversation whose
+context the previous turn just evicted, and each switch is billed as a full re-prefill.
+Where the backend exposes the two signals — llama.cpp/halogen do (`kv_cache_usage` with
+`--metrics`, per-request `prompt_n` timings) — ollamaMQ reads them: on a backend reporting
+less than 25% of the cache free, a conversation whose last prefill on it hit below 50%
+lines up behind the conversations that are cache-hot, so the resident set keeps hitting
+instead of trading misses one request at a time. The hold is bounded by a 90 s wait valve
+and never applies to a conversation with nothing measured or a backend without the
+signals, so an uninstrumented fleet schedules exactly as before.
+`ollamamq_cache_scheduling_total{action="held_back"}` counts the rounds where a cold user
+actually gave way; `kv % free` on the backend card is the pressure signal itself.
 
 ### Port Configuration
 
