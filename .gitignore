@@ -6,3 +6,5 @@ ollamamq-requests.jsonl
 # docker-compose.yml run in the checkout
 /config/
 /logs/
+__pycache__/
+*.pyc

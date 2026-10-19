@@ -1159,6 +1159,8 @@ fn cold_hold(
     let Some(b) = backends.iter().find(|b| b.url == aff.backend_url) else {
         return false;
     };
+    // shortcut: sums resident model contexts as the KV pool; if a multi-model
+    // backend turns out to keep per-model pools, size it from that instead.
     match (entry.inc_tok, b.kv_free_pct, b.loaded_ctx.values().sum::<u64>()) {
         (Some(inc), Some(free_pct), total) if total > 0 && free_pct < 100 => {
             inc > total.saturating_mul(free_pct as u64) / 100
@@ -6244,6 +6246,42 @@ mod tests {
             entry(now - std::time::Duration::from_secs(1), 0.0, SLOT_RESERVE_CHAIN),
         )]);
         assert!(!slot_reserved(Some(&k), &chained, now));
+    }
+
+    #[test]
+    fn reservation_bookkeeping_follows_the_observed_gaps() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        let k = key("thread", "m");
+        // Scripted clock: completions land one second apart, so every
+        // observed turnaround is 1 s until the scripted 20 s pause.
+        let c = std::time::Instant::now();
+        state.slot_reserve.lock_or_recover().insert(
+            k.clone(),
+            SlotReserve {
+                at: c,
+                gap_max_ms: 0.0,
+                chain: 0,
+            },
+        );
+        for turn in 1..=3u64 {
+            note_follow_up(state.as_ref(), &k, c + std::time::Duration::from_secs(turn));
+            let mut table = state.slot_reserve.lock_or_recover();
+            let e = table.get_mut(&k).unwrap();
+            assert_eq!(e.chain, turn as u16, "reserved win each turn");
+            assert!((e.gap_max_ms - 1_000.0).abs() < 40.0);
+            e.at = c + std::time::Duration::from_secs(turn); // the completion
+        }
+        // A 20 s pause exceeds the 2 s floor window: chain resets and the
+        // decaying max adopts it (window would now be 30 s, clamped).
+        note_follow_up(
+            state.as_ref(),
+            &k,
+            c + std::time::Duration::from_secs(23),
+        );
+        let e: SlotReserve = state.slot_reserve.lock_or_recover()[&k];
+        assert_eq!(e.chain, 0, "a dispatch outside the window breaks the chain");
+        assert!((e.gap_max_ms - 20_000.0).abs() < 60.0);
+        assert_eq!(reserve_window(e.gap_max_ms), SLOT_RESERVE_MAX);
     }
 
     #[test]
