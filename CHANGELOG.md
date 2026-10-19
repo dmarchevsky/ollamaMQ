@@ -3,6 +3,30 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.9.3 — 2026-10-18
+
+### Added
+
+- **Cache-aware dispatch.** When a backend reports KV-cache telemetry (llama.cpp/halogen
+  with `--metrics`) and per-request `prompt_eval` timings, two mechanisms replace the plain
+  per-request round-robin that thrashes a cache too small for all active conversations:
+  - *Hold-back*: a conversation whose last prefill missed the cache — and whose estimated
+    next-turn increment (evaluated + decoded last turn) does not fit the free KV — queues
+    behind the conversations the backend served most recently, instead of forcing a context
+    switch and a full re-prefill every round. Bounded: 16 yields per request, and a
+    conversation is never held on its first two turns.
+  - *Slot reservation*: a session that finished a turn keeps queue priority for its own
+    follow-up while its adaptive window is open — 1.5x the session's worst recent
+    turn-to-turn pause, clamped 2–30 s (client tool time measured 0.5 s median / 4.3 s max
+    in the reference logs) — so a whole agent cycle runs on one warm cache. 64 reserved
+    wins in a row force one ordinary fair round; nobody ever waits on an idle session.
+  Both fail open: no session identity, no telemetry, or an unmeasurable cache means the
+  exact scheduling behaviour of `v0.9.2`. New counter
+  `ollamamq_cache_scheduling_total{action="held_back"|"reserved_first"}`; `kv % free` on
+  the backend card is the pressure signal. Replay of a saturated Brainiac hour (484
+  requests, one backend): **−50% prefill, −80% avoidable cache waste (210 → 20 full
+  re-prefills), mean queue wait 856 s → 674 s** — simulator and method in `tests/sim/`.
+
 ## v0.9.2 — 2026-10-18
 
 ### Changed

@@ -79,6 +79,9 @@ pub struct Task {
     /// When the request was queued; used to fail fast (503) when no backend
     /// can ever serve it instead of letting the client hang forever.
     pub queued_at: std::time::Instant,
+    /// How many cache-hot dispatches this request was held behind by
+    /// [`cold_hold`]; bounds the hold-back's delay.
+    pub cache_passes: u8,
     /// Label (or id) of the client API key that sent it, for per-key metrics.
     pub key_label: Option<String>,
     /// Sticky-routing key for this request (see [`derive_session_key`]): the
@@ -721,6 +724,12 @@ pub struct AppState {
     /// Which backend each conversation was last served by, for sticky routing
     /// (see [`Affinity`] and `settings.sticky_routing`).
     pub affinity: Mutex<HashMap<SessionKey, Affinity>>,
+    /// Last measured prefix-cache hit of each conversation on each backend,
+    /// keyed by (session, backend url). See [`ConvCache`] and [`cold_hold`].
+    pub conv_cache: Mutex<HashMap<(SessionKey, String), ConvCache>>,
+    /// When each session last finished a turn — the slot-reservation window
+    /// for its follow-up request. See [`SLOT_RESERVE`].
+    pub slot_reserve: Mutex<HashMap<SessionKey, SlotReserve>>,
     /// `settings.sticky_routing` as a [`StickyMode`] disc; atomic so the
     /// scheduler reads it without another lock.
     pub sticky_mode: std::sync::atomic::AtomicU8,
@@ -911,6 +920,272 @@ impl SessionKey {
 pub struct Affinity {
     pub backend_url: String,
     last_use: std::time::Instant,
+}
+
+/// A conversation the backend served this many times more recently than its
+/// last own service is treated as cache-resident and never held back: those
+/// are the turns the cache still holds.
+const CACHE_GRACE: usize = 2;
+
+/// A cache-cold front request yields at most this many cache-hot dispatches
+/// before it goes regardless — the fairness bound on [`cold_hold`].
+const CACHE_HOLD_PASSES: u8 = 16;
+
+/// The last measured prefill hit at or above this keeps a conversation in
+/// front: its prefix is resident and its next turn is nearly free.
+const CACHE_HOT_HIT_PCT: u8 = 50;
+
+/// The longest a measured cache hit is trusted. Older than this the conversation
+/// is simply unknown (an idle eviction may have flushed it), and unknown is
+/// never treated as cold.
+const CACHE_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a conversation's row (hit measurement + turn history) is kept
+/// before prune drops it. Longer than [`CACHE_STATE_TTL`] on purpose: under
+/// saturation a conversation may only get served every few minutes, and the
+/// turn count — the evidence that a miss is cache contention rather than a
+/// first turn — must survive that.
+const CACHE_HISTORY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+
+/// How long a session's follow-up request outranks every other user's queue
+/// when nothing is measured about that session yet: the client's local tool
+/// time between receiving an answer and sending the next request. Measured on
+/// the reference deployment's request log — median 0.5 s, p99 4.1 s, max 4.3 s
+/// over 595 turn-to-turn continuations. See [`reserve_window`] for how the
+/// window adapts to each session. It costs nothing when the session does not
+/// come back (no queued task, no reorder) and at most one turn per bystander
+/// when it does.
+const SLOT_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bounds on the adaptive reservation window (see [`reserve_window`]).
+const SLOT_RESERVE_MIN: std::time::Duration = std::time::Duration::from_secs(2);
+const SLOT_RESERVE_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many consecutive dispatches a session may win on its reservation
+/// before it must stand in the ordinary fair order for one round. Without it
+/// a never-quiet agent keeps the slot indefinitely — fine for its cache, not
+/// for the queue behind it.
+const SLOT_RESERVE_CHAIN: u16 = 64;
+
+/// A follow-up observed this far after the previous completion is a new
+/// engagement, not a tool turnaround: it never feeds the gap average.
+const SLOT_GAP_IGNORE: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// What the reservation knows about one session: when its last turn
+/// completed, the session's recent worst turn-to-turn turnaround (ms, decay
+/// 2% per later observation; 0 = nothing measured yet), and how many reserved
+/// dispatches it has won in a row.
+#[derive(Clone, Copy, Debug)]
+pub struct SlotReserve {
+    at: std::time::Instant,
+    gap_max_ms: f64,
+    chain: u16,
+}
+
+/// The reservation window for a session: 1.5x its recent worst turnaround —
+/// a session keeps its slot at least as long as it ever hesitated, so a fleet
+/// with slow tools (sandbox spins, package installs) is not scheduled by one
+/// deployment's median — clamped to [`SLOT_RESERVE_MIN`]..=[`SLOT_RESERVE_MAX`].
+fn reserve_window(gap_max_ms: f64) -> std::time::Duration {
+    if gap_max_ms <= 0.0 {
+        return SLOT_RESERVE;
+    }
+    let ms = (1.5 * gap_max_ms).clamp(
+        SLOT_RESERVE_MIN.as_secs_f64() * 1000.0,
+        SLOT_RESERVE_MAX.as_secs_f64() * 1000.0,
+    );
+    std::time::Duration::from_secs_f64(ms / 1000.0)
+}
+
+/// The last measured prefix-cache hit of one conversation on one backend,
+/// taken from the backend's own usage stats. This is what tells the scheduler
+/// whose context is currently resident where.
+#[derive(Clone, Copy, Debug)]
+pub struct ConvCache {
+    hit_pct: u8,
+    at: std::time::Instant,
+    /// Completed turns of this conversation on this backend. A first-turn
+    /// miss is not evidence of cache contention — the context was simply
+    /// never there — so it never holds.
+    turns: u32,
+    /// Tokens the backend evaluated last turn plus what it decoded since —
+    /// the estimated incremental prefill work of the next turn if the cache
+    /// kept everything else. `None` for servers that report no `prompt_eval`.
+    inc_tok: Option<u64>,
+}
+
+/// The share of a prompt the backend served from its prefix cache, percent
+/// 0–100 — the same accounting as the activity view's `cache %` column.
+/// `None` when the server reported no prompt counts at all.
+fn cache_hit_pct(prompt: u64, evaluated: Option<u64>) -> Option<u8> {
+    let evaluated = evaluated?;
+    if prompt == 0 {
+        return None;
+    }
+    Some(100u8.saturating_sub((evaluated.min(prompt) * 100 / prompt) as u8))
+}
+
+/// Remember how much of this conversation's prompt the backend skipped.
+fn record_conv_cache(
+    state: &AppState,
+    key: &SessionKey,
+    backend_url: &str,
+    hit_pct: u8,
+    inc_tok: Option<u64>,
+) {
+    let mut table = state.conv_cache.lock_or_recover();
+    let entry = table.entry((key.clone(), backend_url.to_string())).or_insert(ConvCache {
+        hit_pct: 0,
+        at: std::time::Instant::now(),
+        turns: 0,
+        inc_tok: None,
+    });
+    entry.turns = entry.turns.saturating_add(1);
+    entry.hit_pct = hit_pct;
+    entry.inc_tok = inc_tok;
+    entry.at = std::time::Instant::now();
+}
+
+/// Note a finished turn so the session's follow-up can keep priority for
+/// [`SLOT_RESERVE`] (see [`slot_reserved`]).
+fn reserve_slot(state: &AppState, key: &SessionKey) {
+    let mut table = state.slot_reserve.lock_or_recover();
+    let entry = table.entry(key.clone()).or_insert(SlotReserve {
+        at: std::time::Instant::now(),
+        gap_max_ms: 0.0,
+        chain: 0,
+    });
+    entry.at = std::time::Instant::now();
+}
+
+/// Feed the observed client turnaround of a dispatching follow-up into the
+/// session's reservation: `arrived` is when the request entered the queue, so
+/// the gap since the last completion is exactly the tool time the reservation
+/// exists to cover. Also tracks the chain of consecutive reserved wins: a win
+/// at the cap resets it, forcing exactly one ordinary fair round every
+/// [`SLOT_RESERVE_CHAIN`] turns, and any dispatch that came in outside the
+/// window resets it too.
+fn note_follow_up(state: &AppState, key: &SessionKey, arrived: std::time::Instant) {
+    let mut table = state.slot_reserve.lock_or_recover();
+    let Some(entry) = table.get_mut(key) else {
+        return;
+    };
+    let Some(gap) = arrived.checked_duration_since(entry.at) else {
+        entry.chain = 0; // queued during its own previous turn: not a turnaround
+        return;
+    };
+    if gap >= SLOT_GAP_IGNORE {
+        entry.chain = 0; // a new engagement, not a running cycle
+        return;
+    }
+    let gap_ms = gap.as_secs_f64() * 1000.0;
+    entry.chain = if gap < reserve_window(entry.gap_max_ms) {
+        if entry.chain >= SLOT_RESERVE_CHAIN {
+            0
+        } else {
+            entry.chain.saturating_add(1)
+        }
+    } else {
+        0
+    };
+    // Decaying max: the window covers this session's worst recent pause, and
+    // a fleet-wide slowdown is followed within a few turns.
+    entry.gap_max_ms = gap_ms.max(entry.gap_max_ms * 0.98);
+}
+
+/// Decide whether a user's front request should wait this selection round.
+/// Its conversation last MISSED the prefix cache on the backend that last
+/// served it, that backend reports its KV cache (halogen with metrics — a
+/// plain Ollama reports nothing and is never held) and the conversation's
+/// estimated next-turn increment does not fit the free KV (or the backend
+/// cannot size it and the cache is simply not empty), more recently served
+/// conversations may still own that cache (the grace window), and the request
+/// has not yet spent [`CACHE_HOLD_PASSES`] yields.
+///
+/// Why a yield budget instead of a wait bound: under a saturated backlog every
+/// request has already waited longer than any sane time valve, so a time bound
+/// disarms exactly when the hold-back matters; a per-request yield budget
+/// bounds the hold itself whatever the queue depth.
+///
+/// Every unknown counts as not cold: no session identity, no fresh
+/// measurement, or a backend that reports no KV usage.
+fn cold_hold(
+    session_key: Option<&SessionKey>,
+    passes: u8,
+    affinity: &HashMap<SessionKey, Affinity>,
+    conv_cache: &HashMap<(SessionKey, String), ConvCache>,
+    backends: &[BackendStatus],
+    now: std::time::Instant,
+) -> bool {
+    if passes >= CACHE_HOLD_PASSES {
+        return false;
+    }
+    let Some(key) = session_key else {
+        return false;
+    };
+    let Some(aff) = affinity.get(key) else {
+        return false;
+    };
+    let Some(entry) = conv_cache.get(&(key.clone(), aff.backend_url.clone())) else {
+        return false;
+    };
+    if now.saturating_duration_since(entry.at) >= CACHE_STATE_TTL {
+        return false;
+    }
+    if entry.hit_pct >= CACHE_HOT_HIT_PCT || entry.turns < 2 {
+        return false;
+    }
+    // The conversations served most recently still own the cache: their turns
+    // are the cheap ones; this one would only evict them.
+    let fresher = conv_cache
+        .iter()
+        .filter(|((k, url), c)| {
+            url == &aff.backend_url
+                && k != key
+                && now.saturating_duration_since(c.at) < CACHE_STATE_TTL
+                && c.at > entry.at
+        })
+        .count();
+    if fresher < CACHE_GRACE {
+        return false;
+    }
+    // The budget rule, when both sides are measured: the next turn's
+    // incremental prefill (what the backend evaluated and decoded last turn)
+    // against the free KV it reports. A conversation whose increment does not
+    // fit evicts the resident set however it is ordered: send it to the back.
+    // When either side is unmeasured (no `prompt_eval`, no reported context
+    // size) fall back to the pressure signal alone: a not-empty cache means
+    // somebody could be evicted.
+    let Some(b) = backends.iter().find(|b| b.url == aff.backend_url) else {
+        return false;
+    };
+    // shortcut: sums resident model contexts as the KV pool; if a multi-model
+    // backend turns out to keep per-model pools, size it from that instead.
+    match (entry.inc_tok, b.kv_free_pct, b.loaded_ctx.values().sum::<u64>()) {
+        (Some(inc), Some(free_pct), total) if total > 0 && free_pct < 100 => {
+            inc > total.saturating_mul(free_pct as u64) / 100
+        }
+        (_, Some(free_pct), _) => free_pct < 100,
+        _ => false,
+    }
+}
+
+/// Whether this session finished a turn recently enough that its queued
+/// follow-up goes first this round: inside its adaptive reservation window
+/// (see [`reserve_window`]) and under the consecutive-win cap
+/// ([`SLOT_RESERVE_CHAIN`]). Fail-open: an unknown session or no reservation
+/// is never privileged.
+fn slot_reserved(
+    session_key: Option<&SessionKey>,
+    reserved: &HashMap<SessionKey, SlotReserve>,
+    now: std::time::Instant,
+) -> bool {
+    session_key.is_some_and(|key| {
+        reserved.get(key).is_some_and(|e| {
+            e.chain < SLOT_RESERVE_CHAIN
+                && now.saturating_duration_since(e.at) < reserve_window(e.gap_max_ms)
+        })
+    })
 }
 
 /// Bytes of a prompt's canonical form fed into the fingerprint. The leading
@@ -1252,6 +1527,41 @@ fn prune_affinity(state: &AppState) {
     }
 }
 
+/// Forget cache measurements idle for [`CACHE_HISTORY_MAX_AGE`], the idlest past
+/// `sticky_max_entries` (the table tracks the same live conversations as the
+/// affinity table does), and anything pointing at a removed backend.
+fn prune_conv_cache(state: &AppState) {
+    let max = state
+        .sticky_max_entries
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let now = std::time::Instant::now();
+    let urls: HashSet<String> = state
+        .backends
+        .lock_or_recover()
+        .iter()
+        .map(|b| b.url.clone())
+        .collect();
+    let mut table = state.conv_cache.lock_or_recover();
+    table.retain(|(_, url), c| {
+        now.saturating_duration_since(c.at) < CACHE_HISTORY_MAX_AGE && urls.contains(url)
+    });
+    if table.len() > max {
+        let mut idle: Vec<((SessionKey, String), std::time::Instant)> = table
+            .iter()
+            .map(|(k, c)| (k.clone(), c.at))
+            .collect();
+        idle.sort_by_key(|(_, at)| *at);
+        for (k, _) in idle.into_iter().take(table.len() - max) {
+            table.remove(&k);
+        }
+    }
+    drop(table);
+    state
+        .slot_reserve
+        .lock_or_recover()
+        .retain(|_, e| now.saturating_duration_since(e.at) < SLOT_RESERVE_MAX);
+}
+
 /// Backends come and go: forget every remembered placement.
 pub fn clear_affinity(state: &AppState) {
     state.affinity.lock_or_recover().clear();
@@ -1328,6 +1638,8 @@ impl AppState {
             global_counter: std::sync::atomic::AtomicUsize::new(0),
             fair_share: Mutex::new(HashMap::new()),
             affinity: Mutex::new(HashMap::new()),
+            conv_cache: Mutex::new(HashMap::new()),
+            slot_reserve: Mutex::new(HashMap::new()),
             sticky_mode: std::sync::atomic::AtomicU8::new(
                 crate::config::StickyMode::default() as u8,
             ),
@@ -2424,10 +2736,17 @@ pub async fn run_worker(state: Arc<AppState>) {
             tokio::time::sleep(USER_PRUNE_INTERVAL).await;
             prune_idle_users(&prune_state, USER_RETENTION);
             prune_affinity(&prune_state);
+            prune_conv_cache(&prune_state);
         }
     });
 
     loop {
+        // Cache-aware hold-back bookkeeping for this selection round (see
+        // `cold_hold` and the ordering block below).
+        let mut cold_present = false;
+        let mut first_hot_user: Option<String> = None;
+        let mut first_reserved_user: Option<String> = None;
+        let mut cold_users: Vec<String> = Vec::new();
         let selection_opt = {
             // Snapshot the model config once, before the queues lock, so the
             // per-task pin lookup below never takes model_config (lock order:
@@ -2518,8 +2837,71 @@ pub async fn run_worker(state: Arc<AppState>) {
                 current_idx += 1;
                 if !rest.is_empty() {
                     let start = current_idx % rest.len();
-                    order.extend(rest[start..].iter().copied());
-                    order.extend(rest[..start].iter().copied());
+                    let rotated: Vec<usize> = rest[start..]
+                        .iter()
+                        .copied()
+                        .chain(rest[..start].iter().copied())
+                        .collect();
+                    // Cache-aware hold-back: a conversation whose last
+                    // prefill missed the cache of the backend that last
+                    // served it lines up behind the recently served (likely
+                    // still resident) ones, instead of forcing a context
+                    // switch and a full re-prefill every round (see
+                    // `cold_hold`). Where the signal is absent this is the
+                    // plain fair order, unchanged.
+                    let now = std::time::Instant::now();
+                    let affinity = state.affinity.lock_or_recover();
+                    let conv_cache = state.conv_cache.lock_or_recover();
+                    let reserve = state.slot_reserve.lock_or_recover();
+                    let is_reserved = |ui: usize| {
+                        slot_reserved(
+                            queues
+                                .get(&active_users[ui])
+                                .and_then(|q| q.front())
+                                .and_then(|t| t.session_key.as_ref()),
+                            &reserve,
+                            now,
+                        )
+                    };
+                    let is_cold = |ui: usize| {
+                        queues
+                            .get(&active_users[ui])
+                            .and_then(|q| q.front())
+                            .is_some_and(|t| {
+                                cold_hold(
+                                    t.session_key.as_ref(),
+                                    t.cache_passes,
+                                    &affinity,
+                                    &conv_cache,
+                                    &backends,
+                                    now,
+                                )
+                            })
+                    };
+                    // Slot reservation first: a session that finished a turn
+                    // within SLOT_RESERVE keeps the queue head for its own
+                    // follow-up, so an agent can run a whole cycle without
+                    // another session touching its backend mid-cycle.
+                    let (reserved, rest_rot): (Vec<usize>, Vec<usize>) =
+                        rotated.into_iter().partition(|&ui| is_reserved(ui));
+                    let (hot, cold): (Vec<usize>, Vec<usize>) =
+                        rest_rot.into_iter().partition(|&ui| !is_cold(ui));
+                    cold_present = !cold.is_empty();
+                    first_hot_user = reserved
+                        .first()
+                        .or(hot.first())
+                        .map(|&ui| active_users[ui].clone());
+                    first_reserved_user = if order.len() + reserved.len() + hot.len() + cold.len()
+                        > 1
+                    {
+                        reserved.first().map(|&ui| active_users[ui].clone())
+                    } else {
+                        None
+                    };
+                    cold_users = cold.iter().map(|&ui| active_users[ui].clone()).collect();
+                    order.extend(reserved);
+                    order.extend(hot);
+                    order.extend(cold);
                 }
 
                 let limits = state.model_limits.lock_or_recover();
@@ -2853,6 +3235,24 @@ pub async fn run_worker(state: Arc<AppState>) {
                         }
 
                         let task = queues.get_mut(user_id).unwrap().remove(pos).unwrap();
+                        // Observe this follow-up's client turnaround to adapt
+                        // the session's reservation window and chain (see
+                        // [`note_follow_up`]).
+                        if let Some(key) = task.session_key.as_ref() {
+                            note_follow_up(state.as_ref(), key, task.queued_at);
+                        }
+                        // A cache-hot turn went ahead of the held
+                        // conversations: charge each of them a yield, so
+                        // being held back stays bounded (see `cold_hold`).
+                        if !cold_users.is_empty() && !cold_users.contains(user_id) {
+                            for cu in &cold_users {
+                                if let Some(front) =
+                                    queues.get_mut(cu).and_then(|q| q.front_mut())
+                                {
+                                    front.cache_passes = front.cache_passes.saturating_add(1);
+                                }
+                            }
+                        }
                         release_queued_bytes(&state, task.body.len() as u64);
                         state
                             .global_counter
@@ -2942,6 +3342,19 @@ pub async fn run_worker(state: Arc<AppState>) {
 
         match selection_opt {
             Some((user_id, task, backend_idx, backend_url, backend_token, metadata)) => {
+                // A cache-cold user waited while this cache-hot dispatch ran
+                // ahead of it (see `cold_hold`); its release is the same wait
+                // visible as queue time in the activity view.
+                if cold_present && first_hot_user.as_deref() == Some(user_id.as_str()) {
+                    state
+                        .metrics
+                        .inc(&crate::metrics::CACHE_SCHEDULING, &["held_back"], 1.0);
+                }
+                if first_reserved_user.as_deref() == Some(user_id.as_str()) {
+                    state
+                        .metrics
+                        .inc(&crate::metrics::CACHE_SCHEDULING, &["reserved_first"], 1.0);
+                }
                 let state_clone = state.clone();
                 let client_clone = client.clone();
                 let url = format!("{}{}", backend_url, task.path);
@@ -3213,6 +3626,33 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     // The exact usage replaces the stream estimate: only
                                     // the difference is added (a counter cannot go down).
                                     let usage = crate::metrics::parse_usage(&tail);
+                                    // How much of a served conversation's
+                                    // prompt the backend skipped from its KV
+                                    // cache — the scheduler's view of who is
+                                    // cache-hot where (see `cold_hold`).
+                                    if status.is_success()
+                                        && !client_disconnected
+                                        && let Some(key) = task.session_key.as_ref()
+                                    {
+                                        // The follow-up (the client's next tool
+                                        // call) keeps queue priority while the
+                                        // session visibly stays active.
+                                        reserve_slot(&state_clone, key);
+                                        if let Some(hit) =
+                                            usage.and_then(|u| cache_hit_pct(u.prompt, u.prompt_eval))
+                                        {
+                                            // What the next turn must re-feed
+                                            // if the cache keeps nothing of
+                                            // this one: what was evaluated
+                                            // plus what was decoded.
+                                            let inc = usage
+                                                .and_then(|u| u.prompt_eval)
+                                                .map(|pe| pe.saturating_add(usage.map_or(0, |u| u.completion)));
+                                            record_conv_cache(
+                                                &state_clone, key, &backend_url, hit, inc,
+                                            );
+                                        }
+                                    }
                                     if let Some(u) = usage {
                                         count_tokens("prompt", u.prompt);
                                         count_tokens(
@@ -3575,6 +4015,7 @@ pub async fn proxy_handler(
         body,
         requested_model: requested_model.clone(),
         stuck_warned: false,
+        cache_passes: 0,
         queued_at: std::time::Instant::now(),
         key_label: client.as_ref().map(|c| {
             if c.key_label.is_empty() {
@@ -4459,6 +4900,7 @@ mod tests {
                 responder: tx,
                 requested_model: Some("no-such-model-xyz".to_string()),
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
@@ -4546,6 +4988,7 @@ mod tests {
                 responder: tx,
                 requested_model: Some("llama3".to_string()),
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
@@ -4829,6 +5272,7 @@ mod tests {
             responder: tx,
             requested_model: None,
             stuck_warned: false,
+            cache_passes: 0,
             queued_at: std::time::Instant::now(),
             key_label: None,
             session_key: None,
@@ -5452,6 +5896,7 @@ mod tests {
                 responder: tx,
                 requested_model: Some("qwen3.8-27b".to_string()),
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
@@ -5759,6 +6204,376 @@ mod tests {
         assert_eq!(v.last_seen(), half);
     }
 
+        #[test]
+    fn slot_reserve_privileges_only_a_recent_session() {
+        let k = key("thread", "m");
+        let other = key("other", "m");
+        let now = std::time::Instant::now();
+        let entry = |at: std::time::Instant, gap_max: f64, chain: u16| SlotReserve {
+            at,
+            gap_max_ms: gap_max,
+            chain,
+        };
+        let reserved =
+            HashMap::from([(k.clone(), entry(now - std::time::Duration::from_secs(3), 0.0, 0))]);
+        // A session that finished a turn inside the window goes first.
+        assert!(slot_reserved(Some(&k), &reserved, now));
+        // Everything else is ordinary traffic.
+        assert!(!slot_reserved(Some(&other), &reserved, now));
+        assert!(!slot_reserved(None, &reserved, now));
+        // Past the window the session lost its claim on the slot.
+        assert!(!slot_reserved(
+            Some(&k),
+            &reserved,
+            now + std::time::Duration::from_secs(5)
+        ));
+        // A session whose worst recent pause was 20 s stays privileged 12 s
+        // after its last turn (window 30 s); the unmeasured default is 5 s.
+        let slow = HashMap::from([(
+            k.clone(),
+            entry(now - std::time::Duration::from_secs(12), 20_000.0, 0),
+        )]);
+        assert!(slot_reserved(Some(&k), &slow, now));
+        // ... and a snappy one (worst pause 0.1 s -> 2 s floor) is not.
+        let fast = HashMap::from([(
+            k.clone(),
+            entry(now - std::time::Duration::from_secs(3), 100.0, 0),
+        )]);
+        assert!(!slot_reserved(Some(&k), &fast, now));
+        // The consecutive-win cap forces an ordinary round at the limit.
+        let chained = HashMap::from([(
+            k.clone(),
+            entry(now - std::time::Duration::from_secs(1), 0.0, SLOT_RESERVE_CHAIN),
+        )]);
+        assert!(!slot_reserved(Some(&k), &chained, now));
+    }
+
+    #[test]
+    fn reservation_bookkeeping_follows_the_observed_gaps() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        let k = key("thread", "m");
+        // Scripted clock: completions land one second apart, so every
+        // observed turnaround is 1 s until the scripted 20 s pause.
+        let c = std::time::Instant::now();
+        state.slot_reserve.lock_or_recover().insert(
+            k.clone(),
+            SlotReserve {
+                at: c,
+                gap_max_ms: 0.0,
+                chain: 0,
+            },
+        );
+        for turn in 1..=3u64 {
+            note_follow_up(state.as_ref(), &k, c + std::time::Duration::from_secs(turn));
+            let mut table = state.slot_reserve.lock_or_recover();
+            let e = table.get_mut(&k).unwrap();
+            assert_eq!(e.chain, turn as u16, "reserved win each turn");
+            assert!((e.gap_max_ms - 1_000.0).abs() < 40.0);
+            e.at = c + std::time::Duration::from_secs(turn); // the completion
+        }
+        // A 20 s pause exceeds the 2 s floor window: chain resets and the
+        // decaying max adopts it (window would now be 30 s, clamped).
+        note_follow_up(
+            state.as_ref(),
+            &k,
+            c + std::time::Duration::from_secs(23),
+        );
+        let e: SlotReserve = state.slot_reserve.lock_or_recover()[&k];
+        assert_eq!(e.chain, 0, "a dispatch outside the window breaks the chain");
+        assert!((e.gap_max_ms - 20_000.0).abs() < 60.0);
+        assert_eq!(reserve_window(e.gap_max_ms), SLOT_RESERVE_MAX);
+    }
+
+    #[test]
+    fn reserve_window_tracks_the_sessions_own_turnaround() {
+        // Nothing measured: the reference-fleet default.
+        assert_eq!(reserve_window(0.0), SLOT_RESERVE);
+        // 1.5x the decaying worst gap, clamped to the bounds.
+        assert_eq!(reserve_window(2_000.0), std::time::Duration::from_secs(3));
+        assert_eq!(reserve_window(1.0), SLOT_RESERVE_MIN);
+        assert_eq!(reserve_window(60_000.0), SLOT_RESERVE_MAX);
+    }
+
+    #[test]
+    fn cache_hit_pct_is_the_skipped_share() {
+        assert_eq!(cache_hit_pct(100, Some(25)), Some(75));
+        assert_eq!(cache_hit_pct(100, Some(0)), Some(100));
+        assert_eq!(cache_hit_pct(100, Some(100)), Some(0));
+        assert_eq!(cache_hit_pct(100, Some(150)), Some(0)); // clamped, never negative
+        assert_eq!(cache_hit_pct(0, Some(0)), None);
+        assert_eq!(cache_hit_pct(100, None), None); // server reported nothing
+    }
+
+    #[test]
+    fn cold_hold_only_holds_a_starved_cache_miss() {
+        let k = key("thread", "m");
+        let url = "http://127.0.0.1:9";
+        let now = std::time::Instant::now();
+        let ago = |secs: u64| now - std::time::Duration::from_secs(secs);
+        let backends = |free: Option<u8>| {
+            let mut b = BackendStatus::new(url.to_string(), None, Vec::new());
+            b.kv_free_pct = free;
+            vec![b]
+        };
+        let aff = HashMap::from([(
+            k.clone(),
+            Affinity {
+                backend_url: url.to_string(),
+                last_use: now,
+            },
+        )]);
+        let empty_aff: HashMap<SessionKey, Affinity> = HashMap::new();
+        // The candidate (fresh miss `hit`% at `at_cold`) plus `n_fresher`
+        // conversations this backend served more recently.
+        let memory = |hit: u8, at_cold: std::time::Instant, n_fresher: usize| {
+            let mut m = HashMap::from([(
+                (k.clone(), url.to_string()),
+                ConvCache {
+                    hit_pct: hit,
+                    at: at_cold,
+                    turns: 3,
+                    inc_tok: None,
+                },
+            )]);
+            for i in 0..n_fresher {
+                m.insert(
+                    (
+                        key(&format!("other-{i}"), "m"),
+                        url.to_string(),
+                    ),
+                    ConvCache {
+                        hit_pct: 100,
+                        at: now - std::time::Duration::from_secs(1 + i as u64 / 10),
+                        turns: 5,
+                        inc_tok: None,
+                    },
+                );
+            }
+            m
+        };
+        let fresh = |hit: u8| memory(hit, ago(3), 2);
+        let empty_mem: HashMap<(SessionKey, String), ConvCache> = HashMap::new();
+
+        // A fresh miss with two hotter conversations served since: hold.
+        assert!(cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &fresh(10),
+            &backends(Some(5)),
+            now
+        ));
+        // No session identity, no memory, no affinity: nothing to hold.
+        assert!(!cold_hold(None, 0, &aff, &fresh(10), &backends(Some(5)), now));
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &empty_mem,
+            &backends(Some(5)),
+            now
+        ));
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &empty_aff,
+            &fresh(10),
+            &backends(Some(5)),
+            now
+        ));
+        // Cache-hot conversation: it is the one the hold protects.
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &memory(90, ago(3), 2),
+            &backends(Some(5)),
+            now
+        ));
+        // A first- or second-turn miss proves nothing about contention: no hold.
+        {
+            let mut m = fresh(10);
+            m.get_mut(&(k.clone(), url.to_string())).unwrap().turns = 1;
+            assert!(!cold_hold(Some(&k), 0, &aff, &m, &backends(Some(5)), now));
+        }
+        // Inside the grace window (fewer than CACHE_GRACE newer services): the
+        // cache may still hold this conversation's context; never hold it.
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &memory(10, ago(3), 1),
+            &backends(Some(5)),
+            now
+        ));
+        // No KV telemetry (plain Ollama): the pathology is unobservable.
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &fresh(10),
+            &backends(None),
+            now
+        ));
+        // A fully free cache reports itself as such: room for this turn anyway.
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &fresh(10),
+            &backends(Some(100)),
+            now
+        ));
+        // A stale measurement describes an unknown cache: never cold.
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &memory(10, ago(600), 2),
+            &backends(Some(5)),
+            now
+        ));
+        // The yield budget bounds starvation: spent, the miss is dispatched.
+        assert!(!cold_hold(
+            Some(&k),
+            CACHE_HOLD_PASSES,
+            &aff,
+            &fresh(10),
+            &backends(Some(5)),
+            now
+        ));
+        // A remembered backend that is gone holds nobody.
+        let mut gone = backends(Some(5));
+        gone[0].url = "http://elsewhere".into();
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &fresh(10),
+            &gone,
+            now
+        ));
+        // KV budget: the backend can size its cache (200k tokens, 5% free =
+        // 10k) and the conversation's measured increment decides, not just
+        // "the cache is not empty".
+        let mut budgeted = backends(Some(5));
+        budgeted[0].loaded_ctx.insert("m".to_string(), 200_000);
+        let with_inc = |inc: Option<u64>| {
+            let mut m = fresh(10);
+            m.get_mut(&(k.clone(), url.to_string())).unwrap().inc_tok = inc;
+            m
+        };
+        // 30k to refeed > 10k free: it would evict the resident set, hold.
+        assert!(cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &with_inc(Some(30_000)),
+            &budgeted,
+            now
+        ));
+        // 5k < 10k free: it fits without eviction, no reason to hold even
+        // though the cache is 95% full.
+        assert!(!cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &with_inc(Some(5_000)),
+            &budgeted,
+            now
+        ));
+        // Unknown increment (server without prompt_eval): the pressure
+        // fallback applies again.
+        assert!(cold_hold(
+            Some(&k),
+            0,
+            &aff,
+            &with_inc(None),
+            &budgeted,
+            now
+        ));
+    }
+
+    /// A served conversation's prefix-cache hit is recorded per
+    /// (session, backend) from the server's own usage/timings, and a
+    /// halogen-style `/metrics` gauge lands on the backend as `kv_free_pct` —
+    /// the two signals `cold_hold` reads.
+    #[tokio::test]
+    async fn cache_hit_and_kv_pressure_are_recorded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route(
+                    "/v1/models",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({ "data": [{ "id": "m" }] }))
+                    }),
+                )
+                .route(
+                    "/metrics",
+                    axum::routing::get(|| async { "llamacpp:kv_cache_usage 0.95\n" }),
+                )
+                .route(
+                    "/v1/chat/completions",
+                    axum::routing::post(|| async {
+                        axum::Json(serde_json::json!({
+                            "choices": [{ "message": { "content": "hi" } }],
+                            "usage": { "prompt_tokens": 100, "completion_tokens": 2 },
+                            "timings": { "prompt_n": 10 },
+                        }))
+                    }),
+                );
+            let _ = axum::serve(listener, app).await;
+        });
+        let state = new_test_state(vec![url]);
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "thread-1".parse().expect("header value"));
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proxy_handler(
+                State(state.clone()),
+                ConnectInfo("127.0.0.1:41040".parse().expect("addr")),
+                Method::POST,
+                headers,
+                axum::extract::OriginalUri("/v1/chat/completions".parse().expect("uri")),
+                Bytes::from_static(br#"{"model":"m","messages":[]}"#),
+            ),
+        )
+        .await
+        .expect("answered")
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(res.into_body(), usize::MAX).await;
+
+        // Both signals are populated asynchronously: the usage at response
+        // end, the KV gauge on a probe round.
+        let (hit, free) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let free = state.backends.lock_or_recover()[0].kv_free_pct;
+                let hit = state
+                    .conv_cache
+                    .lock_or_recover()
+                    .iter()
+                    .find(|((k, _), _)| k.conversation == "thread-1")
+                    .map(|(_, c)| c.hit_pct);
+                if let (Some(h), Some(f)) = (hit, free) {
+                    break (h, f);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the cache signals were never recorded");
+        assert_eq!(hit, 90, "10 of 100 prompt tokens evaluated");
+        assert_eq!(free, 5, "0.95 used = 5% free");
+        worker.abort();
+    }
+
     #[test]
     fn fair_share_lets_a_past_heavy_user_back_in() {
         // The old ordering key was cumulative since startup, so a user with a
@@ -5805,6 +6620,7 @@ mod tests {
                     responder: tx,
                     requested_model: None,
                     stuck_warned: false,
+                    cache_passes: 0,
                     queued_at: std::time::Instant::now(),
                     key_label: None,
                     session_key: None,
@@ -5932,6 +6748,7 @@ mod tests {
                 responder: tx,
                 requested_model: Some(model.to_string()),
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key,
@@ -6353,6 +7170,7 @@ mod tests {
                     responder: tx,
                     requested_model: None,
                     stuck_warned: false,
+                    cache_passes: 0,
                     queued_at: now,
                     key_label: None,
                     session_key: None,
@@ -6741,6 +7559,7 @@ mod tests {
                 responder: tx,
                 requested_model: None,
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
@@ -6902,6 +7721,7 @@ mod tests {
                 responder: tx,
                 requested_model: Some(model.to_string()),
                 stuck_warned: false,
+                cache_passes: 0,
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
