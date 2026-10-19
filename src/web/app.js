@@ -572,12 +572,13 @@ function renderTimeline(st, ov) {
   const body = [...groups.values()]
     .sort((a, b) => (a.pseudo - b.pseudo) || (b.last - a.last))
     .map(g => {
-      // Rows step down with the axis: the session that started first in the
-      // window is the top row. The cap keeps the most recent starts.
+      // Same order as Details: last activity first, so a live session tops its
+      // group here and sits next to the same neighbours down below. The cap
+      // keeps the freshest activity of the group.
       const sess = [...g.sess.entries()]
-        .map(([key, rs]) => ({ key, rs, at: Math.min(...rs.map(x => x.plan.at)) }))
-        .sort((a, b) => a.at - b.at);
-      const shown = sess.slice(-TL_ROWS);
+        .map(([key, rs]) => ({ key, rs, end: Math.max(...rs.map(x => x.plan.end)) }))
+        .sort((a, b) => b.end - a.end);
+      const shown = sess.slice(0, TL_ROWS);
       hidden += sess.length - shown.length;
       const lane = g.idx != null ? laneOf.get(g.idx) : null;
       // Nothing but the name stands on the canvas — what the backend is doing
@@ -636,21 +637,34 @@ function rowBackend(r, ov) {
     : of('n' + r.o.backend, null, r.o.backend, true, null);
 }
 
-/** Clicking a row opens Details and jumps to that conversation. */
+/**
+ * Clicking a graph row focuses that conversation in whichever view is open:
+ * a folded Details block unfolds, a conversation hidden behind "Active" is
+ * revealed by flipping Show to "All", then the target scrolls into view and
+ * flashes. Both list rows and Details headers carry its data-key.
+ */
 function wireTimeline() {
+  const target = k => $$('#ov-now [data-key]').find(e => e.dataset.key === k);
   $$('#ov-timeline .tl-row').forEach(row => {
     row.onclick = () => {
-      if (S.reqView !== 'details') {
-        S.reqView = 'details';
-        try { localStorage.setItem('omq.reqView', S.reqView); } catch { /* storage blocked */ }
-        $('#ov-req-view input[value="details"]').checked = true;
-        render();
+      const key = row.dataset.key;
+      let redraw = false;
+      if (!target(key) && S.reqShow !== 'all') {
+        S.reqShow = 'all';
+        try { localStorage.setItem('omq.reqShow', S.reqShow); } catch { /* storage blocked */ }
+        $('#ov-req-show input[value="all"]').checked = true;
+        redraw = true;
       }
-      const head = $$('#ov-now .det-h').find(b => b.dataset.key === row.dataset.key);
-      if (!head) return;
-      head.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      head.classList.add('flash');
-      setTimeout(() => head.classList.remove('flash'), 1200);
+      if (S.collapsed.delete(key)) {
+        try { localStorage.setItem('omq.collapsed', JSON.stringify([...S.collapsed])); } catch { /* storage blocked */ }
+        redraw = true;
+      }
+      if (redraw) render();
+      const el = target(key);
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.add('flash');
+      setTimeout(() => el.classList.remove('flash'), 1200);
     };
   });
 }
@@ -745,12 +759,25 @@ function renderDetails(rows) {
     const asc = [...unit].sort((a, b) => a.plan.at - b.plan.at);
     const last = Math.max(...unit.map(x => x.plan.end));
     const bk = head.o.backend ? ` → ${esc(bkName(head.o.backend))}` : '';
+    // The conversation's current state: a running request decides (prefill
+    // until the first token, decode after), else a queued one; an idle
+    // conversation carries no chip at all.
+    const run = unit.find(x => x.kind === 'run'), wait = unit.find(x => x.kind === 'wait');
+    const chip = run
+      ? (run.o.state === 'generating' ? '<span class="badge ok">decode</span>'
+        : '<span class="badge accent">prefill</span>')
+      : wait ? `<span class="badge q" title="Position in this client's own queue">waiting #${wait.o.pos}</span>`
+      : '';
+    // The summary is three right-aligned columns so the numbers line up
+    // across headers; on phones the columns drop their min-widths and wrap.
+    const sum = `<span class="sum"><i>${unit.length} req</i><i>${fmtTok(unit.reduce((a, x) => a + rowTokens(x), 0))} tok</i>`
+      + `<i>${fmtTime(asc[0].plan.at)}→${last >= now - 1500 ? 'now' : fmtTime(last)}</i></span>`;
     out.push(`<button class="det-h" style="--c:var(--${c})" data-key="${esc(head.key)}" aria-expanded="${!shut}"
       title="${shut ? 'expand' : 'collapse'} this conversation">
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(head.o.client)}</span>
-      ${head.s ? `<span class="who">#${esc(head.s)}</span>` : ''}
+      ${head.s ? `<span class="who">#${esc(head.s)}</span>` : ''}${chip}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
-      <span class="sum">${unit.length} req · ${fmtTok(unit.reduce((a, x) => a + rowTokens(x), 0))} tok · ${fmtTime(asc[0].plan.at)}→${last >= now - 1500 ? 'now' : fmtTime(last)}</span></button>`);
+      ${sum}</button>`);
     if (shut) continue;
     const lines = [];
     for (let i = 0; i < asc.length; i++) {
@@ -763,7 +790,9 @@ function renderDetails(rows) {
         }
       }
       for (const e of asc[i].plan.events) {
-        lines.push({ t: e.at, html: `<div class="det-row"><span class="when">${fmtTime(e.at)}</span>`
+        // Live stage lines (the running request's now-still-unfinished ones)
+        // wear the yellow the List gives live rows.
+        lines.push({ t: e.at, html: `<div class="det-row${e.live ? ' live' : ''}"><span class="when">${fmtTime(e.at)}</span>`
           + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span></div>` });
       }
     }
@@ -787,6 +816,9 @@ const cvar = cls => cls === 'cother' ? 'c-other' : cls;
 
 /** Generated tokens of a row, however the row is shaped. */
 const rowTokens = row => row.kind === 'done' ? row.o.completion_tokens : row.kind === 'run' ? row.o.tokens : 0;
+
+/** Running and waiting rows share one treatment in both views. */
+const liveCls = row => row.kind === 'run' || row.kind === 'wait' ? ' is-live' : '';
 
 /** Conversations, newest activity first; a request without a session stands alone. */
 function threadUnits(rows) {
@@ -831,7 +863,7 @@ function phoneParts(row, ov) {
   }
   if (row.kind === 'wait') {
     return {
-      head: `<span class="badge warn" title="Position in this client's own queue">waiting #${o.pos}</span>`,
+      head: `<span class="badge q" title="Position in this client's own queue">waiting #${o.pos}</span>`,
       nums: `<span class="dim">≈${fmtTok(o.est_prompt_tokens)} tok</span>`,
       timing: `<span title="waiting for a free slot">wait ${fmtDur(o.waited_secs)}</span>`,
       bk: o.backends.length === 1 ? bkName(ov.backends[o.backends[0]]?.label) : 'any',
@@ -866,7 +898,7 @@ function phoneParts(row, ov) {
  *  backend does. Then the counts, then the timing. */
 function cardPhone(row, ov) {
   const p = phoneParts(row, ov);
-  return `<div class="rq"><div class="rq-1">${p.head}${swatch(row.o.client)}`
+  return `<div class="rq${liveCls(row)}" data-key="${esc(row.key)}"><div class="rq-1">${p.head}${swatch(row.o.client)}`
     + `<span class="who">${esc(row.o.client)}</span>`
     + `<span class="mb"><span class="mo">${esc(row.o.model)}</span><span class="ar">→</span>${esc(p.bk)}</span></div>`
     + `<div class="rq-2">${p.nums}</div>`
@@ -874,12 +906,9 @@ function cardPhone(row, ov) {
 }
 
 /** Phone layout of the List: cards instead of the reflowed table. */
-function requestsPhone(rows, ov, activeN) {
+function requestsPhone(rows, ov) {
   if (!rows.length) return '<div class="empty">Nothing running or waiting</div>';
-  const divider = '<div class="req-div-p"></div>';
-  const items = rows.map(r => ({ r }));
-  if (S.reqShow === 'all' && ov.recent.length) items.splice(activeN, 0, { div: true });
-  return items.map(e => e.div ? divider : cardPhone(e.r, ov)).join('');
+  return rows.map(r => cardPhone(r, ov)).join('');
 }
 
 
@@ -905,7 +934,8 @@ function reqRows(st, ov, all) {
 
 /**
  * The List under the timeline. Show: Active = running + waiting; All also lists
- * recently finished below a divider. View: List = newest first (cards on a
+ * recently finished (live rows carry a yellow tint, no section divider).
+ * View: List = newest first (cards on a
  * phone, a table here); Details = one block per conversation with a line per
  * stage event. Prefill is size · seconds (≈ while estimated), Gen time the
  * generation seconds (for running: since the first token), Cache the
@@ -931,7 +961,7 @@ function renderRequests(st, ov) {
     ? '<span class="badge ok">generating</span>'
     : `<span class="badge accent" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(r.elapsed_secs)}</span>`;
   // A phone gets cards, not a reflowed table: three tight lines per request.
-  if (isPhone()) { setHTML(el, requestsPhone(rows, ov, activeN)); return; }
+  if (isPhone()) { setHTML(el, requestsPhone(rows, ov)); return; }
 
   const clientOf = row => row.o.client;
 
@@ -943,7 +973,7 @@ function renderRequests(st, ov) {
   const tds = row => {
     const head = `<td>${row.kind === 'run' ? pill(row.o)
       : row.kind === 'wait'
-        ? `<span class="badge warn" title="Position in this client's own queue">waiting #${row.o.pos}</span>`
+        ? `<span class="badge q" title="Position in this client's own queue">waiting #${row.o.pos}</span>`
         : row.o.error ? `<span class="badge bad" title="${esc(row.o.outcome)}">${esc(row.o.status && row.o.status >= 500 ? `HTTP ${row.o.status}` : row.o.outcome.replace(/_/g, ' '))}</span>`
           : row.o.outcome === 'ok' ? `<span class="dim mono" title="finished">${fmtTime(row.t)}</span>`
           : `<span class="badge">${esc(row.o.outcome.replace(/_/g, ' '))}</span>`}</td>
@@ -980,11 +1010,7 @@ function renderRequests(st, ov) {
       <td class="num">${x.gen_tps == null ? dash : x.gen_tps.toFixed(1)}</td>`;
   };
 
-  const items = rows.map(r => ({ r }));
-  if (S.reqShow === 'all' && ov.recent.length) items.splice(activeN, 0, { div: true });
-  const body = items.map(e => e.div
-    ? '<tr class="req-div"><td colspan="11"></td></tr>'
-    : `<tr>${tds(e.r)}</tr>`).join('');
+  const body = rows.map(r => `<tr${liveCls(r)} data-key="${esc(r.key)}">${tds(r)}</tr>`).join('');
 
   const head = `<tr><th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
   setHTML(el, rows.length ? `<table>${head}${body}</table>` : '<div class="empty">Nothing running or waiting</div>');
