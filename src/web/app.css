@@ -194,6 +194,8 @@ tr.selected > td { background: var(--accent-soft); }
 .btn.on-boost { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn-group { display: inline-flex; gap: 6px; }
+/* The fold pair never splits — wrap as a unit, never internally. */
+#ov-fold { flex: none; flex-wrap: nowrap; }
 .linkbtn { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; padding: 0; }
 
 /* Backends */
