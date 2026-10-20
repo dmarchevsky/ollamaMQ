@@ -1168,11 +1168,11 @@ function renderBackendStats(ov) {
 }
 
 /** Waste cell for a windowed group (backend/client): share of its prefill
- *  time lost to cache eviction, absolute seconds beside it; `—` when no
+ *  time lost to cache eviction, absolute time beside it; `—` when no
  *  prefill was measurable there (not zero — it is absence, not a clean run). */
-const wasteCell = x => x.waste_pct == null ? dash
+const wasteCell = x => x.waste_pct == null ? '<span class="dim">—</span>'
   : `<span class="${x.waste_pct >= 15 ? 'st-bad' : x.waste_pct >= 5 ? 'st-warn' : 'st-ok'} mono">${x.waste_pct}%</span>`
-  + (x.waste_secs >= 1 ? ` <span class="dim mono">${fmtDur(x.waste_secs)}</span>` : '');
+  + (x.waste_secs >= 60 ? ` <span class="dim mono">${Math.round(x.waste_secs / 60)}m</span>` : '');
 
 function renderClientStats(st, ov) {
   const now = c => [c.running ? `${c.running} running` : '', c.queued ? `<span class="st-warn">${c.queued} waiting</span>` : '']
@@ -1391,18 +1391,18 @@ function clientDetail(r, st) {
          ? `<button class="btn sm" data-action="user" data-op="unblock" data-id="${id}">Unblock</button>`
          : `<button class="btn sm danger" data-action="user" data-op="block" data-id="${id}" title="Block this id (TUI: x)">Block</button>`}
        ${ipBtn}`;
-  const meta = `
-    <div><b>${u ? u.queued + u.processing : 0}</b>in queue</div>
-    <div><b>${fmtNum(u?.done ?? 0)}</b>requests done</div>
-    <div><b>${fmtNum(u?.dropped ?? 0)}</b>dropped</div>
-    <div><b class="mono">${esc(u?.ip ?? '—')}</b>last IP</div>${waste}
-    ${c ? `<div><b>${fmtAgo(lastUsed(c))}</b>last key use</div><div><b>${fmtDate(c.created_at_ms)}</b>created</div>` : ''}`;
   // Windowed waste lives in the overview payload (the Overview poll caches it);
   // without a cached overview there is nothing to show, so the tile is absent.
   const w = (S.overview?.clients || []).find(x => x.id === r.id);
   const waste = w && w.waste_pct != null
     ? `<div><b${w.waste_pct >= 15 ? ' class="st-bad"' : w.waste_pct >= 5 ? ' class="st-warn"' : ''}>${w.waste_pct}%</b>prefill lost to cache eviction (${fmtDur(w.waste_secs)})</div>`
     : '';
+  const meta = `
+    <div><b>${u ? u.queued + u.processing : 0}</b>in queue</div>
+    <div><b>${fmtNum(u?.done ?? 0)}</b>requests done</div>
+    <div><b>${fmtNum(u?.dropped ?? 0)}</b>dropped</div>
+    <div><b class="mono">${esc(u?.ip ?? '—')}</b>last IP</div>${waste}
+    ${c ? `<div><b>${fmtAgo(lastUsed(c))}</b>last key use</div><div><b>${fmtDate(c.created_at_ms)}</b>created</div>` : ''}`;
   let body;
   if (c) {
     body = `
