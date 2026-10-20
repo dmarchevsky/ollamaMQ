@@ -26,7 +26,7 @@
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
-- **Prometheus Metrics**: `GET /metrics` reports requests, outcomes, tokens, bytes and latency **per client and per model**, plus live queue and backend state.
+- **Prometheus Metrics**: `GET /metrics` reports requests, outcomes, tokens, bytes and latency **per client and per model**, plus live queue and backend state — including `ollamamq_cache_waste_seconds_total`, the prefill time lost re-evaluating a conversation's context after it was evicted from a backend's KV cache (the waste share is `rate(cache_waste_seconds_total) / rate(prompt_seconds_total)`; only backends reporting per-request prefill telemetry contribute).
 - **Web UI**: Everything the TUI does, in a browser at `/ui` behind a sign-in page — plus management of clients and their API keys.
 - **Clients & API Keys**: Give each client one or more keys (generated or any string you choose). A request with a client key queues under the client's name, so a key holder can't hop queues by changing `X-User-ID`.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.

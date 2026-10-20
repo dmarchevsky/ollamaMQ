@@ -55,7 +55,7 @@ impl UserRow {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq)]
 pub struct StateSnapshot {
     /// Users in display order.
     pub users: Vec<UserRow>,
@@ -70,6 +70,10 @@ pub struct StateSnapshot {
     pub vip_user: Option<String>,
     pub boost_user: Option<String>,
     pub backends: Vec<BackendStatus>,
+    /// Per backend (same order as `backends`): `(prefill secs, waste secs)`
+    /// of the retained request history; `(0.0, 0.0)` where nothing was
+    /// measurable — the TUI's Waste column renders `—` for those.
+    pub backend_waste: Vec<(f64, f64)>,
     /// Recent request/control events (newest first) for the Logs panel.
     pub logs: Vec<LogEvent>,
     pub active_ops: Vec<ActiveOpView>,
@@ -116,6 +120,23 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
     let vip_user = state.vip_user.lock_or_recover().clone();
     let boost_user = state.boost_user.lock_or_recover().clone();
     let backends = state.backends.lock_or_recover().clone();
+    // Waste totals per backend from the retained finish history (the same
+    // data the Web overview windows over; the TUI shows the whole history).
+    let backend_waste: Vec<(f64, f64)> = {
+        let mut acc: Vec<(f64, f64)> = vec![(0.0, 0.0); backends.len()];
+        let labels: Vec<String> = backends.iter().map(|b| crate::metrics::backend_label(&b.url)).collect();
+        for f in state.stats.finished_since(0) {
+            let Some(w) = f.timing.waste_secs else { continue };
+            let Some(idx) = f.backend.as_deref().and_then(|l| labels.iter().position(|x| x == l)) else {
+                continue;
+            };
+            if let Some((ps, _)) = f.timing.prefill {
+                acc[idx].0 += ps;
+            }
+            acc[idx].1 += w;
+        }
+        acc
+    };
     let logs: Vec<LogEvent> = state
         .logs
         .lock_or_recover()
@@ -168,6 +189,7 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
         vip_user,
         boost_user,
         backends,
+        backend_waste,
         logs,
         active_ops,
         recent_results,
