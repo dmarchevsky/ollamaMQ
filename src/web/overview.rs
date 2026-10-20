@@ -1,7 +1,8 @@
-//! `GET /ui/api/overview?window=5m|15m|1h`: the Overview page's numbers,
-//! computed from the rolling history in [`crate::stats`] plus the live state.
+//! `GET /ui/api/overview?window=Nm|Nh&clients=a,b&backends=..&models=..&mode=key`:
+//! the Overview page's numbers, computed from the rolling history in
+//! [`crate::stats`] plus the live state, narrowed by the filter modal's scope.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
@@ -23,21 +24,66 @@ const MAX_QUEUE: usize = 100;
 /// Rows of the Requests table's finished list.
 const MAX_RECENT: usize = 100;
 /// Fixed lane bucket widths, chosen so the bar count stays ~30–60 and edges
-/// land on round multiples: 5 min→10 s, 15 min→30 s, 1 h→60 s.
+/// land on round multiples: 5 min→10 s, 15 min→30 s, 1 h→60 s; longer
+/// windows widen the bucket to keep the count near 30.
 fn lane_bucket_secs(window_secs: u64) -> u64 {
     match window_secs {
         300 => 10,
         3600 => 60,
+        w if w > 3600 => w.div_ceil(SPARK_BUCKETS as u64).max(60),
         _ => 30,
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct OverviewQuery {
+    /// `5m`, `15m`, `1h`, or any `Nm`/`Nh` up to 24 h (the retention window).
     window: Option<String>,
-    /// Keep only this client's traffic — the Overview client filter. Absent or
-    /// empty means every client.
+    /// Legacy single-client filter (kept: `clients` supersedes it).
     client: Option<String>,
+    /// Comma-separated client selection. A bare name matches every key of
+    /// that client; `name\tkeylabel` matches one key (label mode).
+    clients: Option<String>,
+    /// Comma-separated backend labels.
+    backends: Option<String>,
+    /// Comma-separated model names.
+    models: Option<String>,
+    /// `key` groups the client table and lane segments by client + key label.
+    mode: Option<String>,
+}
+
+/// The Overview filter selection: `None` on every axis means "everything".
+#[derive(Default)]
+struct Scope {
+    clients: Option<HashSet<String>>,
+    backends: Option<HashSet<String>>,
+    models: Option<HashSet<String>>,
+}
+
+impl Scope {
+    /// `entry` is a bare client name (matches any key) or `name\tkeylabel`.
+    fn client_ok(&self, client: &str, key: &str) -> bool {
+        self.clients.as_ref().is_none_or(|s| {
+            s.contains(client) || s.contains(&format!("{client}\t{key}"))
+        })
+    }
+    /// Whether the client name (any key) is in scope — for per-user gauges
+    /// that cannot be split per key.
+    fn client_name_ok(&self, client: &str) -> bool {
+        self.clients.as_ref().is_none_or(|s| {
+            s.contains(client) || s.iter().any(|e| e.starts_with(&format!("{client}\t")))
+        })
+    }
+    fn model_ok(&self, m: &str) -> bool {
+        self.models.as_ref().is_none_or(|s| s.contains(m))
+    }
+    fn backend_ok(&self, b: &str) -> bool {
+        self.backends.as_ref().is_none_or(|s| s.contains(b))
+    }
+}
+
+fn csv(v: Option<&str>) -> Option<HashSet<String>> {
+    v.map(|s| s.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect())
 }
 
 #[derive(Serialize)]
@@ -123,6 +169,8 @@ struct ClientStats {
 #[derive(Serialize)]
 struct Waiting {
     client: String,
+    /// API key label (or id), `none` when keyless — the label mode suffix.
+    key: String,
     model: String,
     waited_secs: f64,
     /// 1-based position in the client's own queue.
@@ -186,6 +234,8 @@ struct Recent {
     error: bool,
     status: Option<u16>,
     waited_secs: Option<f64>,
+    /// API key label (or id), `none` when keyless — the label mode suffix.
+    key: String,
     prompt_tokens: u64,
     prefill_secs: Option<f64>,
     prefill_tokens: Option<u64>,
@@ -200,23 +250,35 @@ struct Recent {
     gen_tps: Option<f64>,
 }
 
-/// One source of the Overview, narrowed to the selected client: `client`'s
-/// items only, or everything when no client is selected. Backend-wide gauges
-/// (free slots, online state) never filter — they are the backend's, not the
-/// client's.
-fn keep<T>(items: Vec<T>, client: Option<&str>, client_of: impl Fn(&T) -> &str) -> Vec<T> {
-    match client {
-        Some(c) => items.into_iter().filter(|it| client_of(it) == c).collect(),
-        None => items,
-    }
+/// Items the scope selects on the client axis (per-request precision).
+fn keep<T>(items: Vec<T>, scope: &Scope, ident: impl Fn(&T) -> (&str, &str)) -> Vec<T> {
+    items
+        .into_iter()
+        .filter(|it| {
+            let (c, k) = ident(it);
+            scope.client_ok(c, k)
+        })
+        .collect()
 }
 
 fn window_secs(w: Option<&str>) -> u64 {
-    match w {
-        Some("5m") => 300,
-        Some("1h") => 3600,
-        _ => 900,
-    }
+    let s = match w {
+        Some(s) => s.trim().to_ascii_lowercase(),
+        None => return 900,
+    };
+    let (num, mult) = match s.strip_suffix('h') {
+        Some(n) => (n, 3600),
+        None => match s.strip_suffix('m') {
+            Some(n) => (n, 60),
+            None => (s.as_str(), 60), // a bare number reads as minutes
+        },
+    };
+    num
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v > 0)
+        .map(|v| (v * mult).min(24 * 3600)) // nothing is kept longer than a day
+        .unwrap_or(900)
 }
 
 /// Percent of the prompt that did not need prefill (prefix-cache hit).
@@ -335,7 +397,18 @@ pub async fn get_overview(
     Query(q): Query<OverviewQuery>,
 ) -> Json<OverviewView> {
     let window = window_secs(q.window.as_deref());
-    let client = q.client.as_deref().filter(|c| !c.is_empty());
+    let key_mode = q.mode.as_deref() == Some("key");
+    let mut clients = csv(q.clients.as_deref());
+    if clients.is_none() {
+        if let Some(c) = q.client.as_deref().filter(|c| !c.is_empty()) {
+            clients = Some(HashSet::from([c.to_string()]));
+        }
+    }
+    let scope = Scope { clients, backends: csv(q.backends.as_deref()), models: csv(q.models.as_deref()) };
+    // Display identity: in key mode a client is shown as `client:keylabel`.
+    let disp = |client: &str, key: &str| -> String {
+        if key_mode && key != "none" { format!("{client}:{key}") } else { client.to_string() }
+    };
     let now = stats::now_ms();
     let from = now.saturating_sub(window * 1000);
     let bucket_secs = window as f64 / SPARK_BUCKETS as f64;
@@ -344,26 +417,38 @@ pub async fn get_overview(
     let w_ms = lane_bucket_secs(window) * 1000;
     let n = (window * 1000 / w_ms) as usize;
     let lane_from = now / w_ms * w_ms - (n as u64 - 1) * w_ms;
-    let finished = keep(state.stats.finished_since(from), client, |f| &f.client);
+    let finished = state
+        .stats
+        .finished_since(from)
+        .into_iter()
+        .filter(|f| {
+            scope.client_ok(&f.client, &f.key)
+                && scope.model_ok(&f.model)
+                && f.backend.as_deref().is_none_or(|b| scope.backend_ok(b))
+        })
+        .collect::<Vec<_>>();
     let mut snap = snapshot::capture(&state, 0);
-    // The per-user rows carry the live Queue/Running gauges, so they filter too.
-    if let Some(c) = client {
-        snap.users.retain(|u| u.id == c);
-    }
-    let runs = keep(state.runs.list(), client, |r| &r.client);
+    // The per-user rows carry the live Queue/Running gauges, so they filter too
+    // (by client name — a user row cannot be split per key).
+    snap.users.retain(|u| scope.client_name_ok(&u.id));
+    let runs = keep(state.runs.list(), &scope, |r| (&r.client, r.key.as_str()))
+        .into_iter()
+        .filter(|r| scope.model_ok(&r.model) && scope.backend_ok(&r.backend))
+        .collect::<Vec<_>>();
 
     // Waiting requests, copied out under the queues lock and labelled
     // afterwards (that takes the backends lock).
-    let waiting: Vec<(String, Option<String>, f64, usize, usize, Option<String>)> = state
+    let waiting: Vec<(String, Option<String>, Option<String>, f64, usize, usize, Option<String>)> = state
         .queues
         .lock_or_recover()
         .iter()
-        .filter(|(id, _)| client.is_none_or(|c| *id == c))
+        .filter(|(id, _)| scope.client_name_ok(id))
         .flat_map(|(client, q)| {
             q.iter().enumerate().map(move |(i, t)| {
                 (
                     client.clone(),
                     t.requested_model.clone(),
+                    t.key_label.clone(),
                     t.queued_at.elapsed().as_secs_f64(),
                     i + 1,
                     t.body.len(),
@@ -377,7 +462,7 @@ pub async fn get_overview(
         let backends = state.backends.lock_or_recover();
         waiting
             .into_iter()
-            .map(|(client, model, waited_secs, pos, body_len, session)| Waiting {
+            .map(|(client, model, key_label, waited_secs, pos, body_len, session)| Waiting {
                 backends: model
                     .as_deref()
                     .map(|m| {
@@ -392,9 +477,18 @@ pub async fn get_overview(
                 model: model_label_in(&backends, model.as_deref()),
                 est_prompt_tokens: (body_len / 4) as u64,
                 session,
+                key: crate::stats::key_or_none(&key_label),
                 client,
                 waited_secs,
                 pos,
+            })
+            .filter(|w| {
+                scope.client_ok(&w.client, &w.key)
+                    && scope.model_ok(&w.model)
+                    // A waiting request belongs to a selected backend when any
+                    // backend that could take it is selected.
+                    && (scope.backends.is_none()
+                        || w.backends.iter().any(|i| scope.backend_ok(&backend_label(&backends[*i].url))))
             })
             .collect()
     };
@@ -435,10 +529,11 @@ pub async fn get_overview(
                 online: b.is_online,
                 api_type: b.api_type.display(),
                 // Backend-wide when unfiltered; the client's own requests when
-                // the filter is on (free slots stay the backend's).
-                running: match client {
-                    Some(_) => runs.iter().filter(|r| r.backend == label).count(),
-                    None => b.active_requests,
+                // a client filter is on (free slots stay the backend's).
+                running: if scope.clients.is_some() {
+                    runs.iter().filter(|r| r.backend == label).count()
+                } else {
+                    b.active_requests
                 },
                 max: state.backend_capacity(b).0,
                 free: state.free_slots(b, loading_at(idx).is_some()),
@@ -449,6 +544,10 @@ pub async fn get_overview(
                 label,
             }
         })
+        // The backend filter hides whole backends (their lanes and capacity
+        // rows go too); indices stay the originals.
+        .into_iter()
+        .filter(|b| scope.backend_ok(&b.label))
         .collect();
 
     // --- activity swimlanes
@@ -468,14 +567,14 @@ pub async fn get_overview(
             let wait_ms = (f.queue_wait.unwrap_or(0.0) * 1000.0) as u64;
             if wait_ms > 0 {
                 occ[idx].push(Occ {
-                    client: f.client.clone(),
+                    client: disp(&f.client, &f.key),
                     from_ms: run_start.saturating_sub(wait_ms),
                     to_ms: run_start,
                     waiting: true,
                 });
             }
             occ[idx].push(Occ {
-                client: f.client.clone(),
+                client: disp(&f.client, &f.key),
                 from_ms: run_start,
                 to_ms: run_end,
                 waiting: false,
@@ -498,7 +597,7 @@ pub async fn get_overview(
         requests[idx] += 1;
         let start = now.saturating_sub((r.started.elapsed().as_secs_f64() * 1000.0) as u64);
         occ[idx].push(Occ {
-            client: r.client.clone(),
+            client: disp(&r.client, &r.key),
             from_ms: start,
             to_ms: now,
             waiting: false,
@@ -506,7 +605,7 @@ pub async fn get_overview(
         let wait_ms = (r.waited_secs * 1000.0) as u64;
         if wait_ms > 0 {
             occ[idx].push(Occ {
-                client: r.client.clone(),
+                client: disp(&r.client, &r.key),
                 from_ms: start.saturating_sub(wait_ms),
                 to_ms: start,
                 waiting: true,
@@ -519,7 +618,7 @@ pub async fn get_overview(
         if w.backends.len() == 1 {
             let idx = w.backends[0];
             occ[idx].push(Occ {
-                client: w.client.clone(),
+                client: disp(&w.client, &w.key),
                 from_ms: now.saturating_sub((w.waited_secs * 1000.0) as u64),
                 to_ms: now,
                 waiting: true,
@@ -560,6 +659,7 @@ pub async fn get_overview(
             prefill_tokens: f.timing.prefill.map(|(_, t)| t),
             gen_secs: f.timing.decode.map(|(s, _)| s),
             session: f.session.clone(),
+            key: f.key.clone(),
             cache_pct: cache_pct(f.timing.prompt_tokens, f.timing.prefill.map(|(_, t)| t)),
             ttft_secs: f.timing.ttft,
             completion_tokens: f.timing.completion_tokens,
@@ -572,26 +672,32 @@ pub async fn get_overview(
         .collect();
 
     // --- clients: slot time of finished requests plus, for those still
-    // running, the part of their run inside the window.
-    let mut by_client: BTreeMap<String, Agg> = group_by(&finished, |f| Some(f.client.clone()));
+    // running, the part of their run inside the window. In key mode the rows
+    // are per client + key pair (`client:keylabel`); the live per-user gauges
+    // (running/queued) cannot be split per key, so keyed rows carry finished
+    // traffic and their own running seconds only.
+    let mut by_client: BTreeMap<String, Agg> = group_by(&finished, |f| Some(disp(&f.client, &f.key)));
     let mut running_secs: HashMap<String, f64> = HashMap::new();
     for r in &runs {
         let secs = r.started.elapsed().as_secs_f64().min(window as f64);
-        *running_secs.entry(r.client.clone()).or_default() += secs;
+        *running_secs.entry(disp(&r.client, &r.key)).or_default() += secs;
     }
-    for u in snap.users.iter().filter(|u| u.outstanding() > 0) {
-        by_client.entry(u.id.clone()).or_default();
+    if !key_mode {
+        for u in snap.users.iter().filter(|u| u.outstanding() > 0) {
+            by_client.entry(u.id.clone()).or_default();
+        }
     }
     let mut clients: Vec<ClientStats> = by_client
         .into_iter()
         .map(|(id, agg)| {
             let mut stats = agg.summary();
             stats.busy_secs += running_secs.get(&id).copied().unwrap_or(0.0);
-            let user = snap.users.iter().find(|u| u.id == id);
+            let uname = id.split(':').next().unwrap_or(id.as_str());
+            let user = snap.users.iter().find(|u| u.id == uname);
             ClientStats {
                 registered: user.is_some_and(|u| u.registered),
-                running: user.map_or(0, |u| u.processing),
-                queued: user.map_or(0, |u| u.queued),
+                running: if key_mode { 0 } else { user.map_or(0, |u| u.processing) },
+                queued: if key_mode { 0 } else { user.map_or(0, |u| u.queued) },
                 share: 0.0,
                 stats,
                 id,
@@ -662,8 +768,29 @@ mod tests {
         assert_eq!(window_secs(Some("5m")), 300);
         assert_eq!(window_secs(Some("15m")), 900);
         assert_eq!(window_secs(Some("1h")), 3600);
+        assert_eq!(window_secs(Some("90m")), 5400);
+        assert_eq!(window_secs(Some("6h")), 21600);
+        assert_eq!(window_secs(Some("30h")), 24 * 3600); // clamped to retention
         assert_eq!(window_secs(Some("bogus")), 900);
         assert_eq!(window_secs(None), 900);
+    }
+
+    #[test]
+    fn scope_matches_names_and_key_pairs() {
+        let scope = Scope {
+            clients: csv(Some("alice,bob\tgen")),
+            backends: csv(Some("b1")),
+            models: None,
+        };
+        assert!(scope.client_ok("alice", "anykey")); // bare name: every key
+        assert!(scope.client_ok("bob", "gen"));
+        assert!(!scope.client_ok("bob", "dev"));
+        assert!(!scope.client_ok("carol", "gen"));
+        assert!(scope.client_name_ok("bob")); // user gauges see the name
+        assert!(scope.backend_ok("b1") && !scope.backend_ok("b2"));
+        assert!(scope.model_ok("anything")); // unlisted axis = everything
+        let all = Scope::default();
+        assert!(all.client_ok("whoever", "whatever") && all.backend_ok("x"));
     }
 
     fn occ(client: &str, from_ms: u64, to_ms: u64, waiting: bool) -> Occ {
@@ -779,6 +906,7 @@ mod tests {
             state.stats.record(crate::stats::Finished {
                 at_ms: stats::now_ms(),
                 client: (*client).to_string(),
+                key: "none".into(),
                 model: "m".into(),
                 backend: Some(label.clone()),
                 outcome: "ok",
@@ -797,7 +925,7 @@ mod tests {
     async fn overview(state: &Arc<AppState>, client: Option<&str>) -> OverviewView {
         get_overview(
             State(state.clone()),
-            Query(OverviewQuery { window: None, client: client.map(str::to_string) }),
+            Query(OverviewQuery { window: None, client: client.map(str::to_string), ..Default::default() }),
         )
         .await
         .0
