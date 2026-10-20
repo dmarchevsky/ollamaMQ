@@ -246,9 +246,10 @@ function overviewPath() {
   const f = S.filters;
   let p = `overview?window=${encodeURIComponent(f.win)}`;
   if (f.mode === 'key') p += '&mode=key';
-  if (f.clients.length) p += `&clients=${f.clients.map(encodeURIComponent).join(',')}`;
-  if (f.backends.length) p += `&backends=${f.backends.map(encodeURIComponent).join(',')}`;
-  if (f.models.length) p += `&models=${f.models.map(encodeURIComponent).join(',')}`;
+  // An FNONE selection sends the empty value — the server reads "no entries"
+  // as a scope that matches nothing.
+  const q = (name, sel) => !sel.length ? '' : `&${name}=${sel.map(v => v === FNONE ? '' : encodeURIComponent(v)).join(',')}`;
+  p += q('clients', f.clients) + q('backends', f.backends) + q('models', f.models);
   return p;
 }
 
@@ -370,8 +371,24 @@ function openFilters() {
 }
 
 /** A checkbox row, checked when the selection is empty (= everything) or holds
- *  the value. */
+ *  the value. `FNONE` is the explicit *nothing ticked* selection — it matches
+ *  no real value, so the whole list renders unticked and the server receives
+ *  an empty scope parameter that selects nothing. */
+const FNONE = '\u0000none';
 const fchk = (sel, val, label) => `<label class="check"><input type="checkbox" value="${esc(val)}"${!sel.length || sel.includes(val) ? ' checked' : ''}> ${label}</label>`;
+const cntText = (sel, n) => sel.length === 1 && sel[0] === FNONE ? 'none' : !sel.length ? 'all' : `${sel.length} of ${n}`;
+
+/** Refresh a list's `all / none / k of n` counter from its checkbox state. */
+function updCnt(id) {
+  const all = $$('input', $('#' + id));
+  const on = all.filter(i => i.checked).length;
+  const el = $(`#dlg-filters [data-cnt="${id}"]`);
+  if (el) el.textContent = on === all.length ? 'all' : on ? `${on} of ${all.length}` : 'none';
+}
+
+/** List header: title, live count and the working all · none links. */
+const flhead = (title, id, sel, n) => `<div class="fhead"><b>${title}</b><span class="hint" data-cnt="${id}">${cntText(sel, n)}</span>
+  <span class="ftog"><button type="button" class="linkbtn" data-tog="all" data-l="${id}">all</button> · <button type="button" class="linkbtn" data-tog="none" data-l="${id}">none</button></span></div>`;
 
 function drawFilters() {
   const f = S.filters, st = S.state, ov = S.overview || {};
@@ -386,12 +403,17 @@ function drawFilters() {
     <div class="frow"><span class="seg" role="radiogroup" aria-label="Client identity">
       <label><input type="radio" name="fmode" value="client"${f.mode === 'client' ? ' checked' : ''}><span>Clients</span></label>
       <label><input type="radio" name="fmode" value="key"${f.mode === 'key' ? ' checked' : ''}><span>Clients + label</span></label></span></div>`);
-  const cl = clientChoices(st, ov), bk = ov.backends || [], md = modelChoices(st, ov);
-  setHTML($('#f-clients'), `<div class="fhead"><b>Clients</b><span class="hint">${f.clients.length ? `${f.clients.length} of ${cl.length}` : 'all'}</span></div>
+  const cl = clientChoices(st, ov);
+  // Universes come from the unfiltered state, never from the scoped overview:
+  // a filtered list could shrink to its own selection, and "all boxes ticked"
+  // would then compact back to "everything" and silently drop the filter.
+  const bk = [...new Set(st ? st.backends.map(b => hostOf(b.url)) : (ov.backends || []).map(b => b.label))];
+  const md = modelChoices(st);
+  setHTML($('#f-clients'), `${flhead('Clients', 'f-cl-list', f.clients, cl.length)}
     <div class="flist" id="f-cl-list">${cl.map(c => fchk(f.clients, c.id, `${swatch(c.label)}${esc(c.label)}`)).join('')}</div>`);
-  setHTML($('#f-backends'), `<div class="fhead"><b>Backends</b><span class="hint">${f.backends.length ? `${f.backends.length} of ${bk.length}` : 'all'}</span></div>
-    <div class="flist" id="f-bk-list">${bk.map(b => fchk(f.backends, b.label, bkCell(b.label))).join('')}</div>`);
-  setHTML($('#f-models'), `<div class="fhead"><b>Models</b><span class="hint">${f.models.length ? `${f.models.length} of ${md.length}` : 'all'}</span></div>
+  setHTML($('#f-backends'), `${flhead('Backends', 'f-bk-list', f.backends, bk.length)}
+    <div class="flist" id="f-bk-list">${bk.map(l => fchk(f.backends, l, bkCell(l))).join('')}</div>`);
+  setHTML($('#f-models'), `${flhead('Models', 'f-md-list', f.models, md.length)}
     <div class="flist" id="f-md-list">${md.map(m => fchk(f.models, m, esc(m))).join('')}</div>`);
 }
 
@@ -407,29 +429,32 @@ function clientChoices(st, ov) {
   return [...pairs].sort((a, b) => a[1].localeCompare(b[1])).map(([id, label]) => ({ id, label }));
 }
 
-/** Every model any backend lists, plus whatever traffic in the window used. */
-function modelChoices(st, ov) {
-  const s = new Set((st ? modelCatalog(st) : []).map(m => m.name));
-  for (const r of ov.recent || []) if (r.model) s.add(r.model);
-  for (const w of ov.queue || []) if (w.model) s.add(w.model);
-  return [...s].sort((a, b) => a.localeCompare(b));
+/** Models the modal offers: everything the Models page considers served or
+ *  partially served — hidden ones cannot be requested anyway. */
+function modelChoices(st) {
+  return (st ? modelCatalog(st) : [])
+    .filter(m => m.status !== 'hidden')
+    .map(m => m.name)
+    .sort((a, b) => a.localeCompare(b));
 }
 
 /** Read the modal back into S.filters. A list with every box ticked stores
- *  empty — "everything" travels compactly, matching the server's scope rule
- *  (no ticked boxes at all would be "nothing to show", so it reads as all). */
+ *  empty — "everything" travels compactly, matching the server's scope rule;
+ *  a list with no box ticked stores `FNONE`, which travels as an empty scope
+ *  parameter and shows nothing. The custom interval wins over a preset. */
 function collectFilters() {
   const f = S.filters;
   const win = $('#dlg-filters input[name="fwin"]:checked')?.value;
   const n = ($('#f-win-n').value || '').trim();
-  f.win = win || (/^\d+$/.test(n)
+  const custom = /^\d+$/.test(n)
     ? Math.min(+n || 1, $('#f-win-u').value === 'h' ? 24 : 1440) + $('#f-win-u').value
-    : '15m');
+    : null;
+  f.win = custom || win || '15m';
   f.mode = $('#dlg-filters input[name="fmode"]:checked').value;
   const read = id => {
     const all = $$('#' + id + ' input');
     const on = [...all].filter(i => i.checked).map(i => i.value);
-    return on.length === all.length ? [] : on;
+    return on.length === all.length ? [] : on.length ? on : [FNONE];
   };
   f.clients = read('f-cl-list');
   f.backends = read('f-bk-list');
@@ -932,6 +957,10 @@ function threadUnits(rows) {
   return [...groups.values()].sort((a, b) => Math.min(...b.map(x => x.plan.at)) - Math.min(...a.map(x => x.plan.at)));
 }
 
+const saveCollapsed = () => {
+  try { localStorage.setItem('omq.collapsed', JSON.stringify([...S.collapsed])); } catch { /* storage blocked */ }
+};
+
 /** Fold handlers for the Details conversation headers (state lives in
  *  S.collapsed, because the list is rebuilt on every poll). */
 function wireFold() {
@@ -939,7 +968,7 @@ function wireFold() {
     b.onclick = () => {
       const k = b.dataset.key;
       if (S.collapsed.has(k)) S.collapsed.delete(k); else S.collapsed.add(k);
-      try { localStorage.setItem('omq.collapsed', JSON.stringify([...S.collapsed])); } catch { /* storage blocked */ }
+      saveCollapsed();
       render();
     };
   });
@@ -1053,6 +1082,7 @@ function renderRequests(st, ov) {
   segCount('#ov-req-show', 1, activeN + ov.recent.length);
 
   const el = $('#ov-now');
+  $('#ov-fold').hidden = S.reqView !== 'details';
   if (S.reqView === 'details') {
     for (const r of rows) r.plan = stagePlan(r, now);
     setHTML(el, renderDetails(rows));
@@ -1369,6 +1399,7 @@ function clientDetail(r, st) {
           <td class="actions"><span class="btn-group">
             <button class="btn sm" data-action="copy-key" data-id="${esc(k.id)}">Copy</button>
             <button class="btn sm" data-action="reassign-key" data-id="${esc(k.id)}" ${S.clients.length < 2 ? 'disabled' : ''}>Reassign</button>
+            <button class="btn sm" data-action="rename-key" data-id="${esc(k.id)}">Rename</button>
             <button class="btn sm danger" data-action="revoke-key" data-id="${esc(k.id)}">Revoke</button>
           </span></td></tr>`;
       }).join('')}</table></div>`
@@ -2089,6 +2120,21 @@ const actions = {
     if (!await confirmDlg('Revoke key?', `<code>${esc(maskKey(f.key.key))}</code> (${esc(f.key.label || 'no label')}) stops identifying <b>${esc(f.client.name)}</b> immediately.`, 'Revoke')) return;
     return act('DELETE', `keys/${encodeURIComponent(f.key.id)}`, undefined, 'Key revoked');
   },
+  'rename-key': el => {
+    const td = el.closest('tr').children[1];
+    if ($('input', td)) return;
+    td.innerHTML = `<input type="text" maxlength="60" value="${esc(findKey(el.dataset.id).key.label || '')}" placeholder="label" title="Enter saves, Esc cancels">`;
+    const inp = $('input', td);
+    inp.focus();
+    inp.select();
+    inp.addEventListener('keydown', async e => {
+      if (e.key === 'Escape') render();
+      else if (e.key === 'Enter') { e.preventDefault(); if (await act('PATCH', `keys/${encodeURIComponent(el.dataset.id)}`, { label: inp.value.trim() }, 'Label updated')) render(); }
+    });
+    inp.addEventListener('blur', () => { if (document.contains(inp)) render(); });
+  },
+  'fold-all': () => { S.collapsed.clear(); saveCollapsed(); render(); },
+  'fold-none': () => { for (const b of $$('#ov-now .det-h')) S.collapsed.add(b.dataset.key); saveCollapsed(); render(); },
 
   'log-detail': async el => {
     const seq = el.dataset.seq;
@@ -2154,6 +2200,27 @@ $('#dlg-filters').addEventListener('close', e => {
     poll();
   }
 });
+// Modal interactions: the custom interval and the presets exclude each other,
+// switching identity repopulates the Clients list at once, and the all/none
+// links tick whole lists.
+{
+  const dlg = $('#dlg-filters');
+  const clearPresets = () => $$('input[name="fwin"]', dlg).forEach(r => { r.checked = false; });
+  dlg.addEventListener('input', e => { if (e.target.id === 'f-win-n') clearPresets(); });
+  dlg.addEventListener('change', e => {
+    const t = e.target;
+    if (t.name === 'fwin') $(dlg).querySelector('#f-win-n').value = '';
+    else if (t.id === 'f-win-u') clearPresets();
+    else if (t.name === 'fmode') { collectFilters(); drawFilters(); }
+    else if (t.type === 'checkbox' && t.closest('.flist')) updCnt(t.closest('.flist').id);
+  });
+  dlg.addEventListener('click', e => {
+    const b = e.target.closest('[data-tog]');
+    if (!b) return;
+    $$('input', $('#' + b.dataset.l)).forEach(i => { i.checked = b.dataset.tog === 'all'; });
+    updCnt(b.dataset.l);
+  });
+}
 $('#f-reset').addEventListener('click', () => {
   S.filters = { win: '15m', mode: 'client', clients: [], backends: [], models: [] };
   drawFilters();

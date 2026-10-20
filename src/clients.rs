@@ -458,6 +458,25 @@ impl ClientStore {
         self.commit(next)
     }
 
+    /// Rename a key's label (what the Overview's label mode shows); an empty
+    /// string clears it.
+    pub fn set_key_label(&mut self, id: &str, label: &str) -> Result<(), StoreError> {
+        let mut next = self.clients.clone();
+        let mut hit = false;
+        for c in &mut next {
+            for k in &mut c.keys {
+                if k.id == id {
+                    k.label = clip(label);
+                    hit = true;
+                }
+            }
+        }
+        if !hit {
+            return Err(StoreError::NotFound(format!("no key '{id}'")));
+        }
+        self.commit(next)
+    }
+
     fn client_idx(clients: &[Client], name: &str) -> Result<usize, StoreError> {
         clients
             .iter()
