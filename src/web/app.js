@@ -1107,10 +1107,17 @@ function reqRows(st, ov, all) {
   const rows = [
     ...(st.runs || [])
       .map(r => ({ kind: 'run', t: now, s: r.session || null, o: r, key: keyOf(r, 'live') })),
-    ...ov.queue.map(w => ({ kind: 'wait', t: now - w.waited_secs * 1000, s: w.session || null, o: w, key: keyOf(w, 'queue') })),
+    // Waiting and finished rows come from the Overview payload (filtered
+    // server-side by client, model and backend), so the priority filter — which
+    // the server knows nothing about — has to be applied here too, or filtering
+    // by `top` would still list every other session waiting in front of it.
+    ...ov.queue.filter(w => prioSel(priOf(w)))
+      .map(w => ({ kind: 'wait', t: now - w.waited_secs * 1000, s: w.session || null, o: w, key: keyOf(w, 'queue') })),
   ];
   const activeN = rows.length;
-  if (all) for (const x of ov.recent) rows.push({ kind: 'done', t: x.at_ms, s: x.session || null, o: x, key: keyOf(x, x.at_ms) });
+  if (all) for (const x of ov.recent) {
+    if (prioSel(priOf(x))) rows.push({ kind: 'done', t: x.at_ms, s: x.session || null, o: x, key: keyOf(x, x.at_ms) });
+  }
   return { rows, activeN };
 }
 
