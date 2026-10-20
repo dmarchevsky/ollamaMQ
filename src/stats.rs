@@ -56,6 +56,11 @@ pub struct Finished {
     /// [`crate::dispatcher::SessionKey::tag`]); `None` for non-chat requests
     /// and sticky-less traffic.
     pub session: Option<String>,
+    /// Human label the client sent for that conversation (`X-Session-Name`);
+    /// display only, never part of the key.
+    pub session_label: Option<String>,
+    /// Scheduling level the request was served at: `normal`, `high` or `top`.
+    pub priority: &'static str,
     /// Seconds it waited in the queue; `None` when refused before queuing.
     pub queue_wait: Option<f64>,
     pub timing: Timing,
@@ -231,6 +236,8 @@ mod tests {
             backend: Some(backend.into()),
             outcome,
             session: None,
+            session_label: None,
+            priority: "normal",
             queue_wait: Some(1.0),
             timing,
         }

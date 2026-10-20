@@ -31,6 +31,7 @@ pub const EDITABLE: &[(&str, bool)] = &[
     ("sticky_ttl", true),
     ("sticky_lag", true),
     ("sticky_max_entries", true),
+    ("client_priority", true),
     ("allow_all_routes", true),
     ("metrics_token", true),
     ("log_content_limit", true),
@@ -64,6 +65,7 @@ pub fn defaults() -> Settings {
         sticky_ttl: Some(1800),
         sticky_lag: Some(0),
         sticky_max_entries: Some(10_000),
+        client_priority: Some(crate::config::ClientPriority::Global),
         request_log_path: Some("ollamamq-requests.jsonl".into()),
         request_log_max_bytes: Some(10 * 1024 * 1024),
         request_log_max_files: Some(5),
@@ -211,6 +213,14 @@ pub fn apply(state: &AppState, eff: &Settings) {
         eff.sticky_max_entries
             .or(d.sticky_max_entries)
             .unwrap_or(10_000) as u64,
+        Relaxed,
+    );
+    state.client_priority.store(
+        *eff
+            .client_priority
+            .as_ref()
+            .unwrap_or(&crate::config::ClientPriority::Global)
+            as u8,
         Relaxed,
     );
     state

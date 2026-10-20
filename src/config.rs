@@ -65,6 +65,32 @@ impl StickyMode {
     }
 }
 
+/// How far a client's self-declared session priority reaches. See
+/// `Settings::client_priority`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientPriority {
+    /// Priority is operator-set only; the header is ignored.
+    Off,
+    /// `high` is honoured inside its own client; `top` is treated as `high`.
+    /// (`self` is a Rust keyword, hence the rename.)
+    #[serde(rename = "self")]
+    Intra,
+    /// Both `high` and `top` are honoured.
+    #[default]
+    Global,
+}
+
+impl ClientPriority {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => ClientPriority::Off,
+            1 => ClientPriority::Intra,
+            _ => ClientPriority::Global,
+        }
+    }
+}
+
 /// Runtime settings (all optional; CLI flags take precedence).
 ///
 /// The web UI edits these in place: a save rewrites `appconf.yaml` itself
@@ -133,6 +159,15 @@ pub struct Settings {
     /// (default 10000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticky_max_entries: Option<usize>,
+    /// How far a `X-Session-Priority` a client declares for itself reaches
+    /// (default `global`). `off`: the header is ignored and priority is
+    /// operator-only. `self`: `high` (first within its own client) is honoured,
+    /// `top` is treated as `high`. `global`: both are honoured, so a client can
+    /// put its session first on the whole board. Either way the header is
+    /// honoured only for authenticated clients, and an operator pin always
+    /// wins over what the client claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_priority: Option<ClientPriority>,
     /// Path of the size-rotated request log file (default
     /// "ollamamq-requests.jsonl" in the working directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,7 +350,7 @@ impl Settings {
         pick!(
             port, host, timeout, load_keep_alive, allow_all_routes, stuck_timeout,
             max_concurrent_per_backend, detect_backend_slots, model_aliases, ip_identity,
-            sticky_routing, sticky_ttl, sticky_lag, sticky_max_entries,
+            sticky_routing, sticky_ttl, sticky_lag, sticky_max_entries, client_priority,
             request_log_path, request_log_max_bytes, request_log_max_files, log_content_limit,
             max_body_bytes, max_queued_bytes, clients_file, models_file,
             metrics_token, web_ui

@@ -160,6 +160,7 @@ pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
         .route("/logs", get(list_logs))
         .route("/logs/{seq}", get(get_log))
         .route("/users/{id}/{op}", post(user_action))
+        .route("/sessions/{tag}/priority", post(session_priority))
         .route("/blocked/unblock", post(unblock))
         .route("/backends/{idx}/{op}", post(model_control))
         .route("/config/reload", post(reload_config))
@@ -408,6 +409,10 @@ struct RunView {
     est_prompt_tokens: u64,
     /// Conversation tag for the session views; `None` when there is none.
     session: Option<String>,
+    /// Human label the client sent for that conversation; display only.
+    session_label: Option<String>,
+    /// Scheduling level this request is being served at.
+    priority: &'static str,
 }
 
 #[derive(Serialize)]
@@ -601,6 +606,8 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
                     tokens: r.tokens,
                     est_prompt_tokens: r.est_prompt_tokens,
                     session: r.session,
+                    session_label: r.session_label,
+                    priority: r.priority,
                     client: r.client,
                     key: r.key,
                     model: r.model,
@@ -693,6 +700,34 @@ async fn get_log(State(state): State<Arc<AppState>>, Path(seq): Path<u64>) -> Ap
 }
 
 // ------------------------------------------------------- users & blocking
+
+/// Operator pin of a session's priority, by the six-hex tag the UI shows:
+/// `{"level": "normal" | "high" | "top"}`. A pin outranks whatever the client
+/// claims, including pinning a session down at `normal`. See
+/// [`AppState::pin_session`].
+async fn session_priority(
+    State(state): State<Arc<AppState>>,
+    Path(tag): Path<String>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> ApiResult<serde_json::Value> {
+    let level = body
+        .get("level")
+        .and_then(|v| v.as_str())
+        .and_then(crate::dispatcher::Priority::from_name)
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_REQUEST, "level must be normal, high or top")
+        })?;
+    // A pin is keyed by the tag, so it can always be set: the conversation may
+    // be mid-first-request, where nothing about it is resolvable yet.
+    if tag.len() != 6 || !tag.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "session tag must be six hex digits",
+        ));
+    }
+    state.pin_session(&tag, level);
+    ok()
+}
 
 async fn user_action(
     State(state): State<Arc<AppState>>,

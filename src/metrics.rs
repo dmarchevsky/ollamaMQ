@@ -929,6 +929,10 @@ pub struct Run {
     pub est_prompt_tokens: u64,
     /// Conversation tag for the session views (see [`crate::dispatcher::SessionKey::tag`]).
     pub session: Option<String>,
+    /// Human label the client sent for that conversation; display only.
+    pub session_label: Option<String>,
+    /// Scheduling level this request is being served at.
+    pub priority: &'static str,
 }
 
 /// Requests in progress, for the live views (`/metrics` gauges, the web
@@ -951,6 +955,8 @@ impl Runs {
         waited_secs: f64,
         est_prompt_tokens: u64,
         session: Option<&str>,
+        session_label: Option<String>,
+        priority: &'static str,
     ) -> RunGuard<'_> {
         let id = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.lock_or_recover().insert(
@@ -967,6 +973,8 @@ impl Runs {
                 tokens: 0,
                 est_prompt_tokens,
                 session: session.map(str::to_string),
+                session_label,
+                priority,
             },
         );
         RunGuard { runs: self, id }
@@ -1113,7 +1121,7 @@ mod tests {
     fn runs_clear_on_drop_and_show_as_gauges() {
         let runs = Runs::default();
         {
-            let g = runs.start("dm", "laptop", "qwen", "b:1", 0.5, 1_000, None);
+            let g = runs.start("dm", "laptop", "qwen", "b:1", 0.5, 1_000, None, None, "normal");
             g.update(|r| r.tokens += 5);
             let l = runs.list();
             assert_eq!((l.len(), l[0].tokens), (1, 5));

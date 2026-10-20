@@ -125,6 +125,12 @@ struct StatusView {
     /// Requests dropped in the window — same outcomes as the lifetime `Drop`
     /// counter: timeout, blocked, client gone, backend error (not 429s).
     dropped: u64,
+    /// Conversations currently running or waiting above `normal` priority.
+    priority_sessions: usize,
+    /// Operator pins as `(session tag, level)`. The UI shows a session's pin
+    /// rather than the level the request in that row happened to run at, so a
+    /// click visibly sticks — the level on a finished row is history.
+    pins: Vec<(String, &'static str)>,
 }
 
 #[derive(Serialize)]
@@ -181,6 +187,10 @@ struct Waiting {
     est_prompt_tokens: u64,
     /// Conversation tag for the session views; `None` when there is none.
     session: Option<String>,
+    /// Human label the client sent for that conversation; display only.
+    session_label: Option<String>,
+    /// Scheduling level this request waits at.
+    priority: &'static str,
 }
 
 /// One backend's swimlane: occupancy per time bucket, plus what to flag.
@@ -243,6 +253,10 @@ struct Recent {
     gen_secs: Option<f64>,
     /// Conversation tag of the finished request; `None` when there was none.
     session: Option<String>,
+    /// Human label the client sent for that conversation; display only.
+    session_label: Option<String>,
+    /// Scheduling level the request was served at.
+    priority: &'static str,
     /// Share of the prompt served from the prefix cache, 0–100.
     cache_pct: Option<u8>,
     ttft_secs: Option<f64>,
@@ -438,7 +452,7 @@ pub async fn get_overview(
 
     // Waiting requests, copied out under the queues lock and labelled
     // afterwards (that takes the backends lock).
-    let waiting: Vec<(String, Option<String>, Option<String>, f64, usize, usize, Option<String>)> = state
+    let waiting: Vec<(String, Option<String>, Option<String>, f64, usize, usize, Option<String>, Option<String>, &'static str)> = state
         .queues
         .lock_or_recover()
         .iter()
@@ -453,6 +467,8 @@ pub async fn get_overview(
                     i + 1,
                     t.body.len(),
                     t.session_key.as_ref().map(|k| k.tag()),
+                    t.session_label.clone(),
+                    t.priority.as_str(),
                 )
             })
         })
@@ -462,7 +478,7 @@ pub async fn get_overview(
         let backends = state.backends.lock_or_recover();
         waiting
             .into_iter()
-            .map(|(client, model, key_label, waited_secs, pos, body_len, session)| Waiting {
+            .map(|(client, model, key_label, waited_secs, pos, body_len, session, session_label, priority)| Waiting {
                 backends: model
                     .as_deref()
                     .map(|m| {
@@ -477,6 +493,8 @@ pub async fn get_overview(
                 model: model_label_in(&backends, model.as_deref()),
                 est_prompt_tokens: (body_len / 4) as u64,
                 session,
+                session_label,
+                priority,
                 key: crate::stats::key_or_none(&key_label),
                 client,
                 waited_secs,
@@ -659,6 +677,8 @@ pub async fn get_overview(
             prefill_tokens: f.timing.prefill.map(|(_, t)| t),
             gen_secs: f.timing.decode.map(|(s, _)| s),
             session: f.session.clone(),
+            session_label: f.session_label.clone(),
+            priority: f.priority,
             key: f.key.clone(),
             cache_pct: cache_pct(f.timing.prompt_tokens, f.timing.prefill.map(|(_, t)| t)),
             ttft_secs: f.timing.ttft,
@@ -731,6 +751,31 @@ pub async fn get_overview(
         .count() as u64;
 
     let online: Vec<_> = backends.iter().filter(|b| b.online).collect();
+    // Conversations running or waiting above `normal`, counted once each (by
+    // session tag, or by client when the request carries no session): the
+    // status line's "N priority" counter.
+    let priority_sessions = {
+        let mut conv: std::collections::HashSet<String> = Default::default();
+        for r in &runs {
+            if r.priority != "normal" {
+                conv.insert(
+                    r.session
+                        .clone()
+                        .unwrap_or_else(|| format!("client:{}", r.client)),
+                );
+            }
+        }
+        for w in &queue {
+            if w.priority != "normal" {
+                conv.insert(
+                    w.session
+                        .clone()
+                        .unwrap_or_else(|| format!("client:{}", w.client)),
+                );
+            }
+        }
+        conv.len()
+    };
     Json(OverviewView {
         window_secs: window,
         now_ms: now,
@@ -750,6 +795,8 @@ pub async fn get_overview(
                 .then(|| totals.errors as f64 * 100.0 / totals.requests as f64),
             done: done_window,
             dropped: dropped_window,
+            priority_sessions,
+            pins: state.session_pins(),
         },
         backends,
         clients,
@@ -911,6 +958,8 @@ mod tests {
                 backend: Some(label.clone()),
                 outcome: "ok",
                 session: None,
+                session_label: None,
+                priority: "normal",
                 queue_wait: Some(0.0),
                 timing: crate::stats::Timing {
                     duration: Some(1.0),

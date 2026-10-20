@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::control::{self, ControlAction, LoadOptions};
-use crate::dispatcher::{AppState, BackendApiType, LogEvent};
+use crate::dispatcher::{AppState, BackendApiType, LogEvent, Priority};
 use crate::snapshot::{self, StateSnapshot};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -398,6 +398,40 @@ impl TuiDashboard {
                                 && i < snapshot.users.len()
                             {
                                 state.toggle_vip(&snapshot.users[i].id);
+                            }
+                        }
+                        KeyCode::Char('P') => {
+                            // Whole-client priority: every request of this
+                            // client that is waiting right now, plus a pin on
+                            // the conversations behind them. Requests already
+                            // running keep the level they were queued with.
+                            if self.active_panel == Panel::Users
+                                && let Some(i) = self.table_state.selected()
+                                && i < snapshot.users.len()
+                            {
+                                let user = snapshot.users[i].id.clone();
+                                let now = snapshot
+                                    .live_priority
+                                    .iter()
+                                    .find(|(u, _)| *u == user)
+                                    .map(|(_, l)| *l)
+                                    .unwrap_or("normal");
+                                let next = match now {
+                                    "high" => Priority::Top,
+                                    "top" => Priority::Normal,
+                                    _ => Priority::High,
+                                };
+                                let n = state.pin_user_sessions(&user, next);
+                                self.flash = Some(FlashMsg {
+                                    text: format!(
+                                        "{user}: {} waiting request{} set to {}",
+                                        n,
+                                        if n == 1 { "" } else { "s" },
+                                        next.as_str()
+                                    ),
+                                    ok: true,
+                                    at: Instant::now(),
+                                });
                             }
                         }
                         KeyCode::Char('b') => {
@@ -1178,6 +1212,14 @@ impl TuiDashboard {
                         Style::default().fg(Color::Yellow).bold(),
                     ));
                 }
+                // A level above normal, read off what this client has queued or
+                // running now — set with 'P', or with a badge in the web UI.
+                if let Some((_, level)) = snapshot.live_priority.iter().find(|(u, _)| u == user) {
+                    spans.push(Span::styled(
+                        if *level == "top" { " [TOP]" } else { " [HGH]" },
+                        Style::default().fg(Color::LightMagenta).bold(),
+                    ));
+                }
                 if is_blocked {
                     spans.push(Span::styled(
                         // Blocking a registered client disables it.
@@ -1486,7 +1528,7 @@ impl TuiDashboard {
     }
 
     fn render_detailed_help(&self) -> Paragraph<'static> {
-        Paragraph::new("\n  EXPAND MODELS: 'Space' or 'Enter' (in Backends panel)\n  CYCLE MODELS: 'Tab' / 'Shift+Tab' on an expanded backend (▶ cursor); 'L'/'U' then act on the cursor model directly\n  SHOW ALL MODELS: 'a' (in Backends panel)\n  MODEL CONTROL: 'L' load / 'U' unload (Backends panel)\n  CONFIG: 'r' re-reads appconf.yaml and re-applies it (loads listed models on their backends)\n  LOGS: bottom panel shows requests in (→) / out (←) and control ops (⟳), newest first\n  VIP: 'p' | BOOST: 'b' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing / cursor | ● Queued | ⟳ Control op in progress")
+        Paragraph::new("\n  EXPAND MODELS: 'Space' or 'Enter' (in Backends panel)\n  CYCLE MODELS: 'Tab' / 'Shift+Tab' on an expanded backend (▶ cursor); 'L'/'U' then act on the cursor model directly\n  SHOW ALL MODELS: 'a' (in Backends panel)\n  MODEL CONTROL: 'L' load / 'U' unload (Backends panel)\n  CONFIG: 'r' re-reads appconf.yaml and re-applies it (loads listed models on their backends)\n  LOGS: bottom panel shows requests in (→) / out (←) and control ops (⟳), newest first\n  VIP: 'p' | BOOST: 'b' | PRIORITY of a client's waiting requests: 'P' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing / cursor | ● Queued | ⟳ Control op in progress | [HGH]/[TOP] priority")
             .block(Block::default().title(" Help ").borders(Borders::ALL))
             .style(Style::default().fg(Color::Gray))
     }
@@ -1544,6 +1586,7 @@ mod tests {
             disabled_clients: HashSet::new(),
             vip_user: None,
             boost_user: None,
+            live_priority: Vec::new(),
             backends: Vec::new(),
             logs: Vec::new(),
             active_ops: Vec::new(),
@@ -1574,6 +1617,22 @@ mod tests {
             cells.windows(3).any(|w| w == ["3", "41", "3"]),
             "alice's Q/Done/Drop columns wrong: {alice:?}"
         );
+    }
+
+    #[test]
+    fn a_priority_client_carries_its_level_marker() {
+        let mut dash = TuiDashboard::new();
+        dash.active_panel = Panel::Users;
+        let mut snap = snapshot(vec![user("alice", 2, 0, 0, 0), user("bob", 1, 0, 0, 0)]);
+        snap.live_priority = vec![("alice".to_string(), "top")];
+        let screen = painted(&mut dash, &snap);
+        let alice = screen
+            .lines()
+            .find(|l| l.contains("alice"))
+            .expect("alice row");
+        let bob = screen.lines().find(|l| l.contains("bob")).expect("bob row");
+        assert!(alice.contains("[TOP]"), "level marker missing: {alice:?}");
+        assert!(!bob.contains('['), "an ordinary client wears nothing: {bob:?}");
     }
 
     #[test]
