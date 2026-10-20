@@ -1012,6 +1012,11 @@ pub struct ConvCache {
     /// the estimated incremental prefill work of the next turn if the cache
     /// kept everything else. `None` for servers that report no `prompt_eval`.
     inc_tok: Option<u64>,
+    /// Cumulative prefill seconds this conversation lost to cache evictions
+    /// on this backend (see [`estimate_cache_waste`]); `None` = unmeasurable.
+    waste_secs: f64,
+    /// Turns on this backend where the estimate was above zero.
+    waste_events: u32,
 }
 
 /// The share of a prompt the backend served from its prefix cache, percent
@@ -1025,13 +1030,15 @@ fn cache_hit_pct(prompt: u64, evaluated: Option<u64>) -> Option<u8> {
     Some(100u8.saturating_sub((evaluated.min(prompt) * 100 / prompt) as u8))
 }
 
-/// Remember how much of this conversation's prompt the backend skipped.
+/// Remember how much of this conversation's prompt the backend skipped, and
+/// add what this turn lost to an eviction (`waste`, see [`estimate_cache_waste`]).
 fn record_conv_cache(
     state: &AppState,
     key: &SessionKey,
     backend_url: &str,
     hit_pct: u8,
     inc_tok: Option<u64>,
+    waste: f64,
 ) {
     let mut table = state.conv_cache.lock_or_recover();
     let entry = table.entry((key.clone(), backend_url.to_string())).or_insert(ConvCache {
@@ -1039,11 +1046,78 @@ fn record_conv_cache(
         at: std::time::Instant::now(),
         turns: 0,
         inc_tok: None,
+        waste_secs: 0.0,
+        waste_events: 0,
     });
     entry.turns = entry.turns.saturating_add(1);
     entry.hit_pct = hit_pct;
     entry.inc_tok = inc_tok;
+    entry.waste_secs += waste;
+    if waste > 0.0 {
+        entry.waste_events += 1;
+    }
     entry.at = std::time::Instant::now();
+}
+
+/// What the previous turn left behind in the KV cache for this conversation
+/// on this backend, before the current turn overwrites the entry.
+fn conv_cache_prior(state: &AppState, key: &SessionKey, backend_url: &str) -> Option<ConvCache> {
+    state
+        .conv_cache
+        .lock_or_recover()
+        .get(&(key.clone(), backend_url.to_string()))
+        .copied()
+}
+
+/// Prefill seconds this turn burned re-evaluating context the backend already
+/// had before an eviction forced a full re-prefill.
+///
+/// Even a perfect cache must re-evaluate `prompt - prev_inc` tokens: the
+/// previous answer re-enters the prompt and was only ever *decoded*, and any
+/// new user/tool content is genuinely new. Everything evaluated beyond that
+/// floor had been prefilled here before and was evicted in between; its share
+/// of the measured prefill time is the waste.
+///
+/// `None` (never zero) when the numbers say nothing: no prior turn on this
+/// backend (a first turn's miss is not eviction — the context was simply
+/// never there), a backend that reports no eval counts, or a prompt that was
+/// essentially all cache hit. `prev` must be this conversation's own entry
+/// from before this turn; `turns == 0` (never completed a turn here) is
+/// never waste. Ollama folds model loading into its `prompt_eval_duration`,
+/// so its numbers are an upper bound.
+/// `shortcut: assumes one live conversation per session key per backend; a
+/// client whose turns interleave two models never accumulates two turns under
+/// one key here (the model is part of the key), so nothing is misattributed.`
+fn estimate_cache_waste(prompt: u64, prompt_secs: f64, prev: Option<&ConvCache>) -> Option<f64> {
+    let prev = prev.filter(|p| p.turns >= 1)?;
+    let inc = prev.inc_tok?;
+    if prev.hit_pct >= 95 {
+        return None;
+    }
+    let refeed_floor = prompt.saturating_sub(inc);
+    // A prompt no larger than the previous increment gives no evidence of an
+    // eviction: a shrinking (truncated) context is not the scheduler's problem.
+    if refeed_floor == 0 {
+        return None;
+    }
+    let evicted = prompt.saturating_sub(refeed_floor); // = min(prompt, inc)
+    if evicted == 0 {
+        return None;
+    }
+    // A turn that hit almost everything had nothing evicted.
+    let hit_now = 100u64.saturating_sub(evicted * 100 / prompt);
+    if hit_now >= 95 {
+        return None;
+    }
+    Some(prompt_secs * evicted as f64 / prompt as f64)
+}
+
+/// Sessionless fallback: no per-conversation memory, so a full re-prefill of
+/// a roughly unchanged prompt right after a nearly-full hit is charged fully.
+/// Deliberately coarse — the session-keyed path is the honest one.
+fn estimate_cache_waste_sessionless(prompt: u64, prompt_secs: f64) -> Option<f64> {
+    let hit = cache_hit_pct(prompt, Some(prompt))?;
+    (hit <= 10).then_some(prompt_secs)
 }
 
 /// Note a finished turn so the session's follow-up can keep priority for
@@ -3628,6 +3702,46 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     // The exact usage replaces the stream estimate: only
                                     // the difference is added (a counter cannot go down).
                                     let usage = crate::metrics::parse_usage(&tail);
+                                    // Time this turn lost re-prefilling context
+                                    // this backend already had (see
+                                    // `estimate_cache_waste`). Read before the
+                                    // entry below overwrites it.
+                                    let served = status.is_success() && !client_disconnected;
+                                    let prior = served
+                                        .then(|| task.session_key.as_ref())
+                                        .flatten()
+                                        .and_then(|k| conv_cache_prior(&state_clone, k, &backend_url));
+                                    let waste_secs = served
+                                        .then(|| {
+                                            let u = usage?;
+                                            let ps = u.prompt_secs?;
+                                            if u.prompt == 0 {
+                                                return None;
+                                            }
+                                            match &prior {
+                                                Some(_) => {
+                                                    estimate_cache_waste(u.prompt, ps, prior.as_ref())
+                                                }
+                                                // No usable session memory (no session
+                                                // key at all): the coarse sessionless
+                                                // variant, if the prompt came back
+                                                // essentially un-cached. A known
+                                                // session's first turn is never waste.
+                                                _ if task.session_key.is_none() => {
+                                                    estimate_cache_waste_sessionless(u.prompt, ps)
+                                                }
+                                                _ => None,
+                                            }
+                                        })
+                                        .flatten();
+                                    if let Some(w) = waste_secs.filter(|w| *w > 0.0) {
+                                        metrics.inc(
+                                            &crate::metrics::CACHE_WASTE_SECONDS,
+                                            &[&user_id, &m_model, &m_backend],
+                                            w,
+                                        );
+                                        metrics.inc(&crate::metrics::CACHE_WASTE_EVENTS, &[&m_backend], 1.0);
+                                    }
                                     // How much of a served conversation's
                                     // prompt the backend skipped from its KV
                                     // cache — the scheduler's view of who is
@@ -3652,6 +3766,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 .map(|pe| pe.saturating_add(usage.map_or(0, |u| u.completion)));
                                             record_conv_cache(
                                                 &state_clone, key, &backend_url, hit, inc,
+                                                waste_secs.unwrap_or(0.0),
                                             );
                                         }
                                     }
@@ -3668,6 +3783,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         ttft: first_token.map(|t| (t - started).as_secs_f64()),
                                         prompt_tokens: usage.map_or(0, |u| u.prompt),
                                         completion_tokens: usage.map_or(live_tokens, |u| u.completion),
+                                        waste_secs,
                                         ..Default::default()
                                     };
                                     if status.is_success() && !client_disconnected {
@@ -3707,6 +3823,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             bytes: Some(total_bytes),
                                             content_type: resp_content_type,
                                             content: Some(content_str.clone()),
+                                            waste_secs,
                                         });
                                         log_out(
                                             format!(
@@ -3744,6 +3861,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     bytes: Some(total_bytes),
                                     content_type: None,
                                     content: Some(err_msg.clone()),
+                                    waste_secs: None,
                                 });
                                 let _ = task.responder.send(ResponsePart::Error(e)).await;
                                 let mut dropped = state_clone.dropped_counts.lock_or_recover();
@@ -3926,6 +4044,7 @@ pub async fn proxy_handler(
                 bytes: Some(0),
                 content_type: None,
                 content: None,
+                waste_secs: None,
             });
             state.log_event(LogEvent {
                 at: std::time::SystemTime::now(),
@@ -4165,6 +4284,7 @@ pub async fn proxy_handler(
             .and_then(|v| v.to_str().ok())
             .map(str::to_string),
         content: Some(content.clone()),
+        waste_secs: None,
     });
 
     state.log_event(crate::dispatcher::LogEvent {
@@ -6308,6 +6428,55 @@ mod tests {
         assert_eq!(cache_hit_pct(100, None), None); // server reported nothing
     }
 
+    /// A `ConvCache` as if the previous turn evaluated `inc` tokens at
+    /// `hit`% cache, on its `turns`-th turn here.
+    fn prior(hit: u8, inc: Option<u64>, turns: u32) -> ConvCache {
+        ConvCache {
+            hit_pct: hit,
+            at: std::time::Instant::now(),
+            turns,
+            inc_tok: inc,
+            waste_secs: 0.0,
+            waste_events: 0,
+        }
+    }
+
+    #[test]
+    fn cache_waste_charges_only_the_evicted_prefix() {
+        // 20k prompt, the old turn left 15k evaluated+decoded behind: even a
+        // perfect cache must re-feed 5k (the answer re-enters the prompt),
+        // so of the 45s prefill, 15k/20k were evicted -> 33.75s wasted.
+        let w = estimate_cache_waste(20_000, 45.0, Some(&prior(30, Some(15_000), 2))).unwrap();
+        assert!((w - 33.75).abs() < 1e-9);
+        // Nothing beyond the floor was re-evaluated (prompt grew past the old
+        // turn's footprint only by new content): perfect cache, no waste.
+        assert_eq!(estimate_cache_waste(20_000, 10.0, Some(&prior(30, Some(0), 2))), None);
+        // A shrinking (truncated) context is not an eviction.
+        assert_eq!(estimate_cache_waste(5_000, 10.0, Some(&prior(30, Some(15_000), 2))), None);
+        // A first turn on this backend is never eviction (context was never here).
+        assert_eq!(estimate_cache_waste(20_000, 45.0, None), None);
+        assert_eq!(estimate_cache_waste(20_000, 45.0, Some(&prior(30, Some(15_000), 0))), None);        // The previous turn already hit the cache: nothing could be evicted.
+        assert_eq!(estimate_cache_waste(20_000, 45.0, Some(&prior(100, Some(15_000), 2))), None);
+        // This turn hit almost everything anyway.
+        let w = estimate_cache_waste(20_000, 45.0, Some(&prior(30, Some(200), 2)));
+        assert!(w.is_none(), "a 99% hit turn wastes nothing");
+    }
+
+    #[test]
+    fn cache_waste_needs_eval_counts_and_a_real_prompt() {
+        // inc None: the server reports no prompt_eval at all -> unmeasurable.
+        assert_eq!(estimate_cache_waste(20_000, 45.0, Some(&prior(30, None, 2))), None);
+        assert_eq!(estimate_cache_waste(0, 45.0, Some(&prior(30, Some(15_000), 2))), None);
+    }
+
+    #[test]
+    fn cache_waste_sessionless_needs_a_full_miss() {
+        // No session memory: only an essentially-uncached prompt is charged,
+        // and then the whole prefill time (upper bound, coarse by design).
+        assert_eq!(estimate_cache_waste_sessionless(1000, 10.0), Some(10.0));
+        assert_eq!(estimate_cache_waste_sessionless(0, 10.0), None); // no prompt counts
+    }
+
     #[test]
     fn cold_hold_only_holds_a_starved_cache_miss() {
         let k = key("thread", "m");
@@ -6337,6 +6506,8 @@ mod tests {
                     at: at_cold,
                     turns: 3,
                     inc_tok: None,
+                    waste_secs: 0.0,
+                    waste_events: 0,
                 },
             )]);
             for i in 0..n_fresher {
@@ -6350,6 +6521,8 @@ mod tests {
                         at: now - std::time::Duration::from_secs(1 + i as u64 / 10),
                         turns: 5,
                         inc_tok: None,
+                        waste_secs: 0.0,
+                        waste_events: 0,
                     },
                 );
             }

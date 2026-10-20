@@ -37,6 +37,9 @@ pub struct Timing {
     pub decode: Option<(f64, u64)>,
     /// Prompt evaluation (prefill) time and the prompt tokens evaluated.
     pub prefill: Option<(f64, u64)>,
+    /// Prefill seconds lost re-evaluating evicted context (see
+    /// [`crate::dispatcher::estimate_cache_waste`]); `None` when unmeasurable.
+    pub waste_secs: Option<f64>,
 }
 
 /// One request that left the proxy: served, failed, or refused.
@@ -137,6 +140,7 @@ pub struct Agg {
     completion_tokens: u64,
     prefill_secs: f64,
     prefill_tokens: u64,
+    waste_secs: f64,
     busy_secs: f64,
 }
 
@@ -156,6 +160,11 @@ pub struct Summary {
     pub completion_tokens: u64,
     /// Backend slot time the finished requests used.
     pub busy_secs: f64,
+    /// Prefill seconds lost to cache eviction in the window.
+    pub waste_secs: f64,
+    /// Share of the window's prefill time lost to eviction, percent 0–100;
+    /// `None` when no prefill was measurable (shown as "—", not 0).
+    pub waste_pct: Option<u8>,
 }
 
 impl Agg {
@@ -172,6 +181,7 @@ impl Agg {
             self.prefill_secs += secs;
             self.prefill_tokens += n;
         }
+        self.waste_secs += t.waste_secs.unwrap_or(0.0);
         self.busy_secs += t.duration.unwrap_or(0.0);
     }
 
@@ -188,6 +198,9 @@ impl Agg {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             busy_secs: self.busy_secs,
+            waste_secs: self.waste_secs,
+            waste_pct: (self.prefill_secs > 0.0)
+                .then(|| ((self.waste_secs * 100.0 / self.prefill_secs).round() as u8).min(100)),
         }
     }
 }
@@ -269,6 +282,7 @@ mod tests {
             completion_tokens: tokens,
             decode: Some((gen_secs, tokens)),
             prefill: Some((0.5, 100)),
+            waste_secs: None,
         };
         let items = vec![
             fin(1, "dm", "gpu:1", "ok", ok(1.0, 10.0, 200)),

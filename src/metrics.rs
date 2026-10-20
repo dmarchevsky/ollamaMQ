@@ -88,6 +88,16 @@ pub const PROMPT_EVAL_TOKENS: CounterDef = CounterDef {
     help: "Prompt tokens evaluated (not served from cache), pairs with prompt_seconds_total.",
     labels: &["client", "model", "backend"],
 };
+pub const CACHE_WASTE_SECONDS: CounterDef = CounterDef {
+    name: "ollamamq_cache_waste_seconds_total",
+    help: "Prefill time lost re-evaluating context a backend already had before it was evicted (estimated; only backends reporting per-request prefill telemetry contribute). Waste share = rate(this) / rate(ollamamq_prompt_seconds_total).",
+    labels: &["client", "model", "backend"],
+};
+pub const CACHE_WASTE_EVENTS: CounterDef = CounterDef {
+    name: "ollamamq_cache_waste_events_total",
+    help: "Turns that lost time to a cache eviction (cache_waste_seconds_total > 0).",
+    labels: &["backend"],
+};
 pub const AFFINITY_DECISIONS: CounterDef = CounterDef {
     name: "ollamamq_affinity_decisions_total",
     help: "Sticky routing outcomes: hit = the conversation stayed on its backend, moved = it went elsewhere (no memory, busy, or off).",
@@ -152,6 +162,8 @@ const COUNTERS: &[&CounterDef] = &[
     &GEN_TOKENS,
     &PROMPT_SECONDS,
     &PROMPT_EVAL_TOKENS,
+    &CACHE_WASTE_SECONDS,
+    &CACHE_WASTE_EVENTS,
     &AFFINITY_DECISIONS,
     &CONTROL_OPS,
     &CACHE_SCHEDULING,
@@ -1190,6 +1202,19 @@ mod tests {
         let openai = br#"{"usage":{"prompt_tokens":1,"completion_tokens":2}}"#;
         let u = parse_usage(openai).unwrap();
         assert_eq!((u.prompt_secs, u.gen_secs, u.prompt_eval), (None, None, None));
+    }
+
+    #[test]
+    fn cache_waste_counters_render() {
+        let m = Metrics::new();
+        m.inc(&CACHE_WASTE_SECONDS, &["alice", "llama3", "b:1"], 42.5);
+        m.inc(&CACHE_WASTE_EVENTS, &["b:1"], 1.0);
+        let mut out = String::new();
+        m.render_recorded(&mut out);
+        assert!(out.contains(
+            "ollamamq_cache_waste_seconds_total{client=\"alice\",model=\"llama3\",backend=\"b:1\"} 42.5"
+        ));
+        assert!(out.contains("ollamamq_cache_waste_events_total{backend=\"b:1\"} 1"));
     }
 
     #[test]

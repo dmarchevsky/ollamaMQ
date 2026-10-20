@@ -34,6 +34,10 @@ pub struct ReqRecord {
     /// Body content, truncated to the configured limit (lossy UTF-8).
     /// Shared (not copied) with the TUI log event built from the same body.
     pub content: Option<Arc<String>>,
+    /// Prefill seconds lost to a cache eviction on this request; absent when
+    /// not measurable (old lines and non-inference records stay as they were).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waste_secs: Option<f64>,
 }
 
 /// Non-blocking producer for the size-rotated request log.
@@ -242,6 +246,7 @@ mod tests {
             content_type: Some("application/json".into()),
             // Padding keeps each serialized line in the ~100-250 byte range.
             content: Some(Arc::new(format!("x{}", "y".repeat(20)))),
+            waste_secs: None,
         }
     }
 
