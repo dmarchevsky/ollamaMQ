@@ -3,7 +3,7 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
-## v0.13.0 — 2026-10-20
+## v0.12.2 — 2026-10-20
 
 ### Added
 
