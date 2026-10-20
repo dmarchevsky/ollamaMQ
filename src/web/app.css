@@ -14,17 +14,18 @@
   --warn-soft: #fdf1dc;
   --bad: #c9302c;
   --bad-soft: #fbe7e6;
-  /* One "live" colour: running or waiting requests, wherever they are listed. */
-  --live: #eab308;
+  /* The decode stage's own green — deliberately not --ok (a softer teal, the
+     colour decoding had before the short blue-prefill experiment). */
+  --decode: #1baf7a;
   --vip: #8a3ffc;
   --vip-soft: #f1e8ff;
   --nav-bg: #161a22;
   --nav-text: #c3c9d4;
   --nav-active: #ffffff;
   /* Client colours on the Overview (names are always printed beside them).
-     Deliberately avoids every status hue in use — accent blue (waiting/prefill),
-     --ok green (decode), --bad red (error), --live yellow, --warn amber and
-     --vip violet — so an identity swatch can never be misread as a stage. */
+     Deliberately avoids every status hue in use — accent blue (waiting),
+     --warn amber (prefill), the --decode teal, --bad red (error) and --vip
+     violet — so an identity swatch can never be misread as a stage. */
   --c1: #0891b2;   /* cyan  */
   --c2: #db2777;   /* pink  */
   --c3: #ea580c;   /* orange */
@@ -56,7 +57,7 @@
     --warn-soft: #2e2412;
     --bad: #ff6b66;
     --bad-soft: #321716;
-    --live: #e3b341;
+    --decode: #199e70;
     --vip: #b48cff;
     --vip-soft: #261b3d;
     --nav-bg: #0b0d12;
@@ -167,6 +168,8 @@ tr.selected > td { background: var(--accent-soft); }
 .badge.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
 /* queued: the outlined twin of the graph's hollow waiting chip */
 .badge.q { background: transparent; color: var(--accent); border-color: var(--accent); }
+/* decoding / generating — the stage's own teal, matching the graph chip */
+.badge.dec { background: color-mix(in srgb, var(--decode) 14%, transparent); color: var(--decode); border-color: transparent; }
 .sdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-right: 8px; vertical-align: 1px; }
 .sdot.on { background: var(--ok); } .sdot.off { background: var(--bad); }
 .dir { font-family: var(--mono); font-size: 11.5px; font-weight: 700; }
@@ -249,6 +252,27 @@ dialog label:not(.check) { display: block; font-size: 12.5px; font-weight: 600; 
 dialog label:not(.check) input, dialog label:not(.check) select { display: block; width: 100%; margin-top: 5px; font-weight: 400; }
 dialog .check { margin-bottom: 12px; }
 dialog p { color: var(--muted); margin: 0 0 14px; }
+/* --- Filters modal: time row, identity toggle, checkbox lists side by side. --- */
+#ov-filters .fdot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); margin-left: 6px; }
+#ov-filters.on { color: var(--accent); border-color: var(--accent); }
+#dlg-filters { width: min(680px, 94vw); }
+#dlg-filters h3 { margin: 0 0 2px; }
+#dlg-filters .fhead { display: flex; align-items: baseline; gap: 10px; margin: 12px 0 5px; }
+#dlg-filters .fhead b { font-size: 12.5px; color: var(--text); }
+#dlg-filters .fhead .hint { font-size: 11.5px; color: var(--faint); }
+#dlg-filters .frow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#dlg-filters .frow input[type=text] { width: 64px; margin-top: 0; display: inline; }
+#dlg-filters .frow select { width: auto; margin-top: 0; }
+#dlg-filters .ftwo { display: flex; gap: 18px; flex-wrap: wrap; }
+#dlg-filters .ftwo > div { flex: 1 1 250px; min-width: 0; }
+#dlg-filters .flist { border: 1px solid var(--border); border-radius: 8px;
+  max-height: 170px; overflow: auto; margin: 5px 0 6px; padding: 3px; }
+#dlg-filters .flist label.check { display: flex; align-items: center; gap: 8px;
+  margin: 0; padding: 3px 8px; border-radius: 6px; font-size: 13px; font-weight: 400; }
+#dlg-filters .flist label.check:hover { background: var(--surface-2); }
+#dlg-filters .flist input { width: auto; margin: 0; }
+#dlg-filters .fcount { font-size: 11.5px; color: var(--faint); margin: 0 0 2px; }
+#dlg-filters .dlg-actions { display: flex; align-items: center; gap: 8px; }
 .field-hint { font-size: 12px; margin: -6px 0 12px !important; color: var(--faint) !important; }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; padding: 2px; margin-bottom: 14px; background: var(--surface-2); }
@@ -589,49 +613,10 @@ tr.is-off td { color: var(--muted); }
 }
 
 /* ================================================================ Overview:
-   client filter, phone layout (see .dev-flow/overview-mobile-ui/plan). */
-
-/* --- Client filter chips, inside the sticky header so they pin with it. On a
-   phone the row takes its own line and scrolls sideways, so a fleet of clients
-   costs one row of height; on desktop it joins the stats line and wraps only
-   when the client list outgrows it. --- */
+   phone layout (see .dev-flow/overview-mobile-ui/plan). */
 .topbar { flex-wrap: wrap; row-gap: 8px; }
-.clbar { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.clbar .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--faint); flex: 0 0 auto; }
-.clwrap { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; flex: 1 1 0; min-width: 0; padding: 1px 0 2px; }
-.clwrap::-webkit-scrollbar { display: none; }
-@media (min-width: 721px) {
-  /* The stats never break internally on a desktop: when the header runs out of
-     room the chip row shrinks (it scrolls) instead of pushing VIP/Boost down. */
-  .stats { flex-wrap: nowrap; }
-  .clbar { flex: 1 1 auto; }
-}
-.clchip {
-  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
-  font: inherit; font-size: 12px; color: var(--muted); background: var(--surface-2);
-  border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px;
-  cursor: pointer; white-space: nowrap;
-}
-.clchip:hover { color: var(--text); border-color: var(--faint); }
-.clchip .sw { margin-right: 0; }
-.clchip .n { color: var(--faint); font-variant-numeric: tabular-nums; }
-.clchip[aria-pressed="true"] {
-  color: var(--text); border-color: var(--c, var(--accent));
-  background: color-mix(in srgb, var(--c, var(--accent)) 16%, var(--surface));
-}
-.clchip.all[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
-/* Last chip is cut off where the row scrolls: fade it out instead of slicing a
-   chip in half. Clearing the filter is the `All` chip, always first in the row. */
-.clbar .clwrap {
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
-  mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
-}
 @media (max-width: 720px) {
   .topbar { gap: 8px 10px; padding: 8px 12px 8px; }
-  .clbar { flex-basis: 100%; order: 4; margin: 0 -12px; padding: 0 12px; }
-  .clwrap { margin-right: -12px; padding-right: 12px; }
-  .clchip { padding: 4px 10px; }
-  .clbar .lbl { display: none; }
 }
 
 /* --- Activity panel header on a phone: title and both switches stay on ONE
@@ -706,8 +691,8 @@ tr.is-off td { color: var(--muted); }
    nothing else — the swatch by the client name is where identity lives, so every
    chip matches the legend. */
 .tl-track .sg.w { background: var(--accent-soft); border: 1px solid var(--accent); }
-.tl-track .sg.p { background: var(--accent); }
-.tl-track .sg.g { background: var(--ok); }
+.tl-track .sg.p { background: var(--warn); }
+.tl-track .sg.g { background: var(--decode); }
 .tl-track .sg.e { background: var(--bad); }
 .tl-track .now { position: absolute; right: 0; top: -1px; bottom: -1px;
   border-left: 1px solid var(--muted); }
@@ -717,8 +702,8 @@ tr.is-off td { color: var(--muted); }
 .tl-legend .sw { margin-right: 4px; }
 .tl-legend .sw { border-radius: 0; }
 .tl-legend .sw.w { background: var(--accent-soft); border: 1px solid var(--accent); }
-.tl-legend .sw.p { background: var(--accent); }
-.tl-legend .sw.g { background: var(--ok); }
+.tl-legend .sw.p { background: var(--warn); }
+.tl-legend .sw.g { background: var(--decode); }
 .tl-legend .sw.e { background: var(--bad); }
 /* Details: one collapsible block per session. */
 .det-h { display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left;
@@ -735,11 +720,12 @@ tr.is-off td { color: var(--muted); }
 .det-h .sum i { font-style: normal; min-width: 52px; text-align: right; }
 .det-h .sum i:nth-child(2) { min-width: 66px; }
 .det-h .sum i:last-child { min-width: 0; }
-/* Live rows — List table, phone cards, Details stage lines — share one
-   yellow tint; the header keeps its client hue untouched. */
-#ov-now tr.is-live > td { background: color-mix(in srgb, var(--live) 14%, transparent); }
-#ov-now .rq.is-live { background: color-mix(in srgb, var(--live) 14%, transparent); border-radius: 6px; }
-#ov-now .det-row.live { background: color-mix(in srgb, var(--live) 18%, transparent); border-radius: 4px; }
+/* Live rows — List table, phone cards, Details stage lines — wash in the
+   conversation's own client colour (the graph stays clean: there, the client
+   wash means hover). Yellow means prefill and nothing else. */
+#ov-now tr.is-live > td { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent); }
+#ov-now .rq.is-live { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent); border-radius: 6px; }
+#ov-now .det-row.live { background: color-mix(in srgb, var(--c, var(--accent)) 16%, transparent); border-radius: 4px; }
 /* Details: every stage is its own event line with its
    own timestamp, threaded down the left by the session colour. */
 .det-body { border-left: 2px dotted color-mix(in srgb, var(--c, var(--accent)) 45%, var(--border));
@@ -753,8 +739,8 @@ tr.is-off td { color: var(--muted); }
 .det-row .st::before { content: ''; display: inline-block; width: 7px; height: 7px;
   border-radius: 2px; margin-right: 5px; background: var(--c, var(--c1)); }
 .det-row .st.w::before { background: var(--accent-soft); border: 1px solid var(--accent); }
-.det-row .st.p::before { background: var(--accent); }
-.det-row .st.g::before { background: var(--ok); }
+.det-row .st.p::before { background: var(--warn); }
+.det-row .st.g::before { background: var(--decode); }
 .det-row .st.e::before { background: var(--bad); }
 .det-row .st.i::before { background: none; border: 1px dotted var(--faint); }
 .det-row .val { color: var(--muted); min-width: 0; }
@@ -779,8 +765,13 @@ tr.is-off td { color: var(--muted); }
   .tl-track { flex: 1 1 100%; height: 12px; }
   .tl-grp { gap: 6px; }
 }
-/* A timeline row is clickable: it focuses that conversation in the list below. */
+/* A timeline row is clickable: it focuses that conversation in the list below.
+   Hovering the lane or its label lights the whole row in the client's colour —
+   in the graph a client wash always means "under the mouse", never "live". */
 .tl-row { cursor: pointer; }
+.tl-row:hover { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent);
+  outline: 1px dashed color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
+  outline-offset: -1px; border-radius: 6px; }
 .det-h.flash { animation: detflash 1.2s ease-out; }
 #ov-now tr.flash, #ov-now .rq.flash { animation: rowflash 1.2s ease-out; }
 @keyframes rowflash {

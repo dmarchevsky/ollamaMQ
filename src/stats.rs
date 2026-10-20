@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::lock::LockExt;
 
 /// How far back the history goes (the longest Overview window).
-pub const HISTORY: Duration = Duration::from_secs(3600);
+pub const HISTORY: Duration = Duration::from_secs(24 * 3600);
 /// Cap on finished-request records, whatever their age.
 const MAX_FINISHED: usize = 20_000;
 /// Points in each sparkline.
@@ -44,6 +44,9 @@ pub struct Timing {
 pub struct Finished {
     pub at_ms: u64,
     pub client: String,
+    /// API key label (or id), `none` for keyless traffic — the per-key identity
+    /// the Overview's client+label mode groups by.
+    pub key: String,
     pub model: String,
     /// Metrics label of the backend; `None` when it was never dispatched.
     pub backend: Option<String>,
@@ -56,6 +59,11 @@ pub struct Finished {
     /// Seconds it waited in the queue; `None` when refused before queuing.
     pub queue_wait: Option<f64>,
     pub timing: Timing,
+}
+
+/// The metric/UI label of a key: the label (or id) or `none` for keyless.
+pub fn key_or_none(label: &Option<String>) -> String {
+    label.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "none".to_string())
 }
 
 impl Finished {
@@ -218,6 +226,7 @@ mod tests {
         Finished {
             at_ms,
             client: client.into(),
+            key: "none".into(),
             model: "llama3".into(),
             backend: Some(backend.into()),
             outcome,

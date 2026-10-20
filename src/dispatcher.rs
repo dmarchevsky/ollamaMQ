@@ -3151,6 +3151,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 state.stats.record(crate::stats::Finished {
                                     at_ms: crate::stats::now_ms(),
                                     client: user_id.clone(),
+                                    key: crate::stats::key_or_none(&dropped.key_label),
                                     model,
                                     backend: None,
                                     outcome: "timeout",
@@ -3392,6 +3393,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                         state_clone.stats.record(crate::stats::Finished {
                             at_ms: crate::stats::now_ms(),
                             client: user_id.clone(),
+                            key: crate::stats::key_or_none(&m_key),
                             model: m_model.clone(),
                             backend: Some(m_backend.clone()),
                             outcome: o,
@@ -4060,6 +4062,7 @@ pub async fn proxy_handler(
             state.stats.record(crate::stats::Finished {
                 at_ms: crate::stats::now_ms(),
                 client: user_id.clone(),
+                key: crate::stats::key_or_none(&task.key_label),
                 model: model_label.clone(),
                 backend: None,
                 outcome: "queue_full",
@@ -4112,6 +4115,7 @@ pub async fn proxy_handler(
             state.stats.record(crate::stats::Finished {
                 at_ms: crate::stats::now_ms(),
                 client: user_id.clone(),
+                key: crate::stats::key_or_none(&task.key_label),
                 model: model_label.clone(),
                 backend: None,
                 outcome: "overloaded",

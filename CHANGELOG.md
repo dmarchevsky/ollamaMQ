@@ -3,6 +3,30 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.11.0 — 2026-10-19
+
+### Added
+
+- **Filters modal.** The top-bar window selector and client chip row are gone; a
+  `Filters` button opens one modal that picks the interval (5/15/30/60 min or
+  “last N” minutes/hours, up to 24 h), lists and filters clients, backends and
+  models (multi-select), and switches client identity between bare names and
+  `client:key` — the API key label, shown everywhere in Activity and the Clients
+  table. The selection scopes every Overview panel and is remembered per browser.
+- **Session-stable order.** Graph and Details list conversations by when each
+  session started (newest start first) — a running session keeps its place
+  instead of jumping to the top with every request.
+- **Lane hover.** Hovering a swimlane (track or its client label) lights the
+  whole row in that conversation's client colour.
+
+### Changed
+
+- **Stage colours reverted:** prefill is yellow again, decode the old teal,
+  waiting the hollow blue. Yellow means prefill and nothing else: the live
+  highlight moved from yellow to a client-colour wash on List rows and Details
+  stage lines, and the graph reserves that wash for hover.
+- Overview history is kept for 24 h (was 1 h), so long intervals have data.
+
 ## v0.10.1 — 2026-10-19
 
 ### Fixed
