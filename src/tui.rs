@@ -1075,12 +1075,36 @@ impl TuiDashboard {
 
                 let height = name_lines.len() as u16;
 
+                // Share of this backend's prefill time lost to cache eviction
+                // over the retained history; `—` where nothing is measurable.
+                let (prefill_secs, waste_secs) =
+                    snapshot.backend_waste.get(idx).copied().unwrap_or((0.0, 0.0));
+                let (waste_str, waste_style) = if prefill_secs > 0.0 {
+                    let pct = ((waste_secs * 100.0 / prefill_secs).round() as u8).min(100);
+                    let hrs = waste_secs / 3600.0;
+                    let txt = format!(
+                        "{pct:>2}% ({:.1}h)",
+                        if hrs >= 100.0 { 99.9 } else { hrs }
+                    );
+                    let style = if pct >= 15 {
+                        Style::default().fg(Color::Red).bold()
+                    } else if pct >= 5 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Green)
+                    };
+                    (txt, style)
+                } else {
+                    ("   —".to_string(), Style::default().fg(Color::DarkGray))
+                };
+
                 Row::new(vec![
                     Cell::from(Text::from(name_lines)),
                     Cell::from(type_str).style(type_style),
                     Cell::from(b.active_requests.to_string()).style(req_style),
                     Cell::from(b.processed_count.to_string())
                         .style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(waste_str).style(waste_style),
                 ])
                 .height(height)
             })
@@ -1093,10 +1117,11 @@ impl TuiDashboard {
                 Constraint::Length(5),
                 Constraint::Length(4),
                 Constraint::Length(6),
+                Constraint::Length(10),
             ],
         )
         .header(
-            Row::new(vec!["Backend", "API", "Act", "Done"])
+            Row::new(vec!["Backend", "API", "Act", "Done", "Waste"])
                 .style(Style::default().fg(Color::Yellow).bold())
                 .bottom_margin(1),
         )
@@ -1545,6 +1570,7 @@ mod tests {
             vip_user: None,
             boost_user: None,
             backends: Vec::new(),
+            backend_waste: Vec::new(),
             logs: Vec::new(),
             active_ops: Vec::new(),
             recent_results: Vec::new(),
