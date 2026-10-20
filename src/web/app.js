@@ -572,12 +572,12 @@ function renderTimeline(st, ov) {
   const body = [...groups.values()]
     .sort((a, b) => (a.pseudo - b.pseudo) || (b.last - a.last))
     .map(g => {
-      // Same order as Details: last activity first, so a live session tops its
-      // group here and sits next to the same neighbours down below. The cap
-      // keeps the freshest activity of the group.
+      // Same order as Details: sessions are ordered by when they **started**
+      // (newest start first) — a stable position that ongoing traffic inside a
+      // session never reshuffles. The cap keeps the freshest starts of the group.
       const sess = [...g.sess.entries()]
-        .map(([key, rs]) => ({ key, rs, end: Math.max(...rs.map(x => x.plan.end)) }))
-        .sort((a, b) => b.end - a.end);
+        .map(([key, rs]) => ({ key, rs, start: Math.min(...rs.map(x => x.plan.at)) }))
+        .sort((a, b) => b.start - a.start);
       const shown = sess.slice(0, TL_ROWS);
       hidden += sess.length - shown.length;
       const lane = g.idx != null ? laneOf.get(g.idx) : null;
@@ -609,7 +609,7 @@ function tlRow(rows, pctOf, span) {
     return r.plan.events.map(e => `<i class="sg ${e.k}" style="left:${pctOf(e.at).toFixed(3)}%;`
       + `width:${Math.max(0, e.dur * 1000 / span * 100).toFixed(3)}%" title="${esc(stageTip(e))}"></i>`);
   }).join('');
-  return `<div class="tl-row" data-key="${esc(head.key)}">`
+  return `<div class="tl-row" data-key="${esc(head.key)}" style="--c:var(--${cvar(colorClass(head.o.client))})">`
     + `<div class="tl-lab">${swatch(head.o.client)}<b>${esc(head.o.client)}</b>${head.s ? ` #${esc(head.s)}` : ''}</div>`
     + `<div class="tl-track">${cut}${segs}<span class="now"></span></div></div>`;
 }
@@ -767,8 +767,8 @@ function renderDetails(rows) {
     // conversation carries no chip at all.
     const run = unit.find(x => x.kind === 'run'), wait = unit.find(x => x.kind === 'wait');
     const chip = run
-      ? (run.o.state === 'generating' ? '<span class="badge ok">decode</span>'
-        : '<span class="badge accent">prefill</span>')
+      ? (run.o.state === 'generating' ? '<span class="badge dec">decode</span>'
+        : '<span class="badge warn">prefill</span>')
       : wait ? `<span class="badge q" title="Position in this client's own queue">waiting #${wait.o.pos}</span>`
       : '';
     // The summary is three right-aligned columns so the numbers line up
@@ -794,7 +794,7 @@ function renderDetails(rows) {
       }
       for (const e of asc[i].plan.events) {
         // Live stage lines (the running request's now-still-unfinished ones)
-        // wear the yellow the List gives live rows.
+        // wear the client-colour wash the List gives live rows.
         lines.push({ t: e.at, html: `<div class="det-row${e.live ? ' live' : ''}"><span class="when">${fmtTime(e.at)}</span>`
           + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span></div>` });
       }
@@ -823,14 +823,15 @@ const rowTokens = row => row.kind === 'done' ? row.o.completion_tokens : row.kin
 /** Running and waiting rows share one treatment in both views. */
 const liveCls = row => row.kind === 'run' || row.kind === 'wait' ? ' is-live' : '';
 
-/** Conversations, newest activity first; a request without a session stands alone. */
+/** Conversations ordered by when each **started** — newest start first, so a
+ *  session never moves while it runs; a request without a session stands alone. */
 function threadUnits(rows) {
   const groups = new Map();
   for (const r of rows) {
     if (!groups.has(r.key)) groups.set(r.key, []);
     groups.get(r.key).push(r);
   }
-  return [...groups.values()].sort((a, b) => Math.max(...b.map(x => x.t)) - Math.max(...a.map(x => x.t)));
+  return [...groups.values()].sort((a, b) => Math.min(...b.map(x => x.plan.at)) - Math.min(...a.map(x => x.plan.at)));
 }
 
 /** Fold handlers for the Details conversation headers (state lives in
@@ -856,8 +857,8 @@ function phoneParts(row, ov) {
   const o = row.o;
   if (row.kind === 'run') {
     return {
-      head: o.state === 'generating' ? '<span class="badge ok">generating</span>'
-        : `<span class="badge accent" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(o.elapsed_secs)}</span>`,
+      head: o.state === 'generating' ? '<span class="badge dec">generating</span>'
+        : `<span class="badge warn" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(o.elapsed_secs)}</span>`,
       nums: `${fmtNum(o.tokens)} tok · ${o.tokens_per_sec == null ? '…' : o.tokens_per_sec.toFixed(1)} t/s`,
       timing: `<span title="prompt size, estimated">pre ≈${fmtTok(o.est_prompt_tokens)}</span>`
         + (o.ttft_secs != null ? ` · <span title="time to the first token">ttft ${fmtSec1(o.ttft_secs)}</span>` : ''),
@@ -901,7 +902,7 @@ function phoneParts(row, ov) {
  *  backend does. Then the counts, then the timing. */
 function cardPhone(row, ov) {
   const p = phoneParts(row, ov);
-  return `<div class="rq${liveCls(row)}" data-key="${esc(row.key)}"><div class="rq-1">${p.head}${swatch(row.o.client)}`
+  return `<div class="rq${liveCls(row)}" data-key="${esc(row.key)}" style="--c:var(--${cvar(colorClass(row.o.client))})"><div class="rq-1">${p.head}${swatch(row.o.client)}`
     + `<span class="who">${esc(row.o.client)}</span>`
     + `<span class="mb"><span class="mo">${esc(row.o.model)}</span><span class="ar">→</span>${esc(p.bk)}</span></div>`
     + `<div class="rq-2">${p.nums}</div>`
@@ -961,8 +962,8 @@ function renderRequests(st, ov) {
     return;
   }
   const pill = r => r.state === 'generating'
-    ? '<span class="badge ok">generating</span>'
-    : `<span class="badge accent" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(r.elapsed_secs)}</span>`;
+    ? '<span class="badge dec">generating</span>'
+    : `<span class="badge warn" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(r.elapsed_secs)}</span>`;
   // A phone gets cards, not a reflowed table: three tight lines per request.
   if (isPhone()) { setHTML(el, requestsPhone(rows, ov)); return; }
 
@@ -1013,7 +1014,7 @@ function renderRequests(st, ov) {
       <td class="num">${x.gen_tps == null ? dash : x.gen_tps.toFixed(1)}</td>`;
   };
 
-  const body = rows.map(r => `<tr${liveCls(r)} data-key="${esc(r.key)}">${tds(r)}</tr>`).join('');
+  const body = rows.map(r => `<tr${liveCls(r)} data-key="${esc(r.key)}" style="--c:var(--${cvar(colorClass(r.o.client))})">${tds(r)}</tr>`).join('');
 
   const head = `<tr><th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
   setHTML(el, rows.length ? `<table>${head}${body}</table>` : '<div class="empty">Nothing running or waiting</div>');
