@@ -28,6 +28,7 @@ const S = {
   filters: storedFilters(),  // the filter modal's selection (time, identity, lists)
   reqShow: storedReqShow(),  // List under the graph: active | all
   reqView: storedReqView(),  // List under the graph: list | details
+  keyRename: null,           // key id whose Label cell is being edited
   collapsed: storedCollapsed(),// conversation headers the operator folded shut
   colorOf: new Map(),        // client id -> colour slot 1..4
   settings: null,            // api/settings
@@ -1329,6 +1330,8 @@ function rowFlags(r) {
 }
 
 function renderClients(st) {
+  // The 1 s poll must not tear down an open inline label editor.
+  if (S.keyRename) return;
   const all = identities();
   const rows = all.filter(r => S.clientFilter === 'all'
     || (S.clientFilter === 'registered') === !!r.reg);
@@ -2120,17 +2123,34 @@ const actions = {
     return act('DELETE', `keys/${encodeURIComponent(f.key.id)}`, undefined, 'Key revoked');
   },
   'rename-key': el => {
+    const id = el.dataset.id;
+    // Switching rows mid-edit: repaint first, then edit the freshly drawn row.
+    if (S.keyRename && S.keyRename !== id) {
+      S.keyRename = null;
+      render();
+      el = $(`#client-detail [data-action="rename-key"][data-id="${CSS.escape(id)}"]`);
+      if (!el) return;
+    }
     const td = el.closest('tr').children[1];
-    if ($('input', td)) return;
-    td.innerHTML = `<input type="text" maxlength="60" value="${esc(findKey(el.dataset.id).key.label || '')}" placeholder="label" title="Enter saves, Esc cancels">`;
+    const orig = findKey(id).key.label || '';
+    S.keyRename = id;
+    td.innerHTML = `<input type="text" class="rename-inp" maxlength="60" value="${esc(orig)}" placeholder="label" title="Enter saves; Esc or click away cancels">`;
     const inp = $('input', td);
     inp.focus();
     inp.select();
+    const close = () => { S.keyRename = null; render(); };
     inp.addEventListener('keydown', async e => {
-      if (e.key === 'Escape') render();
-      else if (e.key === 'Enter') { e.preventDefault(); if (await act('PATCH', `keys/${encodeURIComponent(el.dataset.id)}`, { label: inp.value.trim() }, 'Label updated')) render(); }
+      if (e.key === 'Escape') close();
+      else if (e.key === 'Enter') {
+        e.preventDefault();
+        const v = inp.value.trim();
+        if (v === orig) close();
+        else if (await act('PATCH', `keys/${encodeURIComponent(id)}`, { label: v }, 'Label updated')) close();
+      }
     });
-    inp.addEventListener('blur', () => { if (document.contains(inp)) render(); });
+    // A failed PATCH keeps the editor open so the typo can be fixed; blur only
+    // closes it while it is still the active edit (close() nulls first).
+    inp.addEventListener('blur', () => { if (S.keyRename === id) close(); });
   },
   'fold-all': () => { S.collapsed.clear(); saveCollapsed(); render(); },
   'fold-none': () => { for (const b of $$('#ov-now .det-h')) S.collapsed.add(b.dataset.key); saveCollapsed(); render(); },
