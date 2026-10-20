@@ -185,7 +185,7 @@ pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
         .route("/models/toggle", post(toggle_model))
         .route(
             "/keys/{id}",
-            axum::routing::patch(move_key).delete(delete_key),
+            axum::routing::patch(patch_key).delete(delete_key),
         )
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "no such API endpoint") })
         .layer(middleware::from_fn(csrf_guard));
@@ -879,20 +879,35 @@ async fn add_key(
 }
 
 #[derive(Deserialize)]
-struct MoveKey {
-    client: String,
+struct KeyPatch {
+    #[serde(default)]
+    client: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
-async fn move_key(
+/// `PATCH /keys/{id}` — move a key to another client, rename its label, or
+/// both; at least one field must be present.
+async fn patch_key(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<MoveKey>,
+    Json(body): Json<KeyPatch>,
 ) -> ApiResult<serde_json::Value> {
-    state
-        .clients
-        .lock_or_recover()
-        .move_key(&id, &body.client)?;
-    info!("web: key {} moved to client '{}'", id, body.client);
+    if body.client.is_none() && body.label.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "nothing to change: pass 'client' and/or 'label'",
+        ));
+    }
+    let mut store = state.clients.lock_or_recover();
+    if let Some(client) = &body.client {
+        store.move_key(&id, client)?;
+    }
+    if let Some(label) = &body.label {
+        store.set_key_label(&id, label)?;
+    }
+    drop(store);
+    info!("web: key {id} updated (client move and/or label rename)");
     ok()
 }
 
@@ -1443,6 +1458,35 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let res = post("clients/nobody/keys", json!({}), true).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Rename the generated key's label through the PATCH route.
+        let kid = generated["id"].as_str().unwrap();
+        let res = c
+            .patch(format!("{base}/ui/api/keys/{kid}"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+            .json(&json!({"label": "work laptop"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let labels: Vec<String> = state
+            .clients
+            .lock_or_recover()
+            .list()
+            .iter()
+            .flat_map(|cl| cl.keys.iter().map(|k| k.key.label.clone()))
+            .collect();
+        assert!(labels.contains(&"work laptop".to_string()));
+        let res = c
+            .patch(format!("{base}/ui/api/keys/{kid}"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             state
                 .clients

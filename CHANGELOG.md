@@ -3,6 +3,28 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.12.0 — 2026-10-20
+
+### Added
+
+- **Key-label rename.** The Clients key table grew a `Rename` button beside
+  Copy/Reassign: the Label cell becomes an input, Enter saves (Esc cancels).
+  `PATCH /api/keys/{id}` now accepts `{label}` next to `{client}`.
+- **Expand all / collapse all** in Activity's Details view, folding every
+  conversation at once (remembered per browser).
+
+### Fixed
+
+- Filters modal: the custom “last N” interval now applies (it was silently
+  losing to the preset radio), sits on the presets' baseline, and switching to
+  *Clients + label* repopulates the client list immediately.
+- The little `all` labels are working **all · none** toggles; *none* empties
+  the panels as an explicit empty scope.
+- Ticking a single backend (or client in label mode), then reopening the modal
+  and pressing Apply no longer resets the filter — the checkbox lists are
+  built from the unfiltered state instead of the already-scoped payload.
+- The modal's Models list no longer offers hidden models.
+
 ## v0.11.0 — 2026-10-19
 
 ### Added

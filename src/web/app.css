@@ -194,6 +194,8 @@ tr.selected > td { background: var(--accent-soft); }
 .btn.on-boost { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn-group { display: inline-flex; gap: 6px; }
+/* The fold pair never splits — wrap as a unit, never internally. */
+#ov-fold { flex: none; flex-wrap: nowrap; }
 .linkbtn { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; padding: 0; }
 
 /* Backends */
@@ -261,6 +263,8 @@ dialog p { color: var(--muted); margin: 0 0 14px; }
 #dlg-filters .fhead b { font-size: 12.5px; color: var(--text); }
 #dlg-filters .fhead .hint { font-size: 11.5px; color: var(--faint); }
 #dlg-filters .frow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#dlg-filters .frow .seg { margin-bottom: 0; }
+#dlg-filters .fhead .ftog { margin-left: auto; font-size: 11.5px; color: var(--faint); white-space: nowrap; }
 #dlg-filters .frow input[type=text] { width: 64px; margin-top: 0; display: inline; }
 #dlg-filters .frow select { width: auto; margin-top: 0; }
 #dlg-filters .ftwo { display: flex; gap: 18px; flex-wrap: wrap; }
