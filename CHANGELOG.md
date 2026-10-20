@@ -3,6 +3,23 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.13.0 — 2026-10-20
+
+### Added
+
+- **Cache-waste metric:** the time lost when a conversation's context was
+  evicted from a backend's KV cache and the next turn had to re-prefill it.
+  Each turn's prefill time is split between the work even a perfect cache
+  could not skip (the previous answer re-entering the prompt, new content)
+  and the evicted prefix — the latter is the waste. `GET /metrics` gains
+  `ollamamq_cache_waste_seconds_total{client,model,backend}` and
+  `ollamamq_cache_waste_events_total{backend}`; the waste share is
+  `rate(cache_waste) / rate(prompt_seconds)`. The Web overview shows a Waste
+  column in the request Details, the Backends and Clients panels and the
+  client detail; the TUI Backends table grows a Waste column; the request log
+  records `waste_secs` per served request. Backends without per-request
+  prefill telemetry (plain Ollama) read as `—` — absence, never zero.
+
 ## v0.12.1 — 2026-10-20
 
 ### Fixed

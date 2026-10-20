@@ -1112,14 +1112,6 @@ fn estimate_cache_waste(prompt: u64, prompt_secs: f64, prev: Option<&ConvCache>)
     Some(prompt_secs * evicted as f64 / prompt as f64)
 }
 
-/// Sessionless fallback: no per-conversation memory, so a full re-prefill of
-/// a roughly unchanged prompt right after a nearly-full hit is charged fully.
-/// Deliberately coarse — the session-keyed path is the honest one.
-fn estimate_cache_waste_sessionless(prompt: u64, prompt_secs: f64) -> Option<f64> {
-    let hit = cache_hit_pct(prompt, Some(prompt))?;
-    (hit <= 10).then_some(prompt_secs)
-}
-
 /// Note a finished turn so the session's follow-up can keep priority for
 /// [`SLOT_RESERVE`] (see [`slot_reserved`]).
 fn reserve_slot(state: &AppState, key: &SessionKey) {
@@ -3715,23 +3707,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         .then(|| {
                                             let u = usage?;
                                             let ps = u.prompt_secs?;
-                                            if u.prompt == 0 {
+                                            if u.prompt == 0 || prior.is_none() {
                                                 return None;
                                             }
-                                            match &prior {
-                                                Some(_) => {
-                                                    estimate_cache_waste(u.prompt, ps, prior.as_ref())
-                                                }
-                                                // No usable session memory (no session
-                                                // key at all): the coarse sessionless
-                                                // variant, if the prompt came back
-                                                // essentially un-cached. A known
-                                                // session's first turn is never waste.
-                                                _ if task.session_key.is_none() => {
-                                                    estimate_cache_waste_sessionless(u.prompt, ps)
-                                                }
-                                                _ => None,
-                                            }
+                                            estimate_cache_waste(u.prompt, ps, prior.as_ref())
                                         })
                                         .flatten();
                                     if let Some(w) = waste_secs.filter(|w| *w > 0.0) {
@@ -6467,14 +6446,6 @@ mod tests {
         // inc None: the server reports no prompt_eval at all -> unmeasurable.
         assert_eq!(estimate_cache_waste(20_000, 45.0, Some(&prior(30, None, 2))), None);
         assert_eq!(estimate_cache_waste(0, 45.0, Some(&prior(30, Some(15_000), 2))), None);
-    }
-
-    #[test]
-    fn cache_waste_sessionless_needs_a_full_miss() {
-        // No session memory: only an essentially-uncached prompt is charged,
-        // and then the whole prefill time (upper bound, coarse by design).
-        assert_eq!(estimate_cache_waste_sessionless(1000, 10.0), Some(10.0));
-        assert_eq!(estimate_cache_waste_sessionless(0, 10.0), None); // no prompt counts
     }
 
     #[test]
