@@ -24,11 +24,10 @@ const S = {
   modelPolicy: null,         // { mode, rules } from api/models
   modelShow: 'all',          // all | served | hidden
   modelQuery: "",
-  overview: null,            // api/overview for the chosen window
-  window: storedWindow(),    // 5m | 15m | 1h
+  overview: null,            // api/overview for the chosen window and filters
+  filters: storedFilters(),  // the filter modal's selection (time, identity, lists)
   reqShow: storedReqShow(),  // List under the graph: active | all
   reqView: storedReqView(),  // List under the graph: list | details
-  client: storedClient(),      // Overview client filter (null = every client)
   collapsed: storedCollapsed(),// conversation headers the operator folded shut
   colorOf: new Map(),        // client id -> colour slot 1..4
   settings: null,            // api/settings
@@ -39,13 +38,20 @@ const S = {
   online: true,
 };
 
-/** The Overview window from the last visit (per browser). */
-function storedWindow() {
+/** The filter modal's selection from the last visit (per browser); the old
+ *  per-window and per-client storage keys fold into it. */
+function storedFilters() {
+  const d = { win: '15m', mode: 'client', clients: [], backends: [], models: [] };
   try {
+    const j = JSON.parse(localStorage.getItem('omq.filters') || 'null');
+    if (j && typeof j === 'object') {
+      return { ...d, ...j, clients: [...(j.clients || [])], backends: [...(j.backends || [])], models: [...(j.models || [])] };
+    }
     const w = localStorage.getItem('omq.window');
-    if (['5m', '15m', '1h'].includes(w)) return w;
+    const c = localStorage.getItem('omq.client');
+    return { ...d, win: ['5m', '15m', '1h'].includes(w) ? w : '15m', clients: c ? [c] : [] };
   } catch { /* storage blocked */ }
-  return '15m';
+  return d;
 }
 
 /** The Requests toggle from the last visit (per browser). */
@@ -65,12 +71,6 @@ function storedReqView() {
     if (localStorage.getItem('omq.reqGroup') === 'threads') return 'details';
   } catch { /* storage blocked */ }
   return 'list';
-}
-
-/** The Overview client filter from the last visit (null = every client). */
-function storedClient() {
-  try { return localStorage.getItem('omq.client') || null; } catch { /* storage blocked */ }
-  return null;
 }
 
 /** Session tags folded shut in Threads, per browser. */
@@ -241,9 +241,15 @@ async function act(method, path, body, okText) {
   }
 }
 
-/** The Overview request, scoped to the selected window and client. */
+/** The Overview request: window and filter scope (see the Filters modal). */
 function overviewPath() {
-  return `overview?window=${S.window}${S.client ? `&client=${encodeURIComponent(S.client)}` : ''}`;
+  const f = S.filters;
+  let p = `overview?window=${encodeURIComponent(f.win)}`;
+  if (f.mode === 'key') p += '&mode=key';
+  if (f.clients.length) p += `&clients=${f.clients.map(encodeURIComponent).join(',')}`;
+  if (f.backends.length) p += `&backends=${f.backends.map(encodeURIComponent).join(',')}`;
+  if (f.models.length) p += `&models=${f.models.map(encodeURIComponent).join(',')}`;
+  return p;
 }
 
 // ------------------------------------------------------------------ polling
@@ -290,8 +296,8 @@ function render() {
   // The sidebar brand is off-canvas on a phone, so Settings repeats the version.
   $('#set-version').textContent = ver ? `Running ollamaMQ ${ver}` : '';
   renderStats(st);
-  renderClientBar(st);
   renderNav(st);
+  renderFiltersBtn();
   ({
     overview: renderOverview,
     backends: renderBackends,
@@ -309,9 +315,9 @@ function renderStats(st) {
   // selector picks); Queue and Running are live gauges either way. Drops are not
   // shown here: they are on the Clients table and in /metrics.
   const w = S.page === 'overview' ? S.overview?.status : null;
-  // With a client picked, Queue/Running come from the scoped Overview too, so
-  // the header tells the same story as the page under it.
-  const scoped = w && S.client;
+  // With a filter on, Queue/Running come from the scoped Overview too, so the
+  // header tells the same story as the page under it.
+  const scoped = w && filtersActive();
   setHTML($('#stats'), `
     <span class="stat q">Queue <b>${fmtNum(scoped ? w.queued : s.queued + s.processing)}</b></span>
     <span class="stat">Running <b>${fmtNum(scoped ? w.running : s.processing)}</b></span>
@@ -320,34 +326,127 @@ function renderStats(st) {
     <span class="stat q">Boost <b>${esc(st.boost ?? '—')}</b></span>`);
 }
 
-/** Every client the dashboard knows: the live roster plus registered names.
- *  Never filtered, so the chip row keeps the whole list while one is picked. */
+/** Every client the dashboard knows: the live roster plus registered names. */
 function clientIds(st) {
   return [...new Set([...st.users.map(u => u.id), ...S.clients.map(c => c.name)])]
     .sort((a, b) => a.localeCompare(b));
 }
 
-/**
- * The client filter chips, pinned in the header with the stats. The number on a
- * chip is that client's live outstanding work (queue + running); clicking picks
- * a client — every panel below is refetched with ?client= — and clicking the
- * same chip again, or clear, goes back to everyone.
- */
-function renderClientBar(st) {
-  const bar = $('#clbar');
-  if (S.page !== 'overview') {
-    bar.hidden = true;
-    return;
-  }
-  bar.hidden = false;
-  const chips = clientIds(st).map(id => {
-    const u = st.users.find(x => x.id === id);
-    const n = u ? u.queued + u.processing : 0;
-    return `<button class="clchip ${colorClass(id)}" data-client="${esc(id)}" aria-pressed="${S.client === id}"
-      title="show only ${esc(id)}">${swatch(id)}${esc(id)}${n ? ` <span class="n">${n}</span>` : ''}</button>`;
-  }).join('');
-  setHTML(bar, `<span class="lbl">Clients</span><div class="clwrap">
-    <button class="clchip all" data-client="" aria-pressed="${!S.client}">All</button>${chips}</div>`);
+// ---------------------------------------------------------------- filters
+
+const FPRESETS = ['5m', '15m', '30m', '1h'];
+const saveFilters = () => {
+  try { localStorage.setItem('omq.filters', JSON.stringify(S.filters)); } catch { /* storage blocked */ }
+};
+
+/** `90m` -> `90 min`, `6h` -> `6 h` — for headers and empty-state labels. */
+function winLabel(w) {
+  const m = /^(\d+)(m|h)$/.exec(w);
+  return m ? `${m[1]} ${m[2] === 'm' ? 'min' : 'h'}` : '15 min';
+}
+
+/** Any deviation from the defaults — the Filters button dots itself on it. */
+const filtersActive = () => {
+  const f = S.filters;
+  return f.win !== '15m' || f.mode !== 'client'
+    || f.clients.length > 0 || f.backends.length > 0 || f.models.length > 0;
+};
+
+/** Mirrors the server's client-scope rule: a bare name matches every key, a
+ *  `name\tkey` entry only that pair. */
+const clientSel = (c, k) => {
+  const s = S.filters.clients;
+  return !s.length || s.includes(c) || (!!k && k !== 'none' && s.includes(`${c}\t${k}`));
+};
+const modelSel = m => !S.filters.models.length || S.filters.models.includes(m);
+const backendSel = b => !S.filters.backends.length || S.filters.backends.includes(hostOf(b || ''));
+/** Display identity: `client`, or `client:key` in label mode — the server's
+ *  own naming for lanes, client stats and capacity segments. */
+const fmtWho = o => (S.filters.mode === 'key' && o.key && o.key !== 'none') ? `${o.client}:${o.key}` : o.client;
+
+function openFilters() {
+  drawFilters();
+  $('#dlg-filters').showModal();
+}
+
+/** A checkbox row, checked when the selection is empty (= everything) or holds
+ *  the value. */
+const fchk = (sel, val, label) => `<label class="check"><input type="checkbox" value="${esc(val)}"${!sel.length || sel.includes(val) ? ' checked' : ''}> ${label}</label>`;
+
+function drawFilters() {
+  const f = S.filters, st = S.state, ov = S.overview || {};
+  const cm = /^(\d+)(m|h)$/.exec(f.win);
+  const preset = FPRESETS.includes(f.win);
+  setHTML($('#f-time'), `<div class="fhead"><b>Time interval</b><span class="hint">or last N — history is kept for 24 h</span></div>
+    <div class="frow"><span class="seg" role="radiogroup" aria-label="Time window">
+      ${FPRESETS.map(w => `<label><input type="radio" name="fwin" value="${w}"${preset && f.win === w ? ' checked' : ''}><span>${winLabel(w)}</span></label>`).join('')}
+    </span><input type="text" id="f-win-n" inputmode="numeric" placeholder="last" value="${preset ? '' : cm[1]}">
+    <select id="f-win-u"><option value="m"${!preset && cm?.[2] === 'm' ? ' selected' : ''}>minutes</option><option value="h"${cm?.[2] === 'h' ? ' selected' : ''}>hours</option></select></div>`);
+  setHTML($('#f-mode'), `<div class="fhead"><b>Client identity</b><span class="hint">label mode lists and shows client:key (API key label)</span></div>
+    <div class="frow"><span class="seg" role="radiogroup" aria-label="Client identity">
+      <label><input type="radio" name="fmode" value="client"${f.mode === 'client' ? ' checked' : ''}><span>Clients</span></label>
+      <label><input type="radio" name="fmode" value="key"${f.mode === 'key' ? ' checked' : ''}><span>Clients + label</span></label></span></div>`);
+  const cl = clientChoices(st, ov), bk = ov.backends || [], md = modelChoices(st, ov);
+  setHTML($('#f-clients'), `<div class="fhead"><b>Clients</b><span class="hint">${f.clients.length ? `${f.clients.length} of ${cl.length}` : 'all'}</span></div>
+    <div class="flist" id="f-cl-list">${cl.map(c => fchk(f.clients, c.id, `${swatch(c.label)}${esc(c.label)}`)).join('')}</div>`);
+  setHTML($('#f-backends'), `<div class="fhead"><b>Backends</b><span class="hint">${f.backends.length ? `${f.backends.length} of ${bk.length}` : 'all'}</span></div>
+    <div class="flist" id="f-bk-list">${bk.map(b => fchk(f.backends, b.label, bkCell(b.label))).join('')}</div>`);
+  setHTML($('#f-models'), `<div class="fhead"><b>Models</b><span class="hint">${f.models.length ? `${f.models.length} of ${md.length}` : 'all'}</span></div>
+    <div class="flist" id="f-md-list">${md.map(m => fchk(f.models, m, esc(m))).join('')}</div>`);
+}
+
+/** Which clients (or client+key pairs) the modal offers in each mode. */
+function clientChoices(st, ov) {
+  if (S.filters.mode !== 'key') return clientIds(st).map(n => ({ id: n, label: n }));
+  const pairs = new Map();
+  const add = (c, k) => pairs.set(k ? `${c}\t${k}` : c, k ? `${c}:${k}` : c);
+  for (const c of S.clients) { pairs.set(c.name, c.name); for (const k of c.keys || []) if (k.label) add(c.name, k.label); }
+  for (const r of st?.runs || []) add(r.client, r.key && r.key !== 'none' ? r.key : null);
+  for (const w of ov.queue || []) add(w.client, w.key && w.key !== 'none' ? w.key : null);
+  for (const x of ov.recent || []) add(x.client, x.key && x.key !== 'none' ? x.key : null);
+  return [...pairs].sort((a, b) => a[1].localeCompare(b[1])).map(([id, label]) => ({ id, label }));
+}
+
+/** Every model any backend lists, plus whatever traffic in the window used. */
+function modelChoices(st, ov) {
+  const s = new Set((st ? modelCatalog(st) : []).map(m => m.name));
+  for (const r of ov.recent || []) if (r.model) s.add(r.model);
+  for (const w of ov.queue || []) if (w.model) s.add(w.model);
+  return [...s].sort((a, b) => a.localeCompare(b));
+}
+
+/** Read the modal back into S.filters. A list with every box ticked stores
+ *  empty — "everything" travels compactly, matching the server's scope rule
+ *  (no ticked boxes at all would be "nothing to show", so it reads as all). */
+function collectFilters() {
+  const f = S.filters;
+  const win = $('#dlg-filters input[name="fwin"]:checked')?.value;
+  const n = ($('#f-win-n').value || '').trim();
+  f.win = win || (/^\d+$/.test(n)
+    ? Math.min(+n || 1, $('#f-win-u').value === 'h' ? 24 : 1440) + $('#f-win-u').value
+    : '15m');
+  f.mode = $('#dlg-filters input[name="fmode"]:checked').value;
+  const read = id => {
+    const all = $$('#' + id + ' input');
+    const on = [...all].filter(i => i.checked).map(i => i.value);
+    return on.length === all.length ? [] : on;
+  };
+  f.clients = read('f-cl-list');
+  f.backends = read('f-bk-list');
+  f.models = read('f-md-list');
+}
+
+/** Dots + tooltip summary on the Filters button. */
+function renderFiltersBtn() {
+  const on = filtersActive();
+  $('#ov-filters').classList.toggle('on', on);
+  $('#f-dot').hidden = !on;
+  const f = S.filters;
+  const bits = [winLabel(f.win), f.mode === 'key' ? 'client+label' : null,
+    f.clients.length ? `${f.clients.length} clients` : null,
+    f.backends.length ? `${f.backends.length} backends` : null,
+    f.models.length ? `${f.models.length} models` : null];
+  $('#ov-filters').title = on ? `Filters: ${bits.filter(Boolean).join(' · ')}` : 'Time, clients, backends and models';
 }
 
 function renderNav(st) {
@@ -423,17 +522,16 @@ function spark(values) {
     <i class="end" style="left:${(x(li) / W * 100).toFixed(1)}%;top:${(y(lv) / H * 100).toFixed(1)}%"></i></div>`;
 }
 
-const WINDOW_LABEL = { '5m': '5 min', '15m': '15 min', '1h': '1 hour' };
-
 function renderOverview(st) {
   const ov = S.overview;
   if (!ov) return;
-  // The payload is already scoped by ?client=; /state is not, so the live runs
-  // are scoped here — Capacity, Requests and their colour all read this copy.
-  const vis = S.client
-    ? { ...st, runs: (st.runs || []).filter(r => r.client === S.client) }
-    : st;
-  assignColors(clientIds(st));
+  // The payload is already scoped by the filter query; /state is not, so the
+  // live runs are scoped here — Capacity, Requests and their colour all read
+  // this copy.
+  const vis = { ...st, runs: (st.runs || []).filter(r => clientSel(r.client, r.key) && modelSel(r.model) && backendSel(r.backend)) };
+  // Identity colours key on the display name, so client+label pairs get their
+  // own hue (the server already names lanes, client rows and segments that way).
+  assignColors([...new Set([...clientIds(st), ...ov.clients.map(c => c.id), ...vis.runs.map(fmtWho)])]);
   const s = ov.status;
 
   // Status line: the one sentence an operator reads first.
@@ -447,7 +545,7 @@ function renderOverview(st) {
     s.queued ? `${s.queued} waiting (oldest ${fmtDur(s.oldest_wait_secs)})` : 'nothing waiting',
     ...s.loading.map(l => `${esc(l.verb)} ${esc(l.model)} on ${esc(bkName(l.backend))}`),
   ];
-  if (s.errors) parts.push(`${s.errors} error${s.errors === 1 ? '' : 's'} in the last ${WINDOW_LABEL[S.window]}`);
+  if (s.errors) parts.push(`${s.errors} error${s.errors === 1 ? '' : 's'} in the last ${winLabel(S.filters.win)}`);
   setHTML($('#ov-status'), `<span class="lvl ${level}"><span class="sdot"></span>${word}</span>${parts.map(p => `<span>${p}</span>`).join('')}`);
 
   renderCapacity(vis, ov);
@@ -549,7 +647,7 @@ function renderTimeline(st, ov) {
   pctOf.start = now - span;
   const { rows } = reqRows(st, ov, true);   // the graph is a window: it shows all of it
   if (!rows.length) {
-    setHTML(el, `<div class="empty">Nothing in the last ${WINDOW_LABEL[S.window]}</div>`);
+    setHTML(el, `<div class="empty">Nothing in the last ${winLabel(S.filters.win)}</div>`);
     return;
   }
   for (const r of rows) r.plan = stagePlan(r, now);
@@ -609,8 +707,8 @@ function tlRow(rows, pctOf, span) {
     return r.plan.events.map(e => `<i class="sg ${e.k}" style="left:${pctOf(e.at).toFixed(3)}%;`
       + `width:${Math.max(0, e.dur * 1000 / span * 100).toFixed(3)}%" title="${esc(stageTip(e))}"></i>`);
   }).join('');
-  return `<div class="tl-row" data-key="${esc(head.key)}" style="--c:var(--${cvar(colorClass(head.o.client))})">`
-    + `<div class="tl-lab">${swatch(head.o.client)}<b>${esc(head.o.client)}</b>${head.s ? ` #${esc(head.s)}` : ''}</div>`
+  return `<div class="tl-row" data-key="${esc(head.key)}" style="--c:var(--${cvar(colorClass(fmtWho(head.o)))})">`
+    + `<div class="tl-lab">${swatch(fmtWho(head.o))}<b>${esc(fmtWho(head.o))}</b>${head.s ? ` #${esc(head.s)}` : ''}</div>`
     + `<div class="tl-track">${cut}${segs}<span class="now"></span></div></div>`;
 }
 
@@ -757,7 +855,7 @@ function renderDetails(rows) {
   const out = [];
   for (const unit of threadUnits(rows)) {
     const head = unit[0];
-    const c = cvar(colorClass(head.o.client));
+    const c = cvar(colorClass(fmtWho(head.o)));
     const shut = S.collapsed.has(head.key);
     const asc = [...unit].sort((a, b) => a.plan.at - b.plan.at);
     const last = Math.max(...unit.map(x => x.plan.end));
@@ -777,7 +875,7 @@ function renderDetails(rows) {
       + `<i>${fmtTime(asc[0].plan.at)}→${last >= now - 1500 ? 'now' : fmtTime(last)}</i></span>`;
     out.push(`<button class="det-h" style="--c:var(--${c})" data-key="${esc(head.key)}" aria-expanded="${!shut}"
       title="${shut ? 'expand' : 'collapse'} this conversation">
-      <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(head.o.client)}</span>
+      <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(fmtWho(head.o))}</span>
       ${head.s ? `<span class="who">#${esc(head.s)}</span>` : ''}${chip}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
       ${sum}</button>`);
@@ -902,8 +1000,8 @@ function phoneParts(row, ov) {
  *  backend does. Then the counts, then the timing. */
 function cardPhone(row, ov) {
   const p = phoneParts(row, ov);
-  return `<div class="rq${liveCls(row)}" data-key="${esc(row.key)}" style="--c:var(--${cvar(colorClass(row.o.client))})"><div class="rq-1">${p.head}${swatch(row.o.client)}`
-    + `<span class="who">${esc(row.o.client)}</span>`
+  return `<div class="rq${liveCls(row)}" data-key="${esc(row.key)}" style="--c:var(--${cvar(colorClass(fmtWho(row.o)))})"><div class="rq-1">${p.head}${swatch(fmtWho(row.o))}`
+    + `<span class="who">${esc(fmtWho(row.o))}</span>`
     + `<span class="mb"><span class="mo">${esc(row.o.model)}</span><span class="ar">→</span>${esc(p.bk)}</span></div>`
     + `<div class="rq-2">${p.nums}</div>`
     + (p.timing ? `<div class="rq-m">${p.timing}</div>` : '') + '</div>';
@@ -925,9 +1023,9 @@ function requestsPhone(rows, ov) {
  */
 function reqRows(st, ov, all) {
   const now = ov.now_ms;
-  const keyOf = (o, fallback) => o.session ? `${o.client}#${o.session}` : `${o.client}·${o.model}·${fallback}`;
+  const keyOf = (o, fallback) => o.session ? `${fmtWho(o)}#${o.session}` : `${fmtWho(o)}·${o.model}·${fallback}`;
   const rows = [
-    ...(st.runs || []).filter(r => !S.client || r.client === S.client)
+    ...(st.runs || [])
       .map(r => ({ kind: 'run', t: now, s: r.session || null, o: r, key: keyOf(r, 'live') })),
     ...ov.queue.map(w => ({ kind: 'wait', t: now - w.waited_secs * 1000, s: w.session || null, o: w, key: keyOf(w, 'queue') })),
   ];
@@ -967,8 +1065,6 @@ function renderRequests(st, ov) {
   // A phone gets cards, not a reflowed table: three tight lines per request.
   if (isPhone()) { setHTML(el, requestsPhone(rows, ov)); return; }
 
-  const clientOf = row => row.o.client;
-
   const backendCell = row => row.kind === 'run' ? `<td>${bkCell(row.o.backend)}</td>`
     : row.kind === 'wait'
       ? `<td class="dim ph-hide">${row.o.backends.length === 1 ? bkName(ov.backends[row.o.backends[0]]?.label) : 'any'}</td>`
@@ -981,7 +1077,7 @@ function renderRequests(st, ov) {
         : row.o.error ? `<span class="badge bad" title="${esc(row.o.outcome)}">${esc(row.o.status && row.o.status >= 500 ? `HTTP ${row.o.status}` : row.o.outcome.replace(/_/g, ' '))}</span>`
           : row.o.outcome === 'ok' ? `<span class="dim mono" title="finished">${fmtTime(row.t)}</span>`
           : `<span class="badge">${esc(row.o.outcome.replace(/_/g, ' '))}</span>`}</td>
-      <td>${swatch(clientOf(row))}<span class="mono">${esc(clientOf(row))}</span></td>
+      <td>${swatch(fmtWho(row.o))}<span class="mono">${esc(fmtWho(row.o))}</span></td>
       <td class="trunc">${esc(row.o.model)}</td>`;
     if (row.kind === 'run') {
       const r = row.o;
@@ -1014,7 +1110,7 @@ function renderRequests(st, ov) {
       <td class="num">${x.gen_tps == null ? dash : x.gen_tps.toFixed(1)}</td>`;
   };
 
-  const body = rows.map(r => `<tr${liveCls(r)} data-key="${esc(r.key)}" style="--c:var(--${cvar(colorClass(r.o.client))})">${tds(r)}</tr>`).join('');
+  const body = rows.map(r => `<tr${liveCls(r)} data-key="${esc(r.key)}" style="--c:var(--${cvar(colorClass(fmtWho(r.o)))})">${tds(r)}</tr>`).join('');
 
   const head = `<tr><th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
   setHTML(el, rows.length ? `<table>${head}${body}</table>` : '<div class="empty">Nothing running or waiting</div>');
@@ -1050,7 +1146,7 @@ function renderClientStats(st, ov) {
       <td class="num">${fmtSecs(c.ttft_p50)}</td>
       <td class="num">${fmtRate(c.gen_p50)}</td>
       <td class="num">${fmtTok(c.prompt_tokens)} / ${fmtTok(c.completion_tokens)}</td></tr>`).join('')}
-    </table>` : `<div class="empty">No requests in the last ${WINDOW_LABEL[S.window]}</div>`);
+    </table>` : `<div class="empty">No requests in the last ${winLabel(S.filters.win)}</div>`);
 }
 
 /** Time to first token; until then the run is waiting for the backend or
@@ -1858,6 +1954,7 @@ async function loadDialog(idx) {
 // ------------------------------------------------------------------ actions
 
 const actions = {
+  'filters': () => openFilters(),
   'add-backend': () => backendDialog(null),
   'backend-edit': el => backendDialog(S.settings.backends.find(b => b.url === el.dataset.url)),
   'backend-toggle': async el => {
@@ -2033,18 +2130,11 @@ $('#client-filter').addEventListener('change', e => { S.clientFilter = e.target.
 $('#model-search').addEventListener('input', e => { S.modelQuery = e.target.value.trim().toLowerCase(); render(); });
 $('#model-show').addEventListener('change', e => { S.modelShow = e.target.value; render(); });
 $('#model-mode').addEventListener('change', e => setModelMode(e.target.value));
-$(`#ov-window input[value="${S.window}"]`).checked = true;
 $(`#ov-req-show input[value="${S.reqShow}"]`).checked = true;
 $(`#ov-req-view input[value="${S.reqView}"]`).checked = true;
 ['input', 'change'].forEach(t => $('#set-form').addEventListener(t, onSettingsInput));
 // Leaving with unsaved settings: the browser asks first.
 window.addEventListener('beforeunload', e => { if (S.draft.size) e.preventDefault(); });
-$('#ov-window').addEventListener('change', e => {
-  S.window = e.target.value;
-  try { localStorage.setItem('omq.window', S.window); } catch { /* storage blocked */ }
-  S.overview = null;
-  poll();
-});
 $('#ov-req-show').addEventListener('change', e => {
   S.reqShow = e.target.value;
   try { localStorage.setItem('omq.reqShow', S.reqShow); } catch { /* storage blocked */ }
@@ -2055,18 +2145,18 @@ $('#ov-req-view').addEventListener('change', e => {
   try { localStorage.setItem('omq.reqView', S.reqView); } catch { /* storage blocked */ }
   render();
 });
-// Client filter chips: pick one, click it again (or clear) to show everyone.
-$('#clbar').addEventListener('click', e => {
-  const chip = e.target.closest('[data-client]');
-  if (!chip) return;
-  const id = chip.dataset.client;
-  S.client = !id || S.client === id ? null : id;
-  try {
-    if (S.client) localStorage.setItem('omq.client', S.client);
-    else localStorage.removeItem('omq.client');
-  } catch { /* storage blocked */ }
-  S.overview = null;
-  poll();
+// The Filters modal writes the scope on Apply (Esc/Cancel discard the edits).
+$('#dlg-filters').addEventListener('close', e => {
+  if (e.target.returnValue === 'ok') {
+    collectFilters();
+    saveFilters();
+    S.overview = null;
+    poll();
+  }
+});
+$('#f-reset').addEventListener('click', () => {
+  S.filters = { win: '15m', mode: 'client', clients: [], backends: [], models: [] };
+  drawFilters();
 });
 // Cards on a phone, table on a desktop: repaint when the viewport crosses over.
 matchMedia('(max-width: 720px)').addEventListener('change', () => render());
@@ -2091,8 +2181,8 @@ function route() {
   if (S.page === 'settings' && was !== 'settings') S.formShown = false;
   $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${S.page}`));
   $$('.nav nav a').forEach(a => a.classList.toggle('active', a.dataset.page === S.page));
-  // The time window scopes the counters too; pages without one hide it.
-  $('#ov-window').style.display = S.page === 'overview' ? '' : 'none';
+  // The Filters button scopes the whole Overview page; other pages hide it.
+  $('#ov-filters').style.display = S.page === 'overview' ? '' : 'none';
   // The link's own text, without its icon and counter spans.
   $('#top-title').textContent = [...$(`.nav nav a[data-page="${S.page}"]`).childNodes]
     .filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent).join('').trim();

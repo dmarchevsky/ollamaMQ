@@ -252,6 +252,27 @@ dialog label:not(.check) { display: block; font-size: 12.5px; font-weight: 600; 
 dialog label:not(.check) input, dialog label:not(.check) select { display: block; width: 100%; margin-top: 5px; font-weight: 400; }
 dialog .check { margin-bottom: 12px; }
 dialog p { color: var(--muted); margin: 0 0 14px; }
+/* --- Filters modal: time row, identity toggle, checkbox lists side by side. --- */
+#ov-filters .fdot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); margin-left: 6px; }
+#ov-filters.on { color: var(--accent); border-color: var(--accent); }
+#dlg-filters { width: min(680px, 94vw); }
+#dlg-filters h3 { margin: 0 0 2px; }
+#dlg-filters .fhead { display: flex; align-items: baseline; gap: 10px; margin: 12px 0 5px; }
+#dlg-filters .fhead b { font-size: 12.5px; color: var(--text); }
+#dlg-filters .fhead .hint { font-size: 11.5px; color: var(--faint); }
+#dlg-filters .frow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#dlg-filters .frow input[type=text] { width: 64px; margin-top: 0; display: inline; }
+#dlg-filters .frow select { width: auto; margin-top: 0; }
+#dlg-filters .ftwo { display: flex; gap: 18px; flex-wrap: wrap; }
+#dlg-filters .ftwo > div { flex: 1 1 250px; min-width: 0; }
+#dlg-filters .flist { border: 1px solid var(--border); border-radius: 8px;
+  max-height: 170px; overflow: auto; margin: 5px 0 6px; padding: 3px; }
+#dlg-filters .flist label.check { display: flex; align-items: center; gap: 8px;
+  margin: 0; padding: 3px 8px; border-radius: 6px; font-size: 13px; font-weight: 400; }
+#dlg-filters .flist label.check:hover { background: var(--surface-2); }
+#dlg-filters .flist input { width: auto; margin: 0; }
+#dlg-filters .fcount { font-size: 11.5px; color: var(--faint); margin: 0 0 2px; }
+#dlg-filters .dlg-actions { display: flex; align-items: center; gap: 8px; }
 .field-hint { font-size: 12px; margin: -6px 0 12px !important; color: var(--faint) !important; }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; padding: 2px; margin-bottom: 14px; background: var(--surface-2); }
@@ -592,49 +613,10 @@ tr.is-off td { color: var(--muted); }
 }
 
 /* ================================================================ Overview:
-   client filter, phone layout (see .dev-flow/overview-mobile-ui/plan). */
-
-/* --- Client filter chips, inside the sticky header so they pin with it. On a
-   phone the row takes its own line and scrolls sideways, so a fleet of clients
-   costs one row of height; on desktop it joins the stats line and wraps only
-   when the client list outgrows it. --- */
+   phone layout (see .dev-flow/overview-mobile-ui/plan). */
 .topbar { flex-wrap: wrap; row-gap: 8px; }
-.clbar { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.clbar .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--faint); flex: 0 0 auto; }
-.clwrap { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; flex: 1 1 0; min-width: 0; padding: 1px 0 2px; }
-.clwrap::-webkit-scrollbar { display: none; }
-@media (min-width: 721px) {
-  /* The stats never break internally on a desktop: when the header runs out of
-     room the chip row shrinks (it scrolls) instead of pushing VIP/Boost down. */
-  .stats { flex-wrap: nowrap; }
-  .clbar { flex: 1 1 auto; }
-}
-.clchip {
-  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
-  font: inherit; font-size: 12px; color: var(--muted); background: var(--surface-2);
-  border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px;
-  cursor: pointer; white-space: nowrap;
-}
-.clchip:hover { color: var(--text); border-color: var(--faint); }
-.clchip .sw { margin-right: 0; }
-.clchip .n { color: var(--faint); font-variant-numeric: tabular-nums; }
-.clchip[aria-pressed="true"] {
-  color: var(--text); border-color: var(--c, var(--accent));
-  background: color-mix(in srgb, var(--c, var(--accent)) 16%, var(--surface));
-}
-.clchip.all[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
-/* Last chip is cut off where the row scrolls: fade it out instead of slicing a
-   chip in half. Clearing the filter is the `All` chip, always first in the row. */
-.clbar .clwrap {
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
-  mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
-}
 @media (max-width: 720px) {
   .topbar { gap: 8px 10px; padding: 8px 12px 8px; }
-  .clbar { flex-basis: 100%; order: 4; margin: 0 -12px; padding: 0 12px; }
-  .clwrap { margin-right: -12px; padding-right: 12px; }
-  .clchip { padding: 4px 10px; }
-  .clbar .lbl { display: none; }
 }
 
 /* --- Activity panel header on a phone: title and both switches stay on ONE

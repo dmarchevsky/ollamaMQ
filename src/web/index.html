@@ -35,15 +35,8 @@
       <button class="nav-toggle" id="nav-toggle" data-action="nav-open" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">☰</button>
       <span class="top-title" id="top-title">Overview</span>
       <div class="stats" id="stats"></div>
-      <div class="seg" id="ov-window" role="radiogroup" aria-label="Time window">
-        <label><input type="radio" name="ov-window" value="5m"><span>5 min</span></label>
-        <label><input type="radio" name="ov-window" value="15m" checked><span>15 min</span></label>
-        <label><input type="radio" name="ov-window" value="1h"><span>1 hour</span></label>
-      </div>
+      <button class="btn" id="ov-filters" data-action="filters" title="Time, clients, backends and models">Filters<span class="fdot" id="f-dot" hidden></span></button>
       <button class="btn reload" data-action="reload-config" title="Re-read appconf.yaml and apply it (TUI: r)" aria-label="Reload config">⟳<span class="reload-label"> Reload config</span></button>
-      <!-- Client filter: pinned with the header, so it stays on screen while the
-           page scrolls. Only the Overview uses it, so only Overview shows it. -->
-      <div class="clbar" id="clbar" hidden></div>
     </header>
 
     <section class="page" id="page-overview">
@@ -165,6 +158,23 @@
 </div>
 
 <!-- Dialogs -->
+<dialog id="dlg-filters">
+  <form method="dialog">
+    <h3>Filters</h3>
+    <p>Applies to every panel on the Overview page.</p>
+    <div id="f-time"></div>
+    <div id="f-mode"></div>
+    <div class="ftwo"><div id="f-clients"></div><div id="f-backends"></div></div>
+    <div id="f-models"></div>
+    <div class="dlg-actions">
+      <button type="button" class="linkbtn" id="f-reset">Reset to defaults</button>
+      <span style="flex:1"></span>
+      <button value="cancel" class="btn" formnovalidate>Cancel</button>
+      <button value="ok" class="btn primary">Apply</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="dlg-client">
   <form method="dialog" data-form="client">
     <h3 data-title>New client</h3>
