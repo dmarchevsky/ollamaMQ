@@ -196,6 +196,12 @@ tr.selected > td { background: var(--accent-soft); }
 .btn-group { display: inline-flex; gap: 6px; }
 /* The fold pair never splits — wrap as a unit, never internally. */
 #ov-fold { flex: none; flex-wrap: nowrap; }
+/* .btn-group's display would override the UA [hidden] rule. */
+#ov-fold[hidden] { display: none; }
+/* Activity controls live under the graph, right-aligned; wrap as units. */
+#ov-req-tools { justify-content: flex-end; gap: 8px; margin: 2px 0 10px; }
+/* Inline label editor: sized so the Label column cannot stretch the table. */
+.rename-inp { width: 9em; display: inline-block; margin: 0; vertical-align: middle; }
 .linkbtn { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; padding: 0; }
 
 /* Backends */
@@ -630,7 +636,7 @@ tr.is-off td { color: var(--muted); }
 @media (max-width: 720px) {
   #page-overview .panel-h { flex-wrap: nowrap; row-gap: 6px; column-gap: 8px; }
   #page-overview .panel-h h2 { margin: 0; flex: 0 0 auto; font-size: 15px; white-space: nowrap; }
-  #page-overview .panel-h .page-tools { gap: 5px; margin-left: auto; min-width: 0; }
+  #page-overview #ov-req-tools { gap: 5px; min-width: 0; }
   #page-overview .page-tools .seg { margin-bottom: 0; }
   #page-overview .page-tools .seg span { padding: 4px 7px; font-size: 11.5px; white-space: nowrap; }
   #page-overview .page-tools .seg span b { color: var(--text); font-variant-numeric: tabular-nums; }
