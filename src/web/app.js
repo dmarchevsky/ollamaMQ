@@ -467,10 +467,9 @@ function renderFiltersBtn() {
   $('#ov-filters').classList.toggle('on', on);
   $('#f-dot').hidden = !on;
   const f = S.filters;
+  const bit = (sel, word) => !sel.length ? null : sel[0] === FNONE ? `no ${word}` : `${sel.length} ${word}`;
   const bits = [winLabel(f.win), f.mode === 'key' ? 'client+label' : null,
-    f.clients.length ? `${f.clients.length} clients` : null,
-    f.backends.length ? `${f.backends.length} backends` : null,
-    f.models.length ? `${f.models.length} models` : null];
+    bit(f.clients, 'clients'), bit(f.backends, 'backends'), bit(f.models, 'models')];
   $('#ov-filters').title = on ? `Filters: ${bits.filter(Boolean).join(' · ')}` : 'Time, clients, backends and models';
 }
 

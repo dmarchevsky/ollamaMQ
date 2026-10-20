@@ -907,7 +907,7 @@ async fn patch_key(
         store.set_key_label(&id, label)?;
     }
     drop(store);
-    info!("web: key {} updated (client:move label:rename)", id);
+    info!("web: key {id} updated (client move and/or label rename)");
     ok()
 }
 
