@@ -2049,16 +2049,22 @@ async function lvNewOnly(curText) {
   const a = prev.messages, b = cur.messages;
   let k = 0;
   while (k < Math.min(a.length, b.length) && JSON.stringify(a[k]) === JSON.stringify(b[k])) k++;
+  // The fresh suffix usually leads with the previous round's reply — first
+  // resent here, already shown in that round's Response section. New input
+  // starts at the next user message.
+  let kShown = k;
+  while (kShown < b.length && b[kShown].role === 'assistant') kShown++;
+  const repliesHidden = kShown > k;
   const inside = k < a.length && k < b.length;
   const changed = Object.keys(cur).filter(x => x !== 'messages' && JSON.stringify(cur[x]) !== JSON.stringify(prev[x]));
   const noteTxt = inside
     ? `History changed at message #${k + 1} (context compacted?) — previous round had ${a.length} messages, this one ${b.length}`
-    : `History identical to the previous round up to message #${k} — ${b.length - k} new message(s)`;
+    : `History identical to the previous round up to message #${k} — ${b.length - kShown} new message(s)${repliesHidden ? ' (the previous reply is hidden; see that round’s Response)' : ''}`;
   const toolNames = new Map();
   for (const m of b.slice(0, k)) for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
   return `<div class="lv-note">${esc(noteTxt)}${changed.length ? ` · also changed: ${esc(changed.join(', '))}` : ''}</div>`
-    + b.slice(k).map(m => msgBlock(m, toolNames)).join('')
-    + `<div class="lv-foot">messages #1–${k} hidden · identical JSON per message</div>`;
+    + b.slice(kShown).map(m => msgBlock(m, toolNames)).join('')
+    + `<div class="lv-foot">messages #1–${kShown} hidden · identical JSON per message${repliesHidden ? ' · previous replies live in that round’s Response' : ''}</div>`;
 }
 
 // --- Settings
