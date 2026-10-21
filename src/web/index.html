@@ -45,22 +45,23 @@
       </div>
       <div class="ov-status" id="ov-status"></div>
       <div class="panel"><div class="panel-h"><h2>Capacity</h2></div><div id="ov-capacity"></div></div>
-      <div class="panel"><div class="panel-h"><h2>Activity</h2>
-        <div class="page-tools">
+      <div class="panel"><div class="panel-h"><h2>Activity</h2></div>
+        <div id="ov-timeline"></div>
+        <div class="page-tools" id="ov-req-tools">
           <div class="seg" id="ov-req-show" role="radiogroup" aria-label="Requests shown">
             <label><input type="radio" name="req-show" value="active" checked><span>Active</span></label>
             <label><input type="radio" name="req-show" value="all"><span>All</span></label>
           </div>
           <span class="btn-group" id="ov-fold" hidden>
-            <button class="btn sm" data-action="fold-all" title="Expand every conversation">expand all</button>
-            <button class="btn sm" data-action="fold-none" title="Collapse every conversation">collapse all</button>
+            <button class="btn sm" data-action="fold-all" title="Expand all conversations" aria-label="Expand all conversations">⊞</button>
+            <button class="btn sm" data-action="fold-none" title="Collapse all conversations" aria-label="Collapse all conversations">⊟</button>
           </span>
           <div class="seg" id="ov-req-view" role="radiogroup" aria-label="List under the graph">
             <label><input type="radio" name="req-view" value="list" checked><span>List</span></label>
             <label><input type="radio" name="req-view" value="details"><span>Details</span></label>
           </div>
         </div>
-      </div><div id="ov-timeline"></div><div id="ov-now"></div></div>
+        <div id="ov-now"></div></div>
       <div class="panel"><div class="panel-h"><h2>Backends</h2><a href="#backends" class="more">Manage →</a></div><div class="tscroll" id="ov-backends"></div></div>
       <div class="panel"><div class="panel-h"><h2>Clients</h2><a href="#clients" class="more">All clients →</a></div><div class="tscroll" id="ov-clients"></div></div>
     </section>

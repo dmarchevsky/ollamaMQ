@@ -28,6 +28,7 @@ const S = {
   filters: storedFilters(),  // the filter modal's selection (time, identity, lists)
   reqShow: storedReqShow(),  // List under the graph: active | all
   reqView: storedReqView(),  // List under the graph: list | details
+  keyRename: null,           // key id whose Label cell is being edited
   collapsed: storedCollapsed(),// conversation headers the operator folded shut
   pins: {},                // session tag -> operator-pinned priority level
   colorOf: new Map(),        // client id -> colour slot 1..4
@@ -899,6 +900,8 @@ function stagePlan(row, now) {
   if (pre >= .05) {
     out.push(ev('p', dispatch, pre, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(pre)}`
       + (o.cache_pct != null ? ` · cache ${o.cache_pct}%` : '')
+      // Time this turn burned re-reading context the backend had evicted.
+      + (o.waste_secs ? `<span class="st-bad"> · waste ${fmtSec1(o.waste_secs)}</span>` : '')
       // The rate divides the tokens actually evaluated (cache-excluded), like
       // the Backends table — dividing the whole prompt by the short time of a
       // cached prefill invented impossible speeds.
@@ -1064,6 +1067,7 @@ function phoneParts(row, ov) {
     o.prefill_tokens != null || o.prefill_secs != null
       ? `<span title="prompt size · prefill time">pre ${fmtTok(o.prompt_tokens)}${o.prefill_secs != null ? ` · ${fmtSec1(o.prefill_secs)}` : ''}</span>` : '',
     o.cache_pct != null ? `<span title="prefix-cache hit">cache ${o.cache_pct}%</span>` : '',
+    o.waste_secs ? `<span class="st-bad" title="prefill time lost to cache eviction">waste ${fmtSec1(o.waste_secs)}</span>` : '',
     o.ttft_secs != null ? `<span title="time to the first token">ttft ${fmtSec1(o.ttft_secs)}</span>` : '',
   ].filter(Boolean).join(' · ');
   return {
@@ -1192,6 +1196,7 @@ function renderRequests(st, ov) {
       <td class="num">${x.waited_secs == null ? dash : fmtDur(x.waited_secs)}</td>
       <td class="num">${pre}</td>
       <td class="num">${x.cache_pct == null ? dash : x.cache_pct + '%'}</td>
+      <td class="num">${x.waste_secs ? `<span class="${x.prefill_secs && x.waste_secs / x.prefill_secs >= .15 ? 'st-bad' : 'st-warn'} mono">${fmtSec1(x.waste_secs)}</span>` : dash}</td>
       <td class="num">${x.ttft_secs == null ? dash : `<span class="mono">${fmtSec1(x.ttft_secs)}</span>`}</td>
       <td class="num">${fmtTok(x.completion_tokens)}</td>
       <td class="num">${x.gen_secs == null ? dash : `<span class="mono">${fmtSec1(x.gen_secs)}</span>`}</td>
@@ -1200,14 +1205,14 @@ function renderRequests(st, ov) {
 
   const body = rows.map(r => `<tr${liveCls(r)} data-key="${esc(r.key)}" style="--c:var(--${cvar(colorClass(fmtWho(r.o)))})">${tds(r)}</tr>`).join('');
 
-  const head = `<tr><th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
+  const head = `<tr><th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num" title="prefill time lost re-reading evicted context">Waste</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
   setHTML(el, rows.length ? `<table>${head}${body}</table>` : '<div class="empty">Nothing running or waiting</div>');
 }
 
 
 function renderBackendStats(ov) {
   setHTML($('#ov-backends'), ov.backends.length ? `<table>
-    <tr><th>Backend</th><th class="num">Slots</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">First token p50 / p95</th><th class="num">Gen tok/s</th><th class="num">Prefill tok/s</th><th>Output tok/s</th></tr>
+    <tr><th>Backend</th><th class="num">Slots</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">First token p50 / p95</th><th class="num">Gen tok/s</th><th class="num">Prefill tok/s</th><th class="num" title="share of prefill time lost re-reading evicted context">Waste</th><th>Output tok/s</th></tr>
     ${ov.backends.map(b => `<tr>
       <td><span class="sdot ${b.online ? 'on' : 'off'}"></span>${bkCell(b.label, true)} ${typeBadge(b.api_type)}</td>
       <td class="num">${b.online ? `${b.running}/${b.max}` : '<span class="st-bad">offline</span>'}</td>
@@ -1216,15 +1221,23 @@ function renderBackendStats(ov) {
       <td class="num">${fmtSecs(b.ttft_p50)} / ${fmtSecs(b.ttft_p95)}</td>
       <td class="num">${fmtRate(b.gen_p50)}</td>
       <td class="num">${fmtRate(b.prefill_tps)}</td>
+      <td class="num">${wasteCell(b)}</td>
       <td class="sparkcell">${b.online ? spark(b.spark) : '<span class="dim">—</span>'}</td></tr>`).join('')}
     </table>` : '<div class="empty">No backends configured</div>');
 }
+
+/** Waste cell for a windowed group (backend/client): share of its prefill
+ *  time lost to cache eviction, absolute time beside it; `—` when no
+ *  prefill was measurable there (not zero — it is absence, not a clean run). */
+const wasteCell = x => x.waste_pct == null ? '<span class="dim">—</span>'
+  : `<span class="${x.waste_pct >= 15 ? 'st-bad' : x.waste_pct >= 5 ? 'st-warn' : 'st-ok'} mono">${x.waste_pct}%</span>`
+  + (x.waste_secs >= 60 ? ` <span class="dim mono">${Math.round(x.waste_secs / 60)}m</span>` : '');
 
 function renderClientStats(st, ov) {
   const now = c => [c.running ? `${c.running} running` : '', c.queued ? `<span class="st-warn">${c.queued} waiting</span>` : '']
     .filter(Boolean).join(' · ') || '<span class="dim">idle</span>';
   setHTML($('#ov-clients'), ov.clients.length ? `<table>
-    <tr><th>Client</th><th>Now</th><th class="num">Requests</th><th>Share of slot time</th><th class="num">Wait p95</th><th class="num">First token p50</th><th class="num">Gen tok/s</th><th class="num">Tokens in / out</th></tr>
+    <tr><th>Client</th><th>Now</th><th class="num">Requests</th><th>Share of slot time</th><th class="num">Wait p95</th><th class="num">First token p50</th><th class="num">Gen tok/s</th><th class="num">Tokens in / out</th><th class="num" title="share of this client's prefill time lost to cache eviction">Waste</th></tr>
     ${ov.clients.map(c => `<tr>
       <td>${swatch(c.id)}<span class="mono">${esc(c.id)}</span>${idBadges(c.id, { registered: c.registered }, st, true)}</td>
       <td>${now(c)}</td>
@@ -1233,7 +1246,8 @@ function renderClientStats(st, ov) {
       <td class="num">${fmtSecs(c.wait_p95)}</td>
       <td class="num">${fmtSecs(c.ttft_p50)}</td>
       <td class="num">${fmtRate(c.gen_p50)}</td>
-      <td class="num">${fmtTok(c.prompt_tokens)} / ${fmtTok(c.completion_tokens)}</td></tr>`).join('')}
+      <td class="num">${fmtTok(c.prompt_tokens)} / ${fmtTok(c.completion_tokens)}</td>
+      <td class="num">${wasteCell(c)}</td></tr>`).join('')}
     </table>` : `<div class="empty">No requests in the last ${winLabel(S.filters.win)}</div>`);
 }
 
@@ -1388,6 +1402,8 @@ function rowFlags(r) {
 }
 
 function renderClients(st) {
+  // The 1 s poll must not tear down an open inline label editor.
+  if (S.keyRename) return;
   const all = identities();
   const rows = all.filter(r => S.clientFilter === 'all'
     || (S.clientFilter === 'registered') === !!r.reg);
@@ -1434,11 +1450,17 @@ function clientDetail(r, st) {
          ? `<button class="btn sm" data-action="user" data-op="unblock" data-id="${id}">Unblock</button>`
          : `<button class="btn sm danger" data-action="user" data-op="block" data-id="${id}" title="Block this id (TUI: x)">Block</button>`}
        ${ipBtn}`;
+  // Windowed waste lives in the overview payload (the Overview poll caches it);
+  // without a cached overview there is nothing to show, so the tile is absent.
+  const w = (S.overview?.clients || []).find(x => x.id === r.id);
+  const waste = w && w.waste_pct != null
+    ? `<div><b${w.waste_pct >= 15 ? ' class="st-bad"' : w.waste_pct >= 5 ? ' class="st-warn"' : ''}>${w.waste_pct}%</b>prefill lost to cache eviction (${fmtDur(w.waste_secs)})</div>`
+    : '';
   const meta = `
     <div><b>${u ? u.queued + u.processing : 0}</b>in queue</div>
     <div><b>${fmtNum(u?.done ?? 0)}</b>requests done</div>
     <div><b>${fmtNum(u?.dropped ?? 0)}</b>dropped</div>
-    <div><b class="mono">${esc(u?.ip ?? '—')}</b>last IP</div>
+    <div><b class="mono">${esc(u?.ip ?? '—')}</b>last IP</div>${waste}
     ${c ? `<div><b>${fmtAgo(lastUsed(c))}</b>last key use</div><div><b>${fmtDate(c.created_at_ms)}</b>created</div>` : ''}`;
   let body;
   if (c) {
@@ -2186,17 +2208,34 @@ const actions = {
     return act('DELETE', `keys/${encodeURIComponent(f.key.id)}`, undefined, 'Key revoked');
   },
   'rename-key': el => {
+    const id = el.dataset.id;
+    // Switching rows mid-edit: repaint first, then edit the freshly drawn row.
+    if (S.keyRename && S.keyRename !== id) {
+      S.keyRename = null;
+      render();
+      el = $(`#client-detail [data-action="rename-key"][data-id="${CSS.escape(id)}"]`);
+      if (!el) return;
+    }
     const td = el.closest('tr').children[1];
-    if ($('input', td)) return;
-    td.innerHTML = `<input type="text" maxlength="60" value="${esc(findKey(el.dataset.id).key.label || '')}" placeholder="label" title="Enter saves, Esc cancels">`;
+    const orig = findKey(id).key.label || '';
+    S.keyRename = id;
+    td.innerHTML = `<input type="text" class="rename-inp" maxlength="60" value="${esc(orig)}" placeholder="label" title="Enter saves; Esc or click away cancels">`;
     const inp = $('input', td);
     inp.focus();
     inp.select();
+    const close = () => { S.keyRename = null; render(); };
     inp.addEventListener('keydown', async e => {
-      if (e.key === 'Escape') render();
-      else if (e.key === 'Enter') { e.preventDefault(); if (await act('PATCH', `keys/${encodeURIComponent(el.dataset.id)}`, { label: inp.value.trim() }, 'Label updated')) render(); }
+      if (e.key === 'Escape') close();
+      else if (e.key === 'Enter') {
+        e.preventDefault();
+        const v = inp.value.trim();
+        if (v === orig) close();
+        else if (await act('PATCH', `keys/${encodeURIComponent(id)}`, { label: v }, 'Label updated')) close();
+      }
     });
-    inp.addEventListener('blur', () => { if (document.contains(inp)) render(); });
+    // A failed PATCH keeps the editor open so the typo can be fixed; blur only
+    // closes it while it is still the active edit (close() nulls first).
+    inp.addEventListener('blur', () => { if (S.keyRename === id) close(); });
   },
   'fold-all': () => { S.collapsed.clear(); saveCollapsed(); render(); },
   'fold-none': () => { for (const b of $$('#ov-now .det-h')) S.collapsed.add(b.dataset.key); saveCollapsed(); render(); },

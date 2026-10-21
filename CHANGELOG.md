@@ -42,6 +42,43 @@ since upstream `v0.5.0`.
   a `400`. The Overview now also returns `status.pins`, and the icon beside a
   session shows the pin (a finished row keeps its historical level underneath).
 
+## v0.12.2 — 2026-10-20
+
+### Added
+
+- **Cache-waste metric:** the time lost when a conversation's context was
+  evicted from a backend's KV cache and the next turn had to re-prefill it.
+  Each turn's prefill time is split between the work even a perfect cache
+  could not skip (the previous answer re-entering the prompt, new content)
+  and the evicted prefix — the latter is the waste. `GET /metrics` gains
+  `ollamamq_cache_waste_seconds_total{client,model,backend}` and
+  `ollamamq_cache_waste_events_total{backend}`; the waste share is
+  `rate(cache_waste) / rate(prompt_seconds)`. The Web overview shows a Waste
+  column in the request Details, the Backends and Clients panels and the
+  client detail; the TUI Backends table grows a Waste column; the request log
+  records `waste_secs` per served request. Backends without per-request
+  prefill telemetry (plain Ollama) read as `—` — absence, never zero.
+
+## v0.12.1 — 2026-10-20
+
+### Fixed
+
+- **Key-label rename actually works:** the 1 s poll used to repaint the Clients
+  page and tear the inline editor down ~1 s after opening it — with the editor
+  gone, Esc/Enter did nothing either. The editor now stays open while you type;
+  Enter saves (or closes if nothing changed), Esc or clicking away cancels.
+- The editor's input no longer stretches the Label column, push the action
+  buttons out of the panel and spawn a horizontal scrollbar.
+- The expand all / collapse all pair now hides in List view (its `.btn-group`
+  display was overriding the browser's `[hidden]` rule).
+
+### Changed
+
+- Activity's controls (Active/All, List/Details, expand/collapse) moved from
+  the panel header to a right-aligned row **under the graph** — the header
+  stays one line on phones.
+- **expand all / collapse all** are now icon buttons (**⊞ / ⊟**) with tooltips.
+
 ## v0.12.0 — 2026-10-20
 
 ### Added

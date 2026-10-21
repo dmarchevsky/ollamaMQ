@@ -227,6 +227,10 @@
     // Free KV share per backend (see the capacity panel): one llama.cpp box
     // with --metrics; the rest report nothing.
     const KV = { '192.168.255.224:8000': 42 };
+    // Demo waste story: one clean backend, one eviction-prone, one blind
+    // (no prefill telemetry -> `—`, not 0).
+    const BE_WASTE = { 0: [2, 220], 1: [19, 6840], 2: [8, 1300] };
+    const CL_WASTE = { 'codex-laptop': [21, 0.21], 'openwebui': [4, 0.04] };
     const queue = demoQueue.map(q => ({
       client: q.client, model: q.model, pos: q.pos, backends: q.backends, session: q.session,
       session_label: q.label, priority: q.prio || 'normal',
@@ -241,6 +245,8 @@
         kv_free_pct: KV[label] ?? null,
         requests: Math.round(requests * scale), errors: Math.round(errors * scale), ttft_p50, ttft_p95, gen_p50, wait_p95: null,
         prefill_tps, prompt_tokens: 0, completion_tokens: 0, busy_secs: 0,
+        waste_pct: BE_WASTE[b.idx]?.[0] ?? null,
+        waste_secs: BE_WASTE[b.idx] ? BE_WASTE[b.idx][1] * scale : 0,
         spark: b.online ? Array.from({ length: 30 }, (_, i) => (gen_p50 || 0) * (0.6 + 0.6 * noise(i + label.length)) * b.max) : Array(30).fill(0),
       };
     });
@@ -254,6 +260,9 @@
         wait_p95: c[3], gen_p50: c[4], prefill_tps: null,
         prompt_tokens: Math.round(c[5] * scale), completion_tokens: Math.round(c[6] * scale),
         busy_secs: c[7] * scale, share: c[7] / totalBusy,
+        // Per-client demo waste: the eviction-prone clients pay for it.
+        waste_pct: CL_WASTE[id]?.[0] ?? null,
+        waste_secs: CL_WASTE[id] ? Math.round(c[7] * CL_WASTE[id][1] * scale) : 0,
       };
     });
     const requests = be.reduce((a, b) => a + b.requests, 0);
@@ -317,6 +326,9 @@
         session_label: i % 4 === 0 ? 'refactor-auth' : i % 4 === 1 ? 'gitlab-runner' : null,
         priority: i % 4 === 0 ? 'top' : i % 4 === 1 ? 'high' : 'normal',
         prompt_tokens: err ? 0 : prompt, prefill_secs: prefill, prefill_tokens: prefillTok, cache_pct: cache,
+        // A near-cold turn after a warm session: almost the whole prefill was
+        // re-reading an evicted context. One of the healthy rows shows it.
+        waste_secs: !err && (cache ?? 100) <= 8 ? prefill * 0.92 : null,
         ttft_secs: err ? null : prefill + 0.2,
         completion_tokens: completion, gen_tps: err ? null : 20 + noise(i + 7) * 40,
         gen_secs: err ? null : completion / (20 + noise(i + 7) * 40),

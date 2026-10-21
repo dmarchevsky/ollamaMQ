@@ -33,6 +33,14 @@ Seed UI state (List/Details, Active/All) via `localStorage` on a `--user-data-di
 (open a tiny `localStorage.setItem('omq.reqView','details');…` page once, then the demo).
 Dark mode: copy `app.css` and rewrite `prefers-color-scheme: dark` to `all` —
 `--force-dark-mode` does nothing on a page that supports dark itself.
+Gotchas: each shot starts at the page top-left (no scroll) — for a lower region hide what is
+above with an inline `<style>`; a `--user-data-dir` profile persists between shots, so use a
+fresh one per intended UI state; for a transient edit state (e.g. the inline key-label editor)
+freeze repaints after opening it (`window.render=function(){}`) or the 1 s poll tears it down
+before the shot — stub only after the demo data has loaded, or the page renders empty. For a
+single component, render a static strip (tiny HTML linking `app.css`, just the markup) instead
+of the whole demo app; embed mockups in plan.md only as `![alt](mockups/x.png)` and re-verify
+every tag resolves to a file before Approve?.
 
 ## release
 

@@ -259,6 +259,8 @@ struct Recent {
     priority: &'static str,
     /// Share of the prompt served from the prefix cache, 0–100.
     cache_pct: Option<u8>,
+    /// Prefill seconds lost to cache eviction; `None` when unmeasurable.
+    waste_secs: Option<f64>,
     ttft_secs: Option<f64>,
     completion_tokens: u64,
     gen_tps: Option<f64>,
@@ -681,6 +683,7 @@ pub async fn get_overview(
             priority: f.priority,
             key: f.key.clone(),
             cache_pct: cache_pct(f.timing.prompt_tokens, f.timing.prefill.map(|(_, t)| t)),
+            waste_secs: f.timing.waste_secs,
             ttft_secs: f.timing.ttft,
             completion_tokens: f.timing.completion_tokens,
             gen_tps: f.gen_speed(),
