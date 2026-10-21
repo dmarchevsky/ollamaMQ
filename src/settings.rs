@@ -69,7 +69,7 @@ pub fn defaults() -> Settings {
         request_log_path: Some("ollamamq-requests.jsonl".into()),
         request_log_max_bytes: Some(10 * 1024 * 1024),
         request_log_max_files: Some(5),
-        log_content_limit: Some(65_536),
+        log_content_limit: Some(1024 * 1024),
         max_body_bytes: Some(64 * 1024 * 1024),
         max_queued_bytes: Some(512 * 1024 * 1024),
         clients_file: Some(crate::clients::DEFAULT_CLIENTS_FILE.into()),
@@ -233,7 +233,7 @@ pub fn apply(state: &AppState, eff: &Settings) {
         Relaxed,
     );
     state.log_content_limit.store(
-        eff.log_content_limit.map(|v| v.max(1024)).unwrap_or(65_536),
+        eff.log_content_limit.map(|v| v.max(1024)).unwrap_or(1024 * 1024),
         Relaxed,
     );
     *state.metrics_token.lock_or_recover() = eff.metrics_token.clone().filter(|t| !t.is_empty());

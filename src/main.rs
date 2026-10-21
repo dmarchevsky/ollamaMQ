@@ -282,7 +282,10 @@ async fn main() {
         .unwrap_or_else(|| "ollamamq-requests.jsonl".to_string());
     let request_log_max_bytes = eff.request_log_max_bytes.unwrap_or(10 * 1024 * 1024);
     let request_log_max_files = eff.request_log_max_files.unwrap_or(5);
-    let log_content_limit = eff.log_content_limit.map(|v| v.max(1024)).unwrap_or(65_536);
+    let log_content_limit = eff
+        .log_content_limit
+        .map(|v| v.max(1024))
+        .unwrap_or(1024 * 1024);
     // Request bodies are buffered whole (a queued request may wait before a
     // backend takes it), so the body limit is a per-request memory commitment.
     // It used to be a flat 1 GiB on every route.

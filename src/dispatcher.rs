@@ -856,7 +856,7 @@ pub struct LogEvent {
     /// Optional body/response content preview (truncated to the configured
     /// limit) for IN/OUT events; None for drops and control actions.
     /// Reference-counted: the TUI snapshots the newest events on every frame,
-    /// and these strings run to `log_content_limit` (64 KiB by default).
+    /// and these strings run to `log_content_limit` (1 MiB by default).
     pub content: Option<Arc<String>>,
     /// Correlation id of the proxied request this event belongs to: the IN and
     /// OUT events of one request share it, which is how the web UI pairs them

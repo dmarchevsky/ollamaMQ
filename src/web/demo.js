@@ -427,7 +427,7 @@
       F('model_aliases', { 'codex-auto-review': 'Qwen3.8-Flash-Next' }, 'file'), F('ip_identity', true, 'default'),
       F('sticky_routing', 'prompt', 'default'), F('sticky_ttl', 1800, 'default'), F('sticky_lag', 0, 'default'),
       F('sticky_max_entries', 10000, 'default'),
-      F('allow_all_routes', false, 'file'), F('metrics_token', null, 'default'), F('log_content_limit', 65536, 'default'),
+      F('allow_all_routes', false, 'file'), F('metrics_token', null, 'default'), F('log_content_limit', 1048576, 'default'),
     ],
     startup: [
       F('host', '0.0.0.0', 'file', false), F('port', 11435, 'file', false),
