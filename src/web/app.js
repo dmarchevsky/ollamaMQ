@@ -1835,17 +1835,56 @@ async function lvBody() {
 
 const rawView = t => `<pre class="raw">${esc(t)}</pre>`;
 
+/** Chat request truncated by the content limit: recover the scalar params
+ *  from the prefix and as many complete `messages` elements as the capture
+ *  reached. Undefined when this is not a truncated chat request. */
+function salvageChat(text) {
+  const cut = text.indexOf('\n...[truncated:');
+  if (cut < 0) return undefined;
+  const head = text.slice(0, cut);
+  const mi = head.indexOf('"messages"');
+  const open = mi < 0 ? -1 : head.indexOf('[', mi);
+  if (open < 0) return undefined;
+  // Walk the array string-aware and note where each complete element ends
+  // (depth back to 0 on `}`); the capture may end mid-element.
+  const ends = [];
+  let depth = 0, inStr = false, es = false;
+  for (let i = open + 1; i < head.length; i++) {
+    const c = head[i];
+    if (inStr) { if (es) es = false; else if (c === '\\') es = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true;
+    else if (c === '{' || c === '[') depth++;
+    else if (c === '}' || c === ']') { depth--; if (depth === 0 && c === '}') ends.push(i); }
+  }
+  if (!ends.length) return undefined;
+  const arr = tryJson(head.slice(open, ends.at(-1) + 1) + ']');
+  if (!Array.isArray(arr)) return undefined;
+  const obj = { messages: arr };
+  const ms = /"model"\s*:\s*"([^"]*)"/.exec(head);
+  if (ms) obj.model = ms[1];
+  if (/"stream"\s*:\s*true/.test(head)) obj.stream = true;
+  for (const k of ['temperature', 'top_p', 'max_tokens', 'max_completion_tokens', 'num_predict']) {
+    const m = new RegExp(`"${k}"\\s*:\\s*([\\d.]+)`).exec(head);
+    if (m) obj[k] = +m[1];
+  }
+  return obj;
+}
+
 /** Chat request body → meta line + transcript blocks; chat response →
  *  reconstructed message + footer; any other JSON → collapsible tree. */
 function formatContent(text) {
+  const trunc = text.includes('[truncated:')
+    ? '<div class="lv-note">Body was truncated by the content limit — showing everything the capture kept.</div>' : '';
   const o = tryJson(text);
   if (o && typeof o === 'object' && !Array.isArray(o)) {
     if (Array.isArray(o.messages)) return transcriptView(o);
     if (o.choices || o.message) return responseView(o) ?? jsonView(o, text);
     return jsonView(o, text);
   }
+  const salv = salvageChat(text);
+  if (salv) return trunc + transcriptView(salv);
   const gs = groupStream(text);
-  if (gs) return gs;
+  if (gs) return gs + trunc;
   return rawView(text);
 }
 
@@ -1912,13 +1951,16 @@ function groupStream(text) {
   if (!lines.length) return null;
   const sse = /^data:/.test(lines[0]);
   if (!sse && !/^\{/.test(lines[0])) return null;
-  const st = { text: '', think: '', tools: [], finish: null, usage: null, chunks: 0, errs: 0 };
+  const trunc = text.includes('[truncated:');
+  const st = { text: '', think: '', tools: [], finish: null, usage: null, chunks: 0, errs: 0, cutTail: false };
   for (const line of lines) {
-    if (sse && !/^data:/.test(line)) continue; // keep-alives, event: lines
+    if (sse && !/^data:/.test(line)) continue; // keep-alives, event:, marker lines
     const payload = sse ? line.slice(5).trim() : line;
     if (payload === '[DONE]') continue;
     const o = tryJson(payload);
-    if (!o || typeof o !== 'object') return null;
+    // A capture truncated by the content limit ends mid-chunk: keep what
+    // parsed instead of dropping the whole view.
+    if (!o || typeof o !== 'object') { if (trunc) { st.cutTail = true; continue; } return null; }
     st.chunks++;
     if (o.error) { st.errs++; st.text += `\n[error: ${o.error.message ?? JSON.stringify(o.error)}]`; continue; }
     if (o.choices?.[0]?.finish_reason) st.finish = o.choices[0].finish_reason;
@@ -1944,7 +1986,7 @@ function groupStream(text) {
   const tools = st.tools.filter(Boolean);
   const foot = [`finish: ${st.finish || '?'}`];
   if (st.usage) foot.push(`prompt ${fmtTok(st.usage.p || 0)} → completion ${fmtTok(st.usage.c || 0)} tok`);
-  foot.push(`${fmtNum(st.chunks)} chunks grouped${st.errs ? ` · ${st.errs} error payload(s)` : ''}`);
+  foot.push(`${fmtNum(st.chunks)} chunks grouped${st.errs ? ` · ${st.errs} error payload(s)` : ''}${st.cutTail ? ' · tail truncated' : ''}`);
   return `<div class="msg asst"><span class="role">assistant</span>${thinkBlock(st.think)}`
     + (st.text ? `<div class="mtext">${esc(st.text)}</div>` : '')
     + tools.map(t => toolCallBlock(t.name, t.args)).join('')
@@ -1981,13 +2023,13 @@ function jsonTree(v, key, depth) {
 /** New only: the current request minus the previous round's message prefix. */
 async function lvNewOnly(curText) {
   const note = msg => `<div class="lv-note">${esc(msg)} — showing the whole request instead.</div>`;
-  const cur = tryJson(curText);
+  const cur = tryJson(curText) || salvageChat(curText);
   if (!cur || !Array.isArray(cur.messages)) return note('Only chat requests carry a message history') + formatContent(curText);
   if (!LV.prevEv) return note('No earlier round of this conversation is in the log ring') + formatContent(curText);
   if (LV.prevText === undefined) {
     LV.prevText = await evContent(LV.prevEv) ?? '';
   }
-  const prev = tryJson(LV.prevText);
+  const prev = tryJson(LV.prevText) || salvageChat(LV.prevText);
   if (!prev || !Array.isArray(prev.messages)) return note('The previous round’s captured content is no longer available') + formatContent(curText);
   const a = prev.messages, b = cur.messages;
   let k = 0;
