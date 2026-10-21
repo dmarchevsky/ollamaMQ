@@ -23,6 +23,7 @@
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
 - **Cache-Aware Hold-Back**: On a backend that reports KV-cache telemetry (llama.cpp/halogen with `--metrics`), a conversation whose last turn mostly *missed* that cache — and whose estimated next-turn prefill does not fit the free KV — lines up behind the conversations served most recently instead of forcing a context switch and a full re-prefill every round. A session that just finished a turn also keeps queue priority for its follow-up for ~5 s (adaptive: 1.5x the session's own worst recent pause, 2–30 s), so an agent runs its whole cycle on its backend undisturbed; at most 64 reserved wins in a row, and any held request yields at most 16 times, so neither mechanism can starve anyone. Plain Ollama (no telemetry) keeps the plain fair order.
 - **Sticky Routing (Session Affinity)**: A conversation goes back to the backend that served its previous turn, so a long multi-turn prompt is not re-prefilled on a backend with no KV slot for it. The key is an explicit session id when the client sends one, else a fingerprint of the conversation's first turn (see [Sticky Routing](#-sticky-routing-session-affinity)).
+- **Session Labels & Priority**: A client can name its conversation (`X-Session-Name`) so it reads as `#refactor-auth` instead of `#a3f19c`, and ask for it to jump the queue (`X-Session-Priority: high|top`) as far as `settings.client_priority` allows. The operator can pin any live session from the icon beside it, the TUI or the API. `top` goes first on the whole board and may overbook its own backend by one slot (see [Session Labels & Priority](#-session-labels--priority)).
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
@@ -332,6 +333,10 @@ settings:
   sticky_lag: 0                  # extra requests its backend may run vs the emptiest eligible one
                                  # before the conversation moves anyway (default 0)
   sticky_max_entries: 10000      # conversations remembered; the idlest are forgotten (default 10000)
+  client_priority: global        # how far a client's own X-Session-Priority claim reaches:
+                                 # off (operator only) | self (high, within its own client) |
+                                 # global (high and top anywhere). Keyless clients never get a
+                                 # say, and a pin set in the UI/TUI/API always wins (default global)
   detect_backend_slots: true     # use the parallel slots a backend reports (llama.cpp /props total_slots,
                                  # halogen /health slots) as its capacity instead of max_concurrent_per_backend;
                                  # models without max_concurrent_requests may then use all of them (default true)
@@ -676,6 +681,73 @@ the outcomes; the payoff shows up as a drop in
 when conversations are hitting their own backend, the problem is not routing: the backend
 cannot hold that many contexts in its cache at once (`OLLAMA_NUM_PARALLEL`, `num_ctx`,
 `load_keep_alive` — or more VRAM), and no routing choice fixes that.
+
+### 🏷️ Session Labels & Priority
+
+Every conversation the proxy can identify has a six-hex **session tag** (the sticky-routing
+session id, shown as `#a3f19c`). Two headers ride along with it:
+
+| header | meaning |
+|---|---|
+| `X-Session-Id` | the conversation id — also what sticky routing keys on |
+| `X-Session-Name` | a readable label for it, shown as `#refactor-auth` |
+| `X-Session-Priority` | `high` or `top`: how far this conversation jumps the queue |
+
+The **label is display text only**. It never enters the session key, so renaming a session
+mid-conversation cannot re-key it and throw away its backend affinity (the same trap as a
+compaction rewriting the history). It is kept to 64 characters of letters, digits, `-` and
+`.`, arrives lowercased with separators collapsed and control characters stripped, and is
+shown in Activity, in the request log and on the run rows. A conversation with no label is
+shown by its tag, as before.
+
+Three levels, no numeric weights:
+
+| level | what it does |
+|---|---|
+| `normal` | the fair order everything else queues in |
+| `high` | first **inside its own client's queue** — no other client moves, so one busy user cannot starve another |
+| `top` | first on the whole board: considered before the VIP client, never held back by the cache hold-back (and not charged against its yield budget), and allowed **one** extra dispatch on the backend its conversation is warm on when that backend is otherwise full — never a second |
+
+Nothing is ever cancelled to make room: a `top` request wins the next slot, it does not take
+one away from a request already running.
+
+How far a client's own claim reaches, by `settings.client_priority`:
+
+| value | a client may claim |
+|---|---|
+| `off` | nothing — priority is the operator's alone |
+| `self` | `high`; a `top` claim is clamped to `high` |
+| `global` *(default)* | `high` and `top` |
+
+Two limits hold in every mode: the header counts only for **authenticated** requests (an API
+key) — a keyless `ip_identity` request never gets a say in the order everyone else waits in —
+and an operator pin always beats the client's claim, in both directions, including holding a
+session down at `normal`. `global` means what it says: any client holding an API key can put
+itself first on the shared board, so on a proxy shared between tenants `self` — or `off`, and
+pin the sessions you actually care about — is the safer setting.
+
+The operator sets it from three places, never from `appconf.yaml` (a pin is live state, not
+configuration):
+
+- **Web** — the icon beside a session *is* the control: clicking it cycles
+  normal → high → top → normal (`▲` violet = top, `△` berry = high, grey `○` =
+  nothing yet — every live conversation carries one, in the List, the Details
+  header and on a phone card). The status line counts the conversations sitting above
+  normal, and the Filters modal can show only those.
+- **TUI** — `P` on a client cycles the level of everything that client has waiting and pins
+  the conversations behind them, so their next turn keeps it. `[HGH]` / `[TOP]` mark the
+  client while it holds.
+- **API** — `POST /ui/api/sessions/<tag>/priority` with `{"level":"top"}` (`high` and
+  `normal` too), same auth as everything under `/ui/api/`. `400` if the tag is not six hex
+  digits or the level is not one of the three.
+
+A pin is keyed by the **tag** rather than by the conversation behind it, so it can be set the
+moment a session is visible — including while its very first request is still running, when
+there is nothing yet to look the conversation up in. It takes effect on that conversation's
+**next** turn (what is already running keeps the level it was queued with; nothing is taken
+away mid-flight). The icon beside the session shows the pin, so the click visibly sticks even
+on a finished row. Pins live in memory and are dropped once nothing carries the tag for
+`sticky_ttl`, so a restart returns everything to `normal`.
 
 ### Cache-Aware Hold-Back
 

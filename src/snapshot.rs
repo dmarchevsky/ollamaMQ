@@ -3,7 +3,7 @@
 //! Built in one pass under short-lived locks; every field is an owned copy,
 //! so callers can render from it without holding any `AppState` lock.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -69,6 +69,10 @@ pub struct StateSnapshot {
     pub disabled_clients: HashSet<String>,
     pub vip_user: Option<String>,
     pub boost_user: Option<String>,
+    /// Per client, the highest priority level anything of theirs sits at right
+    /// now (`"high"` / `"top"`). What the TUI marks, so the marker says what the
+    /// board is doing rather than what was pinned once and has since drained.
+    pub live_priority: Vec<(String, &'static str)>,
     pub backends: Vec<BackendStatus>,
     /// Per backend (same order as `backends`): `(prefill secs, waste secs)`
     /// of the retained request history; `(0.0, 0.0)` where nothing was
@@ -80,6 +84,24 @@ pub struct StateSnapshot {
     pub recent_results: Vec<RecentResultView>,
     /// Which models are served (to mark hidden ones).
     pub model_policy: Arc<crate::model_policy::Policy>,
+}
+
+/// Keep the highest level seen for one client (`top` beats `high`, `normal`
+/// is not stored at all — an absent client is an ordinary one).
+fn note_priority(best: &mut HashMap<String, (&'static str, u8)>, user: &str, level: &'static str) {
+    let rank = if level == "top" {
+        2
+    } else if level == "high" {
+        1
+    } else {
+        0
+    };
+    if rank > 0 {
+        let entry = best.entry(user.to_string()).or_insert((level, rank));
+        if rank > entry.1 {
+            *entry = (level, rank);
+        }
+    }
 }
 
 pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
@@ -119,6 +141,21 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
     blocked_users.extend(disabled_clients.iter().cloned());
     let vip_user = state.vip_user.lock_or_recover().clone();
     let boost_user = state.boost_user.lock_or_recover().clone();
+    // Queued and running requests, per client, reduced to the level they carry.
+    let live_priority: Vec<(String, &'static str)> = {
+        let mut best: HashMap<String, (&'static str, u8)> = HashMap::new();
+        for (user, queue) in state.queues.lock_or_recover().iter() {
+            for task in queue {
+                note_priority(&mut best, user, task.priority.as_str());
+            }
+        }
+        for run in state.runs.list() {
+            note_priority(&mut best, &run.client, run.priority);
+        }
+        best.into_iter()
+            .map(|(user, (level, _))| (user, level))
+            .collect()
+    };
     let backends = state.backends.lock_or_recover().clone();
     // Waste totals per backend from the retained finish history (the same
     // data the Web overview windows over; the TUI shows the whole history).
@@ -188,6 +225,7 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
         disabled_clients,
         vip_user,
         boost_user,
+        live_priority,
         backends,
         backend_waste,
         logs,

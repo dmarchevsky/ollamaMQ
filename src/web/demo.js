@@ -158,8 +158,8 @@
 
   // Runs in progress: tokens grow with time like a streaming backend.
   const demoRuns = [
-    { client: 'codex-laptop', key: 'laptop', model: 'Qwen3.8-Flash-Next', backend: '192.168.6.11:8731', started: now - 94_000, ttfb: 2.4, rate: 38.5, waited: 0.4, est: 21_000, session: 'a3f19c' },
-    { client: 'openwebui', key: 'webui', model: 'Qwen3.8-27B', backend: '192.168.255.224:8000', started: now - 21_000, ttfb: 6.8, rate: 11.2, waited: 2.1, est: 44_000, session: '7e04d2' },
+    { client: 'codex-laptop', key: 'laptop', model: 'Qwen3.8-Flash-Next', backend: '192.168.6.11:8731', started: now - 94_000, ttfb: 2.4, rate: 38.5, waited: 0.4, est: 21_000, session: 'a3f19c', label: 'refactor-auth', prio: 'top' },
+    { client: 'openwebui', key: 'webui', model: 'Qwen3.8-27B', backend: '192.168.255.224:8000', started: now - 21_000, ttfb: 6.8, rate: 11.2, waited: 2.1, est: 44_000, session: '7e04d2', label: 'gitlab-runner', prio: 'high' },
     { client: 'n8n-agents', key: 'prod', model: 'llama3.3:70b', backend: 'gpu-box.lan:11434', started: now - 3_000, ttfb: null, rate: 0, waited: 12.6, est: 3_200, session: null },
   ];
   const runView = () => demoRuns.map(r => {
@@ -168,7 +168,8 @@
     return { client: r.client, key: r.key, model: r.model, backend: r.backend, elapsed_secs: elapsed,
       state: r.ttfb != null && elapsed >= r.ttfb ? 'generating' : 'prefill', waited_secs: r.waited,
       ttfb_secs: r.ttfb, ttft_secs: r.ttfb, tokens: Math.floor(gen * r.rate), tokens_per_sec: gen >= 1 ? r.rate : null,
-      est_prompt_tokens: r.est, session: r.session };
+      est_prompt_tokens: r.est, session: r.session,
+      session_label: r.label, priority: r.prio || 'normal' };
   });
 
   function snapshot() {
@@ -187,12 +188,12 @@
   const noise = n => { const x = Math.sin(n * 12.9898) * 43758.5453; return x - Math.floor(x); };
   // `backends`: indexes of the backends that can serve the model.
   const demoQueue = [
-    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 38_000, pos: 1, backends: [0], est: 18_000, session: 'a3f19c' },
-    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 21_000, pos: 2, backends: [0], est: 9_500, session: 'a3f19c' },
-    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 4_000, pos: 3, backends: [0], est: 2_400, session: 'a3f19c' },
-    { client: 'openwebui', model: 'Qwen3.8-27B', since: now - 9_000, pos: 1, backends: [1], est: 40_000, session: '7e04d2' },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 38_000, pos: 1, backends: [0], est: 18_000, session: 'a3f19c', label: 'refactor-auth', prio: 'top' },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 21_000, pos: 2, backends: [0], est: 9_500, session: 'a3f19c', label: 'refactor-auth', prio: 'top' },
+    { client: 'codex-laptop', model: 'Qwen3.8-Flash-Next', since: now - 4_000, pos: 3, backends: [0], est: 2_400, session: 'a3f19c', label: 'refactor-auth', prio: 'top' },
+    { client: 'openwebui', model: 'Qwen3.8-27B', since: now - 9_000, pos: 1, backends: [1], est: 40_000, session: '7e04d2', label: 'gitlab-runner', prio: 'high' },
     { client: 'grafana-alerts', model: 'Gemma-4-E4B', since: now - 2_000, pos: 1, backends: [2], est: 800 },
-    { client: 'n8n-agents', model: 'BGE-M3', since: now - 17_000, pos: 1, backends: [3], est: 5_000 },
+    { client: 'n8n-agents', model: 'BGE-M3', since: now - 17_000, pos: 1, backends: [3], est: 5_000, session: 'b7c2d9', label: 'nightly-eval' },
     { client: 'anonymous', model: 'unknown', since: now - 6_000, pos: 1, backends: [], est: 1_200 },
   ];
   // Per backend over 15 minutes: requests, errors, first token p50/p95, gen tok/s, prefill tok/s.
@@ -232,6 +233,7 @@
     const CL_WASTE = { 'codex-laptop': [21, 0.21], 'openwebui': [4, 0.04] };
     const queue = demoQueue.map(q => ({
       client: q.client, model: q.model, pos: q.pos, backends: q.backends, session: q.session,
+      session_label: q.label, priority: q.prio || 'normal',
       waited_secs: (t - q.since) / 1000, est_prompt_tokens: q.est,
     }));
     const be = backends.map(b => {
@@ -321,6 +323,8 @@
         outcome: err ? 'backend_error' : 'ok', error: err, status: err ? 500 : 200,
         waited_secs: noise(i + 9) * 3,
         session: i % 4 === 0 ? 'a3f19c' : i % 4 === 1 ? '7e04d2' : null,
+        session_label: i % 4 === 0 ? 'refactor-auth' : i % 4 === 1 ? 'gitlab-runner' : null,
+        priority: i % 4 === 0 ? 'top' : i % 4 === 1 ? 'high' : 'normal',
         prompt_tokens: err ? 0 : prompt, prefill_secs: prefill, prefill_tokens: prefillTok, cache_pct: cache,
         // A near-cold turn after a warm session: almost the whole prefill was
         // re-reading an evicted context. One of the healthy rows shows it.
@@ -340,6 +344,8 @@
         loading: backends.filter(b => b.active_op).map(loadingOf),
         errors, error_pct: requests ? errors * 100 / requests : null,
         done: recent.filter(r => r.outcome === 'ok').length, dropped: recent.filter(r => r.outcome === 'backend_error').length,
+        pins: [['a3f19c', 'top'], ['7e04d2', 'high'], ['b7c2d9', 'top']],
+        priority_sessions: new Set([...demoRuns, ...demoQueue].filter(r => (r.prio || 'normal') !== 'normal').map(r => r.session || r.client)).size,
       },
       backends: be, clients: clientRows, queue, lanes, recent,
     };

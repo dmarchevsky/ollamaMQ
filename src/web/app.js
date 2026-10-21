@@ -30,6 +30,7 @@ const S = {
   reqView: storedReqView(),  // List under the graph: list | details
   keyRename: null,           // key id whose Label cell is being edited
   collapsed: storedCollapsed(),// conversation headers the operator folded shut
+  pins: {},                // session tag -> operator-pinned priority level
   colorOf: new Map(),        // client id -> colour slot 1..4
   settings: null,            // api/settings
   draft: new Map(),          // unsaved settings: name -> value (null = reset)
@@ -42,11 +43,11 @@ const S = {
 /** The filter modal's selection from the last visit (per browser); the old
  *  per-window and per-client storage keys fold into it. */
 function storedFilters() {
-  const d = { win: '15m', mode: 'client', clients: [], backends: [], models: [] };
+  const d = { win: '15m', mode: 'client', clients: [], backends: [], models: [], priority: [] };
   try {
     const j = JSON.parse(localStorage.getItem('omq.filters') || 'null');
     if (j && typeof j === 'object') {
-      return { ...d, ...j, clients: [...(j.clients || [])], backends: [...(j.backends || [])], models: [...(j.models || [])] };
+      return { ...d, ...j, clients: [...(j.clients || [])], backends: [...(j.backends || [])], models: [...(j.models || [])], priority: [...(j.priority || [])] };
     }
     const w = localStorage.getItem('omq.window');
     const c = localStorage.getItem('omq.client');
@@ -276,7 +277,13 @@ async function poll() {
     if (logs) S.logs = logs;
     if (clients) S.clients = clients;
     if (models) S.modelPolicy = models;
-    if (overview) S.overview = overview;
+    if (overview) {
+      S.overview = overview;
+      // Operator pins by session tag. The icon shows the pin when there is one,
+      // because the level on a finished row is history — the pin is what that
+      // conversation runs at next.
+      S.pins = Object.fromEntries(overview.status.pins || []);
+    }
     if (settings) S.settings = settings;
     if (me) S.me = me;
     S.online = true;
@@ -351,7 +358,8 @@ function winLabel(w) {
 const filtersActive = () => {
   const f = S.filters;
   return f.win !== '15m' || f.mode !== 'client'
-    || f.clients.length > 0 || f.backends.length > 0 || f.models.length > 0;
+    || f.clients.length > 0 || f.backends.length > 0 || f.models.length > 0
+    || f.priority.length > 0;
 };
 
 /** Mirrors the server's client-scope rule: a bare name matches every key, a
@@ -365,6 +373,38 @@ const backendSel = b => !S.filters.backends.length || S.filters.backends.include
 /** Display identity: `client`, or `client:key` in label mode — the server's
  *  own naming for lanes, client stats and capacity segments. */
 const fmtWho = o => (S.filters.mode === 'key' && o.key && o.key !== 'none') ? `${o.client}:${o.key}` : o.client;
+/** A session as a person reads it: the label the client sent, else the tag. */
+const sessName = o => o.session_label || o.session || null;
+const prioSel = p => !S.filters.priority.length || S.filters.priority.includes(p || 'normal');
+/** Priority in the tight places (graph lane, phone card): a glyph in the one
+ *  hue that already means "priority", so no new status colour is invented. */
+/** The priority mark: one glyph whose colour carries the level, and the thing
+ *  you click to change it (`tag` given). The grey `○` — "no priority yet" — is
+ *  shown everywhere a control is, because a control that only appears once a
+ *  session already has priority is not a control. It is a span with a click
+ *  action rather than a button: a Details header is itself a button and cannot
+ *  hold one. */
+const PRI = {
+  normal: { g: '○', tip: 'no priority — click to make it high' },
+  high: { g: '△', tip: 'high — first inside its own client — click for top' },
+  top: { g: '▲', tip: 'top — first on the whole board — click to clear' },
+};
+const priLevel = p => (p === 'high' || p === 'top') ? p : 'normal';
+/** The level a conversation runs at next: the operator's pin if it has one,
+ *  otherwise the level the request being shown carried. */
+const priOf = o => (o.session && S.pins[o.session]) || priLevel(o.priority);
+/** Read-only glyph, for places with no room or no click target (graph lanes). */
+const priMark = o => { const l = priOf(o); const d = PRI[l];
+  return `<span class="pri ${l}" title="${l} priority${S.pins[o.session] ? ' — pinned by you' : ''}">${d.g}</span>`; };
+/** The same glyph as the control that cycles normal → high → top → normal. */
+const priCtl = (o, tag) => {
+  const l = priOf(o), d = PRI[l], pinned = !!S.pins[tag];
+  return tag
+    ? `<span class="pri ${l}" data-action="session-pri" data-tag="${esc(tag)}" data-pri="${l}"
+        title="${d.tip}${pinned ? ' — pinned by you, applies to the next turn' : ''}"
+        aria-label="${l} priority, click to change">${d.g}</span>`
+    : priMark(o);
+};
 
 function openFilters() {
   drawFilters();
@@ -416,6 +456,9 @@ function drawFilters() {
     <div class="flist" id="f-bk-list">${bk.map(l => fchk(f.backends, l, bkCell(l))).join('')}</div>`);
   setHTML($('#f-models'), `${flhead('Models', 'f-md-list', f.models, md.length)}
     <div class="flist" id="f-md-list">${md.map(m => fchk(f.models, m, esc(m))).join('')}</div>`);
+  const pr = ['normal', 'high', 'top'];
+  setHTML($('#f-priority'), `${flhead('Priority', 'f-pr-list', f.priority, pr.length)}
+    <div class="flist" id="f-pr-list">${pr.map(p => fchk(f.priority, p, `${p === 'normal' ? '' : `<span class="pri ${p}">${PRI[p].g}</span>`}${p}`)).join('')}</div>`);
 }
 
 /** Which clients (or client+key pairs) the modal offers in each mode. */
@@ -460,6 +503,7 @@ function collectFilters() {
   f.clients = read('f-cl-list');
   f.backends = read('f-bk-list');
   f.models = read('f-md-list');
+  f.priority = read('f-pr-list');
 }
 
 /** Dots + tooltip summary on the Filters button. */
@@ -470,7 +514,7 @@ function renderFiltersBtn() {
   const f = S.filters;
   const bit = (sel, word) => !sel.length ? null : sel[0] === FNONE ? `no ${word}` : `${sel.length} ${word}`;
   const bits = [winLabel(f.win), f.mode === 'key' ? 'client+label' : null,
-    bit(f.clients, 'clients'), bit(f.backends, 'backends'), bit(f.models, 'models')];
+    bit(f.clients, 'clients'), bit(f.backends, 'backends'), bit(f.models, 'models'), bit(f.priority, 'priority')];
   $('#ov-filters').title = on ? `Filters: ${bits.filter(Boolean).join(' · ')}` : 'Time, clients, backends and models';
 }
 
@@ -553,7 +597,7 @@ function renderOverview(st) {
   // The payload is already scoped by the filter query; /state is not, so the
   // live runs are scoped here — Capacity, Requests and their colour all read
   // this copy.
-  const vis = { ...st, runs: (st.runs || []).filter(r => clientSel(r.client, r.key) && modelSel(r.model) && backendSel(r.backend)) };
+  const vis = { ...st, runs: (st.runs || []).filter(r => clientSel(r.client, r.key) && modelSel(r.model) && backendSel(r.backend) && prioSel(priLevel(r.priority))) };
   // Identity colours key on the display name, so client+label pairs get their
   // own hue (the server already names lanes, client rows and segments that way).
   assignColors([...new Set([...clientIds(st), ...ov.clients.map(c => c.id), ...vis.runs.map(fmtWho)])]);
@@ -568,8 +612,11 @@ function renderOverview(st) {
     `${s.backends_online} of ${s.backends_total} backends online`,
     `${s.free} of ${s.capacity} slots free`,
     s.queued ? `${s.queued} waiting (oldest ${fmtDur(s.oldest_wait_secs)})` : 'nothing waiting',
+    s.priority_sessions
+      ? `<span class="pri-count" title="${s.priority_sessions} conversation${s.priority_sessions === 1 ? '' : 's'} running or waiting above normal priority">${s.priority_sessions} priority</span>`
+      : null,
     ...s.loading.map(l => `${esc(l.verb)} ${esc(l.model)} on ${esc(bkName(l.backend))}`),
-  ];
+  ].filter(Boolean);
   if (s.errors) parts.push(`${s.errors} error${s.errors === 1 ? '' : 's'} in the last ${winLabel(S.filters.win)}`);
   setHTML($('#ov-status'), `<span class="lvl ${level}"><span class="sdot"></span>${word}</span>${parts.map(p => `<span>${p}</span>`).join('')}`);
 
@@ -693,7 +740,9 @@ function renderTimeline(st, ov) {
   const axis = `<div class="tl-axis">${[0, 1 / 3, 2 / 3].map(tick).join('')}<span style="left:100%">now</span></div>`;
   let hidden = 0;
   const body = [...groups.values()]
-    .sort((a, b) => (a.pseudo - b.pseudo) || (b.last - a.last))
+    // Backends alphabetically, so the panel does not rearrange itself every
+    // time a request lands; the pseudo-group ("no free backend") stays last.
+    .sort((a, b) => (a.pseudo - b.pseudo) || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
     .map(g => {
       // Same order as Details: sessions are ordered by when they **started**
       // (newest start first) — a stable position that ongoing traffic inside a
@@ -733,7 +782,7 @@ function tlRow(rows, pctOf, span) {
       + `width:${Math.max(0, e.dur * 1000 / span * 100).toFixed(3)}%" title="${esc(stageTip(e))}"></i>`);
   }).join('');
   return `<div class="tl-row" data-key="${esc(head.key)}" style="--c:var(--${cvar(colorClass(fmtWho(head.o)))})">`
-    + `<div class="tl-lab">${swatch(fmtWho(head.o))}<b>${esc(fmtWho(head.o))}</b>${head.s ? ` #${esc(head.s)}` : ''}</div>`
+    + `<div class="tl-lab" title="${esc(fmtWho(head.o))}${head.s ? ` · session ${esc(head.s)}` : ''} · ${esc(priOf(head.o))} priority">${swatch(fmtWho(head.o))}<b>${esc(head.o.session_label ? `#${head.o.session_label}` : fmtWho(head.o))}</b>${head.o.session_label || head.s ? priMark(head.o) : ''}</div>`
     + `<div class="tl-track">${cut}${segs}<span class="now"></span></div></div>`;
 }
 
@@ -903,7 +952,7 @@ function renderDetails(rows) {
     out.push(`<button class="det-h" style="--c:var(--${c})" data-key="${esc(head.key)}" aria-expanded="${!shut}"
       title="${shut ? 'expand' : 'collapse'} this conversation">
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(fmtWho(head.o))}</span>
-      ${head.s ? `<span class="who">#${esc(head.s)}</span>` : ''}${chip}
+      ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}${chip}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
       ${sum}</button>`);
     if (shut) continue;
@@ -967,7 +1016,10 @@ const saveCollapsed = () => {
  *  S.collapsed, because the list is rebuilt on every poll). */
 function wireFold() {
   $$('#ov-now .det-h').forEach(b => {
-    b.onclick = () => {
+    b.onclick = e => {
+      // The priority control sits in this header; folding on top of setting a
+      // level would hide the very row the click was about.
+      if (e.target.closest('.pri')) return;
       const k = b.dataset.key;
       if (S.collapsed.has(k)) S.collapsed.delete(k); else S.collapsed.add(k);
       saveCollapsed();
@@ -1033,10 +1085,10 @@ function phoneParts(row, ov) {
 function cardPhone(row, ov) {
   const p = phoneParts(row, ov);
   return `<div class="rq${liveCls(row)}" data-key="${esc(row.key)}" style="--c:var(--${cvar(colorClass(fmtWho(row.o)))})"><div class="rq-1">${p.head}${swatch(fmtWho(row.o))}`
-    + `<span class="who">${esc(fmtWho(row.o))}</span>`
+    + `<span class="who">${esc(fmtWho(row.o))}</span>${row.o.session_label || row.o.session ? priMark(row.o) : ''}`
     + `<span class="mb"><span class="mo">${esc(row.o.model)}</span><span class="ar">→</span>${esc(p.bk)}</span></div>`
     + `<div class="rq-2">${p.nums}</div>`
-    + (p.timing ? `<div class="rq-m">${p.timing}</div>` : '') + '</div>';
+    + ((sessName(row.o) ? `<span title="conversation">#${esc(sessName(row.o))}</span>${p.timing ? ' · ' : ''}` : '') + p.timing ? `<div class="rq-m">${sessName(row.o) ? `<span title="conversation">#${esc(sessName(row.o))}</span>${p.timing ? ' · ' : ''}` : ''}${p.timing}</div>` : '') + '</div>';
 }
 
 /** Phone layout of the List: cards instead of the reflowed table. */
@@ -1059,10 +1111,17 @@ function reqRows(st, ov, all) {
   const rows = [
     ...(st.runs || [])
       .map(r => ({ kind: 'run', t: now, s: r.session || null, o: r, key: keyOf(r, 'live') })),
-    ...ov.queue.map(w => ({ kind: 'wait', t: now - w.waited_secs * 1000, s: w.session || null, o: w, key: keyOf(w, 'queue') })),
+    // Waiting and finished rows come from the Overview payload (filtered
+    // server-side by client, model and backend), so the priority filter — which
+    // the server knows nothing about — has to be applied here too, or filtering
+    // by `top` would still list every other session waiting in front of it.
+    ...ov.queue.filter(w => prioSel(priOf(w)))
+      .map(w => ({ kind: 'wait', t: now - w.waited_secs * 1000, s: w.session || null, o: w, key: keyOf(w, 'queue') })),
   ];
   const activeN = rows.length;
-  if (all) for (const x of ov.recent) rows.push({ kind: 'done', t: x.at_ms, s: x.session || null, o: x, key: keyOf(x, x.at_ms) });
+  if (all) for (const x of ov.recent) {
+    if (prioSel(priOf(x))) rows.push({ kind: 'done', t: x.at_ms, s: x.session || null, o: x, key: keyOf(x, x.at_ms) });
+  }
   return { rows, activeN };
 }
 
@@ -1110,7 +1169,7 @@ function renderRequests(st, ov) {
         : row.o.error ? `<span class="badge bad" title="${esc(row.o.outcome)}">${esc(row.o.status && row.o.status >= 500 ? `HTTP ${row.o.status}` : row.o.outcome.replace(/_/g, ' '))}</span>`
           : row.o.outcome === 'ok' ? `<span class="dim mono" title="finished">${fmtTime(row.t)}</span>`
           : `<span class="badge">${esc(row.o.outcome.replace(/_/g, ' '))}</span>`}</td>
-      <td>${swatch(fmtWho(row.o))}<span class="mono">${esc(fmtWho(row.o))}</span></td>
+      <td>${swatch(fmtWho(row.o))}<span class="mono">${esc(fmtWho(row.o))}</span>${sessName(row.o) ? ` <span class="mono dim">#${esc(sessName(row.o))}</span>` : ''} ${priCtl(row.o, row.o.session)}</td>
       <td class="trunc">${esc(row.o.model)}</td>`;
     if (row.kind === 'run') {
       const r = row.o;
@@ -1647,6 +1706,7 @@ const FIELD_META = {
   sticky_ttl: { label: 'Remember a conversation for', unit: 's', min: 1, help: 'Idle time after which a conversation may move to another backend.' },
   sticky_lag: { label: 'Slack before a conversation moves', unit: 'requests', min: 0, help: 'How many more requests its backend may run than the emptiest one before the conversation goes elsewhere instead of waiting.' },
   sticky_max_entries: { label: 'Conversations remembered', min: 1, help: 'The idlest are forgotten past this.' },
+  client_priority: { label: 'How far a client’s own priority claim reaches', kind: 'select', options: [['off', 'Off — priority is set here only'], ['self', 'Within its own client (high)'], ['global', 'Anywhere (high and top)']], help: 'A client can ask for its session to jump the queue with an X-Session-Priority header. Off ignores it; “within its own client” caps the ask at first place among that client’s own sessions; “anywhere” also allows top, which goes first on the whole board. Keyless requests never get a say, and a pin set here always wins.' },
   allow_all_routes: { label: 'Proxy unknown routes', kind: 'bool', help: 'Forward paths ollamaMQ does not know to the backends.' },
   metrics_token: { label: 'Metrics token', kind: 'secret', help: 'Bearer token that <code>GET /metrics</code> requires.' },
   log_content_limit: { label: 'Captured text per log record', unit: 'KiB', scale: 1024, min: 1, help: 'Request and response text kept for the Logs page.' },
@@ -2006,6 +2066,12 @@ async function loadDialog(idx) {
 // ------------------------------------------------------------------ actions
 
 const actions = {
+  'session-pri': async el => {
+    const next = { normal: 'high', high: 'top', top: 'normal' }[el.dataset.pri] || 'high';
+    // act() re-polls, so the new badge shows up on its own.
+    await act('POST', `sessions/${encodeURIComponent(el.dataset.tag)}/priority`,
+      { level: next }, `Session priority set to ${next}`);
+  },
   'filters': () => openFilters(),
   'add-backend': () => backendDialog(null),
   'backend-edit': el => backendDialog(S.settings.backends.find(b => b.url === el.dataset.url)),

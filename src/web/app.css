@@ -19,6 +19,11 @@
   --decode: #1baf7a;
   --vip: #8a3ffc;
   --vip-soft: #f1e8ff;
+  /* The two priority levels. Deliberately two different hues and neither a stage
+     colour (blue waiting, amber prefill, teal decode, red error) nor a client
+     swatch: violet for `top`, berry for `high`, grey for "no priority yet". */
+  --pri-top: #7c3aed;
+  --pri-high: #b0185f;
   --nav-bg: #161a22;
   --nav-text: #c3c9d4;
   --nav-active: #ffffff;
@@ -60,6 +65,8 @@
     --decode: #199e70;
     --vip: #b48cff;
     --vip-soft: #261b3d;
+    --pri-top: #b48cff;
+    --pri-high: #f472b6;
     --nav-bg: #0b0d12;
     --c1: #22d3ee;   /* cyan  */
     --c2: #f472b6;   /* pink  */
@@ -170,6 +177,22 @@ tr.selected > td { background: var(--accent-soft); }
 .badge.q { background: transparent; color: var(--accent); border-color: var(--accent); }
 /* decoding / generating — the stage's own teal, matching the graph chip */
 .badge.dec { background: color-mix(in srgb, var(--decode) 14%, transparent); color: var(--decode); border-color: transparent; }
+/* Session priority: one glyph, colour carries the level, no pill and no word —
+   the tooltip says what it means and what a click does. `top` violet ▲, `high`
+   berry △, and a grey ○ for "nothing yet": every live session wears one, because
+   a control that only appears once a session already has priority is not a
+   control. Where it is a control it is a span with the click action, since a
+   Details header is itself a button and cannot hold one. */
+.pri { cursor: default; font-weight: 700; }
+.pri.top { color: var(--pri-top); }
+.pri.high { color: var(--pri-high); }
+.pri.normal { color: var(--faint); }
+.pri[data-action] { cursor: pointer; padding: 0 .18em; }
+.pri[data-action]:hover { text-decoration: underline; text-underline-offset: 2px; }
+/* A graph lane is 132px holding a swatch, a name and a tag already, so priority
+   there is a bare glyph after the name, with the level in the tooltip. */
+.tl-lab .pri { font-size: 10px; }
+.ov-status .pri-count { color: var(--pri-top); font-weight: 650; }
 .sdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-right: 8px; vertical-align: 1px; }
 .sdot.on { background: var(--ok); } .sdot.off { background: var(--bad); }
 .dir { font-family: var(--mono); font-size: 11.5px; font-weight: 700; }

@@ -34,6 +34,15 @@ pub struct ReqRecord {
     /// Body content, truncated to the configured limit (lossy UTF-8).
     /// Shared (not copied) with the TUI log event built from the same body.
     pub content: Option<Arc<String>>,
+    /// Conversation tag this request belongs to (`SessionKey::tag`); absent for
+    /// non-chat traffic and sticky-less requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Human label the client sent (`X-Session-Name`); display only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_label: Option<String>,
+    /// Scheduling level resolved for this request.
+    pub priority: &'static str,
     /// Prefill seconds lost to a cache eviction on this request; absent when
     /// not measurable (old lines and non-inference records stay as they were).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -246,6 +255,9 @@ mod tests {
             content_type: Some("application/json".into()),
             // Padding keeps each serialized line in the ~100-250 byte range.
             content: Some(Arc::new(format!("x{}", "y".repeat(20)))),
+            session: None,
+            session_label: None,
+            priority: "normal",
             waste_secs: None,
         }
     }

@@ -72,6 +72,15 @@ settings:
                                # the conversation moves anyway (default 0: only a backend with a
                                # free slot keeps its session).
   # sticky_max_entries: 10000   # conversations remembered; the idlest are forgotten (default)
+  client_priority: global       # how far a client's own X-Session-Priority claim reaches:
+                                #   off     header ignored — priority is set by the operator only
+                                #   self    high honoured; top clamped to high (a client may not
+                                #           jump other clients)
+                                #   global  high and top honoured anywhere (default)
+                                # Two limits in every mode: only authenticated clients (an API key)
+                                # get a say — keyless ip-<address> traffic never does — and a level
+                                # pinned in the UI, TUI or API always beats what the client claims.
+                                # On a proxy shared between tenants, prefer self or off.
   detect_backend_slots: true   # capacity = slots a backend reports (llama.cpp /props total_slots,
                                # halogen /health slots); unreported backends use max_concurrent_per_backend.
                                # Models without max_concurrent_requests may use all reported slots (default true)

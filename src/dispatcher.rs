@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
 };
-use crate::config::StickyMode;
+use crate::config::{ClientPriority, StickyMode};
 use serde::Deserializer as _;
 use std::hash::Hasher;
 use crate::lock::LockExt;
@@ -88,6 +88,11 @@ pub struct Task {
     /// conversation it belongs to, and the backend that should serve it. `None`
     /// means no affinity — the request is placed by load alone.
     pub session_key: Option<SessionKey>,
+    /// Human label for the session (`X-Session-name`), display only.
+    pub session_label: Option<String>,
+    /// Resolved scheduling level of this request (operator pin, else what the
+    /// client claimed, capped by `settings.client_priority`).
+    pub priority: Priority,
 }
 
 /// Which API flavours a backend speaks — and, on the route side of the
@@ -739,6 +744,16 @@ pub struct AppState {
     pub sticky_lag: std::sync::atomic::AtomicU64,
     /// `settings.sticky_max_entries`.
     pub sticky_max_entries: std::sync::atomic::AtomicU64,
+    /// `settings.client_priority` as a [`crate::config::ClientPriority`] disc.
+    pub client_priority: std::sync::atomic::AtomicU8,
+    /// Operator-set priority pins, keyed by the six-hex **tag** the UI shows.
+    /// Keyed by the tag and not by the conversation behind it on purpose: a tag
+    /// is what an operator can see, and the conversation carrying it may not be
+    /// resolvable yet (during its first request there is no affinity entry and
+    /// the request has left the queue). An operator pin wins over what the
+    /// client claims, including pinning a session *down* to `Normal` so a noisy
+    /// client cannot lift itself. In memory only; the stale ones are pruned.
+    pub session_pins: Mutex<HashMap<String, SessionPin>>,
     pub notify: Notify,
     pub backend_freed: Notify,
     pub backends: Mutex<Vec<BackendStatus>>,
@@ -905,8 +920,8 @@ pub struct SessionKey {
 
 impl SessionKey {
     /// Stable short tag for the UI's session views: six hex digits of the
-    /// conversation. Collision across sessions at 16M in 24 bits is ~0%
-    /// for any realistic number of live conversations.
+    /// conversation. Collision across sessions at 16M in 24 bits is ~0% for any
+    /// realistic number of live conversations.
     pub fn tag(&self) -> String {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -915,11 +930,87 @@ impl SessionKey {
     }
 }
 
+/// How far a session jumps the queue. `Normal` is the fair order everything
+/// else follows; `High` is first inside its own client and cannot affect anyone
+/// else's place; `Top` is first on the whole board, is never held back by the
+/// cache hold-back and may run one request over a backend's slot count to stay
+/// on the backend that holds its context. Ordering follows declaration order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Priority {
+    #[default]
+    Normal,
+    High,
+    Top,
+}
+
+impl Priority {
+    /// The level a client's `X-Session-Priority` asks for; anything unrecognised
+    /// (including an absent header) is `Normal`.
+    fn parse(v: Option<&str>) -> Self {
+        match v.map(str::trim).map(str::to_ascii_lowercase) {
+            Some(s) if s == "top" => Priority::Top,
+            Some(s) if s == "high" => Priority::High,
+            _ => Priority::Normal,
+        }
+    }
+
+    /// Name as it travels in the API and the UI payload.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Priority::Normal => "normal",
+            Priority::High => "high",
+            Priority::Top => "top",
+        }
+    }
+
+    pub fn from_name(v: &str) -> Option<Self> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "normal" => Some(Priority::Normal),
+            "high" => Some(Priority::High),
+            "top" => Some(Priority::Top),
+            _ => None,
+        }
+    }
+}
+
+/// A conversation's human label and scheduling level, as resolved for one
+/// request. The label is display-only: it is never part of `SessionKey`, so
+/// renaming a session cannot re-key it and lose its affinity mid-thread.
+pub fn sanitize_label(raw: Option<&str>) -> Option<String> {
+    let mut out = String::new();
+    for ch in raw?.chars() {
+        if out.len() >= 64 {
+            break;
+        }
+        if ch.is_control() || ch.is_whitespace() {
+            if !out.ends_with('-') && !out.is_empty() {
+                out.push('-');
+            }
+            continue;
+        }
+        if !(ch.is_ascii_graphic() || ch.is_alphabetic() || ch.is_numeric()) {
+            continue;
+        }
+        out.extend(ch.to_lowercase());
+    }
+    let trimmed = out.trim_matches('-');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+
 /// The backend a conversation was last served by.
 #[derive(Clone, Debug)]
 pub struct Affinity {
     pub backend_url: String,
     last_use: std::time::Instant,
+}
+
+/// An operator's priority pin on one conversation, with when it was set (idle
+/// pins are pruned like the other per-session tables).
+#[derive(Clone, Copy, Debug)]
+pub struct SessionPin {
+    pub level: Priority,
+    pub since: std::time::Instant,
 }
 
 /// A conversation the backend served this many times more recently than its
@@ -1498,12 +1589,29 @@ fn write_canonical(v: &serde_json::Value, h: &mut BudgetHasher) {
 /// user, so tasks pinned to a busy backend all sit unroutable while other
 /// backends idle. Moving costs one re-prefill; stalling costs everything behind
 /// it in that queue.
+/// The backend a conversation should come back to, when the remembered one is
+/// still fresh (`sticky_ttl`). Used where the caller only needs the URL — the
+/// overbook test above — before the full eligibility check in
+/// [`pick_sticky_backend`].
+fn sticky_url_within_ttl(state: &AppState, key: &SessionKey) -> Option<String> {
+    let ttl = std::time::Duration::from_secs(
+        state
+            .sticky_ttl
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let now = std::time::Instant::now();
+    state.affinity.lock_or_recover().get(key).and_then(|a| {
+        (now.saturating_duration_since(a.last_use) <= ttl).then(|| a.backend_url.clone())
+    })
+}
+
 fn pick_sticky_backend(
     state: &AppState,
     key: &SessionKey,
     eligible: &[usize],
     backends: &[BackendStatus],
     min_conns: usize,
+    top: bool,
 ) -> Option<usize> {
     let ttl = std::time::Duration::from_secs(
         state
@@ -1525,7 +1633,7 @@ fn pick_sticky_backend(
             .copied()
             .find(|&i| backends[i].url == a.backend_url)
     })?;
-    if backends[idx].active_requests > min_conns + lag as usize {
+    if !top && backends[idx].active_requests > min_conns + lag as usize {
         state
             .metrics
             .inc(&crate::metrics::AFFINITY_DECISIONS, &["moved"], 1.0);
@@ -1591,6 +1699,76 @@ fn prune_affinity(state: &AppState) {
             table.remove(&k);
         }
     }
+    // Pins live off the tag, so they outlive the conversation that was pinned
+    // only as long as something still carries it; a pin on a tag nothing carries
+    // (a first request still in flight, a session that has gone) is dropped once
+    // past the same idle limit.
+    let live: HashSet<String> = table.keys().map(|k| k.tag()).collect();
+    state
+        .session_pins
+        .lock_or_recover()
+        .retain(|tag, p| live.contains(tag) || p.since.elapsed() < ttl);
+}
+
+/// The conversation label a client sent (`X-Session-Name`), sanitized for the
+/// UI. Display only: it never takes part in the session key.
+fn session_label_header(headers: &HeaderMap) -> Option<String> {
+    sanitize_label(
+        headers
+            .get("x-session-name")
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
+/// The level a request goes out at: the operator's pin if there is one (a pin
+/// can also hold a session down at `Normal`), else what the client claimed
+/// (`X-Session-Priority`), capped by `settings.client_priority` and refused
+/// outright for unauthenticated traffic — a keyless client gets no say in the
+/// order everyone else queues in.
+pub fn resolve_priority(
+    state: &AppState,
+    headers: &HeaderMap,
+    authenticated: bool,
+    key: Option<&SessionKey>,
+) -> Priority {
+    if let Some(pin) =
+        key.and_then(|k| state.session_pins.lock_or_recover().get(&k.tag()).map(|p| p.level))
+    {
+        return pin;
+    }
+    if !authenticated {
+        return Priority::Normal;
+    }
+    let claimed = Priority::parse(
+        headers
+            .get("x-session-priority")
+            .and_then(|v| v.to_str().ok()),
+    );
+    if claimed == Priority::Normal {
+        return Priority::Normal;
+    }
+    match crate::config::ClientPriority::from_u8(
+        state.client_priority.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
+        ClientPriority::Off => Priority::Normal,
+        // `top` asks to jump other clients; `self` only allows the intra-client
+        // jump, so the claim is clamped rather than ignored.
+        ClientPriority::Intra => Priority::High,
+        ClientPriority::Global => claimed,
+    }
+}
+
+/// The request a client would actually run next: the highest-priority queued
+/// one, and the earliest of those. Priority reorders **inside** a client only —
+/// between clients the fair order is untouched, which is what keeps one loud
+/// client's `high` session from costing anyone else a turn.
+fn next_pos(q: &VecDeque<Task>) -> Option<usize> {
+    (0..q.len()).max_by_key(|&p| (q[p].priority, std::cmp::Reverse(p)))
+}
+
+/// [`next_pos`] as the task itself.
+fn next_task(q: Option<&VecDeque<Task>>) -> Option<&Task> {
+    q.and_then(|q| next_pos(q).map(|p| &q[p]))
 }
 
 /// Forget cache measurements idle for [`CACHE_HISTORY_MAX_AGE`], the idlest past
@@ -1712,6 +1890,10 @@ impl AppState {
             sticky_ttl: std::sync::atomic::AtomicU64::new(1800),
             sticky_lag: std::sync::atomic::AtomicU64::new(0),
             sticky_max_entries: std::sync::atomic::AtomicU64::new(10_000),
+            client_priority: std::sync::atomic::AtomicU8::new(
+                crate::config::ClientPriority::Global as u8,
+            ),
+            session_pins: Mutex::new(HashMap::new()),
             notify: Notify::new(),
             backend_freed: Notify::new(),
             backends: Mutex::new(backends),
@@ -1858,6 +2040,52 @@ impl AppState {
             self.save_blocked_items();
             info!("User unblocked: {}", user_id);
         }
+    }
+
+    /// Pin the level of the conversation carrying the UI tag `tag` (six hex
+    /// digits). Returns how many pins are live afterwards, which is what the
+    /// caller can actually compare against: pinning always succeeds, because
+    /// the key is the tag itself and not something that has to be looked up.
+    pub fn pin_session(&self, tag: &str, level: Priority) -> usize {
+        let want = tag.trim().to_ascii_lowercase();
+        let mut pins = self.session_pins.lock_or_recover();
+        pins.insert(want, SessionPin { level, since: std::time::Instant::now() });
+        pins.len()
+    }
+
+    /// Live pins as `(tag, level)` — what the Overview shows, so the icon beside
+    /// a session can read as the pin the operator set rather than the level the
+    /// request in that row happened to run at.
+    pub fn session_pins(&self) -> Vec<(String, &'static str)> {
+        self.session_pins
+            .lock_or_recover()
+            .iter()
+            .map(|(tag, p)| (tag.clone(), p.level.as_str()))
+            .collect()
+    }
+
+    /// The TUI's one keystroke for a client: set the level of every request of
+    /// that client waiting right now, and pin the conversations behind them so
+    /// the next turn of the same conversation keeps it. A request already
+    /// running keeps the level it was queued with — the order is decided before
+    /// a slot is spent, and nothing is taken away mid-flight. Returns how many
+    /// waiting requests moved.
+    pub fn pin_user_sessions(&self, user: &str, level: Priority) -> usize {
+        let now = std::time::Instant::now();
+        let mut queues = self.queues.lock_or_recover();
+        let Some(queue) = queues.get_mut(user) else {
+            return 0;
+        };
+        let mut pins = self.session_pins.lock_or_recover();
+        let mut moved = 0;
+        for task in queue.iter_mut() {
+            task.priority = level;
+            moved += 1;
+            if let Some(k) = task.session_key.as_ref() {
+                pins.insert(k.tag(), SessionPin { level, since: now });
+            }
+        }
+        moved
     }
 
     /// Toggle `user_id` as the VIP user. A user is never VIP and boost at
@@ -2878,14 +3106,23 @@ pub async fn run_worker(state: Arc<AppState>) {
                     });
                 }
 
-                // Build candidate order: VIP first, then boost on every other
-                // turn, then fair-share round-robin over the rest. The order is
+                // Build candidate order: a `top` session first on the whole
+                // board (it outranks even a VIP client — that is the point of
+                // `top`), then VIP, then boost on every other turn, then
+                // fair-share round-robin over the rest. The order is
                 // a permutation of `active_users` held as indices — it used to
                 // be built by cloning the user ids into two more Vec<String>
                 // and de-duplicating with O(n) string comparisons.
                 let mut order: Vec<usize> = Vec::with_capacity(active_users.len());
                 let position_of = |name: &String| active_users.iter().position(|u| u == name);
-                if let Some(i) = vip.as_ref().and_then(&position_of) {
+                for ui in (0..active_users.len()).filter(|&i| {
+                    next_task(queues.get(&active_users[i])).is_some_and(|t| t.priority == Priority::Top)
+                }) {
+                    order.push(ui);
+                }
+                if let Some(i) = vip.as_ref().and_then(&position_of)
+                    && !order.contains(&i)
+                {
                     order.push(i);
                 }
                 if counter.is_multiple_of(2)
@@ -2921,20 +3158,18 @@ pub async fn run_worker(state: Arc<AppState>) {
                     let reserve = state.slot_reserve.lock_or_recover();
                     let is_reserved = |ui: usize| {
                         slot_reserved(
-                            queues
-                                .get(&active_users[ui])
-                                .and_then(|q| q.front())
-                                .and_then(|t| t.session_key.as_ref()),
+                            next_task(queues.get(&active_users[ui])).and_then(|t| t.session_key.as_ref()),
                             &reserve,
                             now,
                         )
                     };
                     let is_cold = |ui: usize| {
-                        queues
-                            .get(&active_users[ui])
-                            .and_then(|q| q.front())
-                            .is_some_and(|t| {
-                                cold_hold(
+                        next_task(queues.get(&active_users[ui])).is_some_and(|t| {
+                            // A `top` session is never held back: it asked to
+                            // pay the re-prefill rather than wait behind the
+                            // cache-hot ones (see [`Priority::Top`]).
+                            t.priority == Priority::Top
+                                || cold_hold(
                                     t.session_key.as_ref(),
                                     t.cache_passes,
                                     &affinity,
@@ -2942,7 +3177,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     &backends,
                                     now,
                                 )
-                            })
+                        })
                     };
                     // Slot reservation first: a session that finished a turn
                     // within SLOT_RESERVE keeps the queue head for its own
@@ -2981,7 +3216,17 @@ pub async fn run_worker(state: Arc<AppState>) {
                 'users: for &ui in &order {
                     let user_id = &active_users[ui];
                     let queue_len = queues.get(user_id).map(|q| q.len()).unwrap_or(0);
-                    for pos in 0..queue_len {
+                    // Inside one client the highest-priority request goes
+                    // first; among equals the queue order stands (the sort is
+                    // stable). `pos` stays the queue index, so the pin lookup
+                    // above and the removal below still line up with it.
+                    let mut positions: Vec<usize> = (0..queue_len).collect();
+                    if queue_len > 1 {
+                        if let Some(q) = queues.get(user_id) {
+                            positions.sort_by_key(|&p| std::cmp::Reverse(q[p].priority));
+                        }
+                    }
+                    for pos in positions {
                         let task_ref = match queues.get(user_id).and_then(|q| q.get(pos)) {
                             Some(t) => t,
                             None => continue,
@@ -2989,6 +3234,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                         // Cloned before the task is removed below: `task_ref`
                         // borrows `queues` and cannot outlive the removal.
                         let pending_session_key = task_ref.session_key.clone();
+                        // Cloned for the same reason: needed again after the
+                        // task is removed from the queue below.
+                        let task_prio = task_ref.priority;
                         let route_families =
                             families_for_route(&task_ref.method, &task_ref.path);
                         // Metadata reads are cheap and don't use the model
@@ -3011,6 +3259,15 @@ pub async fn run_worker(state: Arc<AppState>) {
                         // it used to be locked and dropped for every task examined.
                         let model_key =
                             task_ref.requested_model.as_deref().map(model_concurrency_key);
+                        // A `top` request may run one over a backend's slot count
+                        // when that backend is the one holding its context: the
+                        // overbook is cheaper than the cold re-prefill anywhere
+                        // else. Exactly one — once this request is in, the backend
+                        // sits at cap+1 and the equality below stops matching.
+                        let over_cap = pending_session_key
+                            .as_ref()
+                            .filter(|_| task_ref.priority == Priority::Top)
+                            .and_then(|k| sticky_url_within_ttl(state.as_ref(), k));
                         // Per-model limit on a given backend: the configured
                         // `max_concurrent_requests`, else 1 — or, on a backend that
                         // reports its slots, all of them (the server runs its own
@@ -3028,6 +3285,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 let online = b.is_online;
                                 let (cap, detected) = state.backend_capacity(b);
                                 let free = metadata
+                                    || (over_cap.as_deref() == Some(b.url.as_str())
+                                        && b.active_requests == cap as usize)
                                     || backend_has_capacity(
                                         b,
                                         model_key.as_deref(),
@@ -3222,6 +3481,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     backend: None,
                                     outcome: "timeout",
                                     session: dropped.session_key.as_ref().map(SessionKey::tag),
+                                    session_label: dropped.session_label.clone(),
+                                    priority: dropped.priority.as_str(),
                                     queue_wait: Some(dropped.queued_at.elapsed().as_secs_f64()),
                                     timing: Default::default(),
                                 });
@@ -3313,10 +3574,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                         // being held back stays bounded (see `cold_hold`).
                         if !cold_users.is_empty() && !cold_users.contains(user_id) {
                             for cu in &cold_users {
-                                if let Some(front) =
-                                    queues.get_mut(cu).and_then(|q| q.front_mut())
-                                {
-                                    front.cache_passes = front.cache_passes.saturating_add(1);
+                                if let Some(q) = queues.get_mut(cu) {
+                                    if let Some(p) = next_pos(q) {
+                                        q[p].cache_passes = q[p].cache_passes.saturating_add(1);
+                                    }
                                 }
                             }
                         }
@@ -3353,6 +3614,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 &eligible_indices,
                                 &backends,
                                 min_conns,
+                                task_prio == Priority::Top,
                             )
                         });
                         let candidates_backends: Vec<usize> = eligible_indices
@@ -3449,6 +3711,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                     };
                     let queue_wait = task.queued_at.elapsed().as_secs_f64();
                     let session_tag = task.session_key.as_ref().map(SessionKey::tag);
+                    let session_label = task.session_label.clone();
+                    let prio = task.priority.as_str();
                     // Counted for Prometheus and kept for the Overview.
                     let outcome = |o: &'static str, timing: crate::stats::Timing| {
                         metrics.inc(
@@ -3464,6 +3728,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                             backend: Some(m_backend.clone()),
                             outcome: o,
                             session: session_tag.clone(),
+                            session_label: session_label.clone(),
+                            priority: prio,
                             queue_wait: Some(queue_wait),
                             timing,
                         });
@@ -3557,6 +3823,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                             queue_wait,
                             est_prompt_tokens,
                             session_tag.as_deref(),
+                            session_label.clone(),
+                            prio,
                         );
                         // Completion tokens already counted from the stream.
                         let mut live_tokens: u64 = 0;
@@ -3802,6 +4070,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             bytes: Some(total_bytes),
                                             content_type: resp_content_type,
                                             content: Some(content_str.clone()),
+                                            session: session_tag.clone(),
+                                            session_label: session_label.clone(),
+                                            priority: prio,
                                             waste_secs,
                                         });
                                         log_out(
@@ -3840,6 +4111,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     bytes: Some(total_bytes),
                                     content_type: None,
                                     content: Some(err_msg.clone()),
+                                    session: session_tag.clone(),
+                                    session_label: session_label.clone(),
+                                    priority: prio,
                                     waste_secs: None,
                                 });
                                 let _ = task.responder.send(ResponsePart::Error(e)).await;
@@ -4023,6 +4297,9 @@ pub async fn proxy_handler(
                 bytes: Some(0),
                 content_type: None,
                 content: None,
+                session: None,
+                session_label: None,
+                priority: "normal",
                 waste_secs: None,
             });
             state.log_event(LogEvent {
@@ -4103,6 +4380,16 @@ pub async fn proxy_handler(
     let model_label = state.model_label(requested_model.as_deref());
     // Kept copy of the conversation tag: `session_key` moves into the task.
     let session_tag = session_key.as_ref().map(SessionKey::tag);
+    // The label is display-only and the priority is resolved here, once: the
+    // pin can also come from the operator, and the client's claim is capped by
+    // `settings.client_priority`.
+    let session_label = session_label_header(&headers);
+    let priority = resolve_priority(
+        state.as_ref(),
+        &headers,
+        client.is_some(),
+        session_key.as_ref(),
+    );
     // Request-log content is captured before `body` moves into the Task.
     let body_len = body.len() as u64;
     let content = Arc::new(crate::reqlog::truncate_utf8(&body, state.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)));
@@ -4125,6 +4412,8 @@ pub async fn proxy_handler(
             }
         }),
         session_key,
+        session_label: session_label.clone(),
+        priority,
     };
 
     {
@@ -4165,6 +4454,8 @@ pub async fn proxy_handler(
                 backend: None,
                 outcome: "queue_full",
                 session: session_tag.clone(),
+                session_label: session_label.clone(),
+                priority: priority.as_str(),
                 queue_wait: None,
                 timing: Default::default(),
             });
@@ -4218,6 +4509,8 @@ pub async fn proxy_handler(
                 backend: None,
                 outcome: "overloaded",
                 session: session_tag.clone(),
+                session_label: session_label.clone(),
+                priority: priority.as_str(),
                 queue_wait: None,
                 timing: Default::default(),
             });
@@ -4263,6 +4556,9 @@ pub async fn proxy_handler(
             .and_then(|v| v.to_str().ok())
             .map(str::to_string),
         content: Some(content.clone()),
+        session: session_tag.clone(),
+        session_label: session_label.clone(),
+        priority: priority.as_str(),
         waste_secs: None,
     });
 
@@ -5007,6 +5303,8 @@ mod tests {
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
+                session_label: None,
+                priority: Default::default(),
             });
         }
 
@@ -5095,6 +5393,8 @@ mod tests {
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
+                session_label: None,
+                priority: Default::default(),
             });
         rx
     }
@@ -5379,6 +5679,8 @@ mod tests {
             queued_at: std::time::Instant::now(),
             key_label: None,
             session_key: None,
+            session_label: None,
+            priority: Default::default(),
         });
         state.processed_counts.lock_or_recover().insert("old".into(), 7);
         state.toggle_boost("old");
@@ -6003,6 +6305,8 @@ mod tests {
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
+                session_label: None,
+                priority: Default::default(),
             });
         rx
     }
@@ -6772,6 +7076,8 @@ mod tests {
                     queued_at: std::time::Instant::now(),
                     key_label: None,
                     session_key: None,
+                    session_label: None,
+                    priority: Default::default(),
                 });
             }
         }
@@ -6834,6 +7140,235 @@ mod tests {
         // The tag identifies the conversation, not the model or the whole key.
         assert_eq!(key("p:abc123", "other").tag(), a.tag());
         assert_ne!(key("p:zzz999", "m").tag(), a.tag(), "different conversation");
+    }
+
+    // -- Session priority ---------------------------------------------------
+    //
+    // Three levels: `normal` is the fair order, `high` jumps only inside its own
+    // client, `top` jumps everybody and pays for it with a context switch. Two
+    // sources: what the client claims in a header (capped by
+    // `settings.client_priority`) and what an operator pins by tag, which always
+    // wins — in both directions.
+
+    fn prio_headers(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-session-priority", v.parse().unwrap());
+        h
+    }
+
+    /// A queued request carrying `level`, enough to exercise the queue helpers.
+    fn task_with(level: Priority) -> Task {
+        let (tx, _rx) = mpsc::channel(1);
+        Task {
+            method: Method::POST,
+            user: "127.0.0.1:41000".to_string(),
+            path: "/v1/chat/completions".into(),
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"{}"),
+            responder: tx,
+            requested_model: Some("m".into()),
+            stuck_warned: false,
+            cache_passes: 0,
+            queued_at: std::time::Instant::now(),
+            key_label: None,
+            session_key: None,
+            session_label: None,
+            priority: level,
+        }
+    }
+
+    #[test]
+    fn client_priority_caps_what_a_client_may_claim() {
+        let state = new_test_state(vec!["http://127.0.0.1:11434".into()]);
+        let cases = [
+            (ClientPriority::Off, "high", Priority::Normal),
+            (ClientPriority::Off, "top", Priority::Normal),
+            (ClientPriority::Intra, "high", Priority::High),
+            // `self` may not jump other clients, so `top` is clamped, not ignored.
+            (ClientPriority::Intra, "top", Priority::High),
+            (ClientPriority::Global, "high", Priority::High),
+            (ClientPriority::Global, "top", Priority::Top),
+            // Anything unrecognised is ordinary traffic, as is no header at all.
+            (ClientPriority::Global, "please", Priority::Normal),
+            (ClientPriority::Global, "", Priority::Normal),
+        ];
+        for (mode, claimed, want) in cases {
+            state
+                .client_priority
+                .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                resolve_priority(&state, &prio_headers(claimed), true, None),
+                want,
+                "mode {mode:?} asked for {claimed:?}"
+            );
+            // Keyless traffic never gets a say in the order everyone queues in.
+            assert_eq!(
+                resolve_priority(&state, &prio_headers(claimed), false, None),
+                Priority::Normal,
+                "unauthenticated {claimed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_operator_pin_outranks_the_clients_claim_in_both_directions() {
+        let state = new_test_state(vec!["http://127.0.0.1:11434".into()]);
+        state
+            .client_priority
+            .store(ClientPriority::Global as u8, std::sync::atomic::Ordering::Relaxed);
+        let k = key("thread", "m");
+        let loud = prio_headers("top");
+        assert_eq!(
+            resolve_priority(&state, &loud, true, Some(&k)),
+            Priority::Top,
+            "no pin yet"
+        );
+        // Holding a conversation down at `normal` is a pin too: the claim dies.
+        state.session_pins.lock_or_recover().insert(
+            k.tag(),
+            SessionPin {
+                level: Priority::Normal,
+                since: std::time::Instant::now(),
+            },
+        );
+        assert_eq!(
+            resolve_priority(&state, &loud, true, Some(&k)),
+            Priority::Normal,
+            "pinned down"
+        );
+        // Another conversation is untouched by this pin.
+        assert_eq!(
+            resolve_priority(&state, &loud, true, Some(&key("other", "m"))),
+            Priority::Top
+        );
+    }
+
+    #[test]
+    fn a_pin_works_for_a_tag_with_nothing_live_behind_it() {
+        let state = new_test_state(vec!["http://127.0.0.1:11434".into()]);
+        let k = key("thread", "m");
+        // Pinning must not depend on the conversation being resolvable: during
+        // its very first request there is no affinity entry and the request has
+        // already left the queue, and pinning then is exactly when it is wanted.
+        assert_eq!(state.pin_session(&k.tag().to_uppercase(), Priority::Top), 1);
+        assert_eq!(
+            resolve_priority(&state, &HeaderMap::new(), false, Some(&k)),
+            Priority::Top,
+            "the pin applies to the conversation the tag was cut from"
+        );
+        // A different conversation is untouched by this pin.
+        assert_eq!(
+            resolve_priority(&state, &prio_headers("top"), true, Some(&key("other", "m"))),
+            Priority::Top,
+            "its own claim, not the pin"
+        );
+        // Pinning the same tag again replaces the level instead of stacking.
+        assert_eq!(state.pin_session(&k.tag(), Priority::Normal), 1);
+        assert_eq!(
+            resolve_priority(&state, &prio_headers("top"), true, Some(&k)),
+            Priority::Normal,
+            "pinned down: the claim no longer lifts it"
+        );
+    }
+
+    #[test]
+    fn one_key_sets_every_waiting_request_of_a_client() {
+        let state = new_test_state(vec!["http://127.0.0.1:11434".into()]);
+        let k = key("thread", "m");
+        let _a = enqueue_chat_with_key(&state, "m", "{}".into(), Some(k.clone()));
+        let _b = enqueue_chat_with_key(&state, "m", "{\"x\":1}".into(), None);
+        assert_eq!(state.pin_user_sessions("tester", Priority::Top), 2);
+        let q = state.queues.lock_or_recover();
+        assert!(
+            q["tester"].iter().all(|t| t.priority == Priority::Top),
+            "every waiting request moved"
+        );
+        drop(q);
+        // The conversation behind a queued request is pinned as well, so its
+        // next turn keeps the level; a request without a session key has
+        // nothing to pin, which is why one pin and not two.
+        assert_eq!(state.session_pins.lock_or_recover().len(), 1);
+        assert_eq!(
+            resolve_priority(&state, &HeaderMap::new(), false, Some(&k)),
+            Priority::Top
+        );
+        assert_eq!(state.pin_user_sessions("nobody", Priority::High), 0);
+    }
+
+    #[test]
+    fn a_clients_own_queue_runs_priority_first_then_arrival_order() {
+        let q: std::collections::VecDeque<Task> = [
+            Priority::Normal,
+            Priority::High,
+            Priority::Normal,
+            Priority::Top,
+        ]
+        .into_iter()
+        .map(task_with)
+        .collect();
+        assert_eq!(next_pos(&q), Some(3), "top goes first");
+        let q2: std::collections::VecDeque<Task> =
+            [Priority::High, Priority::Normal, Priority::High]
+                .into_iter()
+                .map(task_with)
+                .collect();
+        assert_eq!(next_pos(&q2), Some(0), "among equals the earlier one stands");
+        assert_eq!(next_pos(&std::collections::VecDeque::new()), None);
+        assert_eq!(next_task(Some(&q)).map(|t| t.priority), Some(Priority::Top));
+    }
+
+    #[test]
+    fn a_top_session_keeps_its_backend_when_a_normal_one_would_move() {
+        let state = new_test_state(vec![
+            "http://127.0.0.1:11434".into(),
+            "http://127.0.0.1:11435".into(),
+        ]);
+        state
+            .sticky_ttl
+            .store(1800, std::sync::atomic::Ordering::Relaxed);
+        state
+            .sticky_lag
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let k = key("thread", "m");
+        state.affinity.lock_or_recover().insert(
+            k.clone(),
+            Affinity {
+                backend_url: "http://127.0.0.1:11434".into(),
+                last_use: std::time::Instant::now(),
+            },
+        );
+        let mut backends = state.backends.lock_or_recover().clone();
+        backends[0].active_requests = 1;
+        let eligible = vec![0usize, 1];
+        // Ordinary traffic moves on; `top` pays the overbook to stay home.
+        assert_eq!(pick_sticky_backend(&state, &k, &eligible, &backends, 0, false), None);
+        assert_eq!(pick_sticky_backend(&state, &k, &eligible, &backends, 0, true), Some(0));
+    }
+
+    #[test]
+    fn session_labels_arrive_safe_and_short() {
+        assert_eq!(
+            sanitize_label(Some("Refactor  auth module")),
+            Some("refactor-auth-module".into())
+        );
+        assert_eq!(
+            sanitize_label(Some("  --hi\tthere\u{7}--  ")),
+            Some("hi-there".into()),
+            "control characters and edge dashes go"
+        );
+        assert_eq!(sanitize_label(Some("")), None);
+        assert_eq!(sanitize_label(Some("   \n ")), None);
+        assert_eq!(
+            sanitize_label(Some(&"x".repeat(200))).map(|s| s.len()),
+            Some(64),
+            "capped"
+        );
+        // Letters outside ASCII survive: the label is display text the proxy
+        // never puts in a header of its own.
+        assert_eq!(
+            sanitize_label(Some("Refaktor äuth")),
+            Some("refaktor-äuth".into())
+        );
     }
 
     /// True once the conversation is remembered on `url` — polled, because the
@@ -6900,6 +7435,8 @@ mod tests {
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key,
+                session_label: None,
+                priority: Default::default(),
             });
         rx
     }
@@ -7157,7 +7694,7 @@ mod tests {
         let mut busy = backends.clone();
         busy[0].active_requests = 1;
         assert_eq!(
-            pick_sticky_backend(&state, &k, &eligible, &busy, 0),
+            pick_sticky_backend(&state, &k, &eligible, &busy, 0, false),
             None
         );
 
@@ -7166,7 +7703,7 @@ mod tests {
             .sticky_lag
             .store(1, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            pick_sticky_backend(&state, &k, &eligible, &busy, 0),
+            pick_sticky_backend(&state, &k, &eligible, &busy, 0, false),
             Some(0)
         );
 
@@ -7174,7 +7711,7 @@ mod tests {
         state
             .sticky_lag
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(pick_sticky_backend(&state, &k, &[1], &backends, 0), None);
+        assert_eq!(pick_sticky_backend(&state, &k, &[1], &backends, 0, false), None);
 
         // Remembered for longer than the TTL: forgotten.
         state
@@ -7187,7 +7724,7 @@ mod tests {
             .unwrap()
             .last_use = std::time::Instant::now() - std::time::Duration::from_secs(30);
         assert_eq!(
-            pick_sticky_backend(&state, &k, &eligible, &backends, 0),
+            pick_sticky_backend(&state, &k, &eligible, &backends, 0, false),
             None
         );
 
@@ -7197,7 +7734,7 @@ mod tests {
             .sticky_ttl
             .store(1800, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            pick_sticky_backend(&state, &k, &eligible, &backends, 0),
+            pick_sticky_backend(&state, &k, &eligible, &backends, 0, false),
             Some(1)
         );
     }
@@ -7322,6 +7859,8 @@ mod tests {
                     queued_at: now,
                     key_label: None,
                     session_key: None,
+                    session_label: None,
+                    priority: Default::default(),
                 });
         }
 
@@ -7711,6 +8250,8 @@ mod tests {
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
+                session_label: None,
+                priority: Default::default(),
             });
 
         let worker = tokio::spawn(run_worker(state.clone()));
@@ -7873,6 +8414,8 @@ mod tests {
                 queued_at: std::time::Instant::now(),
                 key_label: None,
                 session_key: None,
+                session_label: None,
+                priority: Default::default(),
             });
         rx
     }

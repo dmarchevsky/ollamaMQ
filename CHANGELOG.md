@@ -3,6 +3,45 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.13.0 — 2026-10-20
+
+### Added
+
+- **Session labels.** A client sends `X-Session-Name` and its conversation reads
+  `#refactor-auth` instead of `#a3f19c` — in Activity (graph lane, List, Details,
+  phone cards), in the request log and on the run rows. The label is display
+  text only: it stays out of the session key, so renaming a session cannot
+  re-key it and lose its sticky backend. Kept to 64 characters, lowercased,
+  control characters and edge separators stripped.
+- **Three priority levels** (`normal` / `high` / `top`) from `X-Session-Priority`.
+  `high` goes first inside its own client's queue; `top` goes first on the whole
+  board (ahead of the VIP client), is never held back by the cache hold-back, and
+  may overbook the backend its conversation is warm on by exactly one slot.
+  Nothing running is ever cancelled to make room.
+- `settings.client_priority: off | self | global` (default `global`) caps how far
+  a client's own claim reaches. Keyless requests never get a say, and an operator
+  pin always wins — in both directions, including holding a session at `normal`.
+- **Priority on the operator's three surfaces.** The icon beside a session *is*
+  the control: click cycles normal → high → top (`▲` violet = top, `△` berry =
+  high, grey `○` = none yet, so every live session carries one). The status line
+  counts what sits above normal, the Filters modal can show only those, and
+  `POST /ui/api/sessions/<tag>/priority` `{"level":"top"}` does it in one call.
+  In the TUI, `P` on a client sets everything that client has waiting and marks it
+  `[HGH]` / `[TOP]`.
+
+### Changed
+
+- Activity groups its backends **alphabetically** instead of by most recent
+  activity, so the panel stops rearranging itself between polls. Sessions keep
+  their existing order inside a group (newest start first).
+- An operator priority pin is keyed by the six-hex **session tag** the UI shows,
+  not by the conversation behind it. Pinning any visible session succeeds
+  immediately — including during its first request, when the conversation is not
+  yet resolvable anywhere — and lands on the conversation's next turn. The old
+  `404 no live conversation carries that session tag` is gone; a malformed tag is
+  a `400`. The Overview now also returns `status.pins`, and the icon beside a
+  session shows the pin (a finished row keeps its historical level underneath).
+
 ## v0.12.2 — 2026-10-20
 
 ### Added
