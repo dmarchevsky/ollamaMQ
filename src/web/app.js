@@ -1797,8 +1797,11 @@ async function openRound({ rid, seq }) {
   $$('input[name="lv-scope"]').forEach(r => { r.checked = S.lv.scope === r.value; });
   $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
   drawLv();
-  $('#dlg-log').showModal();
-  $('#dlg-log .lv-body').scrollTop = 0;
+  // Round navigation (↑/↓) re-enters with the dialog already open — showModal
+  // on an open dialog throws.
+  const dlg = $('#dlg-log');
+  if (!dlg.open) dlg.showModal();
+  dlg.querySelector('.lv-body').scrollTop = 0;
 }
 
 /** Fetch one event's captured content (cached on the list entry). */
@@ -2105,6 +2108,7 @@ async function lvNewOnly(curText) {
   // starts at the next user message.
   let kShown = k;
   while (kShown < b.length && b[kShown].role === 'assistant') kShown++;
+  if (kShown >= b.length) kShown = k; // whole tail is replies — show it
   const repliesHidden = kShown > k;
   const inside = k < a.length && k < b.length;
   const changed = Object.keys(cur).filter(x => x !== 'messages' && JSON.stringify(cur[x]) !== JSON.stringify(prev[x]));
