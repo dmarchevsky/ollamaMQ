@@ -100,6 +100,57 @@
     logs.push({ seq: 1000 - i, at_ms: now - i * 23_000 - 1500, dir, user, model, backend, info, has_content: has });
   }
 
+  // A paired-round story: two chat rounds of one conversation (session
+  // a3f19c). Formatted reconstructs the streamed reply; New only diffs the
+  // current request against the previous one in the same session.
+  const chatMsgs = [{ role: 'system', content: 'You are a coding agent. Be concise.' }];
+  for (let i = 1; i <= 11; i++) {
+    chatMsgs.push({ role: 'user', content: `Turn ${i}: look at src/file${i}.rs and summarise it.` });
+    chatMsgs.push({ role: 'assistant', content: `Reading file${i}.`,
+      tool_calls: [{ id: `c${i}`, function: { name: 'read', arguments: JSON.stringify({ path: `src/file${i}.rs` }) } }] });
+    chatMsgs.push({ role: 'tool', tool_call_id: `c${i}`, content: `// file${i}: ${'summary text '.repeat(24)}` });
+  }
+  const reqBody = extra => JSON.stringify({
+    model: 'Qwen3.8-Flash-Next', stream: true, temperature: 0.2, max_tokens: 8192,
+    tools: ['read', 'edit', 'bash', 'write', 'grep'].map(n => ({ function: { name: n } })),
+    messages: [...chatMsgs, ...extra],
+  });
+  const sse = (deltas, usage, finish) => deltas
+    .map(d => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: d }] }) + '\n\n').join('')
+    + 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: finish }], usage }) + '\n\n'
+    + 'data: [DONE]\n\n';
+  const streamOut = sse(
+    [{ role: 'assistant', content: '' },
+     { reasoning: 'The rename chain must move from the oldest slot backwards…' },
+     ...'The rotate() loop shifts files toward older slots. Fix: walk the chain from the newest end, so the current file becomes .0 without clobbering a rotation.'
+       .match(/.{1,14}/g).map(s => ({ content: s })),
+     { tool_calls: [{ index: 0, id: 'c12', function: { name: 'edit', arguments: '{"path":' } }] },
+     { tool_calls: [{ index: 0, function: { arguments: '"src/reqlog.rs"}' } }] }],
+    { prompt_tokens: 1204, completion_tokens: 345 }, 'stop');
+  const prevOut = sse(
+    [{ role: 'assistant', content: '' },
+     ...'Fixed by walking the chain from the oldest slot backwards.'
+       .match(/.{1,14}/g).map(s => ({ content: s }))],
+    { prompt_tokens: 1152, completion_tokens: 96 }, 'stop');
+  const contentBySeq = {
+    1199: reqBody([]),
+    1200: prevOut,
+    1201: reqBody([{ role: 'assistant', content: 'Fixed by walking the chain from the oldest slot backwards.' },
+                  { role: 'tool', tool_call_id: 'c11', content: 'Successfully edited src/reqlog.rs' },
+                  { role: 'user', content: 'Now run cargo test and show the rotation test output.' }]),
+    1202: streamOut,
+  };
+  logs.unshift(
+    { seq: 1202, at_ms: now - 8_000, dir: 'OUT', user: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
+      backend: 'http://192.168.6.11:8731', info: 'POST /v1/chat/completions -> 200 resp=41832B', has_content: true, rid: 901, session: 'a3f19c' },
+    { seq: 1201, at_ms: now - 26_000, dir: 'IN', user: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
+      backend: null, info: 'POST /v1/chat/completions body=676918B', has_content: true, rid: 901, session: 'a3f19c' },
+    { seq: 1200, at_ms: now - 88_000, dir: 'OUT', user: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
+      backend: 'http://192.168.6.11:8731', info: 'POST /v1/chat/completions -> 200 resp=38210B', has_content: true, rid: 900, session: 'a3f19c' },
+    { seq: 1199, at_ms: now - 95_000, dir: 'IN', user: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
+      backend: null, info: 'POST /v1/chat/completions body=651322B', has_content: true, rid: 900, session: 'a3f19c' },
+  );
+
   const SAMPLE_CONTENT = JSON.stringify({
     model: 'Qwen3.8-Flash-Next',
     stream: true,
@@ -158,9 +209,9 @@
 
   // Runs in progress: tokens grow with time like a streaming backend.
   const demoRuns = [
-    { client: 'codex-laptop', key: 'laptop', model: 'Qwen3.8-Flash-Next', backend: '192.168.6.11:8731', started: now - 94_000, ttfb: 2.4, rate: 38.5, waited: 0.4, est: 21_000, session: 'a3f19c', label: 'refactor-auth', prio: 'top' },
-    { client: 'openwebui', key: 'webui', model: 'Qwen3.8-27B', backend: '192.168.255.224:8000', started: now - 21_000, ttfb: 6.8, rate: 11.2, waited: 2.1, est: 44_000, session: '7e04d2', label: 'gitlab-runner', prio: 'high' },
-    { client: 'n8n-agents', key: 'prod', model: 'llama3.3:70b', backend: 'gpu-box.lan:11434', started: now - 3_000, ttfb: null, rate: 0, waited: 12.6, est: 3_200, session: null },
+    { client: 'codex-laptop', key: 'laptop', model: 'Qwen3.8-Flash-Next', backend: '192.168.6.11:8731', started: now - 94_000, ttfb: 2.4, rate: 38.5, waited: 0.4, est: 21_000, session: 'a3f19c', label: 'refactor-auth', prio: 'top', rid: 911 },
+    { client: 'openwebui', key: 'webui', model: 'Qwen3.8-27B', backend: '192.168.255.224:8000', started: now - 21_000, ttfb: 6.8, rate: 11.2, waited: 2.1, est: 44_000, session: '7e04d2', label: 'gitlab-runner', prio: 'high', rid: 912 },
+    { client: 'n8n-agents', key: 'prod', model: 'llama3.3:70b', backend: 'gpu-box.lan:11434', started: now - 3_000, ttfb: null, rate: 0, waited: 12.6, est: 3_200, session: null, rid: 913 },
   ];
   const runView = () => demoRuns.map(r => {
     const elapsed = (Date.now() - r.started) / 1000;
@@ -169,7 +220,7 @@
       state: r.ttfb != null && elapsed >= r.ttfb ? 'generating' : 'prefill', waited_secs: r.waited,
       ttfb_secs: r.ttfb, ttft_secs: r.ttfb, tokens: Math.floor(gen * r.rate), tokens_per_sec: gen >= 1 ? r.rate : null,
       est_prompt_tokens: r.est, session: r.session,
-      session_label: r.label, priority: r.prio || 'normal' };
+      session_label: r.label, priority: r.prio || 'normal', rid: r.rid };
   });
 
   function snapshot() {
@@ -234,7 +285,7 @@
     const queue = demoQueue.map(q => ({
       client: q.client, model: q.model, pos: q.pos, backends: q.backends, session: q.session,
       session_label: q.label, priority: q.prio || 'normal',
-      waited_secs: (t - q.since) / 1000, est_prompt_tokens: q.est,
+      waited_secs: (t - q.since) / 1000, est_prompt_tokens: q.est, rid: 920 + q.pos,
     }));
     const be = backends.map(b => {
       const label = hostOf(b.url);
@@ -325,6 +376,9 @@
         session: i % 4 === 0 ? 'a3f19c' : i % 4 === 1 ? '7e04d2' : null,
         session_label: i % 4 === 0 ? 'refactor-auth' : i % 4 === 1 ? 'gitlab-runner' : null,
         priority: i % 4 === 0 ? 'top' : i % 4 === 1 ? 'high' : 'normal',
+        // The newest a3f19c finish IS the demo round (rid 901) so its Overview
+        // row jumps straight to the paired log records.
+        rid: i === 0 ? 901 : i % 4 === 1 ? 931 : null,
         prompt_tokens: err ? 0 : prompt, prefill_secs: prefill, prefill_tokens: prefillTok, cache_pct: cache,
         // A near-cold turn after a warm session: almost the whole prefill was
         // re-reading an evicted context. One of the healthy rows shows it.
@@ -467,7 +521,8 @@
       if (method === 'GET' && seg[0] === 'logs' && seg.length === 1) return delay(logs);
       if (method === 'GET' && seg[0] === 'logs') {
         const ev = logs.find(l => String(l.seq) === seg[1]) || err('log event expired');
-        const content = !ev.has_content ? null : ev.dir === 'OUT' ? SAMPLE_RESPONSE : SAMPLE_CONTENT;
+        let content = contentBySeq[ev.seq] ?? null;
+        if (content == null && ev.has_content) content = ev.dir === 'OUT' ? SAMPLE_RESPONSE : SAMPLE_CONTENT;
         return delay({ ...ev, content });
       }
       if (method === 'POST' && p === 'config/reload') return delay({ models: 3 });

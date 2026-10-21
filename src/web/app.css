@@ -445,10 +445,9 @@ pre.content {
   }
   .panel table.logs td { padding: 0; text-align: left; font-weight: 400; }
   .panel table.logs td::before { content: none; }
-  .panel table.logs td:nth-child(3) { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .panel table.logs td:nth-child(2) { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .panel table.logs td:nth-child(4), .panel table.logs td:nth-child(5) { grid-column: span 3; font-size: 12.5px; }
   .panel table.logs td:nth-child(4) { color: var(--text); }
-  .panel table.logs td:nth-child(6) { grid-column: span 3; }
   .panel table.logs td.none { display: none; }
 }
 
@@ -816,3 +815,89 @@ tr.is-off td { color: var(--muted); }
   to { box-shadow: 0 0 0 2px transparent; }
 }
 @media (prefers-reduced-motion: reduce) { .det-h.flash, #ov-now tr.flash, #ov-now .rq.flash { animation: none; } }
+
+/* ---------------------------------------------------------------- rounds */
+/* One compact line per request round on the Logs page: IN segment then OUT
+   segment, arrow colour carries the state (blue in, green out, amber still
+   waiting, red failed, violet control). */
+.rline { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+table.logs td.round { padding-right: 16px; }
+.rl { font-size: 12.5px; margin-right: 14px; }
+.rl .ar { font-family: var(--mono); font-weight: 700; margin-right: 5px; }
+.rl.in .ar { color: var(--accent); }
+.rl.out .ar { color: var(--ok); }
+.rl.out.wait .ar { color: var(--warn); }
+.rl.err, .rl.err .ar { color: var(--bad); }
+.rl.ctl .ar { color: var(--vip); }
+
+/* Overview rows jumping to their log round. */
+.det-row[data-action] { cursor: pointer; }
+.det-row .jump { margin-left: auto; color: var(--faint); opacity: 0; }
+.det-row[data-action]:hover .jump { opacity: 1; }
+tr[data-action="log-jump"] { cursor: pointer; }
+.det-h .logs-link { color: var(--faint); font-size: 11.5px; white-space: nowrap; }
+.det-h .logs-link:hover { color: var(--accent); }
+
+/* ------------------------------------------------------------ round view */
+/* Full-screen dialog: header controls, scrollable body. The whole viewport
+   on every device; the close X is pinned to the corner so header wrapping
+   on phones never moves it. */
+dialog.logview {
+  width: 100vw; max-width: none; height: 100vh; max-height: none; margin: 0;
+  border: 0; border-radius: 0; padding: 0; background: var(--bg);
+  display: none; flex-direction: column;
+}
+dialog.logview[open] { display: flex; }
+.lv-head {
+  position: relative; display: flex; align-items: center; gap: 12px; row-gap: 8px;
+  flex-wrap: wrap; padding: 10px 48px 10px 16px; background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.lv-close { position: absolute; top: 10px; right: 12px; line-height: 1; }
+.lv-title { flex: 1; min-width: 0; }
+.lv-title b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lv-title .lv-sub { display: block; color: var(--muted); font-size: 12px; font-family: var(--mono);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lv-body { flex: 1; overflow: auto; padding: 18px 22px; min-height: 0; }
+.lv-wrap { max-width: 1000px; margin: 0 auto; }
+.lv-meta { color: var(--muted); font-size: 12.5px; font-family: var(--mono); margin-bottom: 12px; }
+.lv-note { background: var(--accent-soft); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px; font-size: 12.5px; margin-bottom: 14px; }
+.lv-foot { color: var(--muted); font-size: 12px; font-family: var(--mono); margin: 12px 2px 0; }
+.seg.off { opacity: .45; pointer-events: none; }
+
+/* Transcript blocks (chat request, reconstructed response). */
+.msg { border: 1px solid var(--border); background: var(--surface); border-radius: 8px;
+  margin-bottom: 10px; overflow: hidden; }
+.msg > .role { display: block; padding: 4px 12px; font-size: 11px; font-weight: 700;
+  letter-spacing: .05em; text-transform: uppercase; color: var(--muted);
+  background: var(--surface-2); border-bottom: 1px solid var(--border); }
+.msg.sys > .role { color: var(--vip); }
+.msg.user > .role { color: var(--accent); }
+.msg.asst > .role { color: var(--ok); }
+.msg.tool > .role { color: var(--warn); }
+.msg .mtext { padding: 10px 12px; font: 12.5px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; margin: 0; }
+.msg .msg { margin: 0 12px 10px; }
+.msg details > summary { cursor: pointer; margin: 8px 12px; padding: 4px 10px; font-size: 12px;
+  color: var(--muted); border: 1px dashed var(--border); border-radius: 6px; }
+.msg details[open] > summary { margin-bottom: 0; }
+.msg details .mtext { padding-top: 6px; }
+.tc { margin: 0 12px 10px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.tc .tc-h { padding: 4px 10px; font: 600 12px var(--mono); background: var(--surface-2); }
+.tc .tc-h .fn { color: var(--accent); }
+.tc pre { margin: 0; padding: 8px 10px; font: 12px/1.5 var(--mono); white-space: pre-wrap;
+  word-break: break-word; border-top: 1px solid var(--border); }
+
+/* Raw capture and the collapsible JSON tree. */
+pre.raw { font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; color: var(--text); }
+.jt { font: 12px/1.7 var(--mono); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px; }
+.jt summary { cursor: pointer; }
+.jt b { color: var(--accent); font-weight: 600; }
+
+@media (max-width: 720px) {
+  .lv-body { padding: 12px 10px; }
+  .lv-head { gap: 8px; padding: 8px 44px 8px 10px; }
+}
