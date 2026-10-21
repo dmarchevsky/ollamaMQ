@@ -413,6 +413,8 @@ struct RunView {
     session_label: Option<String>,
     /// Scheduling level this request is being served at.
     priority: &'static str,
+    /// Log correlation id, so the row can jump to the request's log round.
+    rid: u64,
 }
 
 #[derive(Serialize)]
@@ -608,6 +610,7 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
                     session: r.session,
                     session_label: r.session_label,
                     priority: r.priority,
+                    rid: r.rid,
                     client: r.client,
                     key: r.key,
                     model: r.model,
@@ -643,6 +646,14 @@ struct LogView {
     has_content: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// Correlation id of the request this event belongs to; IN and OUT of one
+    /// request share it — the UI pairs log lines with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rid: Option<u64>,
+    /// Conversation tag of the request; lets the UI filter a conversation's
+    /// rounds and find the previous round for the "new only" view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
 }
 
 fn log_view(seq: u64, ev: &crate::dispatcher::LogEvent, with_content: bool) -> LogView {
@@ -659,6 +670,8 @@ fn log_view(seq: u64, ev: &crate::dispatcher::LogEvent, with_content: bool) -> L
         backend: ev.backend.clone(),
         info: ev.info.clone(),
         has_content: ev.content.as_deref().is_some_and(|c| !c.is_empty()),
+        rid: ev.rid,
+        session: ev.session.clone(),
         content: if with_content {
             ev.content.as_deref().map(|c| c.to_string())
         } else {
@@ -1126,6 +1139,8 @@ async fn change_password(
         backend: None,
         info: "web UI password changed".into(),
         content: None,
+        rid: None,
+        session: None,
     });
     Ok(Json(json!({ "changed_at_ms": changed_at_ms })))
 }
@@ -1701,6 +1716,8 @@ mod tests {
             backend: None,
             info,
             content: Some(Arc::new("body".into())),
+            rid: None,
+            session: None,
         };
         // Overflow the ring so the oldest events are evicted.
         for i in 0..350 {
@@ -1732,6 +1749,50 @@ mod tests {
             get("logs/3".into()).await.unwrap().status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn log_records_carry_rid_and_session() {
+        // The web UI pairs IN/OUT into rounds and finds a conversation's
+        // previous round from these two fields on every record.
+        let state = test_state();
+        state.log_event(LogEvent {
+            at: std::time::SystemTime::now(),
+            dir: "IN",
+            user: "u".into(),
+            model: Some("m".into()),
+            backend: None,
+            info: "POST /v1/chat/completions body=10B".into(),
+            content: Some(Arc::new("{\"messages\":[]}".into())),
+            rid: Some(7),
+            session: Some("a3f19c".into()),
+        });
+        state.log_event(LogEvent {
+            at: std::time::SystemTime::now(),
+            dir: "CTL",
+            user: "admin".into(),
+            model: None,
+            backend: None,
+            info: "ctl".into(),
+            content: None,
+            rid: None,
+            session: None,
+        });
+        let base = serve(state).await;
+        let list: Vec<serde_json::Value> = http()
+            .get(format!("{base}/ui/api/logs"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list[1]["rid"], 7);
+        assert_eq!(list[1]["session"], "a3f19c");
+        // Absent when unset — old-shaped records keep their exact shape.
+        assert!(list[0].get("rid").is_none());
+        assert!(list[0].get("session").is_none());
     }
 
     /// Signed-in calls with basic auth, as scripts make them.

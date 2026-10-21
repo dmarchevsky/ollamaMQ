@@ -64,6 +64,10 @@ pub struct Finished {
     pub session_label: Option<String>,
     /// Scheduling level the request was served at: `normal`, `high` or `top`.
     pub priority: &'static str,
+    /// Log correlation id of the request (see [`crate::dispatcher::LogEvent::rid`])
+    /// so the Overview can jump to its log round; `None` for actions that were
+    /// never proxied requests (model load/unload records).
+    pub rid: Option<u64>,
     /// Seconds it waited in the queue; `None` when refused before queuing.
     pub queue_wait: Option<f64>,
     pub timing: Timing,
@@ -251,6 +255,7 @@ mod tests {
             session: None,
             session_label: None,
             priority: "normal",
+            rid: None,
             queue_wait: Some(1.0),
             timing,
         }

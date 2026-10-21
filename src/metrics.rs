@@ -945,6 +945,9 @@ pub struct Run {
     pub session_label: Option<String>,
     /// Scheduling level this request is being served at.
     pub priority: &'static str,
+    /// Correlation id of the request (see [`crate::dispatcher::LogEvent::rid`]),
+    /// so the live Overview row can jump to the request's log round.
+    pub rid: u64,
 }
 
 /// Requests in progress, for the live views (`/metrics` gauges, the web
@@ -969,6 +972,7 @@ impl Runs {
         session: Option<&str>,
         session_label: Option<String>,
         priority: &'static str,
+        rid: u64,
     ) -> RunGuard<'_> {
         let id = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.lock_or_recover().insert(
@@ -987,6 +991,7 @@ impl Runs {
                 session: session.map(str::to_string),
                 session_label,
                 priority,
+                rid,
             },
         );
         RunGuard { runs: self, id }
@@ -1133,7 +1138,7 @@ mod tests {
     fn runs_clear_on_drop_and_show_as_gauges() {
         let runs = Runs::default();
         {
-            let g = runs.start("dm", "laptop", "qwen", "b:1", 0.5, 1_000, None, None, "normal");
+            let g = runs.start("dm", "laptop", "qwen", "b:1", 0.5, 1_000, None, None, "normal", 1);
             g.update(|r| r.tokens += 5);
             let l = runs.list();
             assert_eq!((l.len(), l[0].tokens), (1, 5));
