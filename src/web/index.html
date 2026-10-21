@@ -138,7 +138,7 @@
         <div class="toolbar">
           <input type="search" id="log-filter" placeholder="Filter by user, model, backend, info…" autocomplete="off">
           <select id="log-dir">
-            <option value="">All</option><option value="IN">IN</option><option value="OUT">OUT</option><option value="CTL">CTL</option>
+            <option value="">All</option><option value="awaiting">Awaiting response</option><option value="CTL">Control</option>
           </select>
           <label class="check"><input type="checkbox" id="log-pause"> Pause</label>
         </div>
@@ -257,12 +257,30 @@
   </form>
 </dialog>
 
-<dialog id="dlg-log" class="drawer">
-  <form method="dialog">
-    <div class="drawer-h"><h3 data-title>Log detail</h3><button value="close" class="btn sm">Close</button></div>
-    <dl class="kv" data-meta></dl>
-    <pre class="content" data-content></pre>
-  </form>
+<dialog id="dlg-log" class="logview">
+  <div class="lv-head">
+    <div class="lv-title"><b data-title>Log</b><span class="lv-sub" data-sub></span></div>
+    <div class="lv-tools">
+      <div class="seg" id="lv-scope" role="radiogroup" aria-label="Request scope" title="Request only: everything the client sent, or only what is new since its previous round">
+        <label><input type="radio" name="lv-scope" value="whole"><span>Whole</span></label>
+        <label><input type="radio" name="lv-scope" value="new"><span>New only</span></label>
+      </div>
+      <div class="seg" id="lv-fmt" role="radiogroup" aria-label="Format">
+        <label><input type="radio" name="lv-fmt" value="raw"><span>Raw</span></label>
+        <label><input type="radio" name="lv-fmt" value="fmt"><span>Formatted</span></label>
+      </div>
+      <button class="btn sm" id="lv-jump" title="show the message outline">≣ Jump</button>
+      <div class="lv-nav">
+        <button class="btn sm" id="lv-prev" title="newer round" aria-label="newer round">↑</button>
+        <button class="btn sm" id="lv-next" title="older round" aria-label="older round">↓</button>
+      </div>
+    </div>
+    <button class="btn sm lv-close" data-action="log-close" aria-label="Close">X</button>
+  </div>
+  <div class="lv-shell">
+    <div class="lv-body"><div class="lv-wrap" data-content></div></div>
+    <aside class="lv-rail" id="lv-rail" aria-label="Jump to message" hidden></aside>
+  </div>
 </dialog>
 
 <dialog id="dlg-backend">

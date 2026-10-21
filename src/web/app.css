@@ -445,10 +445,9 @@ pre.content {
   }
   .panel table.logs td { padding: 0; text-align: left; font-weight: 400; }
   .panel table.logs td::before { content: none; }
-  .panel table.logs td:nth-child(3) { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .panel table.logs td:nth-child(2) { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .panel table.logs td:nth-child(4), .panel table.logs td:nth-child(5) { grid-column: span 3; font-size: 12.5px; }
   .panel table.logs td:nth-child(4) { color: var(--text); }
-  .panel table.logs td:nth-child(6) { grid-column: span 3; }
   .panel table.logs td.none { display: none; }
 }
 
@@ -816,3 +815,128 @@ tr.is-off td { color: var(--muted); }
   to { box-shadow: 0 0 0 2px transparent; }
 }
 @media (prefers-reduced-motion: reduce) { .det-h.flash, #ov-now tr.flash, #ov-now .rq.flash { animation: none; } }
+
+/* ---------------------------------------------------------------- rounds */
+/* One compact line per request round on the Logs page: IN segment then OUT
+   segment, arrow colour carries the state (blue in, green out, amber still
+   waiting, red failed, violet control). */
+.rline { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+table.logs td.round { padding-right: 16px; }
+.rl { font-size: 12.5px; margin-right: 14px; }
+.rl .ar { font-family: var(--mono); font-weight: 700; margin-right: 5px; }
+.rl.in .ar { color: var(--accent); }
+.rl.out .ar { color: var(--ok); }
+.rl.out.wait .ar { color: var(--warn); }
+.rl.err, .rl.err .ar { color: var(--bad); }
+.rl.ctl .ar { color: var(--vip); }
+
+/* Overview rows jumping to their log round — permanent chips, not hover-only. */
+.det-row .jump { margin-left: auto; }
+tr[data-action="log-jump"] { cursor: pointer; }
+.jump-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 9px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2);
+  color: var(--muted); font-size: 11px; white-space: nowrap; }
+.jump-chip:hover { color: var(--accent); border-color: var(--accent); }
+
+/* ------------------------------------------------------------ round view */
+/* Full-screen dialog: header controls, scrollable body. The whole viewport
+   on every device; the close X is pinned to the corner so header wrapping
+   on phones never moves it. */
+dialog.logview {
+  width: 100vw; max-width: none; height: 100vh; max-height: none; margin: 0;
+  border: 0; border-radius: 0; padding: 0; background: var(--bg);
+  display: none; flex-direction: column;
+}
+dialog.logview[open] { display: flex; }
+.lv-head {
+  position: relative; display: flex; align-items: center; gap: 12px; row-gap: 8px;
+  flex-wrap: wrap; padding: 10px 48px 10px 16px; background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.lv-close { position: absolute; top: 10px; right: 12px; line-height: 1; }
+.lv-title { flex: 1 1 260px; min-width: 0; }
+.lv-tools { display: flex; gap: 8px; align-items: center; }
+.lv-tools .seg { margin-bottom: 0; }
+.lv-tools .btn { height: 32px; box-sizing: border-box; display: inline-flex; align-items: center; }
+.lv-nav { display: flex; gap: 4px; }
+.lv-nav .btn { padding: 3px 9px; font-size: 13px; }
+.lv-nav .btn[disabled] { opacity: .35; cursor: default; }
+#lv-jump.active { color: var(--accent); border-color: var(--accent); }
+.lv-title b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lv-title .lv-sub { display: block; color: var(--muted); font-size: 12px; font-family: var(--mono);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lv-body { flex: 1; overflow: auto; padding: 18px 22px; min-height: 0; scrollbar-gutter: stable;
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.lv-shell { position: relative; flex: 1; display: flex; min-height: 0; }
+.lv-rail { position: absolute; top: 0; right: 0; bottom: 0; width: 292px; background: var(--surface);
+  border-left: 1px solid var(--border); overflow: auto; padding: 14px 10px; }
+.lv-rail[hidden] { display: none; }
+.lv-shell.railed .lv-body { margin-right: 292px; }
+.lv-rail h4 { margin: 0 4px 8px; font: 700 10.5px var(--mono); letter-spacing: .06em;
+  text-transform: uppercase; color: var(--muted); }
+.lv-item { display: flex; gap: 8px; align-items: baseline; width: 100%; text-align: left;
+  border: 0; background: none; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+.lv-item:hover, .lv-item.on { background: var(--accent-soft); }
+.lv-item .tag { flex: none; width: 56px; font: 700 9.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+.lv-item.user .tag { color: var(--accent); } .lv-item.asst .tag { color: var(--ok); }
+.lv-item.tool .tag { color: var(--warn); } .lv-item.sys .tag { color: var(--vip); }
+.lv-item.sec .tag { color: var(--muted); }
+.lv-item .snip { font: 12px var(--mono); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#dlg-log .flash { outline: 2px solid var(--accent); outline-offset: 1px; }
+.lv-body::-webkit-scrollbar { width: 12px; }
+.lv-body::-webkit-scrollbar-track { background: transparent; }
+.lv-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 7px; border: 3px solid var(--bg); }
+.lv-body::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+.lv-wrap { max-width: 1000px; margin: 0 auto; }
+.lv-sec + .lv-sec { border-top: 1px solid var(--border); margin-top: 22px; padding-top: 16px; }
+.lv-sec-h { margin: 0 0 12px; font: 700 11px/1.4 var(--mono); letter-spacing: .06em;
+  text-transform: uppercase; color: var(--muted); }
+.lv-sec-h .ar { font-size: 13px; margin-right: 7px; }
+.lv-sec-h.req .ar { color: var(--accent); }
+.lv-sec-h.out .ar { color: var(--ok); }
+.lv-meta { color: var(--muted); font-size: 12.5px; font-family: var(--mono); margin-bottom: 12px; }
+.lv-note { background: var(--accent-soft); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px; font-size: 12.5px; margin-bottom: 14px; }
+.lv-foot { color: var(--muted); font-size: 12px; font-family: var(--mono); margin: 12px 2px 0; }
+.seg.off { opacity: .45; pointer-events: none; }
+
+/* Transcript blocks (chat request, reconstructed response). */
+.msg { border: 1px solid var(--border); background: var(--surface); border-radius: 8px;
+  margin-bottom: 10px; overflow: hidden; }
+.msg > .role { display: block; padding: 4px 12px; font-size: 11px; font-weight: 700;
+  letter-spacing: .05em; text-transform: uppercase; color: var(--muted);
+  background: var(--surface-2); border-bottom: 1px solid var(--border); }
+.msg.sys > .role { color: var(--vip); }
+.msg.user > .role { color: var(--accent); }
+.msg.asst > .role { color: var(--ok); }
+.msg.tool > .role { color: var(--warn); }
+.msg .mtext { padding: 10px 12px; font: 12.5px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; margin: 0; }
+.msg .msg { margin: 0 12px 10px; }
+.msg details > summary { cursor: pointer; margin: 8px 12px; padding: 4px 10px; font-size: 12px;
+  color: var(--muted); border: 1px dashed var(--border); border-radius: 6px; }
+.msg details[open] > summary { margin-bottom: 0; }
+.msg details .mtext { padding-top: 6px; }
+.tc { margin: 0 12px 10px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.tc .tc-h { padding: 4px 10px; font: 600 12px var(--mono); background: var(--surface-2); }
+.tc .tc-h .fn { color: var(--accent); }
+.tc pre { margin: 0; padding: 8px 10px; font: 12px/1.5 var(--mono); white-space: pre-wrap;
+  word-break: break-word; border-top: 1px solid var(--border); }
+
+/* Raw capture and the collapsible JSON tree. */
+pre.raw { font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; color: var(--text); }
+.jt { font: 12px/1.7 var(--mono); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px; }
+.jt summary { cursor: pointer; }
+.jt b { color: var(--accent); font-weight: 600; }
+
+@media (max-width: 720px) {
+  .lv-body { padding: 12px 10px; }
+  .lv-head { gap: 8px; padding: 8px 44px 8px 10px; }
+  .lv-head .lv-title { flex: 1 1 100%; }
+  .lv-tools { flex-wrap: wrap; }
+  .lv-rail { left: 0; right: 0; bottom: auto; width: auto; max-height: 62%; border-left: 0;
+    border-bottom: 1px solid var(--border); box-shadow: 0 12px 24px rgba(0,0,0,.25); }
+  .lv-shell.railed .lv-body { margin-right: 0; }
+}

@@ -93,6 +93,9 @@ pub struct Task {
     /// Resolved scheduling level of this request (operator pin, else what the
     /// client claimed, capped by `settings.client_priority`).
     pub priority: Priority,
+    /// Correlation id shared by this request's IN and OUT log events
+    /// (see [`LogEvent::rid`]).
+    pub rid: u64,
 }
 
 /// Which API flavours a backend speaks — and, on the route side of the
@@ -834,6 +837,8 @@ pub struct AppState {
     /// of the ring has the stable sequence number `logs_evicted + i`, which
     /// the web UI uses to fetch one event's full content.
     pub logs_evicted: std::sync::atomic::AtomicU64,
+    /// Assigns per-request log correlation ids (see [`LogEvent::rid`]).
+    pub rid_seq: std::sync::atomic::AtomicU64,
 }
 
 /// One line of the TUI Logs panel: a request entering ("IN") or leaving
@@ -851,8 +856,16 @@ pub struct LogEvent {
     /// Optional body/response content preview (truncated to the configured
     /// limit) for IN/OUT events; None for drops and control actions.
     /// Reference-counted: the TUI snapshots the newest events on every frame,
-    /// and these strings run to `log_content_limit` (64 KiB by default).
+    /// and these strings run to `log_content_limit` (1 MiB by default).
     pub content: Option<Arc<String>>,
+    /// Correlation id of the proxied request this event belongs to: the IN and
+    /// OUT events of one request share it, which is how the web UI pairs them
+    /// into a round. `None` for control actions and refused-before-dispatch
+    /// events that have no matching twin.
+    pub rid: Option<u64>,
+    /// Conversation tag (`SessionKey::tag`) of the request; `None` for
+    /// sticky-less traffic and control actions.
+    pub session: Option<String>,
 }
 
 /// Half-life of a user's fair-share score: load older than this counts half
@@ -1925,7 +1938,13 @@ impl AppState {
             runs: crate::metrics::Runs::default(),
             stats: crate::stats::Stats::default(),
             logs_evicted: std::sync::atomic::AtomicU64::new(0),
+            rid_seq: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Next per-request log correlation id. Starts at 1 so 0 never appears.
+    pub fn next_rid(&self) -> u64 {
+        self.rid_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
 
     /// Pin the API family of backends whose `appconf.yaml` entry carried a
@@ -3483,6 +3502,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     session: dropped.session_key.as_ref().map(SessionKey::tag),
                                     session_label: dropped.session_label.clone(),
                                     priority: dropped.priority.as_str(),
+                                    rid: Some(dropped.rid),
                                     queue_wait: Some(dropped.queued_at.elapsed().as_secs_f64()),
                                     timing: Default::default(),
                                 });
@@ -3494,6 +3514,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     backend: None,
                                     info: log_info,
                                     content: None,
+                                    rid: Some(dropped.rid),
+                                    session: dropped.session_key.as_ref().map(SessionKey::tag),
                                 });
                                 let responder = dropped.responder;
                                 tokio::spawn(async move {
@@ -3713,6 +3735,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                     let session_tag = task.session_key.as_ref().map(SessionKey::tag);
                     let session_label = task.session_label.clone();
                     let prio = task.priority.as_str();
+                    let rid = task.rid;
                     // Counted for Prometheus and kept for the Overview.
                     let outcome = |o: &'static str, timing: crate::stats::Timing| {
                         metrics.inc(
@@ -3730,6 +3753,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             session: session_tag.clone(),
                             session_label: session_label.clone(),
                             priority: prio,
+                            rid: Some(rid),
                             queue_wait: Some(queue_wait),
                             timing,
                         });
@@ -3767,6 +3791,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                             backend,
                             info,
                             content,
+                            rid: Some(rid),
+                            session: session_tag.clone(),
                         });
                     };
 
@@ -3825,6 +3851,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             session_tag.as_deref(),
                             session_label.clone(),
                             prio,
+                            rid,
                         );
                         // Completion tokens already counted from the stream.
                         let mut live_tokens: u64 = 0;
@@ -4281,6 +4308,7 @@ pub async fn proxy_handler(
         && let Some(response) = aggregate_model_list(&state, &path).await
     {
         let ts = crate::reqlog::now_unix_millis();
+        let agg_rid = state.next_rid();
         for (dir, info) in [
             ("IN", format!("GET {} body=0B", path)),
             ("OUT", format!("GET {} -> 200 aggregated", path)),
@@ -4310,6 +4338,8 @@ pub async fn proxy_handler(
                 backend: Some("<all backends>".to_string()),
                 info,
                 content: None,
+                rid: Some(agg_rid),
+                session: None,
             });
         }
         state.metrics.inc(
@@ -4350,6 +4380,8 @@ pub async fn proxy_handler(
             backend: None,
             info: "404 model hidden".to_string(),
             content: None,
+            rid: None,
+            session: None,
         });
         let label = state.model_label(Some(model));
         state.metrics.inc(
@@ -4390,6 +4422,9 @@ pub async fn proxy_handler(
         client.is_some(),
         session_key.as_ref(),
     );
+    // Correlation id shared by this request's IN/OUT log events (the web UI
+    // pairs the two records with it).
+    let rid = state.next_rid();
     // Request-log content is captured before `body` moves into the Task.
     let body_len = body.len() as u64;
     let content = Arc::new(crate::reqlog::truncate_utf8(&body, state.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)));
@@ -4414,6 +4449,7 @@ pub async fn proxy_handler(
         session_key,
         session_label: session_label.clone(),
         priority,
+        rid,
     };
 
     {
@@ -4440,6 +4476,10 @@ pub async fn proxy_handler(
                 backend: None,
                 info: format!("429 queue full ({} waiting)", MAX_QUEUED_PER_USER),
                 content: None,
+                // No IN was logged for this request (it was refused before
+                // reaching the IN site), so it stays an unpaired OUT.
+                rid: None,
+                session: session_tag.clone(),
             });
             state.metrics.inc(
                 &crate::metrics::REQUESTS,
@@ -4456,6 +4496,7 @@ pub async fn proxy_handler(
                 session: session_tag.clone(),
                 session_label: session_label.clone(),
                 priority: priority.as_str(),
+                rid: Some(task.rid),
                 queue_wait: None,
                 timing: Default::default(),
             });
@@ -4495,6 +4536,8 @@ pub async fn proxy_handler(
                 backend: None,
                 info: format!("503 queue memory full ({} B waiting)", queued_now),
                 content: None,
+                rid: None,
+                session: session_tag.clone(),
             });
             state.metrics.inc(
                 &crate::metrics::REQUESTS,
@@ -4511,6 +4554,7 @@ pub async fn proxy_handler(
                 session: session_tag.clone(),
                 session_label: session_label.clone(),
                 priority: priority.as_str(),
+                rid: Some(task.rid),
                 queue_wait: None,
                 timing: Default::default(),
             });
@@ -4570,6 +4614,8 @@ pub async fn proxy_handler(
         backend: None,
         info: format!("{} {} body={}B", task_method, path, body_len),
         content: Some(content),
+        rid: Some(rid),
+        session: session_tag.clone(),
     });
 
     state.notify.notify_one();
@@ -5305,6 +5351,7 @@ mod tests {
                 session_key: None,
                 session_label: None,
                 priority: Default::default(),
+            rid: 1,
             });
         }
 
@@ -5395,6 +5442,7 @@ mod tests {
                 session_key: None,
                 session_label: None,
                 priority: Default::default(),
+            rid: 1,
             });
         rx
     }
@@ -5681,6 +5729,7 @@ mod tests {
             session_key: None,
             session_label: None,
             priority: Default::default(),
+        rid: 1,
         });
         state.processed_counts.lock_or_recover().insert("old".into(), 7);
         state.toggle_boost("old");
@@ -6307,6 +6356,7 @@ mod tests {
                 session_key: None,
                 session_label: None,
                 priority: Default::default(),
+            rid: 1,
             });
         rx
     }
@@ -7078,6 +7128,7 @@ mod tests {
                     session_key: None,
                     session_label: None,
                     priority: Default::default(),
+                rid: 1,
                 });
             }
         }
@@ -7174,6 +7225,7 @@ mod tests {
             session_key: None,
             session_label: None,
             priority: level,
+        rid: 1,
         }
     }
 
@@ -7437,6 +7489,7 @@ mod tests {
                 session_key,
                 session_label: None,
                 priority: Default::default(),
+            rid: 1,
             });
         rx
     }
@@ -7861,6 +7914,7 @@ mod tests {
                     session_key: None,
                     session_label: None,
                     priority: Default::default(),
+                rid: 1,
                 });
         }
 
@@ -8252,6 +8306,7 @@ mod tests {
                 session_key: None,
                 session_label: None,
                 priority: Default::default(),
+            rid: 1,
             });
 
         let worker = tokio::spawn(run_worker(state.clone()));
@@ -8416,6 +8471,7 @@ mod tests {
                 session_key: None,
                 session_label: None,
                 priority: Default::default(),
+            rid: 1,
             });
         rx
     }

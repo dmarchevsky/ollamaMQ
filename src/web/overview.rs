@@ -191,6 +191,8 @@ struct Waiting {
     session_label: Option<String>,
     /// Scheduling level this request waits at.
     priority: &'static str,
+    /// Log correlation id, so the row can jump to the request's log round.
+    rid: u64,
 }
 
 /// One backend's swimlane: occupancy per time bucket, plus what to flag.
@@ -257,6 +259,10 @@ struct Recent {
     session_label: Option<String>,
     /// Scheduling level the request was served at.
     priority: &'static str,
+    /// Log correlation id, so the row can jump to the request's log round.
+    /// `None` for model-load records, which were never proxied requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rid: Option<u64>,
     /// Share of the prompt served from the prefix cache, 0–100.
     cache_pct: Option<u8>,
     /// Prefill seconds lost to cache eviction; `None` when unmeasurable.
@@ -454,7 +460,7 @@ pub async fn get_overview(
 
     // Waiting requests, copied out under the queues lock and labelled
     // afterwards (that takes the backends lock).
-    let waiting: Vec<(String, Option<String>, Option<String>, f64, usize, usize, Option<String>, Option<String>, &'static str)> = state
+    let waiting: Vec<(String, Option<String>, Option<String>, f64, usize, usize, Option<String>, Option<String>, &'static str, u64)> = state
         .queues
         .lock_or_recover()
         .iter()
@@ -471,6 +477,7 @@ pub async fn get_overview(
                     t.session_key.as_ref().map(|k| k.tag()),
                     t.session_label.clone(),
                     t.priority.as_str(),
+                    t.rid,
                 )
             })
         })
@@ -480,7 +487,7 @@ pub async fn get_overview(
         let backends = state.backends.lock_or_recover();
         waiting
             .into_iter()
-            .map(|(client, model, key_label, waited_secs, pos, body_len, session, session_label, priority)| Waiting {
+            .map(|(client, model, key_label, waited_secs, pos, body_len, session, session_label, priority, rid)| Waiting {
                 backends: model
                     .as_deref()
                     .map(|m| {
@@ -501,6 +508,7 @@ pub async fn get_overview(
                 client,
                 waited_secs,
                 pos,
+                rid,
             })
             .filter(|w| {
                 scope.client_ok(&w.client, &w.key)
@@ -681,6 +689,7 @@ pub async fn get_overview(
             session: f.session.clone(),
             session_label: f.session_label.clone(),
             priority: f.priority,
+            rid: f.rid,
             key: f.key.clone(),
             cache_pct: cache_pct(f.timing.prompt_tokens, f.timing.prefill.map(|(_, t)| t)),
             waste_secs: f.timing.waste_secs,
@@ -963,6 +972,7 @@ mod tests {
                 session: None,
                 session_label: None,
                 priority: "normal",
+                rid: None,
                 queue_wait: Some(0.0),
                 timing: crate::stats::Timing {
                     duration: Some(1.0),

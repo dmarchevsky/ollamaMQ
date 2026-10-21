@@ -1043,6 +1043,8 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                                     cfg.name, url, a, want
                                 ),
                                 content: None,
+                                rid: None,
+                                session: None,
                             });
                             let token = st
                                 .backends
@@ -1111,6 +1113,8 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                             cfg.name, url
                         ),
                         content: None,
+                        rid: None,
+                        session: None,
                     });
                     continue;
                 }
@@ -1138,6 +1142,8 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                     backend: None,
                     info,
                     content: None,
+                    rid: None,
+                    session: None,
                 });
             }
         });

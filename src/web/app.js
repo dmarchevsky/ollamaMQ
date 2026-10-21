@@ -485,7 +485,9 @@ function modelChoices(st) {
 /** Read the modal back into S.filters. A list with every box ticked stores
  *  empty — "everything" travels compactly, matching the server's scope rule;
  *  a list with no box ticked stores `FNONE`, which travels as an empty scope
- *  parameter and shows nothing. The custom interval wins over a preset. */
+ *  parameter and shows nothing. A clicked preset beats whatever text is
+ *  still in the custom box (typing there unchecks the presets, so whichever
+ *  control was touched last wins). */
 function collectFilters() {
   const f = S.filters;
   const win = $('#dlg-filters input[name="fwin"]:checked')?.value;
@@ -493,7 +495,7 @@ function collectFilters() {
   const custom = /^\d+$/.test(n)
     ? Math.min(+n || 1, $('#f-win-u').value === 'h' ? 24 : 1440) + $('#f-win-u').value
     : null;
-  f.win = custom || win || '15m';
+  f.win = win || custom || '15m';
   f.mode = $('#dlg-filters input[name="fmode"]:checked').value;
   const read = id => {
     const all = $$('#' + id + ' input');
@@ -600,7 +602,7 @@ function renderOverview(st) {
   const vis = { ...st, runs: (st.runs || []).filter(r => clientSel(r.client, r.key) && modelSel(r.model) && backendSel(r.backend) && prioSel(priLevel(r.priority))) };
   // Identity colours key on the display name, so client+label pairs get their
   // own hue (the server already names lanes, client rows and segments that way).
-  assignColors([...new Set([...clientIds(st), ...ov.clients.map(c => c.id), ...vis.runs.map(fmtWho)])]);
+  assignColors([...new Set([...clientIds(st), ...ov.clients.map(c => c.id), ...vis.runs.map(fmtWho), ...ov.queue.map(w => fmtWho(w))])]);
   const s = ov.status;
 
   // Status line: the one sentence an operator reads first.
@@ -648,8 +650,8 @@ function renderCapacity(st, ov) {
   const sizes = [...(st.runs || []), ...ov.queue].map(x => x.est_prompt_tokens || 0).filter(n => n > 0);
   const avg = sizes.length ? sizes.reduce((a, b) => a + b, 0) / sizes.length : 1;
   const pct = (n, scale) => (Math.max(0, n / scale) * 100).toFixed(2) + '%';
-  const waitSeg = (w, style) => `<i class="seg q ${colorClass(w.client)}" style="${style}" title="${esc(
-    `${w.client} · ${w.model}\n~${fmtTok(w.est_prompt_tokens)} tokens · waiting ${fmtDur(w.waited_secs)} · #${w.pos} in its client's queue`
+  const waitSeg = (w, style) => `<i class="seg q ${colorClass(fmtWho(w))}" style="${style}" title="${esc(
+    `${fmtWho(w)} · ${w.model}\n~${fmtTok(w.est_prompt_tokens)} tokens · waiting ${fmtDur(w.waited_secs)} · #${w.pos} in its client's queue`
     + (w.backends.length > 1 ? `\ncan run on ${w.backends.map(i => label.get(i)).join(', ')}` : ''))}"></i>`;
   const row = (nameCell, barHtml, noteHtml) =>
     `<div class="cap-row"><div class="cap-name">${nameCell}</div>${barHtml}<div class="cap-note">${noteHtml}</div></div>`;
@@ -672,8 +674,8 @@ function renderCapacity(st, ov) {
     const capTok = Math.max(1, runTok + (b.free > 0 ? freeTok : 0));
     const waitTok = waits.reduce((a, w) => a + (w.est_prompt_tokens || avg), 0);
     const scale = Math.max(capTok, waitTok);
-    let bar = runs.map(r => `<i class="seg run ${colorClass(r.client)}" style="flex:0 1 ${pct(r.est_prompt_tokens || avg, scale)}" title="${esc(
-      `${r.client} · ${r.model}\n~${fmtTok(r.est_prompt_tokens)} tokens · ${r.state === 'generating' ? 'generating' : 'waiting for first token'} · ${fmtDur(r.elapsed_secs)}${r.tokens_per_sec ? ` · ${r.tokens_per_sec.toFixed(1)} tok/s` : ''}`)}"></i>`).join('');
+    let bar = runs.map(r => `<i class="seg run ${colorClass(fmtWho(r))}" style="flex:0 1 ${pct(r.est_prompt_tokens || avg, scale)}" title="${esc(
+      `${fmtWho(r)} · ${r.model}\n~${fmtTok(r.est_prompt_tokens)} tokens · ${r.state === 'generating' ? 'generating' : 'waiting for first token'} · ${fmtDur(r.elapsed_secs)}${r.tokens_per_sec ? ` · ${r.tokens_per_sec.toFixed(1)} tok/s` : ''}`)}"></i>`).join('');
     if (b.free > 0) {
       bar += `${runs.length ? '<span class="bar-gap"></span>' : ''}`
         + Array.from({ length: freeN }, () => `<i class="seg free" style="flex:0 1 ${pct(freeTok / freeN, scale)}" title="${b.kv_free_pct != null ? `free · ${b.kv_free_pct}% of the KV cache free` : 'free'}"></i>`).join('');
@@ -686,8 +688,9 @@ function renderCapacity(st, ov) {
   const sharedRow = shared.length ? row(
     '<span class="cap-shared" title="Several backends can serve these models, or none lists them">any backend</span>',
     `<div class="q2-bar"><div class="q-track">${shared.map(w => waitSeg(w, 'flex:1 1 26px')).join('')}</div></div>`, '') : '';
-  // Legend of the board: the clients on it right now, not the window history.
-  const legend = [...new Set([...(st.runs || []).map(r => r.client), ...ov.queue.map(w => w.client)])]
+  // Legend of the board: the conversations on it right now, not the window
+  // history — same identity (client, or client+label) the rows are coloured by.
+  const legend = [...new Set([...(st.runs || []).map(fmtWho), ...ov.queue.map(fmtWho)])]
     .map(id => `<span>${swatch(id)}${esc(id)}</span>`).join('')
     + '<span><i class="sw free"></i>free</span>'
     + '<span><i class="sw loading"></i>loading a model</span>'
@@ -954,6 +957,7 @@ function renderDetails(rows) {
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(fmtWho(head.o))}</span>
       ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}${chip}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
+      ${head.s ? `<span class="logs-link jump-chip" data-action="logs-for" data-session="${esc(head.s)}" title="show this conversation in the Logs page">≣ logs</span>` : ''}
       ${sum}</button>`);
     if (shut) continue;
     const lines = [];
@@ -968,9 +972,11 @@ function renderDetails(rows) {
       }
       for (const e of asc[i].plan.events) {
         // Live stage lines (the running request's now-still-unfinished ones)
-        // wear the client-colour wash the List gives live rows.
-        lines.push({ t: e.at, html: `<div class="det-row${e.live ? ' live' : ''}"><span class="when">${fmtTime(e.at)}</span>`
-          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span></div>` });
+        // wear the client-colour wash the List gives live rows. The line
+        // belongs to one request, so it can open that request's log round.
+        const rid = asc[i].o.rid;
+        lines.push({ t: e.at, html: `<div class="det-row${e.live ? ' live' : ''}"${rid ? ` data-action="log-jump" data-rid="${rid}" title="open this request's log round"` : ''}><span class="when">${fmtTime(e.at)}</span>`
+          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span>${rid ? '<span class="jump jump-chip">≣ Logs</span>' : ''}</div>` });
       }
     }
     lines.sort((a, b) => b.t - a.t);
@@ -1017,9 +1023,9 @@ const saveCollapsed = () => {
 function wireFold() {
   $$('#ov-now .det-h').forEach(b => {
     b.onclick = e => {
-      // The priority control sits in this header; folding on top of setting a
-      // level would hide the very row the click was about.
-      if (e.target.closest('.pri')) return;
+      // The priority control and the logs link sit in this header; folding on
+      // top of using either would hide the very row the click was about.
+      if (e.target.closest('.pri, .logs-link')) return;
       const k = b.dataset.key;
       if (S.collapsed.has(k)) S.collapsed.delete(k); else S.collapsed.add(k);
       saveCollapsed();
@@ -1203,7 +1209,7 @@ function renderRequests(st, ov) {
       <td class="num">${x.gen_tps == null ? dash : x.gen_tps.toFixed(1)}</td>`;
   };
 
-  const body = rows.map(r => `<tr${liveCls(r)} data-key="${esc(r.key)}" style="--c:var(--${cvar(colorClass(fmtWho(r.o)))})">${tds(r)}</tr>`).join('');
+  const body = rows.map(r => `<tr${liveCls(r)} data-key="${esc(r.key)}"${r.o.rid ? ` data-action="log-jump" data-rid="${r.o.rid}" title="open this request's log round"` : ''} style="--c:var(--${cvar(colorClass(fmtWho(r.o)))})">${tds(r)}</tr>`).join('');
 
   const head = `<tr><th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num" title="prefill time lost re-reading evicted context">Waste</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
   setHTML(el, rows.length ? `<table>${head}${body}</table>` : '<div class="empty">Nothing running or waiting</div>');
@@ -1662,27 +1668,458 @@ const fmtInfo = info => info
   .replace(/\b(resp|body)=(\d+)B\b/g, (_, k, n) => `${k === 'resp' ? 'response' : 'body'} ${fmtBytes(+n)}`)
   .replace(/\((\d+) B waiting\)/, (_, n) => `(${fmtBytes(+n)} waiting)`);
 
-function logTable(logs, clickable = true) {
-  if (!logs.length) return '<div class="empty">No matching log events</div>';
+/** One round: the IN and OUT log events that share a rid, or a standalone
+ *  event (CTL, refused-before-dispatch OUT). Newest first, as `logs` is. */
+function logRounds(logs) {
+  const byRid = new Map();
+  const rounds = [];
+  for (const l of logs) {
+    const slot = l.rid && byRid.get(l.rid);
+    if (slot && !slot[l.dir === 'IN' ? 'in' : 'out'] && l.dir !== 'CTL') {
+      slot[l.dir === 'IN' ? 'in' : 'out'] = l;
+      continue;
+    }
+    const r = { in: l.dir === 'IN' ? l : null, out: l.dir === 'OUT' ? l : null, ctl: l.dir === 'CTL' ? l : null, solo: null };
+    if (r.ctl || !l.rid) { r.solo = l; r.in = r.out = null; }
+    if (l.rid && !r.ctl) byRid.set(l.rid, r);
+    rounds.push(r);
+  }
+  return rounds;
+}
+
+/** The compact IN segment text: `POST /v1/chat/completions · 677 KB`. */
+function inSeg(info) {
+  const m = /^(\S+) (\S+) body=(\d+)B$/.exec(info);
+  return m ? `${m[1]} ${m[2]} · ${fmtBytes(+m[3])}` : info;
+}
+
+/** The compact OUT segment text: `200 · 12.3 KB` (else the info note). */
+function outSeg(info) {
+  const m = /^\S+ \S+ -> (\d{3}) resp=(\d+)B$/.exec(info);
+  return m ? `${m[1]} · ${fmtBytes(+m[2])}` : info;
+}
+
+function roundSegs(r) {
+  if (r.ctl) return `<span class="rl ctl"><span class="ar">◆</span>${esc(fmtInfo(r.ctl.info))}</span>`;
+  const segs = [];
+  if (r.solo) return `<span class="rl ${r.solo.dir === 'IN' ? 'in' : 'out'}"><span class="ar">${r.solo.dir === 'IN' ? '→' : '←'}</span>${esc((r.solo.dir === 'IN' ? inSeg : outSeg)(r.solo.info))}</span>`;
+  if (r.in) segs.push(`<span class="rl in"><span class="ar">→</span>${esc(inSeg(r.in.info))}</span>`);
+  if (r.out) {
+    // Red only on a failed status — never on a byte count that happens to
+    // start with 4xx/5xx digits.
+    const st = /-> (\d{3})/.exec(r.out.info);
+    const bad = st ? +st[1] >= 400 : /\b[45]\d\d\b|drop|fail|error|timeout|refus/i.test(r.out.info);
+    segs.push(`<span class="rl out${bad ? ' err' : ''}"><span class="ar">←</span>${esc(outSeg(r.out.info))}</span>`);
+  }
+  if (r.in && !r.out) segs.push('<span class="rl out wait"><span class="ar">←</span>awaiting response</span>');
+  return segs.join(' ');
+}
+
+function logTable(rounds) {
+  if (!rounds.length) return '<div class="empty">No matching log events</div>';
+  const ev = r => r.in || r.out || r.solo;
   return `<table class="logs">
-    <tr><th>Time</th><th></th><th>User</th><th>Model</th><th>Backend</th><th>Info</th></tr>
-    ${logs.map(l => `<tr class="${clickable ? 'clickable' : ''}" ${clickable ? `data-action="log-detail" data-seq="${l.seq}"` : ''}>
-      <td class="time">${fmtTime(l.at_ms)}</td>
-      <td><span class="dir ${esc(l.dir)}">${esc(l.dir)}</span></td>
-      <td class="mono">${esc(l.user)}</td>
-      <td class="trunc ${l.model ? '' : 'none'}">${esc(l.model ?? '—')}</td>
-      <td class="dim ${l.backend ? '' : 'none'}">${l.backend ? bkCell(l.backend) : '—'}</td>
-      <td class="${infoClass(l.info)}">${esc(fmtInfo(l.info))}${l.has_content ? ' <span class="dim">· ⌕</span>' : ''}</td></tr>`).join('')}
+    <tr><th>Time</th><th>User</th><th>Model</th><th>Backend</th><th>Round</th></tr>
+    ${rounds.map(r => { const e = ev(r); const rid = r.in?.rid ?? r.out?.rid;
+      return `<tr class="clickable" ${rid ? `data-action="log-round" data-rid="${rid}"` : `data-action="log-detail" data-seq="${e.seq}"`}>
+      <td class="time">${fmtTime(e.at_ms)}</td>
+      <td class="mono">${esc(e.user)}</td>
+      <td class="trunc ${e.model ? '' : 'none'}">${esc(e.model ?? '—')}</td>
+      <td class="dim ${e.backend ? '' : 'none'}">${e.backend ? bkCell(e.backend) : '—'}</td>
+      <td class="round"><div class="rline">${roundSegs(r)}</div></td></tr>`; }).join('')}
     </table>`;
 }
 
 function renderLogs() {
   const q = $('#log-filter').value.trim().toLowerCase();
   const dir = $('#log-dir').value;
-  const logs = S.logs.filter(l =>
-    (!dir || l.dir === dir) &&
-    (!q || [l.user, l.model, l.backend, l.backend && bkName(l.backend), l.info].some(v => v && String(v).toLowerCase().includes(q))));
-  setHTML($('#logs'), logTable(logs));
+  const rounds = logRounds(S.logs).filter(r =>
+    (dir === '' || (dir === 'awaiting' ? r.in && !r.out : r.ctl)) &&
+    (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.out?.user, r.out?.model, r.out?.backend, r.out?.session,
+      r.in?.info, r.out?.info, r.solo?.user, r.solo?.model, r.solo?.backend, r.solo?.session, r.solo?.info]
+      .some(v => v && String(v).toLowerCase().includes(q))));
+  setHTML($('#logs'), logTable(rounds));
+}
+
+// --- Round viewer
+//
+// Full-screen dialog over one round: Request/Response tabs, Raw (captured
+// bytes) vs Formatted (transcript / reconstructed stream / JSON tree), and
+// Whole vs New only (this round's request minus its predecessor's prefix).
+// All formatting is view-only — the server always serves the raw capture.
+
+const storedLv = () => {
+  try {
+    const v = JSON.parse(localStorage.getItem('omq.lv') || '{}');
+    return { scope: v.scope === 'new' ? 'new' : 'whole', fmt: v.fmt === 'raw' ? 'raw' : 'fmt', rail: !!v.rail };
+  } catch { /* storage blocked */ }
+  return { scope: 'whole', fmt: 'fmt', rail: false };
+};
+const saveLv = () => { try { localStorage.setItem('omq.lv', JSON.stringify(S.lv)); } catch { /* storage blocked */ } };
+S.lv = storedLv();
+
+const LV = { inEv: null, outEv: null, seqOnly: false, prevEv: null, prevText: undefined,
+  rounds: [], roundKey: null };
+let lvToken = 0;
+
+const tryJson = s => { try { return JSON.parse(s); } catch { return undefined; } };
+
+/** Find a round's events in `list` (the newest-first log list) and open the
+ *  viewer. rid pairs them; seq opens one standalone event's side only. */
+async function openRound({ rid, seq }) {
+  let list = S.logs;
+  if (!list.some(l => (rid && l.rid === rid) || (seq && l.seq === seq))) {
+    list = await api('GET', `logs?limit=${LOG_LIMIT}`).catch(() => list);
+  }
+  const inEv = rid ? list.find(l => l.rid === rid && l.dir === 'IN') || null
+    : seq && list.find(l => l.seq === seq)?.dir === 'IN' ? list.find(l => l.seq === seq) : null;
+  const outEv = rid ? list.find(l => l.rid === rid && l.dir === 'OUT') || null
+    : !inEv && seq ? list.find(l => l.seq === seq) || null : null;
+  if (!inEv && !outEv) return toast('log record expired', false);
+  LV.inEv = inEv;
+  LV.outEv = outEv;
+  LV.seqOnly = !rid;
+  LV.rounds = logRounds(list);
+  LV.roundKey = rid ? `r${rid}` : `s${(inEv || outEv).seq}`;
+  // The conversation's previous IN (for New only): nearest older same-session
+  // request still in the ring.
+  const s = (inEv || outEv).session;
+  LV.prevEv = s ? list.find(l => l.session === s && l.dir === 'IN' && l.seq < (inEv || outEv).seq) || null : null;
+  LV.prevText = undefined;
+  $('#dlg-log [data-title]').textContent =
+    `${(inEv || outEv).model || 'control'} · ${(inEv || outEv).user}${outEv?.backend ? ` → ${bkName(outEv.backend)}` : ''}`;
+  const sub = [];
+  if (inEv) sub.push(`→ ${fmtTime(inEv.at_ms)} ${inSeg(inEv.info)}`);
+  if (outEv) sub.push(`← ${fmtTime(outEv.at_ms)} ${outSeg(outEv.info)}`);
+  if (!outEv && inEv) sub.push('← awaiting response');
+  if (s) sub.push(`session #${s}`);
+  $('#dlg-log [data-sub]').textContent = sub.join(' · ');
+  $$('input[name="lv-scope"]').forEach(r => { r.checked = S.lv.scope === r.value; });
+  $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
+  drawLv();
+  // Round navigation (↑/↓) re-enters with the dialog already open — showModal
+  // on an open dialog throws.
+  const dlg = $('#dlg-log');
+  if (!dlg.open) dlg.showModal();
+  dlg.querySelector('.lv-body').scrollTop = 0;
+}
+
+/** Fetch one event's captured content (cached on the list entry). */
+async function evContent(ev) {
+  if (!ev || !ev.has_content) return null;
+  if (ev._content === undefined) {
+    try { ev._content = (await api('GET', `logs/${ev.seq}`)).content ?? ''; }
+    catch { ev._content = null; }
+  }
+  return ev._content;
+}
+
+function lvScopeUsable() {
+  return S.lv.fmt === 'fmt' && !!(LV.inEv?.session && LV.prevEv);
+}
+
+async function drawLv() {
+  const tk = ++lvToken;
+  // New only and Raw interact: the diff needs the parsed body, so the scope
+  // control only applies to the formatted request.
+  $('#lv-scope').classList.toggle('off', !lvScopeUsable());
+  const html = await lvBody();
+  if (tk !== lvToken) return; // a newer click beat us
+  setHTML($('#dlg-log [data-content]'), html);
+  renderRail();
+  const i = lvRoundIdx();
+  $('#lv-prev').disabled = i <= 0;
+  $('#lv-next').disabled = i < 0 || i >= LV.rounds.length - 1;
+  $('#lv-jump').classList.toggle('active', S.lv.rail);
+}
+
+/** One scrollable view: the request section first, then the response. */
+async function lvBody() {
+  const secs = [];
+  if (LV.inEv) {
+    secs.push(lvSec('req', 'Request', inSeg(LV.inEv.info), await lvPart(LV.inEv, 'req')));
+  } else if (!LV.seqOnly) {
+    secs.push(lvSec('req', 'Request', '', '<div class="lv-note">No request was logged — this round was refused before its body arrived.</div>'));
+  }
+  if (LV.outEv) {
+    secs.push(lvSec('out', 'Response', outSeg(LV.outEv.info), await lvPart(LV.outEv, 'out')));
+  } else if (!LV.seqOnly) {
+    secs.push(lvSec('out', 'Response', '', '<div class="lv-note">No response recorded yet — still queued, running, or disconnected.</div>'));
+  }
+  return secs.join('');
+}
+
+const lvSec = (cls, title, info, html) =>
+  `<section class="lv-sec"><h3 class="lv-sec-h ${cls}"><span class="ar">${cls === 'req' ? '→' : '←'}</span>${esc(title)}${info ? ` · ${esc(info)}` : ''}</h3>${html}</section>`;
+
+async function lvPart(ev, kind) {
+  const text = await evContent(ev);
+  if (text == null) return `<div class="empty">No content captured${ev.has_content ? ' (or it left the log ring)' : ''}.</div>`;
+  if (S.lv.fmt === 'raw')
+    return (text.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(text);
+  if (kind === 'req' && S.lv.scope === 'new' && lvScopeUsable()) return lvNewOnly(text);
+  return formatContent(text);
+}
+
+// --- outline rail + round navigation ---
+
+const lvRoundIdx = () => LV.rounds.findIndex(
+  r => (r.solo ? `s${r.solo.seq}` : `r${(r.in || r.out).rid}`) === LV.roundKey);
+
+function lvStep(delta) {
+  const r = LV.rounds[lvRoundIdx() + delta];
+  if (!r) return;
+  if (r.in?.rid || r.out?.rid) openRound({ rid: (r.in || r.out).rid });
+  else openRound({ seq: r.solo.seq });
+}
+
+/** Rebuild the Jump rail from what just rendered: sections + message blocks,
+ *  in document order — it mirrors the view instead of re-deriving it. */
+function renderRail() {
+  const rail = $('#lv-rail');
+  $('#dlg-log .lv-shell').classList.toggle('railed', S.lv.rail);
+  rail.hidden = !S.lv.rail;
+  if (!S.lv.rail) return;
+  const items = [];
+  let n = 0;
+  for (const el of $('#dlg-log [data-content]').querySelectorAll('.lv-sec, .msg')) {
+    let cls = 'sec', tag = '', snip = '';
+    if (el.classList.contains('lv-sec')) {
+      const txt = (el.querySelector('.lv-sec-h')?.textContent || 'Section').trim();
+      tag = txt.startsWith('→') ? 'req' : txt.startsWith('←') ? 'resp' : 'sec';
+      snip = txt.replace(/^[→←]\s*/, '');
+    } else {
+      cls = el.classList.contains('sys') ? 'sys' : el.classList.contains('user') ? 'user'
+        : el.classList.contains('tool') ? 'tool' : 'asst';
+      tag = (el.querySelector(':scope > .role')?.textContent || 'msg').split('·')[0].trim();
+      snip = (el.querySelector(':scope > .mtext')?.textContent || '').split('\n')[0].trim() || tag;
+    }
+    el.dataset.jmp = String(++n);
+    items.push(`<button class="lv-item ${cls}" data-jmp="${n}"><span class="tag">${esc(tag)}</span><span class="snip">${esc(snip.slice(0, 48))}</span></button>`);
+  }
+  setHTML(rail, `<h4>Jump to message</h4>${items.join('') || '<div class="lv-foot">Nothing to jump to in this view.</div>'}`);
+}
+
+// --- formatters: every one returns the raw view if it cannot parse ---
+
+const rawView = t => `<pre class="raw">${esc(t)}</pre>`;
+
+/** Chat request truncated by the content limit: recover the scalar params
+ *  from the prefix and as many complete `messages` elements as the capture
+ *  reached. Undefined when this is not a truncated chat request. */
+function salvageChat(text) {
+  const cut = text.indexOf('\n...[truncated:');
+  if (cut < 0) return undefined;
+  const head = text.slice(0, cut);
+  const mi = head.indexOf('"messages"');
+  const open = mi < 0 ? -1 : head.indexOf('[', mi);
+  if (open < 0) return undefined;
+  // Walk the array string-aware and note where each complete element ends
+  // (depth back to 0 on `}`); the capture may end mid-element.
+  const ends = [];
+  let depth = 0, inStr = false, es = false;
+  for (let i = open + 1; i < head.length; i++) {
+    const c = head[i];
+    if (inStr) { if (es) es = false; else if (c === '\\') es = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true;
+    else if (c === '{' || c === '[') depth++;
+    else if (c === '}' || c === ']') { depth--; if (depth === 0 && c === '}') ends.push(i); }
+  }
+  if (!ends.length) return undefined;
+  const arr = tryJson(head.slice(open, ends.at(-1) + 1) + ']');
+  if (!Array.isArray(arr)) return undefined;
+  const obj = { messages: arr };
+  const ms = /"model"\s*:\s*"([^"]*)"/.exec(head);
+  if (ms) obj.model = ms[1];
+  if (/"stream"\s*:\s*true/.test(head)) obj.stream = true;
+  for (const k of ['temperature', 'top_p', 'max_tokens', 'max_completion_tokens', 'num_predict']) {
+    const m = new RegExp(`"${k}"\\s*:\\s*([\\d.]+)`).exec(head);
+    if (m) obj[k] = +m[1];
+  }
+  return obj;
+}
+
+/** Chat request body → meta line + transcript blocks; chat response →
+ *  reconstructed message + footer; any other JSON → collapsible tree. */
+function formatContent(text) {
+  const trunc = text.includes('[truncated:')
+    ? '<div class="lv-note">Body was truncated by the content limit — showing everything the capture kept.</div>' : '';
+  const o = tryJson(text);
+  if (o && typeof o === 'object' && !Array.isArray(o)) {
+    if (Array.isArray(o.messages)) return transcriptView(o);
+    if (o.choices || o.message) return responseView(o) ?? jsonView(o, text);
+    return jsonView(o, text);
+  }
+  const salv = salvageChat(text);
+  if (salv) return trunc + transcriptView(salv);
+  const gs = groupStream(text);
+  if (gs) return gs + trunc;
+  return rawView(text);
+}
+
+const ROLE_CLS = { system: 'sys', developer: 'sys', user: 'user', assistant: 'asst', tool: 'tool' };
+
+/** A message `content`: string, or parts array (images as placeholders). */
+function msgText(c, images) {
+  let t = typeof c === 'string' ? c : '';
+  if (Array.isArray(c))
+    t = c.map(p => p.type === 'text' ? (p.text || '') : (p.type === 'image_url' || p.type === 'image') ? '[image]' : '')
+      .filter(Boolean).join('\n');
+  if (Array.isArray(images) && images.length) t += (t ? '\n' : '') + `[${images.length} image${images.length > 1 ? 's' : ''}]`;
+  return t;
+}
+
+const thinkBlock = r => r
+  ? `<details><summary>thinking · ${r.length.toLocaleString()} chars</summary><div class="mtext">${esc(r)}</div></details>` : '';
+
+function toolCallBlock(name, args) {
+  const v = typeof args === 'string' ? tryJson(args) : args;
+  const body = v !== undefined ? JSON.stringify(v, null, 2) : String(args ?? '');
+  return `<div class="tc"><div class="tc-h"><span class="fn">${esc(name || 'tool call')}</span></div><pre>${esc(body)}</pre></div>`;
+}
+
+function msgBlock(m, toolNames) {
+  const role = String(m.role || 'message');
+  const label = role === 'tool'
+    ? `tool · ${esc(m.tool_name || m.name || (toolNames && toolNames.get(m.tool_call_id)) || m.tool_call_id || '?')}`
+    : esc(role);
+  let html = `<div class="msg ${ROLE_CLS[role] || 'user'}"><span class="role">${label}</span>`;
+  html += thinkBlock(m.reasoning_content || m.reasoning || '');
+  const t = msgText(m.content, m.images);
+  if (t) html += `<div class="mtext">${esc(t)}</div>`;
+  for (const tc of m.tool_calls || [])
+    html += toolCallBlock(tc.function?.name ?? tc.name, tc.function?.arguments ?? tc.arguments);
+  return html + '</div>';
+}
+
+/** Parameters worth a glance above the transcript. */
+function reqMeta(body) {
+  const bits = [`${(body.messages || []).length} messages`];
+  if (body.stream) bits.push('stream');
+  for (const k of ['temperature', 'top_p', 'max_tokens', 'max_completion_tokens', 'num_predict'])
+    if (body[k] != null) bits.push(`${k} ${body[k]}`);
+  if (Array.isArray(body.tools) && body.tools.length) {
+    const names = body.tools.map(t => t.function?.name ?? t.name).filter(Boolean);
+    bits.push(`tools: ${names.slice(0, 3).join(', ')}${names.length > 3 ? ` +${names.length - 3} more` : ''}`);
+  }
+  return bits.join(' · ');
+}
+
+function transcriptView(body) {
+  const toolNames = new Map();
+  for (const m of body.messages || [])
+    for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
+  return `<div class="lv-meta">${esc(reqMeta(body))}</div>`
+    + (body.messages || []).map(m => msgBlock(m, toolNames)).join('');
+}
+
+/** Reconstruct one assistant message from a streamed response: OpenAI SSE
+ *  (`data: {…}` lines + `[DONE]`) or Ollama-native line-delimited JSON. */
+function groupStream(text) {
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return null;
+  const sse = /^data:/.test(lines[0]);
+  if (!sse && !/^\{/.test(lines[0])) return null;
+  const trunc = text.includes('[truncated:');
+  const st = { text: '', think: '', tools: [], finish: null, usage: null, chunks: 0, errs: 0, cutTail: false };
+  for (const line of lines) {
+    if (sse && !/^data:/.test(line)) continue; // keep-alives, event:, marker lines
+    const payload = sse ? line.slice(5).trim() : line;
+    if (payload === '[DONE]') continue;
+    const o = tryJson(payload);
+    // A capture truncated by the content limit ends mid-chunk: keep what
+    // parsed instead of dropping the whole view.
+    if (!o || typeof o !== 'object') { if (trunc) { st.cutTail = true; continue; } return null; }
+    st.chunks++;
+    if (o.error) { st.errs++; st.text += `\n[error: ${o.error.message ?? JSON.stringify(o.error)}]`; continue; }
+    if (o.choices?.[0]?.finish_reason) st.finish = o.choices[0].finish_reason;
+    if (o.done_reason) st.finish = o.done_reason;
+    if (o.usage) st.usage = { p: o.usage.prompt_tokens ?? o.usage.p, c: o.usage.completion_tokens ?? o.usage.c };
+    if (o.prompt_eval_count != null || o.eval_count != null)
+      st.usage = { p: o.prompt_eval_count ?? st.usage?.p, c: o.eval_count ?? st.usage?.c };
+    const d = o.choices?.[0]?.delta || o.message || (typeof o.response === 'string' ? { content: o.response } : null);
+    if (!d) continue;
+    if (d.content) st.text += d.content;
+    const th = d.reasoning_content || d.reasoning;
+    if (th) st.think += th;
+    for (const t of d.tool_calls || []) {
+      const f = t.function || {};
+      if (f.arguments != null && typeof f.arguments === 'object') { st.tools.push({ name: f.name, args: f.arguments }); continue; }
+      const i = t.index ?? 0;
+      (st.tools[i] ??= { name: '', args: '' });
+      st.tools[i].name += f.name || '';
+      st.tools[i].args += typeof f.arguments === 'string' ? f.arguments : '';
+    }
+  }
+  if (!st.chunks) return null;
+  const tools = st.tools.filter(Boolean);
+  const foot = [`finish: ${st.finish || '?'}`];
+  if (st.usage) foot.push(`prompt ${fmtTok(st.usage.p || 0)} → completion ${fmtTok(st.usage.c || 0)} tok`);
+  foot.push(`${fmtNum(st.chunks)} chunks grouped${st.errs ? ` · ${st.errs} error payload(s)` : ''}${st.cutTail ? ' · tail truncated' : ''}`);
+  return `<div class="msg asst"><span class="role">assistant</span>${thinkBlock(st.think)}`
+    + (st.text ? `<div class="mtext">${esc(st.text)}</div>` : '')
+    + tools.map(t => toolCallBlock(t.name, t.args)).join('')
+    + `</div><div class="lv-foot">${esc(foot.join(' · '))}</div>`;
+}
+
+/** Non-streamed chat response (OpenAI object or Ollama /api/chat object). */
+function responseView(o) {
+  const m = o.choices?.[0]?.message || o.message;
+  if (!m) return null;
+  const usage = o.usage || (o.prompt_eval_count != null ? { p: o.prompt_eval_count, c: o.eval_count } : null);
+  const foot = [`finish: ${o.choices?.[0]?.finish_reason || o.done_reason || '?'}`];
+  if (usage) foot.push(`prompt ${fmtTok(usage.prompt_tokens ?? usage.p ?? 0)} → completion ${fmtTok(usage.completion_tokens ?? usage.c ?? 0)} tok`);
+  return `<div class="msg asst"><span class="role">assistant</span>${msgBlock(m, null)}</div>`
+    + `<div class="lv-foot">${esc(foot.join(' · '))}</div>`;
+}
+
+function jsonView(o, text) {
+  if (text.length > 400_000) return rawView(text);
+  return `<div class="jt">${jsonTree(o, null, 0)}</div>`;
+}
+
+function jsonTree(v, key, depth) {
+  const label = key !== null ? `<b>${esc(key)}</b> ` : '';
+  if (v === null || typeof v !== 'object')
+    return `<div class="jl" style="margin-left:${depth * 14}px">${label}${esc(typeof v === 'string' ? v : String(v))}</div>`;
+  const isArr = Array.isArray(v);
+  const es = isArr ? v.map((x, i) => [i, x]) : Object.entries(v);
+  if (!es.length) return `<div class="jl" style="margin-left:${depth * 14}px">${label}${isArr ? '[]' : '{}'}</div>`;
+  const inner = es.map(([k, v2]) => jsonTree(v2, k, depth + 1)).join('');
+  return `<details${depth < 1 ? ' open' : ''}><summary style="margin-left:${depth * 14}px">${label}${isArr ? `[${es.length}]` : `{${es.length}}`}</summary>${inner}</details>`;
+}
+
+/** New only: the current request minus the previous round's message prefix. */
+async function lvNewOnly(curText) {
+  const note = msg => `<div class="lv-note">${esc(msg)} — showing the whole request instead.</div>`;
+  const cur = tryJson(curText) || salvageChat(curText);
+  if (!cur || !Array.isArray(cur.messages)) return note('Only chat requests carry a message history') + formatContent(curText);
+  if (!LV.prevEv) return note('No earlier round of this conversation is in the log ring') + formatContent(curText);
+  if (LV.prevText === undefined) {
+    LV.prevText = await evContent(LV.prevEv) ?? '';
+  }
+  const prev = tryJson(LV.prevText) || salvageChat(LV.prevText);
+  if (!prev || !Array.isArray(prev.messages)) return note('The previous round’s captured content is no longer available') + formatContent(curText);
+  const a = prev.messages, b = cur.messages;
+  let k = 0;
+  while (k < Math.min(a.length, b.length) && JSON.stringify(a[k]) === JSON.stringify(b[k])) k++;
+  // The fresh suffix usually leads with the previous round's reply — first
+  // resent here, already shown in that round's Response section. New input
+  // starts at the next user message.
+  let kShown = k;
+  while (kShown < b.length && b[kShown].role === 'assistant') kShown++;
+  if (kShown >= b.length) kShown = k; // whole tail is replies — show it
+  const repliesHidden = kShown > k;
+  const inside = k < a.length && k < b.length;
+  const changed = Object.keys(cur).filter(x => x !== 'messages' && JSON.stringify(cur[x]) !== JSON.stringify(prev[x]));
+  const noteTxt = inside
+    ? `History changed at message #${k + 1} (context compacted?) — previous round had ${a.length} messages, this one ${b.length}`
+    : `History identical to the previous round up to message #${k} — ${b.length - kShown} new message(s)${repliesHidden ? ' (the previous reply is hidden; see that round’s Response)' : ''}`;
+  const toolNames = new Map();
+  for (const m of b.slice(0, k)) for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
+  return `<div class="lv-note">${esc(noteTxt)}${changed.length ? ` · also changed: ${esc(changed.join(', '))}` : ''}</div>`
+    + b.slice(kShown).map(m => msgBlock(m, toolNames)).join('')
+    + `<div class="lv-foot">messages #1–${kShown} hidden · identical JSON per message${repliesHidden ? ' · previous replies live in that round’s Response' : ''}</div>`;
 }
 
 // --- Settings
@@ -2240,20 +2677,16 @@ const actions = {
   'fold-all': () => { S.collapsed.clear(); saveCollapsed(); render(); },
   'fold-none': () => { for (const b of $$('#ov-now .det-h')) S.collapsed.add(b.dataset.key); saveCollapsed(); render(); },
 
-  'log-detail': async el => {
-    const seq = el.dataset.seq;
-    let ev;
-    try { ev = await api('GET', `logs/${seq}`); } catch (e) { return toast(e.message, false); }
-    const dlg = $('#dlg-log');
-    $('[data-title]', dlg).textContent = `Log detail — ${ev.dir}`;
-    $('[data-meta]', dlg).innerHTML = [
-      ['Time', new Date(ev.at_ms).toLocaleString()], ['User', ev.user], ['Model', ev.model ?? '—'],
-      ['Backend', ev.backend ?? '—'], ['Info', ev.info],
-    ].map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('');
-    let content = ev.content ?? '';
-    try { content = JSON.stringify(JSON.parse(content), null, 2); } catch { /* not JSON */ }
-    $('[data-content]', dlg).textContent = content || 'No content captured for this event.';
-    dlg.showModal();
+  'log-detail': el => openRound({ seq: +el.dataset.seq }),
+  'log-round': el => openRound({ rid: +el.dataset.rid }),
+  'log-close': () => $('#dlg-log').close(),
+  // Overview row -> the request's log round (rid maps it to the ring).
+  'log-jump': el => { const rid = +el.dataset.rid; if (rid) openRound({ rid }).catch(e => toast(e.message, false)); },
+  // Conversation header -> the Logs page filtered to that session tag.
+  'logs-for': el => {
+    location.hash = '#logs';
+    $('#log-filter').value = el.dataset.session || '';
+    renderLogs();
   },
 };
 
@@ -2276,6 +2709,22 @@ document.addEventListener('keydown', e => {
 $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close('cancel'); }));
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
+// Round-viewer controls: choices persist like the other view preferences.
+$$('input[name="lv-scope"]').forEach(r => r.addEventListener('change', () => { S.lv.scope = r.value; saveLv(); drawLv(); }));
+$('#lv-jump').addEventListener('click', () => { S.lv.rail = !S.lv.rail; saveLv(); renderRail(); $('#lv-jump').classList.toggle('active', S.lv.rail); });
+$('#lv-prev').addEventListener('click', () => lvStep(-1));
+$('#lv-next').addEventListener('click', () => lvStep(1));
+$('#lv-rail').addEventListener('click', e => {
+  const b = e.target.closest('.lv-item');
+  if (!b) return;
+  const t = $('#dlg-log [data-content]').querySelector(`[data-jmp="${b.dataset.jmp}"]`);
+  if (!t) return;
+  t.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  t.classList.add('flash');
+  setTimeout(() => t.classList.remove('flash'), 1200);
+  for (const x of $('#lv-rail').querySelectorAll('.lv-item')) x.classList.toggle('on', x === b);
+});
+$$('input[name="lv-fmt"]').forEach(r => r.addEventListener('change', () => { S.lv.fmt = r.value; saveLv(); drawLv(); }));
 $('#client-filter').addEventListener('change', e => { S.clientFilter = e.target.value; render(); });
 $('#model-search').addEventListener('input', e => { S.modelQuery = e.target.value.trim().toLowerCase(); render(); });
 $('#model-show').addEventListener('change', e => { S.modelShow = e.target.value; render(); });

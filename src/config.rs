@@ -179,7 +179,7 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_log_max_files: Option<usize>,
     /// Max bytes of request/response body content captured per record in the
-    /// request log; values below 1024 are raised to 1024 (default 65536).
+    /// request log; values below 1024 are raised to 1024 (default 1048576).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_content_limit: Option<usize>,
     /// Largest request body accepted on normal routes, in bytes (default
