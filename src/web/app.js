@@ -954,7 +954,7 @@ function renderDetails(rows) {
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(fmtWho(head.o))}</span>
       ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}${chip}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
-      ${head.s ? `<span class="logs-link" data-action="logs-for" data-session="${esc(head.s)}" title="show this conversation in the Logs page">⌕ logs</span>` : ''}
+      ${head.s ? `<span class="logs-link jump-chip" data-action="logs-for" data-session="${esc(head.s)}" title="show this conversation in the Logs page">≣ logs</span>` : ''}
       ${sum}</button>`);
     if (shut) continue;
     const lines = [];
@@ -973,7 +973,7 @@ function renderDetails(rows) {
         // belongs to one request, so it can open that request's log round.
         const rid = asc[i].o.rid;
         lines.push({ t: e.at, html: `<div class="det-row${e.live ? ' live' : ''}"${rid ? ` data-action="log-jump" data-rid="${rid}" title="open this request's log round"` : ''}><span class="when">${fmtTime(e.at)}</span>`
-          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span>${rid ? '<span class="jump">⌕</span>' : ''}</div>` });
+          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span>${rid ? '<span class="jump jump-chip">≣ Logs</span>' : ''}</div>` });
       }
     }
     lines.sort((a, b) => b.t - a.t);
@@ -1748,14 +1748,15 @@ function renderLogs() {
 const storedLv = () => {
   try {
     const v = JSON.parse(localStorage.getItem('omq.lv') || '{}');
-    return { scope: v.scope === 'new' ? 'new' : 'whole', fmt: v.fmt === 'raw' ? 'raw' : 'fmt' };
+    return { scope: v.scope === 'new' ? 'new' : 'whole', fmt: v.fmt === 'raw' ? 'raw' : 'fmt', rail: !!v.rail };
   } catch { /* storage blocked */ }
-  return { scope: 'whole', fmt: 'fmt' };
+  return { scope: 'whole', fmt: 'fmt', rail: false };
 };
 const saveLv = () => { try { localStorage.setItem('omq.lv', JSON.stringify(S.lv)); } catch { /* storage blocked */ } };
 S.lv = storedLv();
 
-const LV = { inEv: null, outEv: null, seqOnly: false, prevEv: null, prevText: undefined };
+const LV = { inEv: null, outEv: null, seqOnly: false, prevEv: null, prevText: undefined,
+  rounds: [], roundKey: null };
 let lvToken = 0;
 
 const tryJson = s => { try { return JSON.parse(s); } catch { return undefined; } };
@@ -1775,6 +1776,8 @@ async function openRound({ rid, seq }) {
   LV.inEv = inEv;
   LV.outEv = outEv;
   LV.seqOnly = !rid;
+  LV.rounds = logRounds(list);
+  LV.roundKey = rid ? `r${rid}` : `s${(inEv || outEv).seq}`;
   // The conversation's previous IN (for New only): nearest older same-session
   // request still in the ring.
   const s = (inEv || outEv).session;
@@ -1792,6 +1795,7 @@ async function openRound({ rid, seq }) {
   $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
   drawLv();
   $('#dlg-log').showModal();
+  $('#dlg-log .lv-body').scrollTop = 0;
 }
 
 /** Fetch one event's captured content (cached on the list entry). */
@@ -1816,6 +1820,11 @@ async function drawLv() {
   const html = await lvBody();
   if (tk !== lvToken) return; // a newer click beat us
   setHTML($('#dlg-log [data-content]'), html);
+  renderRail();
+  const i = lvRoundIdx();
+  $('#lv-prev').disabled = i <= 0;
+  $('#lv-next').disabled = i < 0 || i >= LV.rounds.length - 1;
+  $('#lv-jump').classList.toggle('active', S.lv.rail);
 }
 
 /** One scrollable view: the request section first, then the response. */
@@ -1844,6 +1853,45 @@ async function lvPart(ev, kind) {
     return (text.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(text);
   if (kind === 'req' && S.lv.scope === 'new' && lvScopeUsable()) return lvNewOnly(text);
   return formatContent(text);
+}
+
+// --- outline rail + round navigation ---
+
+const lvRoundIdx = () => LV.rounds.findIndex(
+  r => (r.solo ? `s${r.solo.seq}` : `r${(r.in || r.out).rid}`) === LV.roundKey);
+
+function lvStep(delta) {
+  const r = LV.rounds[lvRoundIdx() + delta];
+  if (!r) return;
+  if (r.in?.rid || r.out?.rid) openRound({ rid: (r.in || r.out).rid });
+  else openRound({ seq: r.solo.seq });
+}
+
+/** Rebuild the Jump rail from what just rendered: sections + message blocks,
+ *  in document order — it mirrors the view instead of re-deriving it. */
+function renderRail() {
+  const rail = $('#lv-rail');
+  $('#dlg-log .lv-shell').classList.toggle('railed', S.lv.rail);
+  rail.hidden = !S.lv.rail;
+  if (!S.lv.rail) return;
+  const items = [];
+  let n = 0;
+  for (const el of $('#dlg-log [data-content]').querySelectorAll('.lv-sec, .msg')) {
+    let cls = 'sec', tag = '', snip = '';
+    if (el.classList.contains('lv-sec')) {
+      const txt = (el.querySelector('.lv-sec-h')?.textContent || 'Section').trim();
+      tag = txt.startsWith('→') ? 'req' : txt.startsWith('←') ? 'resp' : 'sec';
+      snip = txt.replace(/^[→←]\s*/, '');
+    } else {
+      cls = el.classList.contains('sys') ? 'sys' : el.classList.contains('user') ? 'user'
+        : el.classList.contains('tool') ? 'tool' : 'asst';
+      tag = (el.querySelector(':scope > .role')?.textContent || 'msg').split('·')[0].trim();
+      snip = (el.querySelector(':scope > .mtext')?.textContent || '').split('\n')[0].trim() || tag;
+    }
+    el.dataset.jmp = String(++n);
+    items.push(`<button class="lv-item ${cls}" data-jmp="${n}"><span class="tag">${esc(tag)}</span><span class="snip">${esc(snip.slice(0, 48))}</span></button>`);
+  }
+  setHTML(rail, `<h4>Jump to message</h4>${items.join('') || '<div class="lv-foot">Nothing to jump to in this view.</div>'}`);
 }
 
 // --- formatters: every one returns the raw view if it cannot parse ---
@@ -2656,6 +2704,19 @@ $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d)
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
 // Round-viewer controls: choices persist like the other view preferences.
 $$('input[name="lv-scope"]').forEach(r => r.addEventListener('change', () => { S.lv.scope = r.value; saveLv(); drawLv(); }));
+$('#lv-jump').addEventListener('click', () => { S.lv.rail = !S.lv.rail; saveLv(); renderRail(); $('#lv-jump').classList.toggle('active', S.lv.rail); });
+$('#lv-prev').addEventListener('click', () => lvStep(-1));
+$('#lv-next').addEventListener('click', () => lvStep(1));
+$('#lv-rail').addEventListener('click', e => {
+  const b = e.target.closest('.lv-item');
+  if (!b) return;
+  const t = $('#dlg-log [data-content]').querySelector(`[data-jmp="${b.dataset.jmp}"]`);
+  if (!t) return;
+  t.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  t.classList.add('flash');
+  setTimeout(() => t.classList.remove('flash'), 1200);
+  for (const x of $('#lv-rail').querySelectorAll('.lv-item')) x.classList.toggle('on', x === b);
+});
 $$('input[name="lv-fmt"]').forEach(r => r.addEventListener('change', () => { S.lv.fmt = r.value; saveLv(); drawLv(); }));
 $('#client-filter').addEventListener('change', e => { S.clientFilter = e.target.value; render(); });
 $('#model-search').addEventListener('input', e => { S.modelQuery = e.target.value.trim().toLowerCase(); render(); });

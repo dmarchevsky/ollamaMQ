@@ -830,13 +830,13 @@ table.logs td.round { padding-right: 16px; }
 .rl.err, .rl.err .ar { color: var(--bad); }
 .rl.ctl .ar { color: var(--vip); }
 
-/* Overview rows jumping to their log round. */
-.det-row[data-action] { cursor: pointer; }
-.det-row .jump { margin-left: auto; color: var(--faint); opacity: 0; }
-.det-row[data-action]:hover .jump { opacity: 1; }
+/* Overview rows jumping to their log round — permanent chips, not hover-only. */
+.det-row .jump { margin-left: auto; }
 tr[data-action="log-jump"] { cursor: pointer; }
-.det-h .logs-link { color: var(--faint); font-size: 11.5px; white-space: nowrap; }
-.det-h .logs-link:hover { color: var(--accent); }
+.jump-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 9px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2);
+  color: var(--muted); font-size: 11px; white-space: nowrap; }
+.jump-chip:hover { color: var(--accent); border-color: var(--accent); }
 
 /* ------------------------------------------------------------ round view */
 /* Full-screen dialog: header controls, scrollable body. The whole viewport
@@ -854,12 +854,33 @@ dialog.logview[open] { display: flex; }
   border-bottom: 1px solid var(--border);
 }
 .lv-close { position: absolute; top: 10px; right: 12px; line-height: 1; }
-.lv-title { flex: 1; min-width: 0; }
+.lv-title { flex: 1 1 260px; min-width: 0; }
+.lv-tools { display: flex; gap: 8px; align-items: center; }
+.lv-nav { display: flex; gap: 4px; }
+.lv-nav .btn { padding: 3px 9px; font-size: 13px; }
+.lv-nav .btn[disabled] { opacity: .35; cursor: default; }
+#lv-jump.active { color: var(--accent); border-color: var(--accent); }
 .lv-title b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lv-title .lv-sub { display: block; color: var(--muted); font-size: 12px; font-family: var(--mono);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lv-body { flex: 1; overflow: auto; padding: 18px 22px; min-height: 0; scrollbar-gutter: stable;
   scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.lv-shell { position: relative; flex: 1; display: flex; min-height: 0; }
+.lv-rail { position: absolute; top: 0; right: 0; bottom: 0; width: 292px; background: var(--surface);
+  border-left: 1px solid var(--border); overflow: auto; padding: 14px 10px; }
+.lv-rail[hidden] { display: none; }
+.lv-shell.railed .lv-body { margin-right: 292px; }
+.lv-rail h4 { margin: 0 4px 8px; font: 700 10.5px var(--mono); letter-spacing: .06em;
+  text-transform: uppercase; color: var(--muted); }
+.lv-item { display: flex; gap: 8px; align-items: baseline; width: 100%; text-align: left;
+  border: 0; background: none; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+.lv-item:hover, .lv-item.on { background: var(--accent-soft); }
+.lv-item .tag { flex: none; width: 56px; font: 700 9.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+.lv-item.user .tag { color: var(--accent); } .lv-item.asst .tag { color: var(--ok); }
+.lv-item.tool .tag { color: var(--warn); } .lv-item.sys .tag { color: var(--vip); }
+.lv-item.sec .tag { color: var(--muted); }
+.lv-item .snip { font: 12px var(--mono); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#dlg-log .flash { outline: 2px solid var(--accent); outline-offset: 1px; }
 .lv-body::-webkit-scrollbar { width: 12px; }
 .lv-body::-webkit-scrollbar-track { background: transparent; }
 .lv-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 7px; border: 3px solid var(--bg); }
@@ -911,4 +932,9 @@ pre.raw { font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-w
 @media (max-width: 720px) {
   .lv-body { padding: 12px 10px; }
   .lv-head { gap: 8px; padding: 8px 44px 8px 10px; }
+  .lv-head .lv-title { flex: 1 1 100%; }
+  .lv-tools { flex-wrap: wrap; }
+  .lv-rail { left: 0; right: 0; bottom: auto; width: auto; max-height: 62%; border-left: 0;
+    border-bottom: 1px solid var(--border); box-shadow: 0 12px 24px rgba(0,0,0,.25); }
+  .lv-shell.railed .lv-body { margin-right: 0; }
 }
