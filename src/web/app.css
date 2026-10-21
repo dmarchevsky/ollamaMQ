@@ -858,8 +858,19 @@ dialog.logview[open] { display: flex; }
 .lv-title b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lv-title .lv-sub { display: block; color: var(--muted); font-size: 12px; font-family: var(--mono);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.lv-body { flex: 1; overflow: auto; padding: 18px 22px; min-height: 0; }
+.lv-body { flex: 1; overflow: auto; padding: 18px 22px; min-height: 0; scrollbar-gutter: stable;
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.lv-body::-webkit-scrollbar { width: 12px; }
+.lv-body::-webkit-scrollbar-track { background: transparent; }
+.lv-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 7px; border: 3px solid var(--bg); }
+.lv-body::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 .lv-wrap { max-width: 1000px; margin: 0 auto; }
+.lv-sec + .lv-sec { border-top: 1px solid var(--border); margin-top: 22px; padding-top: 16px; }
+.lv-sec-h { margin: 0 0 12px; font: 700 11px/1.4 var(--mono); letter-spacing: .06em;
+  text-transform: uppercase; color: var(--muted); }
+.lv-sec-h .ar { font-size: 13px; margin-right: 7px; }
+.lv-sec-h.req .ar { color: var(--accent); }
+.lv-sec-h.out .ar { color: var(--ok); }
 .lv-meta { color: var(--muted); font-size: 12.5px; font-family: var(--mono); margin-bottom: 12px; }
 .lv-note { background: var(--accent-soft); border: 1px solid var(--border); border-radius: 8px;
   padding: 8px 12px; font-size: 12.5px; margin-bottom: 14px; }

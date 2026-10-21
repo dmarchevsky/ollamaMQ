@@ -1755,7 +1755,7 @@ const storedLv = () => {
 const saveLv = () => { try { localStorage.setItem('omq.lv', JSON.stringify(S.lv)); } catch { /* storage blocked */ } };
 S.lv = storedLv();
 
-const LV = { inEv: null, outEv: null, side: 'req', prevEv: null, prevText: undefined };
+const LV = { inEv: null, outEv: null, seqOnly: false, prevEv: null, prevText: undefined };
 let lvToken = 0;
 
 const tryJson = s => { try { return JSON.parse(s); } catch { return undefined; } };
@@ -1774,7 +1774,7 @@ async function openRound({ rid, seq }) {
   if (!inEv && !outEv) return toast('log record expired', false);
   LV.inEv = inEv;
   LV.outEv = outEv;
-  LV.side = inEv ? 'req' : 'res';
+  LV.seqOnly = !rid;
   // The conversation's previous IN (for New only): nearest older same-session
   // request still in the ring.
   const s = (inEv || outEv).session;
@@ -1788,7 +1788,6 @@ async function openRound({ rid, seq }) {
   if (!outEv && inEv) sub.push('← awaiting response');
   if (s) sub.push(`session #${s}`);
   $('#dlg-log [data-sub]').textContent = sub.join(' · ');
-  $$('input[name="lv-side"]').forEach(r => { r.checked = r.value === LV.side; });
   $$('input[name="lv-scope"]').forEach(r => { r.checked = S.lv.scope === r.value; });
   $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
   drawLv();
@@ -1806,7 +1805,7 @@ async function evContent(ev) {
 }
 
 function lvScopeUsable() {
-  return LV.side === 'req' && S.lv.fmt === 'fmt' && !!(LV.inEv?.session && LV.prevEv);
+  return S.lv.fmt === 'fmt' && !!(LV.inEv?.session && LV.prevEv);
 }
 
 async function drawLv() {
@@ -1819,15 +1818,31 @@ async function drawLv() {
   setHTML($('#dlg-log [data-content]'), html);
 }
 
+/** One scrollable view: the request section first, then the response. */
 async function lvBody() {
-  const ev = LV.side === 'req' ? LV.inEv : LV.outEv;
-  if (!ev) return '<div class="empty">This round has no request side (refused before the request was logged).</div>';
+  const secs = [];
+  if (LV.inEv) {
+    secs.push(lvSec('req', 'Request', inSeg(LV.inEv.info), await lvPart(LV.inEv, 'req')));
+  } else if (!LV.seqOnly) {
+    secs.push(lvSec('req', 'Request', '', '<div class="lv-note">No request was logged — this round was refused before its body arrived.</div>'));
+  }
+  if (LV.outEv) {
+    secs.push(lvSec('out', 'Response', outSeg(LV.outEv.info), await lvPart(LV.outEv, 'out')));
+  } else if (!LV.seqOnly) {
+    secs.push(lvSec('out', 'Response', '', '<div class="lv-note">No response recorded yet — still queued, running, or disconnected.</div>'));
+  }
+  return secs.join('');
+}
+
+const lvSec = (cls, title, info, html) =>
+  `<section class="lv-sec"><h3 class="lv-sec-h ${cls}"><span class="ar">${cls === 'req' ? '→' : '←'}</span>${esc(title)}${info ? ` · ${esc(info)}` : ''}</h3>${html}</section>`;
+
+async function lvPart(ev, kind) {
   const text = await evContent(ev);
-  if (text == null) return `<div class="empty">No content captured for this event${ev.has_content ? ' (or it left the log ring)' : ''}.</div>`;
+  if (text == null) return `<div class="empty">No content captured${ev.has_content ? ' (or it left the log ring)' : ''}.</div>`;
   if (S.lv.fmt === 'raw')
-    return (text.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '')
-      + `<pre class="raw">${esc(text)}</pre>`;
-  if (LV.side === 'req' && S.lv.scope === 'new') return lvNewOnly(text);
+    return (text.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(text);
+  if (kind === 'req' && S.lv.scope === 'new' && lvScopeUsable()) return lvNewOnly(text);
   return formatContent(text);
 }
 
@@ -2634,7 +2649,6 @@ $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d)
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
 // Round-viewer controls: choices persist like the other view preferences.
-$$('input[name="lv-side"]').forEach(r => r.addEventListener('change', () => { LV.side = r.value; drawLv(); }));
 $$('input[name="lv-scope"]').forEach(r => r.addEventListener('change', () => { S.lv.scope = r.value; saveLv(); drawLv(); }));
 $$('input[name="lv-fmt"]').forEach(r => r.addEventListener('change', () => { S.lv.fmt = r.value; saveLv(); drawLv(); }));
 $('#client-filter').addEventListener('change', e => { S.clientFilter = e.target.value; render(); });
