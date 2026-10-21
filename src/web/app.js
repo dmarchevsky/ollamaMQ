@@ -485,7 +485,9 @@ function modelChoices(st) {
 /** Read the modal back into S.filters. A list with every box ticked stores
  *  empty — "everything" travels compactly, matching the server's scope rule;
  *  a list with no box ticked stores `FNONE`, which travels as an empty scope
- *  parameter and shows nothing. The custom interval wins over a preset. */
+ *  parameter and shows nothing. A clicked preset beats whatever text is
+ *  still in the custom box (typing there unchecks the presets, so whichever
+ *  control was touched last wins). */
 function collectFilters() {
   const f = S.filters;
   const win = $('#dlg-filters input[name="fwin"]:checked')?.value;
@@ -493,7 +495,7 @@ function collectFilters() {
   const custom = /^\d+$/.test(n)
     ? Math.min(+n || 1, $('#f-win-u').value === 'h' ? 24 : 1440) + $('#f-win-u').value
     : null;
-  f.win = custom || win || '15m';
+  f.win = win || custom || '15m';
   f.mode = $('#dlg-filters input[name="fmode"]:checked').value;
   const read = id => {
     const all = $$('#' + id + ' input');
@@ -600,7 +602,7 @@ function renderOverview(st) {
   const vis = { ...st, runs: (st.runs || []).filter(r => clientSel(r.client, r.key) && modelSel(r.model) && backendSel(r.backend) && prioSel(priLevel(r.priority))) };
   // Identity colours key on the display name, so client+label pairs get their
   // own hue (the server already names lanes, client rows and segments that way).
-  assignColors([...new Set([...clientIds(st), ...ov.clients.map(c => c.id), ...vis.runs.map(fmtWho)])]);
+  assignColors([...new Set([...clientIds(st), ...ov.clients.map(c => c.id), ...vis.runs.map(fmtWho), ...ov.queue.map(w => fmtWho(w))])]);
   const s = ov.status;
 
   // Status line: the one sentence an operator reads first.
@@ -648,8 +650,8 @@ function renderCapacity(st, ov) {
   const sizes = [...(st.runs || []), ...ov.queue].map(x => x.est_prompt_tokens || 0).filter(n => n > 0);
   const avg = sizes.length ? sizes.reduce((a, b) => a + b, 0) / sizes.length : 1;
   const pct = (n, scale) => (Math.max(0, n / scale) * 100).toFixed(2) + '%';
-  const waitSeg = (w, style) => `<i class="seg q ${colorClass(w.client)}" style="${style}" title="${esc(
-    `${w.client} · ${w.model}\n~${fmtTok(w.est_prompt_tokens)} tokens · waiting ${fmtDur(w.waited_secs)} · #${w.pos} in its client's queue`
+  const waitSeg = (w, style) => `<i class="seg q ${colorClass(fmtWho(w))}" style="${style}" title="${esc(
+    `${fmtWho(w)} · ${w.model}\n~${fmtTok(w.est_prompt_tokens)} tokens · waiting ${fmtDur(w.waited_secs)} · #${w.pos} in its client's queue`
     + (w.backends.length > 1 ? `\ncan run on ${w.backends.map(i => label.get(i)).join(', ')}` : ''))}"></i>`;
   const row = (nameCell, barHtml, noteHtml) =>
     `<div class="cap-row"><div class="cap-name">${nameCell}</div>${barHtml}<div class="cap-note">${noteHtml}</div></div>`;
@@ -672,8 +674,8 @@ function renderCapacity(st, ov) {
     const capTok = Math.max(1, runTok + (b.free > 0 ? freeTok : 0));
     const waitTok = waits.reduce((a, w) => a + (w.est_prompt_tokens || avg), 0);
     const scale = Math.max(capTok, waitTok);
-    let bar = runs.map(r => `<i class="seg run ${colorClass(r.client)}" style="flex:0 1 ${pct(r.est_prompt_tokens || avg, scale)}" title="${esc(
-      `${r.client} · ${r.model}\n~${fmtTok(r.est_prompt_tokens)} tokens · ${r.state === 'generating' ? 'generating' : 'waiting for first token'} · ${fmtDur(r.elapsed_secs)}${r.tokens_per_sec ? ` · ${r.tokens_per_sec.toFixed(1)} tok/s` : ''}`)}"></i>`).join('');
+    let bar = runs.map(r => `<i class="seg run ${colorClass(fmtWho(r))}" style="flex:0 1 ${pct(r.est_prompt_tokens || avg, scale)}" title="${esc(
+      `${fmtWho(r)} · ${r.model}\n~${fmtTok(r.est_prompt_tokens)} tokens · ${r.state === 'generating' ? 'generating' : 'waiting for first token'} · ${fmtDur(r.elapsed_secs)}${r.tokens_per_sec ? ` · ${r.tokens_per_sec.toFixed(1)} tok/s` : ''}`)}"></i>`).join('');
     if (b.free > 0) {
       bar += `${runs.length ? '<span class="bar-gap"></span>' : ''}`
         + Array.from({ length: freeN }, () => `<i class="seg free" style="flex:0 1 ${pct(freeTok / freeN, scale)}" title="${b.kv_free_pct != null ? `free · ${b.kv_free_pct}% of the KV cache free` : 'free'}"></i>`).join('');
@@ -686,8 +688,9 @@ function renderCapacity(st, ov) {
   const sharedRow = shared.length ? row(
     '<span class="cap-shared" title="Several backends can serve these models, or none lists them">any backend</span>',
     `<div class="q2-bar"><div class="q-track">${shared.map(w => waitSeg(w, 'flex:1 1 26px')).join('')}</div></div>`, '') : '';
-  // Legend of the board: the clients on it right now, not the window history.
-  const legend = [...new Set([...(st.runs || []).map(r => r.client), ...ov.queue.map(w => w.client)])]
+  // Legend of the board: the conversations on it right now, not the window
+  // history — same identity (client, or client+label) the rows are coloured by.
+  const legend = [...new Set([...(st.runs || []).map(fmtWho), ...ov.queue.map(fmtWho)])]
     .map(id => `<span>${swatch(id)}${esc(id)}</span>`).join('')
     + '<span><i class="sw free"></i>free</span>'
     + '<span><i class="sw loading"></i>loading a model</span>'
