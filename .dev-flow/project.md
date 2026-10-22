@@ -70,6 +70,7 @@ checkout: `docker compose pull && docker compose up -d`, because compose tracks
 `ghcr.io/dmarchevsky/ollamamq:latest`, which CI publishes from the release tag.
 
 ```flow
+merge = squash
 versionFile = Cargo.toml
 versionTag = v{version}
 ```
