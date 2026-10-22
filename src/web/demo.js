@@ -637,8 +637,7 @@
         const k = body.key ?? genKey();
         if (k.length < 8 || k.length > 256 || /\s/.test(k)) err('key must be 8–256 characters with no whitespace');
         if (allKeys().some(x => x.k.key === k)) err('that key is already assigned to a client');
-        const nk = key(k, body.label, Date.now(), 0);
-        nk.redact_log = !!body.redact_log;
+        const nk = key(k, body.label, Date.now(), 0, body.redact_log);
         c.keys.push(nk);
         return delay(nk);
       }

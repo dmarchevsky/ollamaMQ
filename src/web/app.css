@@ -263,7 +263,6 @@ tr.selected > td { background: var(--accent-soft); }
    client, indented like a backend's model list. */
 tr.key-row > td { background: var(--surface-2); padding-top: 7px; padding-bottom: 7px; }
 tr.key-row > td.keycell { padding-left: 30px; }
-.keyval { word-break: break-all; }
 .key-row .keyval { background: var(--surface); }
 /* The open client row runs into its key band instead of sitting above it. */
 #client-list tr.clickable.open > td { border-bottom: none; }

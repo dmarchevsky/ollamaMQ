@@ -1303,7 +1303,7 @@ function renderBackends(st) {
     const open = S.expanded.has(b.url);
     const pct = b.max ? Math.min(100, (b.active / b.max) * 100) : 0;
     const noText = c?.redact_log
-        ? ' <span class="badge warn" title="No response text is stored for this backend — log entries keep status, size and timing">no text</span>'
+        ? ' ' + redactBadge('No response text is stored for this backend — log entries keep status, size and timing')
         : '';
     const loaded = new Set(b.models_loaded);
     const hiddenHere = new Set(b.models_hidden);
@@ -1438,14 +1438,14 @@ function clientRow(r, st) {
   // Windowed waste lives in the overview payload (the Overview poll caches it);
   // without a cached overview there is nothing to say about it.
   const w = (S.overview?.clients || []).find(x => x.id === r.id);
-  const sub = c
+  const parts = c
     ? [c.note, `${c.keys.length} key${c.keys.length === 1 ? '' : 's'}`,
-      u?.ip ? `last IP ${u.ip}` : '',
-      w?.waste_pct != null ? `${w.waste_pct}% prefill lost to eviction` : ''].filter(Boolean).join(' · ')
+      u?.ip ? `last IP ${esc(u.ip)}` : '',
+      w?.waste_pct != null ? `${w.waste_pct}% prefill lost to eviction` : '']
     : r.id.startsWith('unverified:')
-      ? `a request without a key claimed this registered name, so it queues apart from ${esc(r.id.slice('unverified:'.length))}`
-      : (u?.ip ? 'last IP ' + esc(u.ip) + ' · identified by X-User-ID only, so any request can use this id'
-        : 'identified by X-User-ID only, so any request can use this id');
+      ? [`a request without a key claimed this registered name, so it queues apart from ${esc(r.id.slice('unverified:'.length))}`]
+      : [u?.ip ? `last IP ${esc(u.ip)}` : '', 'identified by X-User-ID only, so any request can use this id'];
+  const sub = parts.filter(Boolean).join(' · ');
   const prio = `
     <button class="btn sm iconly ${st.vip === r.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Always served first (TUI: p)" aria-label="VIP">★<span class="w"> VIP</span></button>
     <button class="btn sm iconly ${st.boost === r.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Extra share of turns (TUI: b)" aria-label="Boost">⚡<span class="w"> Boost</span></button>`;
@@ -1478,7 +1478,8 @@ function clientRow(r, st) {
 }
 
 /** Says why a record has no body text: switched off, not missing. */
-const REDACT_BADGE = '<span class="badge warn" title="No request/response text is stored — the log entry keeps user, model, backend, status, size, session and timing">no text</span>';
+const redactBadge = title => `<span class="badge warn" title="${title}">no text</span>`;
+const REDACT_BADGE = redactBadge('No request/response text is stored — the log entry keeps user, model, backend, status, size, session and timing');
 
 /** Level 2: the client's keys, while its own row is open. */
 function keyRows(r) {
