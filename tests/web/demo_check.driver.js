@@ -3,6 +3,11 @@
 //   <chromium> --virtual-time-budget=10000 --window-size=1280,800 \
 //     --screenshot=out.png "file://<copy>/index.html?demo=1"
 // Console prints "ASSERT PASS/FAIL <name>" per check.
+// Screenshot caveat: chrome-headless-shell with --virtual-time-budget races the
+// modal-open repaint and sometimes captures a stale frame (empty strip where
+// the dialog header should be). Real Chromium over CDP (playwright-core,
+// waitForSelector + settle + screenshot) captures the live layout correctly —
+// 8/8 clean vs the same page the shell coin-flipped.
 addEventListener('load', () => {
   const A = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
   setTimeout(() => { location.hash = '#logs'; }, 400);
