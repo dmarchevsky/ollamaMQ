@@ -3,6 +3,43 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## Unreleased
+
+### Changed
+
+- **Developer playbook only, no product change.** The dev-flow playbook now documents the live
+  test-instance recipe — `8081` is the dev-walk port (and collides with the compose mapping),
+  how to spot a stale proxy pinning it, and running the walk from a config copy with a writable
+  `request_log_path` — and tells the agent to persist findings into `plan/` during long
+  implement stages.
+
+## v0.14.0 — 2026-10-21
+
+### Added
+
+- **Human-readable request logs.** Every log event and live-run row now carries a
+  correlation id and the session tag, and the web UI uses both: the **Logs** page
+  pairs a request with its response into one compact line per round
+  (`→ request · ← response`), and clicking a round opens a full-screen viewer —
+  the request as a message transcript, a streamed reply reconstructed into one
+  assistant message (thinking collapsed, tool calls rebuilt, token footer),
+  `Raw ↔ Formatted`, `Whole ↔ New only` (the diff against the conversation's
+  previous round), a `≣ Jump` message outline, `↑/↓` round navigation and an
+  always-visible scrollbar. Captures truncated by the content limit are salvaged
+  — complete messages and intact chunks render, with a note saying what the
+  capture kept. The captured-text default rose to **1 MiB** (`log_content_limit`);
+  the JSONL file format and the TUI are unchanged.
+- **Overview → log jumps.** Details stage lines and conversation headers carry
+  permanent `≣ Logs` chips: a stage line opens that request's round in the
+  viewer, the header opens the Logs page filtered to the conversation's session.
+
+### Fixed
+
+- A checked preset in the Overview filter modal now wins over leftover custom
+  text — picking a preset after typing "last N" used to keep the custom window.
+- **Capacity** colours conversations (client + API-key label in label mode)
+  exactly like Activity does; before, capacity segments keyed on the bare client.
+
 ## v0.13.0 — 2026-10-20
 
 ### Added
