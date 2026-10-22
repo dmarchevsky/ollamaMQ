@@ -440,6 +440,9 @@ pre.content {
   /* Cards stack, so the level-2 band keeps its own indent and a left rule. */
   tr.key-row { padding-left: 18px; border-left: 2px solid var(--border); }
   tr.key-row > td.keycell { padding-left: 0 !important; }
+  /* One card, not three boxes: after the generic `.panel td` rules, so the
+     band colour and a single outer border survive. */
+  tr.key-row > td { background: var(--surface-2); border-bottom: none; }
 
   /* Overview summaries: fields flow inline under the title. */
   #page-overview .panel table:not(.logs) tr:not(:has(> th)),
