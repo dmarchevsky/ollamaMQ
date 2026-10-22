@@ -3,6 +3,21 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## Unreleased
+
+### Changed
+
+- **Developer playbook only, no product change.** Three stale lines of the dev-flow playbook were
+  replaced with what actually works. Dark-mode screenshots were lying: the recipe rewrote
+  `prefers-color-scheme: dark` to `all`, which is not a valid media query, so the dark block never
+  applied and every "dark" render was a copy of the light one — the recipe now uses `min-width: 0`
+  and carries a probe that proves the emulation took before a shot is trusted. The log-viewer UI
+  assertion driver (`tests/web/demo_check.driver.js`) is documented at last — how to splice it into a
+  copy of the web bundle, the flag that surfaces its `ASSERT PASS/FAIL` lines, and why it has to open
+  a round that stored text. And the test gate now runs `node --check` over the three embedded web
+  bundles before `cargo test`, so a syntax error in `src/web/*.js` can no longer pass while the UI is
+  broken.
+
 ## v0.16.0 — 2026-10-22
 
 ### Added

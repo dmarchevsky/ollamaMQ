@@ -12,7 +12,7 @@ release.artifact = docker buildx imagetools inspect ghcr.io/dmarchevsky/ollamamq
 ## implement
 
 ```flow
-test = cargo test
+test = node --check src/web/app.js && node --check src/web/demo.js && node --check src/web/login.js && cargo test
 build = cargo build --release
 run = cargo run
 ```
@@ -31,8 +31,25 @@ Visual-pass recipe (headless shell): screenshotting the *served* app crashes the
 (zygote socket errors) — render the static bundle instead: `file://<worktree>/src/web/index.html?demo`.
 Seed UI state (List/Details, Active/All) via `localStorage` on a `--user-data-dir` profile
 (open a tiny `localStorage.setItem('omq.reqView','details');…` page once, then the demo).
-Dark mode: copy `app.css` and rewrite `prefers-color-scheme: dark` to `all` —
+Dark mode: copy `app.css` and rewrite `prefers-color-scheme: dark` to `min-width: 0` —
 `--force-dark-mode` does nothing on a page that supports dark itself.
+Never rewrite to `all`: `@media (all)` is an unknown media feature, the block is dropped, and the dark
+shots come out byte-identical to light. Prove the emulation took before trusting a shot — `--dump-dom` a
+page that prints `getComputedStyle(document.documentElement).getPropertyValue('--bg')` (the dark block
+sets it): `#0f1218` with `color-scheme: dark` is dark, `#f4f5f7`/`light` means the block never matched.
+
+Automated UI pass (`tests/web/demo_check.driver.js`): the repo's only scripted UI assertion harness, and
+nothing runs it by itself — `cargo test` never loads it. Copy `src/web/{index.html,app.css,app.js,demo.js,
+login.js}` to a scratch dir, splice the driver's body into the copied `index.html` as a `<script>` before
+`</body>`, then run it and grep the console: `<headless-shell> --no-sandbox --disable-gpu
+--enable-logging=stderr --virtual-time-budget=10000 --window-size=1280,800 --screenshot=out.png
+"file://<copy>/index.html?demo=1" 2>&1 | grep ASSERT`. `--enable-logging=stderr` is what surfaces the
+`ASSERT PASS/FAIL <name>` lines (the harness is silent without it); the virtual-time budget must exceed the
+driver's 3 s timeline. It drives the log viewer (background scroll-lock, body scrollability, `≣` rail
+stamps) and must open a round that has stored text — a redacted round legitimately has nothing to scroll,
+so the body-scrollable check goes silently wrong once the demo carries a redacted round first; the driver
+skips rows marked `no text` for exactly that reason. The shell's screenshot can still capture a stale frame
+of the modal; the assertions are trustworthy, the PNG is a coin-flip.
 Gotchas: each shot starts at the page top-left (no scroll) — for a lower region hide what is
 above with an inline `<style>`; a `--user-data-dir` profile persists between shots, so use a
 fresh one per intended UI state; for a transient edit state (e.g. the inline key-label editor)
@@ -70,6 +87,7 @@ checkout: `docker compose pull && docker compose up -d`, because compose tracks
 `ghcr.io/dmarchevsky/ollamamq:latest`, which CI publishes from the release tag.
 
 ```flow
+merge = squash
 versionFile = Cargo.toml
 versionTag = v{version}
 ```
