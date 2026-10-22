@@ -3,6 +3,16 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## Unreleased
+
+### Changed
+
+- **Developer playbook only, no product change.** The dev-flow playbook now documents the live
+  test-instance recipe — `8081` is the dev-walk port (and collides with the compose mapping),
+  how to spot a stale proxy pinning it, and running the walk from a config copy with a writable
+  `request_log_path` — and tells the agent to persist findings into `plan/` during long
+  implement stages.
+
 ## v0.13.0 — 2026-10-20
 
 ### Added
