@@ -28,10 +28,22 @@ MOCK_PID=$!
 sleep 1
 
 # Isolate from any appconf.yaml in the repo (its backends/load_keep_alive
-# would override the test's expectations).
-cat > "$SCRATCH/appconf.yaml" <<'YAML'
+# would override the test's expectations). The request log goes to the scratch
+# dir so section M can read it back.
+cat > "$SCRATCH/appconf.yaml" <<YAML
 backends: []
 models: []
+settings:
+  request_log_path: $SCRATCH/reqlog.jsonl
+YAML
+
+# One client with body-text capture switched off (section M).
+cat > "$SCRATCH/clients.yaml" <<'YAML'
+clients:
+  - name: redact-me
+    redact_log: true
+    keys:
+      - key: e2e-redact-key
 YAML
 
 ./target/debug/ollamaMQ --no-tui --port 11999 --model-config "$SCRATCH/appconf.yaml" --backend-urls http://127.0.0.1:11990,http://127.0.0.1:11991 > "$SCRATCH/proxy.log" 2>&1 &
@@ -106,6 +118,24 @@ check "K: op visible in admin state" "load" "$(echo "$ADMIN" | python3 -c 'impor
 R=$(curl -s -w '\n%{http_code}' -H "$JH" -X POST $P/admin/models/load -d '{"backend":1,"model":"mock/llama-8b"}')
 check "J: duplicate 409" "409" "$(echo "$R" | tail -1)"
 sleep 2.5  # let the 2s mock load finish
+
+echo "=== M: a client with capture off keeps the entry, drops the text ==="
+curl -s -o /dev/null -X POST $P/api/chat -H "Authorization: Bearer e2e-redact-key" \
+  -H "$JH" -d '{"model":"qwen2.5:7b","messages":[{"role":"user","content":"a secret prompt"}]}'
+sleep 0.6
+MRESULT=$(python3 - "$SCRATCH/reqlog.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+red = [r for r in rows if r.get("redacted")]
+plain = [r for r in rows if not r.get("redacted")]
+ok = (bool(red)
+      and all(r.get("content") is None for r in red)
+      and all(r.get("bytes") for r in red)
+      and any(r.get("content") for r in plain))
+print("yes" if ok else "no")
+PY
+)
+check "M: redacted lines hold no text, plain ones do" "yes" "$MRESULT"
 
 echo "=== final call log ==="
 cat "$SCRATCH/calls.jsonl"
