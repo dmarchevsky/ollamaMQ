@@ -262,6 +262,12 @@ pub struct Backend {
     /// every existing config relies on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Keep the log entry but store no response text for traffic served by this
+    /// backend: status, size, timing and the rest of the record stay as they
+    /// were. A request's own text is logged before routing, so it is covered by
+    /// the client/key setting, not by this one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redact_log: bool,
 }
 
 /// YAML shape of one `backends:` entry: either a bare URL string or an object
@@ -288,6 +294,7 @@ where
                 disabled: false,
                 token: None,
                 kind: None,
+                redact_log: false,
             },
             BackendEntrySpec::Full(b) => b,
         })
@@ -546,6 +553,26 @@ backends:
                 .unwrap()
                 .contains("kind")
         );
+    }
+
+    /// `redact_log: true` keeps the log entry and drops its response text; a
+    /// bare URL entry and an object without the key both keep capture on, and
+    /// the key is not serialised when it is off (config files stay unchanged).
+    #[test]
+    fn parse_backend_redact_log_key() {
+        let yaml = r#"
+backends:
+  - http://127.0.0.1:11434
+  - url: http://127.0.0.1:8000
+    redact_log: true
+"#;
+        let tmp = std::env::temp_dir().join("ollamamq_test_redact.yaml");
+        std::fs::write(&tmp, yaml).unwrap();
+        let cfg = load_config(tmp.to_str().unwrap()).unwrap();
+        assert!(!cfg.backends[0].redact_log);
+        assert!(cfg.backends[1].redact_log);
+        assert!(!serde_yaml::to_string(&cfg.backends[0]).unwrap().contains("redact_log"));
+        assert!(serde_yaml::to_string(&cfg.backends[1]).unwrap().contains("redact_log"));
     }
 
     #[test]

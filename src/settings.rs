@@ -408,6 +408,7 @@ pub fn apply_backends(state: &Arc<AppState>, list: &[Backend]) {
             .map(|n| n.trim().to_string())
             .filter(|n| !n.is_empty());
         b.token = entry.token.clone().filter(|t| !t.is_empty());
+        b.redact_log = entry.redact_log;
         if let Some(pinned) = crate::dispatcher::ApiSet::from_kind(entry.kind.as_deref()) {
             b.forced_api = pinned;
             b.api_type = pinned;
@@ -438,6 +439,41 @@ fn set_disabled(b: &mut BackendStatus, disabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A backend's capture switch follows the file, in both directions.
+    #[test]
+    fn backends_apply_carries_the_capture_switch() {
+        let state = Arc::new(AppState::new(
+            vec![("http://a:1".to_string(), None)],
+            5,
+            86400,
+            60,
+            1,
+            "appconf.yaml".into(),
+            Vec::new(),
+            crate::reqlog::RequestLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        ));
+        let list = [Backend {
+            url: "http://a:1".into(),
+            name: None,
+            disabled: false,
+            token: None,
+            kind: None,
+            redact_log: true,
+        }];
+        apply_backends(&state, &list);
+        assert!(state.backends.lock_or_recover()[0].redact_log);
+        apply_backends(
+            &state,
+            &[Backend {
+                redact_log: false,
+                ..list[0].clone()
+            }],
+        );
+        assert!(!state.backends.lock_or_recover()[0].redact_log);
+    }
 
     #[test]
     fn precedence_is_cli_then_file() {
