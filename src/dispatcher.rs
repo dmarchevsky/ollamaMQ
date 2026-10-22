@@ -96,6 +96,9 @@ pub struct Task {
     /// Correlation id shared by this request's IN and OUT log events
     /// (see [`LogEvent::rid`]).
     pub rid: u64,
+    /// True when its client or key switched body-text capture off: this
+    /// request's log entries keep their metadata and carry no content.
+    pub redact_text: bool,
 }
 
 /// Which API flavours a backend speaks — and, on the route side of the
@@ -614,6 +617,9 @@ pub struct BackendStatus {
     /// it — proxied inference, metadata reads, health probes and model
     /// control ops. A client's own auth header is never overridden.
     pub token: Option<String>,
+    /// From `Backend::redact_log`: no response text is stored for requests this
+    /// backend served.
+    pub redact_log: bool,
     pub active_requests: usize,
     pub processed_count: usize,
     pub is_online: bool,
@@ -688,6 +694,7 @@ impl BackendStatus {
         BackendStatus {
             url,
             token,
+            redact_log: false,
             active_requests: 0,
             processed_count: 0,
             is_online: true,
@@ -866,6 +873,9 @@ pub struct LogEvent {
     /// Conversation tag (`SessionKey::tag`) of the request; `None` for
     /// sticky-less traffic and control actions.
     pub session: Option<String>,
+    /// True when `content` is absent because body-text capture is switched off
+    /// for this request's client, key or backend — not because there was none.
+    pub redacted: bool,
 }
 
 /// Half-life of a user's fair-share score: load older than this counts half
@@ -3230,8 +3240,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                 // the FIRST routable task (not just the front) so an
                 // unroutable request — e.g. an Ollama-family call with every
                 // Ollama backend offline — can't starve everything behind it.
-                let mut selection: Option<(String, Task, usize, String, Option<String>, bool)> =
-                    None;
+                let mut selection: Option<
+                    (String, Task, usize, String, Option<String>, bool, bool),
+                > = None;
                 'users: for &ui in &order {
                     let user_id = &active_users[ui];
                     let queue_len = queues.get(user_id).map(|q| q.len()).unwrap_or(0);
@@ -3516,6 +3527,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     content: None,
                                     rid: Some(dropped.rid),
                                     session: dropped.session_key.as_ref().map(SessionKey::tag),
+                                    redacted: false,
                                 });
                                 let responder = dropped.responder;
                                 tokio::spawn(async move {
@@ -3674,6 +3686,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             selected_backend_idx,
                             backends[selected_backend_idx].url.clone(),
                             backends[selected_backend_idx].token.clone(),
+                            backends[selected_backend_idx].redact_log,
                             metadata,
                         ));
                         if let Some(key) = pending_session_key {
@@ -3692,7 +3705,7 @@ pub async fn run_worker(state: Arc<AppState>) {
         };
 
         match selection_opt {
-            Some((user_id, task, backend_idx, backend_url, backend_token, metadata)) => {
+            Some((user_id, task, backend_idx, backend_url, backend_token, backend_redact, metadata)) => {
                 // A cache-cold user waited while this cache-hot dispatch ran
                 // ahead of it (see `cold_hold`); its release is the same wait
                 // visible as queue time in the activity view.
@@ -3736,6 +3749,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                     let session_label = task.session_label.clone();
                     let prio = task.priority.as_str();
                     let rid = task.rid;
+                    // Either side can switch body text off: the client/key that
+                    // sent it, or the backend serving it (a backend cannot reach
+                    // back into the IN record, already written at arrival).
+                    let redact = task.redact_text || backend_redact;
                     // Counted for Prometheus and kept for the Overview.
                     let outcome = |o: &'static str, timing: crate::stats::Timing| {
                         metrics.inc(
@@ -3793,6 +3810,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             content,
                             rid: Some(rid),
                             session: session_tag.clone(),
+                            redacted: redact,
                         });
                     };
 
@@ -3938,7 +3956,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                     count_tokens("completion", est);
                                                     run.update(|r| r.tokens += est);
                                                 }
-                                                if content_acc.len() < state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)
+                                                if !redact
+                                                    && content_acc.len() < state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)
                                                 {
                                                     let room = state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)
                                                         - content_acc.len();
@@ -4081,10 +4100,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             state_clone.processed_counts.lock_or_recover();
                                         *counts.entry(user_id.clone()).or_insert(0) += 1;
                                         drop(counts);
-                                        let content_str = Arc::new(crate::reqlog::truncate_utf8(
-                                            &content_acc,
-                                            state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed),
-                                        ));
+                                        let content_str = (!redact).then(|| {
+                                            Arc::new(crate::reqlog::truncate_utf8(
+                                                &content_acc,
+                                                state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed),
+                                            ))
+                                        });
                                         state_clone.reqlog.log(crate::reqlog::ReqRecord {
                                             ts: crate::reqlog::now_unix_millis(),
                                             dir: "OUT",
@@ -4096,7 +4117,8 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             status: Some(status.as_u16()),
                                             bytes: Some(total_bytes),
                                             content_type: resp_content_type,
-                                            content: Some(content_str.clone()),
+                                            content: content_str.clone(),
+                                            redacted: redact,
                                             session: session_tag.clone(),
                                             session_label: session_label.clone(),
                                             priority: prio,
@@ -4108,7 +4130,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 method_str, path_str, status.as_u16(), total_bytes
                                             ),
                                             Some(backend_url.clone()),
-                                            Some(content_str),
+                                            content_str,
                                         );
                                     } else {
                                         let mut dropped =
@@ -4138,6 +4160,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     bytes: Some(total_bytes),
                                     content_type: None,
                                     content: Some(err_msg.clone()),
+                                    redacted: false,
                                     session: session_tag.clone(),
                                     session_label: session_label.clone(),
                                     priority: prio,
@@ -4325,6 +4348,7 @@ pub async fn proxy_handler(
                 bytes: Some(0),
                 content_type: None,
                 content: None,
+                redacted: false,
                 session: None,
                 session_label: None,
                 priority: "normal",
@@ -4340,6 +4364,7 @@ pub async fn proxy_handler(
                 content: None,
                 rid: Some(agg_rid),
                 session: None,
+                redacted: false,
             });
         }
         state.metrics.inc(
@@ -4382,6 +4407,7 @@ pub async fn proxy_handler(
             content: None,
             rid: None,
             session: None,
+            redacted: false,
         });
         let label = state.model_label(Some(model));
         state.metrics.inc(
@@ -4427,7 +4453,13 @@ pub async fn proxy_handler(
     let rid = state.next_rid();
     // Request-log content is captured before `body` moves into the Task.
     let body_len = body.len() as u64;
-    let content = Arc::new(crate::reqlog::truncate_utf8(&body, state.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)));
+    let redact_text = client.as_ref().is_some_and(|c| c.redact_log);
+    let content = (!redact_text).then(|| {
+        Arc::new(crate::reqlog::truncate_utf8(
+            &body,
+            state.log_content_limit.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    });
     let task = Task {
         path: path.clone(),
         method,
@@ -4450,6 +4482,7 @@ pub async fn proxy_handler(
         session_label: session_label.clone(),
         priority,
         rid,
+        redact_text,
     };
 
     {
@@ -4480,6 +4513,7 @@ pub async fn proxy_handler(
                 // reaching the IN site), so it stays an unpaired OUT.
                 rid: None,
                 session: session_tag.clone(),
+                redacted: false,
             });
             state.metrics.inc(
                 &crate::metrics::REQUESTS,
@@ -4538,6 +4572,7 @@ pub async fn proxy_handler(
                 content: None,
                 rid: None,
                 session: session_tag.clone(),
+                redacted: false,
             });
             state.metrics.inc(
                 &crate::metrics::REQUESTS,
@@ -4599,7 +4634,8 @@ pub async fn proxy_handler(
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string),
-        content: Some(content.clone()),
+        content: content.clone(),
+        redacted: redact_text,
         session: session_tag.clone(),
         session_label: session_label.clone(),
         priority: priority.as_str(),
@@ -4613,9 +4649,10 @@ pub async fn proxy_handler(
         model: requested_model.clone(),
         backend: None,
         info: format!("{} {} body={}B", task_method, path, body_len),
-        content: Some(content),
+        content,
         rid: Some(rid),
         session: session_tag.clone(),
+        redacted: redact_text,
     });
 
     state.notify.notify_one();
@@ -4802,6 +4839,7 @@ mod tests {
             kv_free_pct: None,
             name: None,
             disabled: false,
+            redact_log: false,
         }
     }
 
@@ -5352,6 +5390,7 @@ mod tests {
                 session_label: None,
                 priority: Default::default(),
             rid: 1,
+            redact_text: false,
             });
         }
 
@@ -5443,6 +5482,7 @@ mod tests {
                 session_label: None,
                 priority: Default::default(),
             rid: 1,
+            redact_text: false,
             });
         rx
     }
@@ -5513,7 +5553,7 @@ mod tests {
     fn add_test_client(state: &Arc<AppState>, name: &str, key: &str) {
         let mut clients = state.clients.lock_or_recover();
         clients.create_client(name, "").expect("create client");
-        clients.add_key(name, Some(key), "").expect("add key");
+        clients.add_key(name, Some(key), "", false).expect("add key");
     }
 
     /// A client key picks the queue (over the client's own `X-User-ID`) and
@@ -5730,6 +5770,7 @@ mod tests {
             session_label: None,
             priority: Default::default(),
         rid: 1,
+        redact_text: false,
         });
         state.processed_counts.lock_or_recover().insert("old".into(), 7);
         state.toggle_boost("old");
@@ -5900,7 +5941,7 @@ mod tests {
             let mut clients = state.clients.lock_or_recover();
             clients.create_client("alice", "").expect("client");
             clients
-                .add_key("alice", Some("alice-key-123"), "laptop")
+                .add_key("alice", Some("alice-key-123"), "laptop", false)
                 .expect("key");
         }
         let worker = tokio::spawn(run_worker(state.clone()));
@@ -6357,6 +6398,7 @@ mod tests {
                 session_label: None,
                 priority: Default::default(),
             rid: 1,
+            redact_text: false,
             });
         rx
     }
@@ -7129,6 +7171,7 @@ mod tests {
                     session_label: None,
                     priority: Default::default(),
                 rid: 1,
+                redact_text: false,
                 });
             }
         }
@@ -7225,7 +7268,8 @@ mod tests {
             session_key: None,
             session_label: None,
             priority: level,
-        rid: 1,
+            rid: 1,
+            redact_text: false,
         }
     }
 
@@ -7490,6 +7534,7 @@ mod tests {
                 session_label: None,
                 priority: Default::default(),
             rid: 1,
+            redact_text: false,
             });
         rx
     }
@@ -7915,6 +7960,7 @@ mod tests {
                     session_label: None,
                     priority: Default::default(),
                 rid: 1,
+                redact_text: false,
                 });
         }
 
@@ -8307,6 +8353,7 @@ mod tests {
                 session_label: None,
                 priority: Default::default(),
             rid: 1,
+            redact_text: false,
             });
 
         let worker = tokio::spawn(run_worker(state.clone()));
@@ -8472,6 +8519,7 @@ mod tests {
                 session_label: None,
                 priority: Default::default(),
             rid: 1,
+            redact_text: false,
             });
         rx
     }

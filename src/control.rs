@@ -1045,6 +1045,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                                 content: None,
                                 rid: None,
                                 session: None,
+                                redacted: false,
                             });
                             let token = st
                                 .backends
@@ -1115,6 +1116,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                         content: None,
                         rid: None,
                         session: None,
+                        redacted: false,
                     });
                     continue;
                 }
@@ -1144,6 +1146,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
                     content: None,
                     rid: None,
                     session: None,
+                    redacted: false,
                 });
             }
         });
@@ -1844,6 +1847,7 @@ mod tests {
             kv_free_pct: None,
             name: None,
             disabled: false,
+            redact_log: false,
         }
     }
 
