@@ -1870,6 +1870,16 @@ function lvStep(delta) {
   else openRound({ seq: r.solo.seq });
 }
 
+/** dmesg -H stamps: absolute when the clock anchors (or drifted ≥ 60 s), `+Ns`
+ *  while the item sits close to the anchor — messages share their section's
+ *  event time, the only real clock a round has. */
+const railStamp = (ms, anchor) =>
+  anchor == null || ms - anchor >= 60_000 ? fmtTime(ms) : `+${Math.floor((ms - anchor) / 1000)}s`;
+
+const lvSecMs = (sec) => !sec ? null
+  : sec.querySelector('.lv-sec-h.req') ? LV.inEv?.at_ms ?? null
+  : sec.querySelector('.lv-sec-h.out') ? LV.outEv?.at_ms ?? null : null;
+
 /** Rebuild the Jump rail from what just rendered: sections + message blocks,
  *  in document order — it mirrors the view instead of re-deriving it. */
 function renderRail() {
@@ -1878,7 +1888,7 @@ function renderRail() {
   rail.hidden = !S.lv.rail;
   if (!S.lv.rail) return;
   const items = [];
-  let n = 0;
+  let n = 0, anchor = null;
   for (const el of $('#dlg-log [data-content]').querySelectorAll('.lv-sec, .msg')) {
     let cls = 'sec', tag = '', snip = '';
     if (el.classList.contains('lv-sec')) {
@@ -1891,8 +1901,11 @@ function renderRail() {
       tag = (el.querySelector(':scope > .role')?.textContent || 'msg').split('·')[0].trim();
       snip = (el.querySelector(':scope > .mtext')?.textContent || '').split('\n')[0].trim() || tag;
     }
+    const ms = el.classList.contains('lv-sec') ? lvSecMs(el) : lvSecMs(el.closest('.lv-sec'));
+    const when = ms == null ? '' : `<span class="when">${railStamp(ms, anchor)}</span>`;
+    if (ms != null && (anchor == null || ms - anchor >= 60_000)) anchor = ms;
     el.dataset.jmp = String(++n);
-    items.push(`<button class="lv-item ${cls}" data-jmp="${n}"><span class="tag">${esc(tag)}</span><span class="snip">${esc(snip.slice(0, 48))}</span></button>`);
+    items.push(`<button class="lv-item ${cls}" data-jmp="${n}">${when}<span class="tag">${esc(tag)}</span><span class="snip">${esc(snip.slice(0, 48))}</span></button>`);
   }
   setHTML(rail, `<h4>Jump to message</h4>${items.join('') || '<div class="lv-foot">Nothing to jump to in this view.</div>'}`);
 }

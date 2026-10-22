@@ -3,7 +3,7 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
-## v0.14.1 — 2026-10-21
+## v0.16.0 — 2026-10-22
 
 ### Added
 
@@ -30,11 +30,70 @@ since upstream `v0.5.0`.
   its capture switch, and the key string itself is read-only — moving a key to
   another client means deleting it and handing out a new one.
 
+### Fixed
+
+- The Clients page no longer scrolls sideways below ~360px — the action cell carried a
+  `min-width` its row never needed — and VIP/boost keep an `aria-label` on the phones
+  where the layout hides the word.
+
 ### Breaking
 
 - `PATCH /ui/api/keys/{id}` no longer accepts `client`; it takes `label` and/or
   `redact_log` and answers `400` when neither is present. Scripts that moved a key
   must delete and re-add it.
+
+## v0.15.0 — 2026-10-22
+
+### Added
+
+- **dmesg-style stamps in the log viewer's Jump outline.** The outline now carries
+  a time column like `dmesg -H`: the request's section opens with its absolute
+  time, and anything within a minute of it shows as a short offset (`+0s`,
+  `+18s`) — so a reply that took 18 seconds reads at a glance. A section or
+  message whose event is missing (still awaiting a response) carries no stamp.
+
+### Fixed
+
+- **The log viewer's scrollbars make sense.** A modal dialog no longer leaves
+  the page behind scrollable — the scrollbar at the screen edge was the Logs
+  list's, not the viewer's, and dragging it scrolled content nobody could see.
+  And the viewer's own scrollbar, thinned to near-invisibility, is visible again
+  where the content actually scrolls.
+
+### Changed
+
+- **Developer playbook only, no product change.** The dev-flow playbook now documents the live
+  test-instance recipe — `8081` is the dev-walk port (and collides with the compose mapping),
+  how to spot a stale proxy pinning it, and running the walk from a config copy with a writable
+  `request_log_path` — and tells the agent to persist findings into `plan/` during long
+  implement stages.
+
+## v0.14.0 — 2026-10-21
+
+### Added
+
+- **Human-readable request logs.** Every log event and live-run row now carries a
+  correlation id and the session tag, and the web UI uses both: the **Logs** page
+  pairs a request with its response into one compact line per round
+  (`→ request · ← response`), and clicking a round opens a full-screen viewer —
+  the request as a message transcript, a streamed reply reconstructed into one
+  assistant message (thinking collapsed, tool calls rebuilt, token footer),
+  `Raw ↔ Formatted`, `Whole ↔ New only` (the diff against the conversation's
+  previous round), a `≣ Jump` message outline, `↑/↓` round navigation and an
+  always-visible scrollbar. Captures truncated by the content limit are salvaged
+  — complete messages and intact chunks render, with a note saying what the
+  capture kept. The captured-text default rose to **1 MiB** (`log_content_limit`);
+  the JSONL file format and the TUI are unchanged.
+- **Overview → log jumps.** Details stage lines and conversation headers carry
+  permanent `≣ Logs` chips: a stage line opens that request's round in the
+  viewer, the header opens the Logs page filtered to the conversation's session.
+
+### Fixed
+
+- A checked preset in the Overview filter modal now wins over leftover custom
+  text — picking a preset after typing "last N" used to keep the custom window.
+- **Capacity** colours conversations (client + API-key label in label mode)
+  exactly like Activity does; before, capacity segments keyed on the bare client.
 
 ## v0.13.0 — 2026-10-20
 
