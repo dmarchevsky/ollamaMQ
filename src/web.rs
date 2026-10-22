@@ -644,6 +644,10 @@ struct LogView {
     backend: Option<String>,
     info: String,
     has_content: bool,
+    /// True when the body text was left out on purpose (capture is off for this
+    /// client, key or backend) rather than because there was nothing to store.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    redacted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     /// Correlation id of the request this event belongs to; IN and OUT of one
@@ -670,6 +674,7 @@ fn log_view(seq: u64, ev: &crate::dispatcher::LogEvent, with_content: bool) -> L
         backend: ev.backend.clone(),
         info: ev.info.clone(),
         has_content: ev.content.as_deref().is_some_and(|c| !c.is_empty()),
+        redacted: ev.redacted,
         rid: ev.rid,
         session: ev.session.clone(),
         content: if with_content {
@@ -910,6 +915,8 @@ struct NewKey {
     key: Option<String>,
     #[serde(default)]
     label: String,
+    #[serde(default)]
+    redact_log: bool,
 }
 
 async fn add_key(
@@ -920,7 +927,7 @@ async fn add_key(
     let key = state
         .clients
         .lock_or_recover()
-        .add_key(&name, body.key.as_deref(), &body.label)?;
+        .add_key(&name, body.key.as_deref(), &body.label, body.redact_log)?;
     // The key itself is never logged.
     info!("web: key {} added to client '{}'", key.id, name);
     Ok(Json(key))
@@ -929,33 +936,30 @@ async fn add_key(
 #[derive(Deserialize)]
 struct KeyPatch {
     #[serde(default)]
-    client: Option<String>,
-    #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
+    redact_log: Option<bool>,
 }
 
-/// `PATCH /keys/{id}` — move a key to another client, rename its label, or
-/// both; at least one field must be present.
+/// `PATCH /keys/{id}` — rename its label and/or switch its body-text capture,
+/// or both; at least one field must be present. A key never changes owner: that
+/// is a delete plus a new key.
 async fn patch_key(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<KeyPatch>,
 ) -> ApiResult<serde_json::Value> {
-    if body.client.is_none() && body.label.is_none() {
+    if body.label.is_none() && body.redact_log.is_none() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "nothing to change: pass 'client' and/or 'label'",
+            "nothing to change: pass 'label' and/or 'redact_log'",
         ));
     }
-    let mut store = state.clients.lock_or_recover();
-    if let Some(client) = &body.client {
-        store.move_key(&id, client)?;
-    }
-    if let Some(label) = &body.label {
-        store.set_key_label(&id, label)?;
-    }
-    drop(store);
-    info!("web: key {id} updated (client move and/or label rename)");
+    state
+        .clients
+        .lock_or_recover()
+        .update_key(&id, body.label.as_deref(), body.redact_log)?;
+    info!("web: key {id} updated (label and/or capture switch)");
     ok()
 }
 
@@ -1141,6 +1145,7 @@ async fn change_password(
         content: None,
         rid: None,
         session: None,
+        redacted: false,
     });
     Ok(Json(json!({ "changed_at_ms": changed_at_ms })))
 }
@@ -1528,6 +1533,30 @@ mod tests {
             .flat_map(|cl| cl.keys.iter().map(|k| k.key.label.clone()))
             .collect();
         assert!(labels.contains(&"work laptop".to_string()));
+        // The capture switch rides the same PATCH route: off for this key means
+        // its requests log entries without body text.
+        let gkey = generated["key"].as_str().unwrap();
+        assert!(!state.clients.lock_or_recover().resolve(gkey).unwrap().redact_log);
+        let res = c
+            .patch(format!("{base}/ui/api/keys/{kid}"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+            .json(&json!({ "redact_log": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(state.clients.lock_or_recover().resolve(gkey).unwrap().redact_log);
+        // A key no longer changes owner: that is a delete plus a new key.
+        let res = c
+            .patch(format!("{base}/ui/api/keys/{kid}"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+            .json(&json!({ "client": "bob" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let res = c
             .patch(format!("{base}/ui/api/keys/{kid}"))
             .basic_auth("admin", Some("pw"))
@@ -1546,6 +1575,41 @@ mod tests {
                 .client,
             "alice"
         );
+
+        // The capture switch is a client setting the UI can flip.
+        let res = c
+            .patch(format!("{base}/ui/api/clients/alice"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+            .json(&json!({ "redact_log": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut st = state.clients.lock_or_recover();
+        assert!(st.list().iter().any(|cl| cl.name == "alice" && cl.redact_log));
+        assert_eq!(
+            st.resolve("my-own-key-1").unwrap().redact_log,
+            true,
+            "a client with capture off covers its keys"
+        );
+        drop(st);
+        // And back off again.
+        let res = c
+            .patch(format!("{base}/ui/api/clients/alice"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+            .json(&json!({ "redact_log": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!state
+            .clients
+            .lock_or_recover()
+            .resolve("my-own-key-1")
+            .unwrap()
+            .redact_log);
 
         // Revoke the generated key.
         let id = generated["id"].as_str().unwrap();
@@ -1718,6 +1782,7 @@ mod tests {
             content: Some(Arc::new("body".into())),
             rid: None,
             session: None,
+            redacted: false,
         };
         // Overflow the ring so the oldest events are evicted.
         for i in 0..350 {
@@ -1766,6 +1831,7 @@ mod tests {
             content: Some(Arc::new("{\"messages\":[]}".into())),
             rid: Some(7),
             session: Some("a3f19c".into()),
+            redacted: false,
         });
         state.log_event(LogEvent {
             at: std::time::SystemTime::now(),
@@ -1777,6 +1843,7 @@ mod tests {
             content: None,
             rid: None,
             session: None,
+            redacted: false,
         });
         let base = serve(state).await;
         let list: Vec<serde_json::Value> = http()
@@ -1856,6 +1923,7 @@ mod tests {
             disabled: false,
             token: None,
             kind: None,
+            redact_log: false,
         }];
         let base = serve(state.clone()).await;
         let c = http();

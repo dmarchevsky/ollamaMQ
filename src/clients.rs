@@ -36,6 +36,10 @@ pub struct ApiKey {
     pub key: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
+    /// Keep this key's log entries but store no request/response text for the
+    /// requests it sends (see [`Client::redact_log`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redact_log: bool,
     #[serde(default, skip_serializing_if = "is_zero_ms")]
     pub created_at_ms: u64,
 }
@@ -60,6 +64,7 @@ where
                 id: String::new(),
                 key,
                 label: String::new(),
+                redact_log: false,
                 created_at_ms: 0,
             },
             KeySpec::Full(k) => k,
@@ -85,6 +90,11 @@ pub struct Client {
     pub vip: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub boost: bool,
+    /// Log entries stay, but no request/response body text is stored for
+    /// requests this client sends (and none for its keys' requests either — a
+    /// key can only turn capture off, never re-enable it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redact_log: bool,
     #[serde(default, skip_serializing_if = "is_zero_ms")]
     pub created_at_ms: u64,
     #[serde(default, deserialize_with = "de_keys", skip_serializing_if = "Vec::is_empty")]
@@ -113,6 +123,7 @@ pub struct ClientView {
     pub disabled: bool,
     pub vip: bool,
     pub boost: bool,
+    pub redact_log: bool,
     pub created_at_ms: u64,
     pub keys: Vec<KeyView>,
 }
@@ -122,6 +133,9 @@ pub struct ClientView {
 pub struct Resolved {
     pub client: String,
     pub disabled: bool,
+    /// True when body-text capture is off for this request: the client's flag
+    /// or the key's own flag (`ApiKey::redact_log`).
+    pub redact_log: bool,
     /// The key that matched (id and label; for metrics, never the secret).
     pub key_id: String,
     pub key_label: String,
@@ -152,6 +166,7 @@ pub struct ClientPatch {
     pub name: Option<String>,
     pub note: Option<String>,
     pub disabled: Option<bool>,
+    pub redact_log: Option<bool>,
 }
 
 pub struct ClientStore {
@@ -257,15 +272,22 @@ impl ClientStore {
         for c in &self.clients {
             for k in &c.keys {
                 if constant_time_eq(&k.key, key) && found.is_none() {
-                    found = Some((k.id.clone(), k.label.clone(), c.name.clone(), c.disabled));
+                    found = Some((
+                        k.id.clone(),
+                        k.label.clone(),
+                        c.name.clone(),
+                        c.disabled,
+                        c.redact_log || k.redact_log,
+                    ));
                 }
             }
         }
-        let (key_id, key_label, client, disabled) = found?;
+        let (key_id, key_label, client, disabled, redact_log) = found?;
         self.last_used.insert(key_id.clone(), now_ms());
         Some(Resolved {
             client,
             disabled,
+            redact_log,
             key_id,
             key_label,
         })
@@ -280,6 +302,7 @@ impl ClientStore {
                 disabled: c.disabled,
                 vip: c.vip,
                 boost: c.boost,
+                redact_log: c.redact_log,
                 created_at_ms: c.created_at_ms,
                 keys: c
                     .keys
@@ -365,6 +388,7 @@ impl ClientStore {
             name: name.to_string(),
             note: clip(note),
             disabled: false,
+            redact_log: false,
             vip: false,
             boost: false,
             created_at_ms: now_ms(),
@@ -393,6 +417,9 @@ impl ClientStore {
         if let Some(disabled) = patch.disabled {
             next[idx].disabled = disabled;
         }
+        if let Some(redact_log) = patch.redact_log {
+            next[idx].redact_log = redact_log;
+        }
         self.commit(next)
     }
 
@@ -410,6 +437,7 @@ impl ClientStore {
         client: &str,
         key: Option<&str>,
         label: &str,
+        redact_log: bool,
     ) -> Result<ApiKey, StoreError> {
         let key = match key.map(str::trim) {
             Some(k) => {
@@ -434,6 +462,7 @@ impl ClientStore {
             id: format!("k{}", random_hex(6)),
             key,
             label: clip(label),
+            redact_log,
             created_at_ms: now_ms(),
         };
         next[idx].keys.push(new_key.clone());
@@ -449,24 +478,26 @@ impl ClientStore {
         Ok(())
     }
 
-    /// Move a key to another client; it keeps its id, value and label.
-    pub fn move_key(&mut self, id: &str, to_client: &str) -> Result<(), StoreError> {
-        let mut next = self.clients.clone();
-        let to = Self::client_idx(&next, to_client)?;
-        let key = Self::take_key(&mut next, id)?;
-        next[to].keys.push(key);
-        self.commit(next)
-    }
-
-    /// Rename a key's label (what the Overview's label mode shows); an empty
-    /// string clears it.
-    pub fn set_key_label(&mut self, id: &str, label: &str) -> Result<(), StoreError> {
+    /// Change a key's label and/or its capture switch; `None` leaves that field
+    /// as it is. The key string and its owner never change — a key moves by
+    /// deleting it and handing out a new one.
+    pub fn update_key(
+        &mut self,
+        id: &str,
+        label: Option<&str>,
+        redact_log: Option<bool>,
+    ) -> Result<(), StoreError> {
         let mut next = self.clients.clone();
         let mut hit = false;
         for c in &mut next {
             for k in &mut c.keys {
                 if k.id == id {
-                    k.label = clip(label);
+                    if let Some(label) = label {
+                        k.label = clip(label);
+                    }
+                    if let Some(redact_log) = redact_log {
+                        k.redact_log = redact_log;
+                    }
                     hit = true;
                 }
             }
@@ -574,7 +605,7 @@ mod tests {
     fn store_with(name: &str, key: &str) -> ClientStore {
         let mut s = ClientStore::in_memory();
         s.create_client(name, "").unwrap();
-        s.add_key(name, Some(key), "").unwrap();
+        s.add_key(name, Some(key), "", false).unwrap();
         s
     }
 
@@ -620,15 +651,15 @@ mod tests {
         ));
         s.create_client("ok.name_1-2", "").unwrap();
         assert!(matches!(
-            s.add_key("ok.name_1-2", Some("short"), ""),
+            s.add_key("ok.name_1-2", Some("short"), "", false),
             Err(StoreError::Invalid(_))
         ));
         assert!(matches!(
-            s.add_key("ok.name_1-2", Some("has a space"), ""),
+            s.add_key("ok.name_1-2", Some("has a space"), "", false),
             Err(StoreError::Invalid(_))
         ));
         assert!(matches!(
-            s.add_key("missing", Some("long-enough-key"), ""),
+            s.add_key("missing", Some("long-enough-key"), "", false),
             Err(StoreError::NotFound(_))
         ));
     }
@@ -642,7 +673,7 @@ mod tests {
         ));
         s.create_client("bob", "").unwrap();
         assert!(matches!(
-            s.add_key("bob", Some("shared-key-1"), ""),
+            s.add_key("bob", Some("shared-key-1"), "", false),
             Err(StoreError::Conflict(_))
         ));
         assert!(matches!(
@@ -661,8 +692,8 @@ mod tests {
     fn generated_keys_are_valid_and_distinct() {
         let mut s = ClientStore::in_memory();
         s.create_client("c", "").unwrap();
-        let a = s.add_key("c", None, "a").unwrap();
-        let b = s.add_key("c", None, "b").unwrap();
+        let a = s.add_key("c", None, "a", false).unwrap();
+        let b = s.add_key("c", None, "b", false).unwrap();
         assert!(a.key.starts_with("omq-") && a.key.len() == 36);
         assert_ne!(a.key, b.key);
         assert_ne!(a.id, b.id);
@@ -670,12 +701,40 @@ mod tests {
     }
 
     #[test]
-    fn move_and_delete_key() {
+    fn capture_switch_or_between_client_and_key() {
+        let mut s = store_with("alice", "alice-key-123");
+        let kid = s.list()[0].keys[0].key.id.clone();
+        assert!(!s.resolve("alice-key-123").unwrap().redact_log);
+
+        // A key can switch its own capture off.
+        s.update_key(&kid, None, Some(true)).unwrap();
+        assert!(s.resolve("alice-key-123").unwrap().redact_log);
+
+        // The client switches it for every key it owns, and un-setting the key
+        // does not re-enable it against the client.
+        s.update_client(
+            "alice",
+            ClientPatch { redact_log: Some(true), ..Default::default() },
+        )
+        .unwrap();
+        s.update_key(&kid, None, Some(false)).unwrap();
+        assert!(s.resolve("alice-key-123").unwrap().redact_log);
+
+        // Only the client back off: capture is on again.
+        s.update_client(
+            "alice",
+            ClientPatch { redact_log: Some(false), ..Default::default() },
+        )
+        .unwrap();
+        assert!(!s.resolve("alice-key-123").unwrap().redact_log);
+        assert!(!serde_yaml::to_string(&s.list()[0].keys[0].key).unwrap().contains("redact_log"));
+    }
+
+    #[test]
+    fn delete_key_and_keep_its_owner() {
         let mut s = store_with("alice", "moving-key-1");
         s.create_client("bob", "").unwrap();
         let id = s.list()[0].keys[0].key.id.clone();
-        s.move_key(&id, "bob").unwrap();
-        assert_eq!(s.resolve("moving-key-1").unwrap().client, "bob");
         s.delete_key(&id).unwrap();
         assert_eq!(s.resolve("moving-key-1"), None);
         assert!(matches!(s.delete_key(&id), Err(StoreError::NotFound(_))));
@@ -725,7 +784,7 @@ mod tests {
         let mut s = ClientStore::load(&path).unwrap();
         assert_eq!(s.len(), 0);
         s.create_client("alice", "note").unwrap();
-        s.add_key("alice", Some("persisted-key"), "laptop").unwrap();
+        s.add_key("alice", Some("persisted-key"), "laptop", false).unwrap();
 
         let mut again = ClientStore::load(&path).unwrap();
         assert_eq!(again.resolve("persisted-key").unwrap().client, "alice");
@@ -759,7 +818,7 @@ mod tests {
         assert_eq!(s.resolve("omq-labeled-key").unwrap().client, "dm");
         assert!(s.list()[0].keys.iter().all(|k| !k.key.id.is_empty()));
         // A change persists the store with full detail; the file still loads.
-        s.add_key("idle", Some("idle-key-1234"), "").unwrap();
+        s.add_key("idle", Some("idle-key-1234"), "", false).unwrap();
         assert!(ClientStore::load(&path).is_ok());
         fs::remove_dir_all(&dir).unwrap();
     }
