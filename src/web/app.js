@@ -1447,8 +1447,8 @@ function clientRow(r, st) {
       : (u?.ip ? 'last IP ' + esc(u.ip) + ' · identified by X-User-ID only, so any request can use this id'
         : 'identified by X-User-ID only, so any request can use this id');
   const prio = `
-    <button class="btn sm ${st.vip === r.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Always served first (TUI: p)">★ VIP</button>
-    <button class="btn sm ${st.boost === r.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Extra share of turns (TUI: b)">⚡ Boost</button>`;
+    <button class="btn sm iconly ${st.vip === r.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Always served first (TUI: p)">★<span class="w"> VIP</span></button>
+    <button class="btn sm iconly ${st.boost === r.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Extra share of turns (TUI: b)">⚡<span class="w"> Boost</span></button>`;
   const ipBtn = !u?.ip ? '' : ipBlocked
     ? `<button class="btn sm" data-action="unblock" data-kind="ip" data-value="${esc(u.ip)}">Unblock IP</button>`
     : `<button class="btn sm danger" data-action="user" data-op="block-ip" data-id="${id}" title="Block ${esc(u.ip)} (TUI: X)">Block IP</button>`;
@@ -1484,21 +1484,19 @@ const REDACT_BADGE = '<span class="badge warn" title="No request/response text i
 function keyRows(r) {
   if (!r.reg || !S.openClients.has(r.id)) return '';
   const ks = r.reg.keys;
-  if (!ks.length) return `<tr class="key-row last"><td colspan="6" class="keycell">
+  if (!ks.length) return `<tr class="key-row"><td colspan="6" class="keycell">
     No keys — this client cannot authenticate yet.
     <button class="btn sm" data-action="add-key" data-name="${esc(r.id)}">+ Key</button></td></tr>`;
-  return ks.map((k, i) => {
+  return ks.map(k => {
     const shown = S.revealed.has(k.id);
     const kid = esc(k.id);
     const word = k.label ? esc(k.label) : '<span class="dim">no label</span>';
-    return `<tr class="key-row ${i === ks.length - 1 ? 'last' : ''}">
-      <td class="keycell"><span class="keyval">${esc(shown ? k.key : maskKey(k.key))}</span>
+    return `<tr class="key-row">
+      <td class="keycell" colspan="5"><span class="keyval">${esc(shown ? k.key : maskKey(k.key))}</span>
         <button class="iconbtn" data-action="reveal" data-id="${kid}" title="${shown ? 'Hide' : 'Show'} the key" aria-label="${shown ? 'Hide' : 'Show'} the key">${shown ? '◉' : '👁'}</button>
         <button class="iconbtn" data-action="copy-key" data-id="${kid}" title="Copy the key" aria-label="Copy the key">⧉</button>
         <b>${word}</b>${k.redact_log ? ' ' + REDACT_BADGE : ''}
-        <div class="client-sub trunc">created ${fmtDate(k.created_at_ms)}</div></td>
-      <td class="num"></td><td class="num"></td><td class="num"></td>
-      <td class="dim nowrap">${fmtAgo(k.last_used_ms)}</td>
+        <div class="client-sub">created ${fmtDate(k.created_at_ms)} · last used ${fmtAgo(k.last_used_ms)}</div></td>
       <td class="actions"><span class="btn-group">
         <button class="btn sm" data-action="edit-key" data-id="${kid}">Edit</button>
         <button class="btn sm danger" data-action="revoke-key" data-id="${kid}">Delete</button>
