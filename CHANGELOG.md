@@ -3,7 +3,23 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
-## Unreleased
+## v0.15.0 — 2026-10-22
+
+### Added
+
+- **dmesg-style stamps in the log viewer's Jump outline.** The outline now carries
+  a time column like `dmesg -H`: the request's section opens with its absolute
+  time, and anything within a minute of it shows as a short offset (`+0s`,
+  `+18s`) — so a reply that took 18 seconds reads at a glance. A section or
+  message whose event is missing (still awaiting a response) carries no stamp.
+
+### Fixed
+
+- **The log viewer's scrollbars make sense.** A modal dialog no longer leaves
+  the page behind scrollable — the scrollbar at the screen edge was the Logs
+  list's, not the viewer's, and dragging it scrolled content nobody could see.
+  And the viewer's own scrollbar, thinned to near-invisibility, is visible again
+  where the content actually scrolls.
 
 ### Changed
 

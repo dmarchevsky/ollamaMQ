@@ -279,6 +279,9 @@ dialog {
   background: var(--surface); color: var(--text); box-shadow: 0 20px 50px rgba(0,0,0,.25);
 }
 dialog::backdrop { background: rgba(10, 14, 22, .45); }
+/* A modal fills the viewport, so the page behind it must not scroll or show
+   its scrollbar — that bar belonged to the log entries list and misled users. */
+html:has(dialog[open]) { overflow: hidden; }
 dialog label:not(.check) { display: block; font-size: 12.5px; font-weight: 600; color: var(--muted); margin-bottom: 12px; }
 dialog label:not(.check) input, dialog label:not(.check) select { display: block; width: 100%; margin-top: 5px; font-weight: 400; }
 dialog .check { margin-bottom: 12px; }
@@ -865,8 +868,7 @@ dialog.logview[open] { display: flex; }
 .lv-title b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lv-title .lv-sub { display: block; color: var(--muted); font-size: 12px; font-family: var(--mono);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.lv-body { flex: 1; overflow: auto; padding: 18px 22px; min-height: 0; scrollbar-gutter: stable;
-  scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.lv-body { flex: 1; overflow: auto; padding: 18px 22px; min-height: 0; scrollbar-gutter: stable; }
 .lv-shell { position: relative; flex: 1; display: flex; min-height: 0; }
 .lv-rail { position: absolute; top: 0; right: 0; bottom: 0; width: 292px; background: var(--surface);
   border-left: 1px solid var(--border); overflow: auto; padding: 14px 10px; }
@@ -877,6 +879,8 @@ dialog.logview[open] { display: flex; }
 .lv-item { display: flex; gap: 8px; align-items: baseline; width: 100%; text-align: left;
   border: 0; background: none; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
 .lv-item:hover, .lv-item.on { background: var(--accent-soft); }
+.lv-item .when { flex: none; width: 44px; text-align: right; font: 600 10px var(--mono); color: var(--faint); }
+.lv-item.sec .when { color: var(--muted); font-weight: 700; }
 .lv-item .tag { flex: none; width: 56px; font: 700 9.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
 .lv-item.user .tag { color: var(--accent); } .lv-item.asst .tag { color: var(--ok); }
 .lv-item.tool .tag { color: var(--warn); } .lv-item.sys .tag { color: var(--vip); }
