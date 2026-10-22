@@ -1447,8 +1447,8 @@ function clientRow(r, st) {
       : (u?.ip ? 'last IP ' + esc(u.ip) + ' · identified by X-User-ID only, so any request can use this id'
         : 'identified by X-User-ID only, so any request can use this id');
   const prio = `
-    <button class="btn sm iconly ${st.vip === r.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Always served first (TUI: p)">★<span class="w"> VIP</span></button>
-    <button class="btn sm iconly ${st.boost === r.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Extra share of turns (TUI: b)">⚡<span class="w"> Boost</span></button>`;
+    <button class="btn sm iconly ${st.vip === r.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Always served first (TUI: p)" aria-label="VIP">★<span class="w"> VIP</span></button>
+    <button class="btn sm iconly ${st.boost === r.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Extra share of turns (TUI: b)" aria-label="Boost">⚡<span class="w"> Boost</span></button>`;
   const ipBtn = !u?.ip ? '' : ipBlocked
     ? `<button class="btn sm" data-action="unblock" data-kind="ip" data-value="${esc(u.ip)}">Unblock IP</button>`
     : `<button class="btn sm danger" data-action="user" data-op="block-ip" data-id="${id}" title="Block ${esc(u.ip)} (TUI: X)">Block IP</button>`;
