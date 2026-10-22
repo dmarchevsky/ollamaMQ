@@ -19,7 +19,8 @@ const S = {
   expanded: new Set(),       // backend URLs with their model list open
   showAll: new Set(),        // backend URLs showing every model
   revealed: new Set(),       // key ids shown unmasked
-  selectedClient: null,
+  openClients: new Set(),    // registered clients whose key rows are shown
+  demoClientsSeeded: false,  // demo mode opens them all once, for static renders
   clientFilter: 'all',       // all | registered | unregistered
   modelPolicy: null,         // { mode, rules } from api/models
   modelShow: 'all',          // all | served | hidden
@@ -28,7 +29,6 @@ const S = {
   filters: storedFilters(),  // the filter modal's selection (time, identity, lists)
   reqShow: storedReqShow(),  // List under the graph: active | all
   reqView: storedReqView(),  // List under the graph: list | details
-  keyRename: null,           // key id whose Label cell is being edited
   collapsed: storedCollapsed(),// conversation headers the operator folded shut
   pins: {},                // session tag -> operator-pinned priority level
   colorOf: new Map(),        // client id -> colour slot 1..4
@@ -1302,10 +1302,13 @@ function renderBackends(st) {
     const c = cfg.get(b.url);
     const open = S.expanded.has(b.url);
     const pct = b.max ? Math.min(100, (b.active / b.max) * 100) : 0;
+    const noText = c?.redact_log
+        ? ' ' + redactBadge('No response text is stored for this backend — log entries keep status, size and timing')
+        : '';
     const loaded = new Set(b.models_loaded);
     const hiddenHere = new Set(b.models_hidden);
     let html = `<tr class="bk-row ${open ? 'open' : ''}" data-action="toggle-backend" data-url="${esc(b.url)}">
-      <td><span class="caret">${open ? '▾' : '▸'}</span><span class="sdot ${b.online ? 'on' : 'off'}"></span>${bkCell(b.url, true)}${b.disabled ? ' <span class="badge">disabled</span>' : ''}${c?.removed ? ' <span class="badge">removed — gone after a restart</span>' : ''}</td>
+      <td><span class="caret">${open ? '▾' : '▸'}</span><span class="sdot ${b.online ? 'on' : 'off'}"></span>${bkCell(b.url, true)}${b.disabled ? ' <span class="badge">disabled</span>' : ''}${c?.removed ? ' <span class="badge">removed — gone after a restart</span>' : ''}${noText}</td>
       <td>${typeBadge(b.api_type)}</td>
       <td class="num" title="${b.max_detected ? `${b.max} slots reported by the backend` : `${b.max} = settings.max_concurrent_per_backend`}">${b.active}/${b.max}<span class="meter"><i style="width:${pct}%"></i></span></td>
       <td class="num">${fmtNum(b.processed)}</td>
@@ -1408,44 +1411,50 @@ function rowFlags(r) {
 }
 
 function renderClients(st) {
-  // The 1 s poll must not tear down an open inline label editor.
-  if (S.keyRename) return;
   const all = identities();
   const rows = all.filter(r => S.clientFilter === 'all'
     || (S.clientFilter === 'registered') === !!r.reg);
-  if (!rows.some(r => r.id === S.selectedClient)) S.selectedClient = rows[0]?.id ?? null;
-
+  // Demo mode is screenshotted without a click: show both levels from the start.
+  if (DEMO && !S.demoClientsSeeded) {
+    S.demoClientsSeeded = true;
+    for (const r of rows) if (r.reg) S.openClients.add(r.id);
+  }
+  const anyOpen = rows.some(r => S.openClients.has(r.id));
+  $('#client-expand').textContent = anyOpen ? 'Collapse all' : 'Expand all';
   setHTML($('#client-list'), rows.length ? `<table>
-    <tr><th>Client</th><th class="num">Queue</th><th class="num">Done</th><th class="num">Drop</th></tr>
-    ${rows.map(r => `<tr class="clickable ${r.id === S.selectedClient ? 'selected' : ''}" data-action="select-client" data-name="${esc(r.id)}">
-      <td><div class="client-name"><span class="mono">${esc(r.id)}</span>${idBadges(r.id, rowFlags(r), st, true)}</div>
-          <div class="client-sub trunc">${esc(r.reg ? (r.reg.note || `${r.reg.keys.length} key${r.reg.keys.length === 1 ? '' : 's'}`) : (r.u?.ip ? `last IP ${r.u.ip}` : 'unregistered'))}</div></td>
-      <td class="num">${queueShort(r.u)}</td>
-      <td class="num">${fmtNum(r.u?.done ?? 0)}</td>
-      <td class="num">${fmtNum(r.u?.dropped ?? 0)}</td></tr>`).join('')}
+    <tr><th>Client / key</th><th class="num">Queue</th><th class="num">Done</th><th class="num">Drop</th><th>Last used</th><th class="num"></th></tr>
+    ${rows.map(r => clientRow(r, st) + keyRows(r)).join('')}
     </table>`
     : `<div class="empty">${S.clientFilter === 'unregistered'
       ? 'No unregistered ids are active.'
       : 'No clients yet.<br>Create one to hand out API keys.'}</div>`);
-
-  const r = rows.find(x => x.id === S.selectedClient);
-  setHTML($('#client-detail'), r ? clientDetail(r, st) : '<div class="empty">Select a client</div>');
 }
 
-function clientDetail(r, st) {
+/** Level 1: one row per id, carrying what the old detail panel offered. */
+function clientRow(r, st) {
   const c = r.reg, u = r.u, id = esc(r.id);
   const ipBlocked = !!u?.ip && st.blocked.ips.includes(u.ip);
-  const status = c
-    ? (c.disabled ? '<span class="badge bad">disabled</span>' : '<span class="badge ok">active</span>')
-    : (u?.blocked ? '<span class="badge bad">blocked</span>' : '<span class="badge">unregistered</span>');
+  const open = S.openClients.has(r.id);
+  // Windowed waste lives in the overview payload (the Overview poll caches it);
+  // without a cached overview there is nothing to say about it.
+  const w = (S.overview?.clients || []).find(x => x.id === r.id);
+  const parts = c
+    ? [c.note, `${c.keys.length} key${c.keys.length === 1 ? '' : 's'}`,
+      u?.ip ? `last IP ${esc(u.ip)}` : '',
+      w?.waste_pct != null ? `${w.waste_pct}% prefill lost to eviction` : '']
+    : r.id.startsWith('unverified:')
+      ? [`a request without a key claimed this registered name, so it queues apart from ${esc(r.id.slice('unverified:'.length))}`]
+      : [u?.ip ? `last IP ${esc(u.ip)}` : '', 'identified by X-User-ID only, so any request can use this id'];
+  const sub = parts.filter(Boolean).join(' · ');
   const prio = `
-    <button class="btn sm ${st.vip === r.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Always served first (TUI: p)">★ VIP</button>
-    <button class="btn sm ${st.boost === r.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Extra share of turns (TUI: b)">⚡ Boost</button>`;
+    <button class="btn sm iconly ${st.vip === r.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Always served first (TUI: p)" aria-label="VIP">★<span class="w"> VIP</span></button>
+    <button class="btn sm iconly ${st.boost === r.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Extra share of turns (TUI: b)" aria-label="Boost">⚡<span class="w"> Boost</span></button>`;
   const ipBtn = !u?.ip ? '' : ipBlocked
     ? `<button class="btn sm" data-action="unblock" data-kind="ip" data-value="${esc(u.ip)}">Unblock IP</button>`
     : `<button class="btn sm danger" data-action="user" data-op="block-ip" data-id="${id}" title="Block ${esc(u.ip)} (TUI: X)">Block IP</button>`;
   const actions = c
     ? `${prio}
+       <button class="btn sm" data-action="add-key" data-name="${id}">+ Key</button>
        <button class="btn sm" data-action="edit-client" data-name="${id}">Edit</button>
        <button class="btn sm ${c.disabled ? '' : 'danger'}" data-action="toggle-client" data-name="${id}">${c.disabled ? 'Enable' : 'Disable'}</button>
        ${ipBtn}
@@ -1456,60 +1465,44 @@ function clientDetail(r, st) {
          ? `<button class="btn sm" data-action="user" data-op="unblock" data-id="${id}">Unblock</button>`
          : `<button class="btn sm danger" data-action="user" data-op="block" data-id="${id}" title="Block this id (TUI: x)">Block</button>`}
        ${ipBtn}`;
-  // Windowed waste lives in the overview payload (the Overview poll caches it);
-  // without a cached overview there is nothing to show, so the tile is absent.
-  const w = (S.overview?.clients || []).find(x => x.id === r.id);
-  const waste = w && w.waste_pct != null
-    ? `<div><b${w.waste_pct >= 15 ? ' class="st-bad"' : w.waste_pct >= 5 ? ' class="st-warn"' : ''}>${w.waste_pct}%</b>prefill lost to cache eviction (${fmtDur(w.waste_secs)})</div>`
-    : '';
-  const meta = `
-    <div><b>${u ? u.queued + u.processing : 0}</b>in queue</div>
-    <div><b>${fmtNum(u?.done ?? 0)}</b>requests done</div>
-    <div><b>${fmtNum(u?.dropped ?? 0)}</b>dropped</div>
-    <div><b class="mono">${esc(u?.ip ?? '—')}</b>last IP</div>${waste}
-    ${c ? `<div><b>${fmtAgo(lastUsed(c))}</b>last key use</div><div><b>${fmtDate(c.created_at_ms)}</b>created</div>` : ''}`;
-  let body;
-  if (c) {
-    body = `
-    <div class="section-h"><h2>API keys</h2><button class="btn sm primary" data-action="add-key" data-name="${id}">+ Add key</button></div>
-    ${c.keys.length ? `<div class="tscroll"><table>
-      <tr><th>Key</th><th>Label</th><th>Created</th><th>Last used</th><th class="num"></th></tr>
-      ${c.keys.map(k => {
-        const shown = S.revealed.has(k.id);
-        return `<tr>
-          <td class="keycell"><span class="keyval">${esc(shown ? k.key : maskKey(k.key))}</span>
-            <button class="linkbtn" style="margin-left:6px" data-action="reveal" data-id="${esc(k.id)}">${shown ? 'hide' : 'show'}</button></td>
-          <td>${esc(k.label || '—')}</td>
-          <td class="dim nowrap">${fmtDate(k.created_at_ms)}</td>
-          <td class="dim nowrap">${fmtAgo(k.last_used_ms)}</td>
-          <td class="actions"><span class="btn-group">
-            <button class="btn sm" data-action="copy-key" data-id="${esc(k.id)}">Copy</button>
-            <button class="btn sm" data-action="reassign-key" data-id="${esc(k.id)}" ${S.clients.length < 2 ? 'disabled' : ''}>Reassign</button>
-            <button class="btn sm" data-action="rename-key" data-id="${esc(k.id)}">Rename</button>
-            <button class="btn sm danger" data-action="revoke-key" data-id="${esc(k.id)}">Revoke</button>
-          </span></td></tr>`;
-      }).join('')}</table></div>`
-      : '<div class="empty">No keys — this client cannot authenticate yet.</div>'}
-    <p class="field-hint" style="margin-top:14px !important">Requests send a key as <code>Authorization: Bearer &lt;key&gt;</code> or <code>X-Api-Key: &lt;key&gt;</code>.
-      Only requests with one of these keys can use the name <code>${id}</code>; VIP, boost and disabled are saved with the client.</p>`;
-  } else if (r.id.startsWith('unverified:')) {
-    const claimed = esc(r.id.slice('unverified:'.length));
-    body = `<p class="note">Requests <b>without an API key</b> claimed the registered name <code>${claimed}</code> in <code>X-User-ID</code>.
-      They are queued apart under this id, so they get none of <code>${claimed}</code>'s queue position, priority or stats.
-      If they are legitimate, give that tool one of <code>${claimed}</code>'s keys.</p>`;
-  } else {
-    body = `<p class="note">Identified only by <code>X-User-ID</code> (or the IP the front proxy fills in), so any request can use this id.
-      VIP and boost on it last until restart. <b>Register</b> it to give it API keys and saved settings —
-      after that, only requests with one of its keys queue here.</p>`;
-  }
-  return `
-    <div class="detail-h">
-      <div><h2><span class="mono">${id}</span> ${status}</h2>
-        <div class="dim">${esc(c ? (c.note || 'No note') : 'Unregistered id')}</div></div>
-    </div>
-    <div class="btn-group detail-actions">${actions}</div>
-    <div class="detail-meta">${meta}</div>
-    ${body}`;
+  return `<tr class="clickable ${open ? 'open' : ''}" data-action="toggle-keys" data-name="${id}">
+      <td><span class="caret">${c ? (open ? '▾' : '▸') : ''}</span>
+        <span class="client-name"><span class="mono">${id}</span>${idBadges(r.id, rowFlags(r), st, true)}
+        ${c?.redact_log ? REDACT_BADGE : ''}</span>
+        <div class="client-sub trunc">${sub}</div></td>
+      <td class="num">${queueShort(u)}</td>
+      <td class="num">${fmtNum(u?.done ?? 0)}</td>
+      <td class="num">${fmtNum(u?.dropped ?? 0)}</td>
+      <td class="dim nowrap">${c ? fmtAgo(lastUsed(c)) : '<span class="dim">—</span>'}</td>
+      <td class="actions"><span class="btn-group">${actions}</span></td></tr>`;
+}
+
+/** Says why a record has no body text: switched off, not missing. */
+const redactBadge = title => `<span class="badge warn" title="${title}">no text</span>`;
+const REDACT_BADGE = redactBadge('No request/response text is stored — the log entry keeps user, model, backend, status, size, session and timing');
+
+/** Level 2: the client's keys, while its own row is open. */
+function keyRows(r) {
+  if (!r.reg || !S.openClients.has(r.id)) return '';
+  const ks = r.reg.keys;
+  if (!ks.length) return `<tr class="key-row"><td colspan="6" class="keycell">
+    No keys — this client cannot authenticate yet.
+    <button class="btn sm" data-action="add-key" data-name="${esc(r.id)}">+ Key</button></td></tr>`;
+  return ks.map(k => {
+    const shown = S.revealed.has(k.id);
+    const kid = esc(k.id);
+    const word = k.label ? esc(k.label) : '<span class="dim">no label</span>';
+    return `<tr class="key-row">
+      <td class="keycell" colspan="5"><span class="keyval">${esc(shown ? k.key : maskKey(k.key))}</span>
+        <button class="iconbtn" data-action="reveal" data-id="${kid}" title="${shown ? 'Hide' : 'Show'} the key" aria-label="${shown ? 'Hide' : 'Show'} the key">${shown ? '◉' : '👁'}</button>
+        <button class="iconbtn" data-action="copy-key" data-id="${kid}" title="Copy the key" aria-label="Copy the key">⧉</button>
+        <b>${word}</b>${k.redact_log ? ' ' + REDACT_BADGE : ''}
+        <div class="client-sub">created ${fmtDate(k.created_at_ms)} · last used ${fmtAgo(k.last_used_ms)}</div></td>
+      <td class="actions"><span class="btn-group">
+        <button class="btn sm" data-action="edit-key" data-id="${kid}">Edit</button>
+        <button class="btn sm danger" data-action="revoke-key" data-id="${kid}">Delete</button>
+      </span></td></tr>`;
+  }).join('');
 }
 
 function findKey(id) {
@@ -1712,6 +1705,9 @@ function roundSegs(r) {
     segs.push(`<span class="rl out${bad ? ' err' : ''}"><span class="ar">←</span>${esc(outSeg(r.out.info))}</span>`);
   }
   if (r.in && !r.out) segs.push('<span class="rl out wait"><span class="ar">←</span>awaiting response</span>');
+  // One chip for the round: the text was switched off, not lost.
+  if (r.in?.redacted || r.out?.redacted || r.solo?.redacted)
+    segs.push(REDACT_BADGE);
   return segs.join(' ');
 }
 
@@ -1854,7 +1850,9 @@ const lvSec = (cls, title, info, html) =>
 
 async function lvPart(ev, kind) {
   const text = await evContent(ev);
-  if (text == null) return `<div class="empty">No content captured${ev.has_content ? ' (or it left the log ring)' : ''}.</div>`;
+  if (text == null) return ev.redacted
+    ? '<div class="lv-note">Text capture is switched off for this client, key or backend. The entry keeps the size, status, session and timing; no body text was ever stored.</div>'
+    : `<div class="empty">No content captured${ev.has_content ? ' (or it left the log ring)' : ''}.</div>`;
   if (S.lv.fmt === 'raw')
     return (text.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(text);
   if (kind === 'req' && S.lv.scope === 'new' && lvScopeUsable()) return lvNewOnly(text);
@@ -2362,10 +2360,12 @@ async function backendDialog(existing) {
     form.url.value = existing.url;
     form.name.value = existing.name || '';
     form.kind.value = existing.kind === 'systemone' ? 'systemone' : '';
+    form.redact_log.checked = !!existing.redact_log;
   }
   const fd = await ask(dlg);
   if (!fd) return;
   const body = { url: fd.get('url').trim(), name: fd.get('name').trim() || null, kind: fd.get('kind') || null };
+  body.redact_log = !!fd.get('redact_log');
   const token = fd.get('token');
   if (token) body.token = token;
   else if (fd.get('clear_token')) body.token = null;
@@ -2453,22 +2453,44 @@ async function clientDialog(existing) {
     form.name.value = existing.name;
     form.note.value = existing.note || '';
     form.disabled.checked = existing.disabled;
+    form.redact_log.checked = !!existing.redact_log;
   }
   const fd = await ask(dlg);
   if (!fd) return;
   const body = { name: fd.get('name').trim(), note: fd.get('note').trim() };
   if (existing) {
     body.disabled = !!fd.get('disabled');
+    body.redact_log = !!fd.get('redact_log');
     const r = await act('PATCH', `clients/${encodeURIComponent(existing.name)}`, body, 'Client saved');
-    if (r) S.selectedClient = body.name;
+    if (r) S.openClients.add(body.name);
   } else {
     const r = await act('POST', 'clients', body, `Client ${body.name} created`);
     if (r) {
-      S.selectedClient = body.name;
+      S.openClients.add(body.name);
       await poll();
     }
   }
 }
+
+/** Edit one key: its label and its capture switch. The key string never moves. */
+async function keyEditDialog(id) {
+  const f = findKey(id);
+  if (!f) return;
+  const dlg = $('#dlg-key-edit');
+  const form = $('form', dlg);
+  form.reset();
+  $('[data-title]', dlg).textContent = `Edit key · ${f.client.name}`;
+  form.key.value = f.key.key;
+  form.label.value = f.key.label || '';
+  form.redact_log.checked = !!f.key.redact_log;
+  const fd = await ask(dlg);
+  if (!fd) return;
+  await act('PATCH', `keys/${encodeURIComponent(id)}`,
+    { label: fd.get('label').trim(), redact_log: !!fd.get('redact_log') }, 'Key saved');
+}
+
+/** Copy whatever the key dialog is showing (the full string is in the field). */
+const copyShownKey = () => copyText($('#dlg-key-edit [name="key"]').value);
 
 async function addKeyDialog(clientName) {
   const dlg = $('#dlg-key');
@@ -2485,11 +2507,11 @@ async function addKeyDialog(clientName) {
   const fd = await ask(dlg);
   if (!fd) return;
   const client = fd.get('client');
-  const body = { label: fd.get('label').trim() };
+  const body = { label: fd.get('label').trim(), redact_log: !!fd.get('redact_log') };
   if (fd.get('mode') === 'manual') body.key = fd.get('key').trim();
   const r = await act('POST', `clients/${encodeURIComponent(client)}/keys`, body);
   if (r) {
-    S.selectedClient = client;
+    S.openClients.add(client);
     S.clients = await api('GET', 'clients');
     render();
     const done = $('#dlg-key-created');
@@ -2600,17 +2622,23 @@ const actions = {
     const name = el.dataset.id;
     const r = await act('POST', 'clients', { name, note: '' }, `${name} registered — add a key so it can authenticate`);
     if (r) {
-      S.selectedClient = name;
+      S.openClients.add(name);
       S.clients = await api('GET', 'clients');
       render();
       addKeyDialog(name);
     }
   },
-  'select-client': el => {
-    S.selectedClient = el.dataset.name;
+  'toggle-keys': el => {
+    // A keyless id has no keys to show: its row says why in its own sub-line.
+    const name = el.dataset.name;
+    S.openClients.has(name) ? S.openClients.delete(name) : S.openClients.add(name);
     render();
-    // The detail panel sits below the list on phones: bring it into view.
-    if (isPhone()) $('#client-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  },
+  'expand-clients': () => {
+    const all = identities().filter(r => r.reg);
+    if (all.every(r => S.openClients.has(r.id))) S.openClients.clear();
+    else for (const r of all) S.openClients.add(r.id);
+    render();
   },
   'add-rule': () => addRuleDialog(),
   'del-rule': el => act('DELETE', `models/rules/${encodeURIComponent(el.dataset.id)}`, undefined, 'Rule removed'),
@@ -2640,52 +2668,12 @@ const actions = {
   },
   'copy-key': el => copyText(findKey(el.dataset.id).key.key),
   'copy-created': () => copyText($('#dlg-key-created [data-key]').textContent),
-  'reassign-key': async el => {
-    const f = findKey(el.dataset.id);
-    const dlg = $('#dlg-reassign');
-    const form = $('form', dlg);
-    $('[data-key]', dlg).textContent = maskKey(f.key.key);
-    fillClientSelect(form.client, null, f.client.name);
-    const fd = await ask(dlg);
-    if (!fd) return;
-    const to = fd.get('client');
-    const r = await act('PATCH', `keys/${encodeURIComponent(f.key.id)}`, { client: to }, `Key moved to ${to}`);
-    if (r) { S.selectedClient = to; render(); }
-  },
+  'copy-shown': () => copyShownKey(),
+  'edit-key': el => keyEditDialog(el.dataset.id),
   'revoke-key': async el => {
     const f = findKey(el.dataset.id);
-    if (!await confirmDlg('Revoke key?', `<code>${esc(maskKey(f.key.key))}</code> (${esc(f.key.label || 'no label')}) stops identifying <b>${esc(f.client.name)}</b> immediately.`, 'Revoke')) return;
-    return act('DELETE', `keys/${encodeURIComponent(f.key.id)}`, undefined, 'Key revoked');
-  },
-  'rename-key': el => {
-    const id = el.dataset.id;
-    // Switching rows mid-edit: repaint first, then edit the freshly drawn row.
-    if (S.keyRename && S.keyRename !== id) {
-      S.keyRename = null;
-      render();
-      el = $(`#client-detail [data-action="rename-key"][data-id="${CSS.escape(id)}"]`);
-      if (!el) return;
-    }
-    const td = el.closest('tr').children[1];
-    const orig = findKey(id).key.label || '';
-    S.keyRename = id;
-    td.innerHTML = `<input type="text" class="rename-inp" maxlength="60" value="${esc(orig)}" placeholder="label" title="Enter saves; Esc or click away cancels">`;
-    const inp = $('input', td);
-    inp.focus();
-    inp.select();
-    const close = () => { S.keyRename = null; render(); };
-    inp.addEventListener('keydown', async e => {
-      if (e.key === 'Escape') close();
-      else if (e.key === 'Enter') {
-        e.preventDefault();
-        const v = inp.value.trim();
-        if (v === orig) close();
-        else if (await act('PATCH', `keys/${encodeURIComponent(id)}`, { label: v }, 'Label updated')) close();
-      }
-    });
-    // A failed PATCH keeps the editor open so the typo can be fixed; blur only
-    // closes it while it is still the active edit (close() nulls first).
-    inp.addEventListener('blur', () => { if (S.keyRename === id) close(); });
+    if (!await confirmDlg('Delete key?', `<code>${esc(maskKey(f.key.key))}</code> (${esc(f.key.label || 'no label')}) stops identifying <b>${esc(f.client.name)}</b> immediately. A key cannot be moved to another client — delete it and hand out a new one.`, 'Delete')) return;
+    return act('DELETE', `keys/${encodeURIComponent(f.key.id)}`, undefined, 'Key deleted');
   },
   'fold-all': () => { S.collapsed.clear(); saveCollapsed(); render(); },
   'fold-none': () => { for (const b of $$('#ov-now .det-h')) S.collapsed.add(b.dataset.key); saveCollapsed(); render(); },

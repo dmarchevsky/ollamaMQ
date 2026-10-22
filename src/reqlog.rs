@@ -34,6 +34,12 @@ pub struct ReqRecord {
     /// Body content, truncated to the configured limit (lossy UTF-8).
     /// Shared (not copied) with the TUI log event built from the same body.
     pub content: Option<Arc<String>>,
+    /// True when body text is switched off for this record's client, key or
+    /// backend: the entry is complete, only `content` is deliberately absent.
+    /// Absent when false, so lines written before this setting existed (and by
+    /// a proxy that never redacts) stay byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
     /// Conversation tag this request belongs to (`SessionKey::tag`); absent for
     /// non-chat traffic and sticky-less requests.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -255,6 +261,7 @@ mod tests {
             content_type: Some("application/json".into()),
             // Padding keeps each serialized line in the ~100-250 byte range.
             content: Some(Arc::new(format!("x{}", "y".repeat(20)))),
+            redacted: false,
             session: None,
             session_label: None,
             priority: "normal",
@@ -351,6 +358,25 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert!(v["content"].is_null());
+    }
+
+    #[test]
+    fn redacted_is_written_only_when_set() {
+        // The redaction marker must not change a line that a proxy without any
+        // redaction rule would have written.
+        let line = serde_json::to_string(&rec(0)).unwrap();
+        assert!(!line.contains("redacted"), "unredacted line carries the key: {line}");
+
+        let mut r = rec(0);
+        r.redacted = true;
+        r.content = None;
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(v["redacted"], true);
+        assert!(v["content"].is_null());
+        // Everything a redacted entry is for survives.
+        assert_eq!(v["dir"], "IN");
+        assert_eq!(v["bytes"], 100);
     }
 
     #[test]

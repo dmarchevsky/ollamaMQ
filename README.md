@@ -399,6 +399,13 @@ Every proxied request (`IN`) and upstream response (`OUT`) is written as JSON li
 | `bytes` | total body size in bytes |
 | `content_type` | body content type |
 | `content` | body preview, truncated to `log_content_limit` with a `...[truncated: N bytes total]` marker |
+| `redacted` | `true` when body text was deliberately not stored (see **Log capture**); the key is absent otherwise |
+
+**Log capture.** Every client, every API key and every backend carries a `redact_log` switch (web UI checkbox, `redact_log: true` in `clients.yaml` / `appconf.yaml`). When it is on, the request is served exactly as before and the log entry is still written — user, model, backend, status, byte counts, session, timing — but no body text is captured, so `content` is `null` and `redacted` is `true`. Nothing about the traffic changes: queues, priority, metrics and the response the client sees are untouched. Only *new* requests are affected; lines already in the file keep what they stored.
+
+- A **client** rule covers its requests in both directions and every key of that client.
+- A **key** rule covers that key's requests in both directions. Redaction is an opt-out: a key whose client is marked stays covered whatever the key says.
+- A **backend** rule covers the **response** text of requests it served. A request's own text is logged before a backend is chosen, so that half is the client/key's job.
 
 **Rotation:** when the file exceeds `request_log_max_bytes` it is renamed to `.0` (existing `.0` → `.1`, etc.), at most `request_log_max_files` rotated files are kept and the oldest is deleted. The current file size is re-read at startup, so sizing/rotation survives restarts.
 
@@ -514,11 +521,11 @@ The web UI is **off** unless a password is configured (`OLLAMA_MQ_UI_PASSWORD`, 
 It covers everything the TUI does:
 
 - **Overview** — status at a glance over a selectable interval (default 15 min, up to 24 h — see below)
-- **Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload** (TUI `L` / `U`); also where backends are configured: **Add** (with **Test connection**), name, token, **Disable/Enable**, **Remove**
-- **Clients** — every queue identity with its queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock** (TUI `p` `b` `x` `X` `u`)
+- **Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload** (TUI `L` / `U`); also where backends are configured: **Add** (with **Test connection**), name, token, **Disable/Enable**, **Remove**, and whether the backend's response text is stored in the log (see [Request logging](#request-logging))
+- **Clients** — every queue identity with its queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock** (TUI `p` `b` `x` `X` `u`). Registered clients are two levels: open a row to edit or delete its keys
 - **Models** — every model the backends list, with a switch per model and filter rules (below)
 - **Blocked** — disabled clients, blocked ids and blocked IPs
-- **Logs** — recent requests paired into rounds: one line per round (`→ request · ← response`), CTL and refused-before-dispatch events standalone. Clicking a round opens a full-screen viewer: the request as a message transcript and the streamed reply reconstructed into one assistant message (thinking collapsed, tool calls rebuilt, token footer), with `Raw ↔ Formatted` and `Whole ↔ New only` switches (New only diffs the history against the round before it), a `≣ Jump` message outline stamped dmesg-style (the request time, `+18s` for what followed within a minute), `↑/↓` round navigation, and `X` to close. The page behind never scrolls while the viewer is open — the only scrollbars are the log's own and the outline's. Truncated captures are salvaged rather than shown as raw.
+- **Logs** — recent requests paired into rounds: one line per round (`→ request · ← response`), CTL and refused-before-dispatch events standalone. A round whose body text was switched off is marked `no text` instead of showing an empty body. Clicking a round opens a full-screen viewer: the request as a message transcript and the streamed reply reconstructed into one assistant message (thinking collapsed, tool calls rebuilt, token footer), with `Raw ↔ Formatted` and `Whole ↔ New only` switches (New only diffs the history against the round before it), a `≣ Jump` message outline stamped dmesg-style (the request time, `+18s` for what followed within a minute), `↑/↓` round navigation, and `X` to close. The page behind never scrolls while the viewer is open — the only scrollbars are the log's own and the outline's. Truncated captures are salvaged rather than shown as raw.
 - **Settings** — limits, model aliases, metrics token, the admin password, and the version you are running (see below)
 - **Reload config** — re-read `appconf.yaml` (TUI `r`)
 
@@ -541,6 +548,7 @@ The **Backends** page lists the configured backends and edits the backend list w
 - **Disabling** one stops new requests at once; running ones finish.
 - **Removing** one disables it now and drops it from the list at the next restart.
 - **Names:** a backend can have a **name** (`backends: - url: …` with `name: gpu-box` in `appconf.yaml`, or in the UI). The UI shows the name instead of `host:port`. Prometheus keeps `backend="host:port"` and adds `ollamamq_backend_info{backend, name}` for dashboards.
+- **Log capture:** a backend can be marked **Do not save response text** (`redact_log: true` on its entry, shown as a `no text` badge in the list). Its requests still log an entry with status, size and timing — only the response text is left out. See [Request logging](#request-logging).
 - **`--backend-urls`:** when given, the list is fixed and the page shows it read-only.
 
 #### Settings
@@ -562,18 +570,31 @@ The **Settings** page edits `appconf.yaml` itself while the proxy runs.
 - **Sessions:** other sessions are signed out.
 - **Forgot it?** Delete `password_hash` from `appconf.yaml` and restart; the configured password works again.
 
-It also manages **clients and their API keys**. The Clients page lists two kinds of client together (filter with *All / Registered / Unregistered*):
+It also manages **clients and their API keys**. The Clients page is one list with two levels (filter with *All / Registered / Unregistered*): a row per id, and — while that row is open — the client's keys beneath it. *Expand all / Collapse all* works over the whole list.
 
 - **Registered clients** are created in the UI and saved in `clients.yaml`. They authenticate with their API keys and are listed even when idle.
 - **Unregistered ids** are what requests without a key are queued under: their `X-User-ID`, or the IP a front proxy fills in, else `anonymous`. They live in memory and drop off the list after an hour idle. **Register** turns one into a client of the same name and opens the add-key dialog.
 
-- Create a client (its name becomes its queue id), then add keys — **generated** (`omq-…`) or **any string you choose** (8–256 printable characters, unique across clients). A key can be relabelled, moved to another client, or revoked; a client can be renamed, disabled (its keys get `403`) or deleted.
+- Create a client (its name becomes its queue id), then add keys — **generated** (`omq-…`) or **any string you choose** (8–256 printable characters, unique across clients). A key is opened from its row to **edit** (label, log capture) or **delete**; a client can be renamed, disabled (its keys get `403`) or deleted. A key always belongs to the client it was created for — moving one means deleting it and handing out a new one.
+- Each client row carries **VIP**, **boost**, **Block IP**, **+ Key** and **Disable**/**Enable**; each key row carries **Edit** and **Delete**.
 - A request carrying a client key (`Authorization: Bearer <key>` or `X-Api-Key: <key>`) queues under that client's name, **whatever `X-User-ID` it sends**. The key is removed before the request is forwarded, so it never reaches a backend (the backend's own `token` applies instead).
 - Requests with no key, or a key no client owns, are queued by `X-User-ID` — **except that registered names are reserved**: a keyless request claiming one (e.g. `X-User-ID: alice` without alice's key) is queued apart as `unverified:alice`, with none of alice's queue position, priority or stats.
 - **Blocking a registered client disables it** (TUI `x`, web *Block* / *Disable*): its keys get `403` and its queued requests are dropped. That is the client's one block switch, saved with it; a user block on a client name from before this rule is converted to *disabled* at startup. Unregistered ids and IPs are blocked as before (`blocked_items.json`).
 - **VIP and boost on a registered client are saved** with it and restored at startup; on an unregistered id they last until restart.
 - **Renaming a client moves its live state** — queued requests, counters, last IP, fair-share position, VIP/boost — to the new name. Requests already being served finish under the old name. Deleting a client turns its name back into an ordinary id and clears its VIP/boost.
 - Keys are stored in plaintext in `settings.clients_file` (default `clients.yaml` next to `appconf.yaml`) so they can be looked up again; the file is written owner-only (`0600`). Changes are saved immediately (atomic replace). A clients file that exists but cannot be parsed stops the proxy at startup rather than being overwritten. The file is hand-editable YAML — a key may be written as just its string (`- omq-…`); ids and timestamps are filled in when the proxy saves it.
+
+  ```yaml
+  clients:
+    - name: codex-laptop
+      redact_log: true      # keep the log entries, store no body text (see Request logging)
+      keys:
+        - key: omq-7f3a9c41d2e8b6057a1c9e3f4b2d8a60
+          label: laptop
+        - key: codex-review-2026
+          label: auto-review
+          redact_log: true  # same switch per key; a key can only opt out, never back in
+  ```
 
 #### Model filtering
 

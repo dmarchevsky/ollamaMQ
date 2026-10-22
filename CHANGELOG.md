@@ -3,6 +3,45 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.16.0 — 2026-10-22
+
+### Added
+
+- **Log capture switch.** A client, one of its API keys or a backend can be marked
+  `redact_log` (`redact_log: true` in `clients.yaml` / `appconf.yaml`, or the
+  checkbox on its row in the web UI). The request is served exactly as before and
+  its log entry is still written — user, model, backend, status, byte counts,
+  session, timing — but no body text is captured, so the line carries
+  `"redacted":true` and a null `content`. Such a round is marked `no text` on the
+  Clients, Backends and Logs pages, and the log viewer says the text was switched
+  off instead of showing an empty body. A key can only opt out: its client's
+  setting always wins. A backend's rule covers its **response** text — a request's
+  own text is logged before a backend is chosen, so that half belongs to the
+  client/key.
+
+### Changed
+
+- **The Clients page is one list with two levels.** A client row carries the
+  controls that used to sit in the side panel (VIP, boost, Block IP, + Key,
+  Edit/Disable/Delete) and opens its keys as rows underneath; Expand all / Collapse
+  all works over the list. On phones the controls share one line (VIP and boost
+  collapse to `★` / `⚡`) and each key becomes one nested card.
+- A key is **edited or deleted, never moved**: the Edit dialog changes its label and
+  its capture switch, and the key string itself is read-only — moving a key to
+  another client means deleting it and handing out a new one.
+
+### Fixed
+
+- The Clients page no longer scrolls sideways below ~360px — the action cell carried a
+  `min-width` its row never needed — and VIP/boost keep an `aria-label` on the phones
+  where the layout hides the word.
+
+### Breaking
+
+- `PATCH /ui/api/keys/{id}` no longer accepts `client`; it takes `label` and/or
+  `redact_log` and answers `400` when neither is present. Scripts that moved a key
+  must delete and re-add it.
+
 ## v0.15.0 — 2026-10-22
 
 ### Added

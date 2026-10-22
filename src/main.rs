@@ -319,6 +319,7 @@ async fn main() {
                 disabled: false,
                 token: None,
                 kind: None,
+                redact_log: false,
             })
             .collect(),
         None => layers.backend_list(),
@@ -330,6 +331,7 @@ async fn main() {
             disabled: false,
             token: None,
             kind: None,
+            redact_log: false,
         }]
     } else {
         backend_list

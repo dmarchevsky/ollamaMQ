@@ -32,6 +32,9 @@ backends:
     token: "some-api-key"          #   authenticated reverse proxy (LM Studio, vLLM, ...)
   - url: http://10.137.1.5:1234    # LM Studio
     name: lmstudio-box             # optional: shown in the web UI instead of host:port
+  - url: http://10.137.1.6:11434
+    redact_log: true               # keep the log entry, store no response text from this
+                                   #   backend (request text is covered by the client/key flag)
 
 # --- Runtime settings -------------------------------------------------------
 settings:

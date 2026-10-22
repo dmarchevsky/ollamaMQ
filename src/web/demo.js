@@ -20,7 +20,7 @@
     },
     {
       url: 'http://192.168.255.224:8001', online: true, api_type: 'OpenAI', active: 0, max: 1, processed: 311,
-      current_model: null, models_available: ['Gemma-4-E4B'], models_loaded: [],
+      current_model: null, models_available: ['Gemma-4-E4B'], models_loaded: [], redact_log: true,
       loaded_known: false, loaded_ctx: {}, can_control: false, active_op: null, results: [],
     },
     {
@@ -64,14 +64,14 @@
   };
 
   let keySeq = 1;
-  const key = (k, label, created, used) => ({ id: `k${keySeq++}`, key: k, label, created_at_ms: created, last_used_ms: used });
+  const key = (k, label, created, used, redact) => ({ id: `k${keySeq++}`, key: k, label, created_at_ms: created, last_used_ms: used, redact_log: !!redact });
   const clients = [
     { name: 'codex-laptop', note: 'Codex CLI on the work laptop', disabled: false, created_at_ms: now - 21 * day,
       keys: [key('omq-7f3a9c41d2e8b6057a1c9e3f4b2d8a60', 'laptop', now - 21 * day, now - 4000),
-             key('codex-review-2026', 'auto-review', now - 6 * day, now - 3 * min)] },
+             key('codex-review-2026', 'auto-review', now - 6 * day, now - 3 * min, true)] },
     { name: 'openwebui', note: 'Open WebUI (docker)', disabled: false, created_at_ms: now - 40 * day,
       keys: [key('omq-1b9e44c0a7f3d25e8c6b0f9a3d7e1c52', 'webui', now - 40 * day, now - 9000)] },
-    { name: 'n8n-agents', note: 'Workflow automations', disabled: false, created_at_ms: now - 12 * day,
+    { name: 'n8n-agents', note: 'Workflow automations', disabled: false, redact_log: true, created_at_ms: now - 12 * day,
       keys: [key('omq-c08d2f6a91b3e7d4405f8a2c6e9b13d7', 'prod', now - 12 * day, now - 18 * min),
              key('n8n-staging-key-01', 'staging', now - 3 * day, now - 2 * day)] },
     { name: 'dm-desktop', note: '', disabled: false, created_at_ms: now - 5 * day,
@@ -141,6 +141,13 @@
     1202: streamOut,
   };
   logs.unshift(
+    // A round whose text was never stored: the entry is there, the body is not.
+    { seq: 1204, at_ms: now - 4_000, dir: 'OUT', user: 'n8n-agents', model: 'BGE-M3',
+      backend: 'http://192.168.255.224:8001', info: 'POST /v1/embeddings -> 200 resp=51208B', has_content: false,
+      redacted: true, rid: 903, session: 'b7c2d9' },
+    { seq: 1203, at_ms: now - 6_000, dir: 'IN', user: 'n8n-agents', model: 'BGE-M3',
+      backend: null, info: 'POST /v1/embeddings body=491322B', has_content: false,
+      redacted: true, rid: 903, session: 'b7c2d9' },
     { seq: 1202, at_ms: now - 8_000, dir: 'OUT', user: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
       backend: 'http://192.168.6.11:8731', info: 'POST /v1/chat/completions -> 200 resp=41832B', has_content: true, rid: 901, session: 'a3f19c' },
     { seq: 1201, at_ms: now - 26_000, dir: 'IN', user: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
@@ -447,7 +454,7 @@
     backends: backends.map(b => ({
       url: b.url, label: hostOf(b.url), name: b.name ?? null, token_set: tokenSet.has(b.url), kind: null,
       disabled: b.disabled || removedUrls.has(b.url), removed: removedUrls.has(b.url), online: b.online && !b.disabled,
-      api_type: b.api_type, slots: b.max, slots_detected: b.max > 1,
+      api_type: b.api_type, slots: b.max, slots_detected: b.max > 1, redact_log: b.redact_log ?? false,
     })),
   });
   function putSettings(set) {
@@ -504,6 +511,7 @@
         const b = findBackend(normUrl(body.url));
         if ('name' in body) { checkName(body.name, b.url); b.name = body.name || null; }
         if ('disabled' in body) b.disabled = body.disabled;
+        if ('redact_log' in body) b.redact_log = body.redact_log;
         if (body.token) tokenSet.add(b.url); else if ('token' in body) tokenSet.delete(b.url);
         return delay(settingsView());
       }
@@ -619,6 +627,7 @@
             c.name = body.name;
           }
           if (body.note !== undefined) c.note = body.note;
+          if (body.redact_log !== undefined) c.redact_log = body.redact_log;
           if (body.disabled !== undefined) { c.disabled = body.disabled; syncDisabled(); }
           return delay({});
         }
@@ -628,14 +637,16 @@
         const k = body.key ?? genKey();
         if (k.length < 8 || k.length > 256 || /\s/.test(k)) err('key must be 8–256 characters with no whitespace');
         if (allKeys().some(x => x.k.key === k)) err('that key is already assigned to a client');
-        const nk = key(k, body.label, Date.now(), 0);
+        const nk = key(k, body.label, Date.now(), 0, body.redact_log);
         c.keys.push(nk);
         return delay(nk);
       }
       if (seg[0] === 'keys') {
         const f = allKeys().find(x => x.k.id === seg[1]) || err('no such key');
-        f.c.keys.splice(f.c.keys.indexOf(f.k), 1);
-        if (method === 'PATCH') findClient(body.client).keys.push(f.k);
+        if (method === 'PATCH') {
+          if ('label' in body) f.k.label = body.label;
+          if ('redact_log' in body) f.k.redact_log = body.redact_log;
+        } else f.c.keys.splice(f.c.keys.indexOf(f.k), 1);
         return delay({});
       }
       err(`demo: unhandled ${method} ${path}`);

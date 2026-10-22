@@ -60,6 +60,8 @@ struct BackendCfgView {
     token_set: bool,
     kind: Option<String>,
     disabled: bool,
+    /// No response text is stored for this backend (see `Backend::redact_log`).
+    redact_log: bool,
     /// No longer configured; it stays (disabled) until the next restart.
     removed: bool,
     online: bool,
@@ -127,6 +129,7 @@ pub fn view(state: &AppState) -> SettingsView {
                 token_set: b.token.as_deref().is_some_and(|t| !t.is_empty()),
                 kind: b.kind.clone(),
                 disabled: b.disabled,
+                redact_log: b.redact_log,
                 removed: false,
                 online: st.is_some_and(|s| s.is_online),
                 api_type: st.map_or("???", |s| s.api_type.display()),
@@ -144,6 +147,7 @@ pub fn view(state: &AppState) -> SettingsView {
             token_set: s.token.is_some(),
             kind: None,
             disabled: true,
+            redact_log: s.redact_log,
             removed: true,
             online: false,
             api_type: s.api_type.display(),
@@ -277,6 +281,8 @@ pub struct BackendInput {
     token: Option<String>,
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
+    redact_log: bool,
 }
 
 fn clean(v: Option<String>) -> Option<String> {
@@ -298,6 +304,7 @@ pub async fn add_backend(
         disabled: false,
         token: clean(input.token),
         kind: clean(input.kind),
+        redact_log: input.redact_log,
     });
     cfg.backends = list;
     commit(&state, cfg)?;
@@ -316,6 +323,8 @@ pub struct BackendUpdate {
     kind: Option<Option<String>>,
     #[serde(default)]
     disabled: Option<bool>,
+    #[serde(default)]
+    redact_log: Option<bool>,
 }
 
 /// Tells an absent field (`None`) from an explicit `null` (`Some(None)`).
@@ -349,6 +358,9 @@ pub async fn update_backend(
     }
     if let Some(v) = u.disabled {
         b.disabled = v;
+    }
+    if let Some(v) = u.redact_log {
+        b.redact_log = v;
     }
     cfg.backends = list;
     commit(&state, cfg)?;
