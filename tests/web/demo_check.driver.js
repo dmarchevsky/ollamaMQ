@@ -11,7 +11,13 @@
 addEventListener('load', () => {
   const A = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
   setTimeout(() => { location.hash = '#logs'; }, 400);
-  setTimeout(() => { const tr = document.querySelector('#logs tbody tr[data-action]'); if (tr) tr.click(); }, 1500);
+  // Open a round that has stored text: a redacted round legitimately has nothing
+  // to scroll, so it cannot prove the body scrolls (see the capture switch).
+  setTimeout(() => {
+    const tr = [...document.querySelectorAll('#logs tbody tr[data-action]')]
+      .find(r => !/no text/.test(r.textContent));
+    if (tr) tr.click();
+  }, 1500);
   setTimeout(() => {
     document.querySelector('#lv-jump').click();
     const de = document.documentElement;
