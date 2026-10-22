@@ -112,15 +112,16 @@
             <label><input type="radio" name="client-filter" value="registered"><span>Registered</span></label>
             <label><input type="radio" name="client-filter" value="unregistered"><span>Unregistered</span></label>
           </div>
+          <button class="btn" id="client-expand" data-action="expand-clients">Expand all</button>
           <button class="btn primary" data-action="new-client">+ New client</button>
         </div>
       </div>
       <p class="hint"><b>Registered</b> clients authenticate with their API keys and keep their settings across restarts.
-        <b>Unregistered</b> ids come from <code>X-User-ID</code> (or the client's IP) and are shown while active.</p>
-      <div class="split">
-        <div class="panel flush" id="client-list"></div>
-        <div class="panel" id="client-detail"></div>
-      </div>
+        <b>Unregistered</b> ids come from <code>X-User-ID</code> (or the client's IP) and are shown while active.
+        Open a client to manage its keys. A client or key marked <span class="badge warn">no text</span> keeps its log
+        entries but stores no request/response text; requests send their key as
+        <code>Authorization: Bearer &lt;key&gt;</code> or <code>X-Api-Key: &lt;key&gt;</code>.</p>
+      <div class="panel flush" id="client-list"></div>
     </section>
 
     <section class="page" id="page-blocked">
@@ -188,6 +189,10 @@
     <p class="field-hint">Letters, digits, <code>. _ -</code>. Requests with this client's keys queue under this name.</p>
     <label>Note <input name="note" placeholder="optional" autocomplete="off"></label>
     <label class="check" data-only="edit"><input type="checkbox" name="disabled"> Disabled — its keys are rejected with 403</label>
+    <label class="check" data-only="edit"><input type="checkbox" name="redact_log"> Do not save request/response text for this client</label>
+    <p class="field-hint" data-only="edit">Log entries are still written — user, model, backend, status, size, session,
+      timing — only the captured body text is left out, here and for every key of this client. Lines already in the
+      log file keep what they stored.</p>
     <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary" data-submit>Create</button></div>
   </form>
 </dialog>
@@ -202,7 +207,22 @@
     </div>
     <label data-only="manual">Key <input name="key" placeholder="any string, 8–256 chars, no spaces" autocomplete="off" spellcheck="false"></label>
     <label>Label <input name="label" placeholder="optional, e.g. laptop" autocomplete="off"></label>
+    <label class="check"><input type="checkbox" name="redact_log"> Do not save request/response text for this key</label>
     <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary">Add key</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-key-edit">
+  <form method="dialog" data-form="key-edit">
+    <h3 data-title>Edit key</h3>
+    <label>Key <span class="keyrow"><input name="key" readonly autocomplete="off" spellcheck="false">
+      <button type="button" class="iconbtn" data-action="copy-shown" title="Copy the key" aria-label="Copy the key">⧉</button></span></label>
+    <p class="field-hint">The key string itself never changes — <b>Delete</b> it and hand out a new one.</p>
+    <label>Label <input name="label" placeholder="optional, e.g. laptop" autocomplete="off"></label>
+    <label class="check"><input type="checkbox" name="redact_log"> Do not save request/response text for this key</label>
+    <p class="field-hint">A key can only switch capture off: if its client is marked
+      <span class="badge warn">no text</span>, its keys stay covered whatever they say here.</p>
+    <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary">Save</button></div>
   </form>
 </dialog>
 
@@ -210,17 +230,8 @@
   <form method="dialog">
     <h3>Key created</h3>
     <p>Key for <b data-client></b>. It stays visible on the client page too.</p>
-    <div class="keybox"><code data-key></code><button type="button" class="btn sm" data-action="copy-created">Copy</button></div>
+    <div class="keybox"><code data-key></code><button type="button" class="iconbtn bordered" data-action="copy-created" title="Copy the key" aria-label="Copy the key">⧉</button></div>
     <div class="dlg-actions"><button value="ok" class="btn primary">Done</button></div>
-  </form>
-</dialog>
-
-<dialog id="dlg-reassign">
-  <form method="dialog" data-form="reassign">
-    <h3>Reassign key</h3>
-    <p>Move <code data-key></code> to another client. In-flight requests keep their current queue.</p>
-    <label>New client <select name="client"></select></label>
-    <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary">Move key</button></div>
   </form>
 </dialog>
 
@@ -297,6 +308,10 @@
       <option value="">Detect automatically</option>
       <option value="systemone">System One (Laya and other servers that list no models)</option>
     </select></label>
+    <label class="check"><input type="checkbox" name="redact_log"> Do not save response text from this backend</label>
+    <p class="field-hint">Log entries stay — user, model, status, size, timing — only the captured response text is
+      left out. A request's own text is logged before a backend is chosen, so it is covered by the client/key
+      setting, not by this one.</p>
     <div class="test-row"><button type="button" class="btn sm" data-action="test-backend">Test connection</button><span class="test-result" data-test></span></div>
     <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary" data-submit>Add backend</button></div>
   </form>
