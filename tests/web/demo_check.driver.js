@@ -169,3 +169,31 @@ addEventListener('load', () => setTimeout(() => {
   A2('logs-request-view-splits-rounds', rounds >= before && localStorage.getItem('omq.logGroup') === 'request',
     `${rounds} request rows vs ${before} conversation rows`);
 }, 12000));
+
+// The Overview list: one view (Details), the conversation's log chip at the
+// right edge of each header like the stage lines below it, and the serving
+// rates an active conversation is getting.
+addEventListener('load', () => setTimeout(() => {
+  const A3 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  document.querySelector('a[data-page="overview"]').click();
+  document.querySelector('#ov-req-show input[value="all"]').click();
+  setTimeout(() => {
+    A3('overview-list-is-details-only', !document.querySelector('#ov-req-view')
+      && !document.querySelector('#ov-now .rq')
+      && document.querySelectorAll('#ov-now .det-h').length > 0,
+      `${document.querySelectorAll('#ov-now .det-h').length} conversation headers, no List toggle`);
+    const heads = [...document.querySelectorAll('#ov-now .det-h')];
+    const withLink = heads.filter(h => h.querySelector('.logs-link'));
+    const edge = withLink.map(h => Math.round(
+      h.querySelector('.logs-link').getBoundingClientRect().right - h.getBoundingClientRect().right));
+    A3('header-logs-chip-rightmost', withLink.length > 0 && edge.every(d => d <= 12),
+      `${withLink.length} headers, chip inset ${edge.slice(0, 4).join('/')}px`);
+    A3('header-logs-chip-pointer', withLink.every(h => getComputedStyle(h.querySelector('.logs-link')).cursor === 'pointer'),
+      withLink.length ? getComputedStyle(withLink[0].querySelector('.logs-link')).cursor : 'no chip');
+    const dec = [...document.querySelectorAll('#ov-now .det-h .badge.dec')].map(b => b.textContent);
+    const pre = [...document.querySelectorAll('#ov-now .det-h .badge.warn')].map(b => b.textContent);
+    A3('header-shows-decode-rate', dec.some(t => /^decode [\d.]+ t\/s$/.test(t)), dec.slice(0, 3).join(' | ') || 'none');
+    A3('header-shows-prefill-rate', pre.some(t => /^prefill [\d≈.]+ ?(tok\/s|s|m ..s)$/.test(t)),
+      pre.slice(0, 3).join(' | ') || 'none');
+  }, 900);
+}, 16500));

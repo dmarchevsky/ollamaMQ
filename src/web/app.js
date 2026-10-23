@@ -29,8 +29,7 @@ const S = {
   modelQuery: "",
   overview: null,            // api/overview for the chosen window and filters
   filters: storedFilters(),  // the filter modal's selection (time, identity, lists)
-  reqShow: storedReqShow(),  // List under the graph: active | all
-  reqView: storedReqView(),  // List under the graph: list | details
+  reqShow: storedReqShow(),  // the Activity list: active rows only, or the window too
   collapsed: storedCollapsed(),// conversation headers the operator folded shut
   pins: {},                // session tag -> operator-pinned priority level
   colorOf: new Map(),        // client id -> colour slot 1..4
@@ -64,17 +63,6 @@ function storedReqShow() {
     if (localStorage.getItem('omq.reqShow') === 'all') return 'all';
   } catch { /* storage blocked */ }
   return 'active';
-}
-
-/** The list view from the last visit; a folded Thread becomes Details. */
-function storedReqView() {
-  try {
-    const v = localStorage.getItem('omq.reqView');
-    if (v === 'details') return 'details';
-    if (v === 'list') return 'list';
-    if (localStorage.getItem('omq.reqGroup') === 'threads') return 'details';
-  } catch { /* storage blocked */ }
-  return 'list';
 }
 
 /** Session tags folded shut in Threads, per browser. */
@@ -961,9 +949,16 @@ function renderDetails(rows) {
     // until the first token, decode after), else a queued one; an idle
     // conversation carries no chip at all.
     const run = unit.find(x => x.kind === 'run'), wait = unit.find(x => x.kind === 'wait');
+    // An active conversation says how it is being served, not only that it is.
+    // Decode is the live stream's own rate; prefill is measured on the newest
+    // finished request here, because a request cannot time its own prefill — by
+    // the time the first token proves anything, it is already decoding.
+    const pre = run ? prefillRate(unit) : null;
     const chip = run
-      ? (run.o.state === 'generating' ? '<span class="badge dec">decode</span>'
-        : '<span class="badge warn">prefill</span>')
+      ? (run.o.state === 'generating'
+        ? `${pre ? `<span class="badge warn" title="${pre.tip}">prefill ${pre.txt} tok/s</span>` : ''}`
+          + `<span class="badge dec" title="tokens generated per second, this request">${run.o.tokens_per_sec != null ? `decode ${fmtRate(run.o.tokens_per_sec)} t/s` : 'decode \u2026'}</span>`
+        : `<span class="badge warn" title="the first token has not arrived${pre ? ` \u2014 prefill runs at ${pre.txt} tok/s here (${pre.tip})` : ''}">prefill ${fmtDur(run.o.elapsed_secs)}</span>`)
       : wait ? `<span class="badge q" title="Position in this client's own queue">waiting #${wait.o.pos}</span>`
       : '';
     // The summary is three right-aligned columns so the numbers line up
@@ -975,8 +970,8 @@ function renderDetails(rows) {
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(fmtWho(head.o))}</span>
       ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}${chip}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
-      ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(head.o.client)}" title="open this conversation in the viewer">\u2263 view conversation</span>` : ''}
-      ${sum}</button>`);
+      ${sum}
+      ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(head.o.client)}" title="open this conversation in the viewer">\u2263 view conversation</span>` : ''}</button>`);
     if (shut) continue;
     const lines = [];
     for (let i = 0; i < asc.length; i++) {
@@ -993,7 +988,7 @@ function renderDetails(rows) {
       }
       for (const e of asc[i].plan.events) {
         // Live stage lines (the running request's now-still-unfinished ones)
-        // wear the client-colour wash the List gives live rows. The line
+        // wear the client's own colour wash. The line
         // belongs to one request, so it opens the conversation on that request.
         const rid = asc[i].o.rid;
         lines.push({ t: e.at, html: `<div class="det-row${e.live ? ' live' : ''}"${rid ? ` data-action="log-jump" data-rid="${rid}" title="open this conversation at this request"` : ''}><span class="when">${fmtTime(e.at)}</span>`
@@ -1018,10 +1013,32 @@ function segCount(sel, i, n) {
 /** `--c1`…`--c8` name of a client's hue slot. */
 const cvar = cls => cls === 'cother' ? 'c-other' : cls;
 
+/** Prefill speed of one finished request: prompt tokens over the time the
+ *  backend spent reading them (dispatch to first token). Null when either half
+ *  is missing — a response that never streamed has no first token to measure. */
+function prefillOf(o) {
+  const secs = o.prefill_secs ?? (o.stage?.first_token != null && o.stage?.dispatch != null
+    ? (o.stage.first_token - o.stage.dispatch) / 1000 : null);
+  const tok = o.prefill_tokens ?? o.prompt_tokens;
+  if (!secs || !tok || secs <= 0) return null;
+  return { tps: tok / secs, tok, secs };
+}
+
+/** The prefill speed a running conversation is being served at, from the newest
+ *  finished request in it whose prefill was measurable. */
+function prefillRate(unit) {
+  const done = unit.filter(x => x.kind === 'done').sort((a, b) => (b.o.at_ms || 0) - (a.o.at_ms || 0));
+  for (const d of done) {
+    const p = prefillOf(d.o);
+    if (p) return { txt: fmtRate(p.tps), tip: `measured on the last finished request here: ${fmtTok(p.tok)} tok in ${fmtSec1(p.secs)}` };
+  }
+  return null;
+}
+
 /** Generated tokens of a row, however the row is shaped. */
 const rowTokens = row => row.kind === 'done' ? row.o.completion_tokens : row.kind === 'run' ? row.o.tokens : 0;
 
-/** Running and waiting rows share one treatment in both views. */
+/** Running and waiting rows share one treatment wherever they are listed. */
 const liveCls = row => row.kind === 'run' || row.kind === 'wait' ? ' is-live' : '';
 
 /** Conversations ordered by when each **started** — newest start first, so a
@@ -1056,73 +1073,6 @@ function wireFold() {
 }
 
 
-/**
- * What a phone row says about one request: its status, its own numbers, one
- * timing line. Field names live in the tooltips — the desktop table has columns
- * for them — and Gen time is left out, since tokens and tok/s give it away.
- */
-function phoneParts(row, ov) {
-  const o = row.o;
-  if (row.kind === 'run') {
-    return {
-      head: o.state === 'generating' ? '<span class="badge dec">generating</span>'
-        : `<span class="badge warn" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(o.elapsed_secs)}</span>`,
-      nums: `${fmtNum(o.tokens)} tok · ${o.tokens_per_sec == null ? '…' : o.tokens_per_sec.toFixed(1)} t/s`,
-      timing: `<span title="prompt size, estimated">pre ≈${fmtTok(o.est_prompt_tokens)}</span>`
-        + (o.ttft_secs != null ? ` · <span title="time to the first token">ttft ${fmtSec1(o.ttft_secs)}</span>` : ''),
-      bk: bkName(o.backend),
-    };
-  }
-  if (row.kind === 'wait') {
-    return {
-      head: `<span class="badge q" title="Position in this client's own queue">waiting #${o.pos}</span>`,
-      nums: `<span class="dim">≈${fmtTok(o.est_prompt_tokens)} tok</span>`,
-      timing: `<span title="waiting for a free slot">wait ${fmtDur(o.waited_secs)}</span>`,
-      bk: o.backends.length === 1 ? bkName(ov.backends[o.backends[0]]?.label) : 'any',
-    };
-  }
-  if (o.error) {
-    return {
-      head: `<span class="badge bad" title="${esc(o.outcome)}">${esc(o.status && o.status >= 500 ? `HTTP ${o.status}` : o.outcome.replace(/_/g, ' '))}</span>`,
-      nums: `<span class="st-bad">${esc(o.outcome.replace(/_/g, ' '))}</span>`,
-      timing: o.backend ? '' : '<span class="dim">never dispatched</span>',
-      bk: o.backend ? bkName(o.backend) : '—',
-    };
-  }
-  const timing = [
-    o.waited_secs > 0 ? `<span title="waiting for a free slot">wait ${fmtDur(o.waited_secs)}</span>` : '',
-    o.prefill_tokens != null || o.prefill_secs != null
-      ? `<span title="prompt size · prefill time">pre ${fmtTok(o.prompt_tokens)}${o.prefill_secs != null ? ` · ${fmtSec1(o.prefill_secs)}` : ''}</span>` : '',
-    o.cache_pct != null ? `<span title="prefix-cache hit">cache ${o.cache_pct}%</span>` : '',
-    o.waste_secs ? `<span class="st-bad" title="prefill time lost to cache eviction">waste ${fmtSec1(o.waste_secs)}</span>` : '',
-    o.ttft_secs != null ? `<span title="time to the first token">ttft ${fmtSec1(o.ttft_secs)}</span>` : '',
-  ].filter(Boolean).join(' · ');
-  return {
-    head: o.outcome === 'ok' ? `<span class="t">${fmtTime(row.t)}</span>`
-      : `<span class="badge">${esc(o.outcome.replace(/_/g, ' '))}</span>`,
-    nums: `${fmtTok(o.completion_tokens)} tok · ${o.gen_tps == null ? '—' : o.gen_tps.toFixed(1)} t/s`,
-    timing,
-    bk: o.backend ? bkName(o.backend) : '—',
-  };
-}
-
-/** Phone card: the first line names the conversation *and* where it ran — model
- *  and backend belong together, so the model gives way (ellipsis) before the
- *  backend does. Then the counts, then the timing. */
-function cardPhone(row, ov) {
-  const p = phoneParts(row, ov);
-  return `<div class="rq${liveCls(row)}" data-key="${esc(row.key)}" style="--c:var(--${cvar(colorClass(fmtWho(row.o)))})"><div class="rq-1">${p.head}${swatch(fmtWho(row.o))}`
-    + `<span class="who">${esc(fmtWho(row.o))}</span>${row.o.session_label || row.o.session ? priMark(row.o) : ''}`
-    + `<span class="mb"><span class="mo">${esc(row.o.model)}</span><span class="ar">→</span>${esc(p.bk)}</span></div>`
-    + `<div class="rq-2">${p.nums}</div>`
-    + ((sessName(row.o) ? `<span title="conversation">#${esc(sessName(row.o))}</span>${p.timing ? ' · ' : ''}` : '') + p.timing ? `<div class="rq-m">${sessName(row.o) ? `<span title="conversation">#${esc(sessName(row.o))}</span>${p.timing ? ' · ' : ''}` : ''}${p.timing}</div>` : '') + '</div>';
-}
-
-/** Phone layout of the List: cards instead of the reflowed table. */
-function requestsPhone(rows, ov) {
-  if (!rows.length) return '<div class="empty">Nothing running or waiting</div>';
-  return rows.map(r => cardPhone(r, ov)).join('');
-}
 
 
 /**
@@ -1153,89 +1103,23 @@ function reqRows(st, ov, all) {
 }
 
 /**
- * The List under the timeline. Show: Active = running + waiting; All also lists
- * recently finished (live rows carry a yellow tint, no section divider).
- * View: List = newest first (cards on a
- * phone, a table here); Details = one block per conversation with a line per
- * stage event. Prefill is size · seconds (≈ while estimated), Gen time the
- * generation seconds (for running: since the first token), Cache the
- * prefix-cache share of finished prompts.
+ * The list under the timeline: one block per conversation, one line per stage
+ * event. Show: Active = running + waiting; All also lists recently finished
+ * (live lines carry the client's colour wash). Prefill is size · seconds
+ * (≈ while estimated), Gen time the generation seconds (for a running request:
+ * since its first token), Cache the prefix-cache share of finished prompts.
  */
 function renderRequests(st, ov) {
-  const dash = '<span class="dim">—</span>';
   const now = ov.now_ms;
   const { rows, activeN } = reqRows(st, ov, S.reqShow === 'all');
-  // The counts that used to be a sentence above the table sit in the toggle —
+  // The counts that used to be a sentence above the list sit in the toggle —
   // the All count is the whole window even while Active is selected.
   segCount('#ov-req-show', 0, activeN);
   segCount('#ov-req-show', 1, activeN + ov.recent.length);
-
-  const el = $('#ov-now');
-  $('#ov-fold').hidden = S.reqView !== 'details';
-  if (S.reqView === 'details') {
-    for (const r of rows) r.plan = stagePlan(r, now);
-    setHTML(el, renderDetails(rows));
-    wireFold();
-    return;
-  }
-  const pill = r => r.state === 'generating'
-    ? '<span class="badge dec">generating</span>'
-    : `<span class="badge warn" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(r.elapsed_secs)}</span>`;
-  // A phone gets cards, not a reflowed table: three tight lines per request.
-  if (isPhone()) { setHTML(el, requestsPhone(rows, ov)); return; }
-
-  const backendCell = row => row.kind === 'run' ? `<td>${bkCell(row.o.backend)}</td>`
-    : row.kind === 'wait'
-      ? `<td class="dim ph-hide">${row.o.backends.length === 1 ? bkName(ov.backends[row.o.backends[0]]?.label) : 'any'}</td>`
-      : row.o.backend ? `<td>${bkCell(row.o.backend)}</td>` : `<td>${dash}</td>`;
-
-  const tds = row => {
-    const head = `<td>${row.kind === 'run' ? pill(row.o)
-      : row.kind === 'wait'
-        ? `<span class="badge q" title="Position in this client's own queue">waiting #${row.o.pos}</span>`
-        : row.o.error ? `<span class="badge bad" title="${esc(row.o.outcome)}">${esc(row.o.status && row.o.status >= 500 ? `HTTP ${row.o.status}` : row.o.outcome.replace(/_/g, ' '))}</span>`
-          : row.o.outcome === 'ok' ? `<span class="dim mono" title="finished">${fmtTime(row.t)}</span>`
-          : `<span class="badge">${esc(row.o.outcome.replace(/_/g, ' '))}</span>`}</td>
-      <td>${swatch(fmtWho(row.o))}<span class="mono">${esc(fmtWho(row.o))}</span>${sessName(row.o) ? ` <span class="mono dim">#${esc(sessName(row.o))}</span>` : ''} ${priCtl(row.o, row.o.session)}</td>
-      <td class="trunc">${esc(row.o.model)}</td>`;
-    if (row.kind === 'run') {
-      const r = row.o;
-      return head + backendCell(row) + `
-      <td class="num">${fmtDur(r.waited_secs ?? 0)}</td>
-      <td class="num"><span class="mono">≈${fmtTok(r.est_prompt_tokens)} · ${r.ttft_secs != null ? fmtSec1(r.ttft_secs) : '…'}</span></td>
-      <td class="num">${dash}</td>
-      <td class="num">${firstToken(r)}</td>
-      <td class="num">${fmtNum(r.tokens)}</td>
-      <td class="num">${r.ttft_secs != null && r.state === 'generating' ? `<span class="mono">${fmtSec1(Math.max(0, r.elapsed_secs - r.ttft_secs))}</span>` : dash}</td>
-      <td class="num">${r.tokens_per_sec == null ? dash : r.tokens_per_sec.toFixed(1)}</td>`;
-    }
-    if (row.kind === 'wait') {
-      const w = row.o;
-      return head + backendCell(row) + `
-      <td class="num st-warn">${fmtDur(w.waited_secs)}</td>
-      <td class="num"><span class="mono">≈${fmtTok(w.est_prompt_tokens)} · —</span></td>
-      <td class="num">${dash}</td><td class="num">${dash}</td><td class="num">${dash}</td><td class="num">${dash}</td><td class="num">${dash}</td>`;
-    }
-    const x = row.o;
-    const pre = x.prefill_secs == null && x.prefill_tokens == null ? dash
-      : `<span class="mono">${fmtTok(x.prompt_tokens)} · ${x.prefill_secs == null ? '—' : fmtSec1(x.prefill_secs)}</span>`;
-    return head + backendCell(row) + `
-      <td class="num">${x.waited_secs == null ? dash : fmtDur(x.waited_secs)}</td>
-      <td class="num">${pre}</td>
-      <td class="num">${x.cache_pct == null ? dash : x.cache_pct + '%'}</td>
-      <td class="num">${x.waste_secs ? `<span class="${x.prefill_secs && x.waste_secs / x.prefill_secs >= .15 ? 'st-bad' : 'st-warn'} mono">${fmtSec1(x.waste_secs)}</span>` : dash}</td>
-      <td class="num">${x.ttft_secs == null ? dash : `<span class="mono">${fmtSec1(x.ttft_secs)}</span>`}</td>
-      <td class="num">${fmtTok(x.completion_tokens)}</td>
-      <td class="num">${x.gen_secs == null ? dash : `<span class="mono">${fmtSec1(x.gen_secs)}</span>`}</td>
-      <td class="num">${x.gen_tps == null ? dash : x.gen_tps.toFixed(1)}</td>`;
-  };
-
-  const body = rows.map(r => `<tr${liveCls(r)} data-key="${esc(r.key)}"${r.o.rid ? ` data-action="log-jump" data-rid="${r.o.rid}" title="open this request's conversation"` : ''} style="--c:var(--${cvar(colorClass(fmtWho(r.o)))})">${tds(r)}</tr>`).join('');
-
-  const head = `<tr><th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num" title="prefill time lost re-reading evicted context">Waste</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
-  setHTML(el, rows.length ? `<table>${head}${body}</table>` : '<div class="empty">Nothing running or waiting</div>');
+  for (const r of rows) r.plan = stagePlan(r, now);
+  setHTML($('#ov-now'), renderDetails(rows));
+  wireFold();
 }
-
 
 function renderBackendStats(ov) {
   setHTML($('#ov-backends'), ov.backends.length ? `<table>
@@ -3219,18 +3103,12 @@ $('#model-search').addEventListener('input', e => { S.modelQuery = e.target.valu
 $('#model-show').addEventListener('change', e => { S.modelShow = e.target.value; render(); });
 $('#model-mode').addEventListener('change', e => setModelMode(e.target.value));
 $(`#ov-req-show input[value="${S.reqShow}"]`).checked = true;
-$(`#ov-req-view input[value="${S.reqView}"]`).checked = true;
 ['input', 'change'].forEach(t => $('#set-form').addEventListener(t, onSettingsInput));
 // Leaving with unsaved settings: the browser asks first.
 window.addEventListener('beforeunload', e => { if (S.draft.size) e.preventDefault(); });
 $('#ov-req-show').addEventListener('change', e => {
   S.reqShow = e.target.value;
   try { localStorage.setItem('omq.reqShow', S.reqShow); } catch { /* storage blocked */ }
-  render();
-});
-$('#ov-req-view').addEventListener('change', e => {
-  S.reqView = e.target.value;
-  try { localStorage.setItem('omq.reqView', S.reqView); } catch { /* storage blocked */ }
   render();
 });
 // The Filters modal writes the scope on Apply (Esc/Cancel discard the edits).

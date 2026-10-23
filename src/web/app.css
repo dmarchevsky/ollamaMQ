@@ -708,23 +708,6 @@ tr.is-off td { color: var(--muted); }
   #page-overview .panel-h { flex-wrap: wrap; }
 }
 
-/* --- Request cards (phone). Replaces the table-reflow for #ov-now: three tight
-   lines, no repeated field labels (their names stay in title= tooltips, and the
-   desktop table keeps them as columns). Gen time is left out — tokens and tok/s
-   on line 2 give it. --- */
-#ov-now .rq { padding: 9px 0; border-bottom: 1px solid var(--border); }
-#ov-now .rq:last-child { border-bottom: none; }
-.rq-1 { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 12.5px; }
-.rq-1 .sw { margin-right: 0; }
-.rq-1 .who { font-weight: 600; white-space: nowrap; }
-.rq-1 .t { font: 12px var(--mono); color: var(--muted); }
-/* model → backend share the first line with the client; the model is what gives
-   way first, so the backend is always readable. */
-.rq-1 .mb { margin-left: auto; display: flex; align-items: baseline; gap: 5px; min-width: 0;
-  color: var(--muted); font-size: 12px; white-space: nowrap; }
-.rq-1 .mb .mo { color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.rq-2 { margin-top: 2px; font: 12px var(--mono); color: var(--muted); }
-.rq-m { margin-top: 2px; font: 11px var(--mono); color: var(--muted); }
 /* --- Merged Activity panel: the session timeline and the Details list.
    One panel: a session-per-row timeline on top, the request list below.
    Bars are positioned in % of the window (no SVG scaling tricks), so a row
@@ -791,11 +774,8 @@ tr.is-off td { color: var(--muted); }
 .det-h .sum i { font-style: normal; min-width: 52px; text-align: right; }
 .det-h .sum i:nth-child(2) { min-width: 66px; }
 .det-h .sum i:last-child { min-width: 0; }
-/* Live rows — List table, phone cards, Details stage lines — wash in the
-   conversation's own client colour (the graph stays clean: there, the client
-   wash means hover). Yellow means prefill and nothing else. */
-#ov-now tr.is-live > td { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent); }
-#ov-now .rq.is-live { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent); border-radius: 6px; }
+/* The lines of a running request wash in the conversation's own client colour
+   (the graph stays clean: there, the client wash means hover). */
 #ov-now .det-row.live { background: color-mix(in srgb, var(--c, var(--accent)) 16%, transparent); border-radius: 4px; }
 /* Details: every stage is its own event line with its
    own timestamp, threaded down the left by the session colour. */
@@ -822,6 +802,9 @@ tr.is-off td { color: var(--muted); }
   .det-h .sub { flex: 1 1 auto; min-width: 0; }
   .det-h .sum { margin-left: 0; }
   .det-h .sum i { min-width: 0; }
+  /* when the header wraps, the log chip still ends the line it lands on, as the
+     stage lines below do */
+  .det-h .logs-link { margin-left: auto; }
   /* one line per stage event, so the columns stay tight on a narrow screen */
   .det-row { font-size: 10.5px; gap: 7px; }
   .det-row .when { flex-basis: 46px; }
@@ -844,16 +827,11 @@ tr.is-off td { color: var(--muted); }
   outline: 1px dashed color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
   outline-offset: -1px; border-radius: 6px; }
 .det-h.flash { animation: detflash 1.2s ease-out; }
-#ov-now tr.flash, #ov-now .rq.flash { animation: rowflash 1.2s ease-out; }
-@keyframes rowflash {
-  from { outline: 2px solid var(--accent); }
-  to { outline: 2px solid transparent; }
-}
 @keyframes detflash {
   from { box-shadow: 0 0 0 2px var(--c, var(--accent)); }
   to { box-shadow: 0 0 0 2px transparent; }
 }
-@media (prefers-reduced-motion: reduce) { .det-h.flash, #ov-now tr.flash, #ov-now .rq.flash { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .det-h.flash { animation: none; } }
 
 /* ---------------------------------------------------------------- rounds */
 /* One compact line per request round on the Logs page: IN segment then OUT
@@ -869,9 +847,11 @@ table.logs td.round { padding-right: 16px; }
 .rl.err, .rl.err .ar { color: var(--bad); }
 .rl.ctl .ar { color: var(--vip); }
 
-/* Overview rows jumping to their log round — permanent chips, not hover-only. */
+/* Overview rows jumping to their log round — permanent chips, not hover-only,
+   and clickable-looking: they sit in text rows whose cursor is the text one. */
 .det-row .jump { margin-left: auto; }
-tr[data-action="log-jump"] { cursor: pointer; }
+.det-row[data-action], .jump-chip { cursor: pointer; }
+.det-h .logs-link { flex: none; }
 .jump-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 9px;
   border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2);
   color: var(--muted); font-size: 11px; white-space: nowrap; }

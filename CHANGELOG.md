@@ -7,6 +7,16 @@ since upstream `v0.5.0`.
 
 ### Changed
 
+- **The Overview has one list now — Details — and it says how fast you are being served.**
+  The **List / Details** switch is gone (with it the phone's card layout and the wide twelve-column
+  table): the Activity panel always threads conversations, one line per stage event. A conversation
+  header now carries the rates an active session is getting instead of just the word `decode` or
+  `prefill`: `decode 88.7 t/s` from the live stream and `prefill 349 tok/s` measured on the last
+  finished request in that conversation — a request cannot time its own prefill, so while its first
+  token is still out the header shows `prefill 4.2s` and puts the last measured rate in its tooltip.
+  The `≣ view conversation` chip moved to the right edge of the header, where the stage lines below
+  already keep their `≣ View` chips, and both are now `cursor: pointer` (they used to show a text
+  cursor over their own label).
 - **The conversation viewer stops repeating itself, and the jump tree grew real timings.**
   A turn no longer shows the messages the previous request already sent — those are on screen in
   the turns above — so the `7 earlier messages, already sent in the previous request — expand`
