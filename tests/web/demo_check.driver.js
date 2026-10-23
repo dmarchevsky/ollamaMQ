@@ -72,6 +72,38 @@ addEventListener('load', () => {
         // Capture turned off reads as a decision, in the tree and in the turn.
         const off = document.querySelector('.turn-h [title*="no body text"]');
         A('redacted-labelled', !!off || !LV.conv.redacted, 'capture-off turns are labelled');
+
+        // --- The jump tree: nodes fold independently, and a message row jumps
+        // to that message instead of merely to its request. Sequential waits,
+        // so the chain stays readable instead of nesting one level per click.
+        const wait = ms => new Promise(r => setTimeout(r, ms));
+        (async () => {
+          document.querySelector('#lv-rail [data-action="lv-collapse"]').click();
+          await wait(500);
+          const before = [...LV.openTree];
+          const turnNodes = [...document.querySelectorAll('#lv-rail .lv-node.turn')];
+          const other = turnNodes.find(n => !before.includes(n.dataset.rid)) || turnNodes[0];
+          other.querySelector('.car').click();
+          await wait(600);
+          const openTree = [...LV.openTree];
+          const expanded = [...document.querySelectorAll('#dlg-log section.turn')]
+            .filter(sx => sx.querySelector('.lv-sec')).length;
+          A('tree-expand-independent', before.every(r => openTree.includes(r))
+            && openTree.includes(+other.dataset.rid) && expanded >= 2,
+            `open ${openTree.join(',')} (was ${before.join(',')}), ${expanded} request blocks readable`);
+          A('tree-single-highlight', document.querySelectorAll('#lv-rail .lv-node.on').length <= 1,
+            `${document.querySelectorAll('#lv-rail .lv-node.on').length} row(s) highlighted`);
+          const msg = document.querySelector('#lv-rail .lv-node.l3');
+          if (!msg) { A('tree-child-focus', false, 'no message node in the tree'); return; }
+          msg.click();
+          await wait(600);
+          const fl = document.querySelector('#dlg-log .msg.flash');
+          const want = `lv-m-${msg.dataset.rid}-${msg.dataset.idx}`;
+          A('tree-child-focus', !!fl && fl.id === want,
+            fl ? `focused ${fl.id}` : `nothing focused, wanted ${want}`);
+          A('tree-child-marked', document.querySelector('#lv-rail .lv-node.on')?.dataset.idx
+            === msg.dataset.idx, 'the tree row shows which message is in view');
+        })();
       }, 600);
     }, 600);
   }, 3000);

@@ -41,6 +41,20 @@ since upstream `v0.5.0`.
   bundles before `cargo test`, so a syntax error in `src/web/*.js` can no longer pass while the UI is
   broken.
 
+### Fixed
+
+- **The jump tree folded everything else whenever you opened one request.** Body blocks and tree
+  nodes shared one open-set, and focusing a request replaced it (`LV.open = new Set([rid])`), so
+  expanding a node collapsed the rest — and because every node of the focused request was marked as
+  current, an expanded request painted a solid wall of highlight. Tree nodes now have their own
+  state, each request opens and closes independently, and only the row in view is marked. Clicking a
+  message row (`USER` / `ASSIST` / `TOOL`) now focuses *that message* — opening the turn, unfolding
+  the resent-history block if the message lives in it, scrolling it into view and flashing it —
+  instead of only scrolling to the request header.
+- **`≡ View conversation` in Overview → Details failed for keyed traffic.** The chip sent the display
+  name (which becomes `client:key` when the identity filter is by key) where the store matches on the
+  client, so the viewer answered *no such conversation in the log*. It sends the client identity now.
+
 ## v0.16.0 — 2026-10-22
 
 ### Added

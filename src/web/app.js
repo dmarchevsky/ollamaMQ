@@ -974,7 +974,7 @@ function renderDetails(rows) {
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(fmtWho(head.o))}</span>
       ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}${chip}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
-      ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(fmtWho(head.o))}" title="open this conversation in the viewer">\u2263 view conversation</span>` : ''}
+      ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(head.o.client)}" title="open this conversation in the viewer">\u2263 view conversation</span>` : ''}
       ${sum}</button>`);
     if (shut) continue;
     const lines = [];
@@ -1788,7 +1788,7 @@ const storedLv = () => {
 const saveLv = () => { try { localStorage.setItem('omq.lv', JSON.stringify(S.lv)); } catch { /* storage blocked */ } };
 S.lv = storedLv();
 
-const LV = { conv: null, rid: null, open: new Set(), content: new Map() };
+const LV = { conv: null, rid: null, open: new Set(), openTree: new Set(), focusMsg: null, content: new Map() };
 let lvToken = 0;
 
 const tryJson = s => { try { return JSON.parse(s); } catch { return undefined; } };
@@ -1814,6 +1814,8 @@ async function openConv({ rid, session, user } = {}) {
   LV.conv = conv;
   LV.rid = rid || (resuming && LV.rid) || conv.turns.at(-1)?.rid || null;
   LV.open = new Set(LV.rid != null ? [LV.rid] : []);
+  LV.openTree = new Set(LV.open);
+  LV.focusMsg = null;
   LV.content = new Map();
   $('#dlg-log [data-title]').textContent =
     `${conv.model || 'traffic'} · ${conv.user}${conv.backend ? ` → ${bkName(conv.backend)}` : ''}`;
@@ -1840,6 +1842,8 @@ async function openSeq(seq) {
   };
   LV.rid = seq;
   LV.open = new Set([seq]);
+  LV.openTree = new Set([seq]);
+  LV.focusMsg = null;
   LV.content = new Map([[seq, { req: null, resp: ev.content ?? null, reqObj: null }]]);
   $('#dlg-log [data-title]').textContent = `control \u00b7 ${ev.user}`;
   $('#dlg-log [data-sub]').textContent = `${fmtTime(ev.at_ms)} \u00b7 ${ev.info}`;
@@ -1901,15 +1905,16 @@ const lvSec = (cls, title, info, html) =>
 /** Capture switched off is a decision, not a gap: say so and show what was kept. */
 const lvOff = () => '<div class="lv-off">capture turned off — no request or response text is stored for this client, key or backend. Its timeline, sizes and message roles are still recorded.</div>';
 
-function lvMsgsHtml(obj, prevCount) {
+function lvMsgsHtml(obj, prevCount, rid) {
   const msgs = (obj && obj.messages) || [];
   const toolNames = new Map();
   for (const m of msgs) for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
   // A turn that carries exactly as many messages as the previous one added
   // nothing comparable: show them all instead of folding the whole block away.
   const hidden = prevCount > 0 && prevCount < msgs.length ? prevCount : 0;
-  const earlier = msgs.slice(0, hidden).map(m => msgBlock(m, toolNames)).join('');
-  const fresh = msgs.slice(hidden).map(m => msgBlock(m, toolNames)).join('');
+  const mid = (i) => (rid != null ? `lv-m-${rid}-${i}` : undefined);
+  const earlier = msgs.slice(0, hidden).map((m, i) => msgBlock(m, toolNames, mid(i))).join('');
+  const fresh = msgs.slice(hidden).map((m, i) => msgBlock(m, toolNames, mid(hidden + i))).join('');
   const collapse = hidden
     ? `<details class="lv-hist"><summary>${hidden} earlier messages, already sent in the previous request — expand</summary>${earlier}</details>`
     : '';
@@ -1922,7 +1927,7 @@ function lvReqHtml(t, c) {
   if (S.lv.fmt === 'raw')
     return (c.req.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(c.req);
   if (!c.reqObj) return rawView(c.req);
-  return `<div class="lv-meta">${esc(reqMeta(c.reqObj))}</div>` + lvMsgsHtml(c.reqObj, prevCount);
+  return `<div class="lv-meta">${esc(reqMeta(c.reqObj))}</div>` + lvMsgsHtml(c.reqObj, prevCount, t.rid);
 }
 
 function lvRespHtml(t, c) {
@@ -1997,12 +2002,34 @@ function lvScroll() {
   if (el) el.scrollIntoView({ block: 'start' });
 }
 
-/** Focus one request: expand it, render, scroll to it. */
+/** Focus one request: expand it (leaving the others as they were), scroll to it. */
 async function lvFocus(rid) {
   if (rid == null || lvIdxOf(rid) < 0) return;
   LV.rid = rid;
-  LV.open = new Set([rid]);
+  LV.focusMsg = null;
+  LV.open.add(rid);
+  LV.openTree.add(rid);
   await lvDraw({ scroll: true });
+}
+
+/** A tree message node (the `USER` / `ASSIST` / `TOOL` line under a request):
+ *  focus that message, not just its request — open the turn, unfold the history
+ *  block if the message lives in it, scroll it into view and flash it. */
+async function lvFocusMsg(rid, idx) {
+  if (lvIdxOf(rid) < 0) return;
+  const needed = !LV.open.has(rid) || !LV.content.has(rid);
+  LV.rid = rid;
+  LV.open.add(rid);
+  LV.openTree.add(rid);
+  LV.focusMsg = [rid, idx];
+  if (needed) await lvDraw({ scroll: false });
+  const el = document.getElementById(`lv-m-${rid}-${idx}`);
+  if (!el) { lvScroll(); lvDrawRail(); return; }
+  for (const d of [el.closest('details'), ...el.querySelectorAll('details')]) if (d) d.open = true;
+  el.scrollIntoView({ block: 'center' });
+  el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 1300);
+  lvDrawRail();
 }
 
 async function lvStep(delta) {
@@ -2011,10 +2038,11 @@ async function lvStep(delta) {
 }
 
 async function lvToggle(rid) {
-  if (LV.open.has(rid) && LV.rid !== rid) LV.open.delete(rid);
-  else if (LV.open.has(rid)) LV.open.delete(rid);
-  else LV.open.add(rid);
+  // Each request opens and closes on its own: opening one never folds the others.
+  if (LV.open.has(rid)) { LV.open.delete(rid); LV.openTree.delete(rid); }
+  else { LV.open.add(rid); LV.openTree.add(rid); }
   LV.rid = rid;
+  LV.focusMsg = null;
   await lvDraw({ scroll: false });
 }
 
@@ -2025,10 +2053,11 @@ async function lvReload() {
   try { conv = await api('GET', 'conv?key=' + encodeURIComponent(key)); }
   catch (e) { return toast(e.message, false); }
   // Turn text is refetched too: a finished response may have arrived since.
-  const open = [...LV.open];
+  const open = [...LV.open], openTree = [...LV.openTree];
   LV.conv = conv;
   LV.content = new Map();
   LV.open = new Set(open.filter(r => conv.turns.some(t => t.rid === r)));
+  LV.openTree = new Set(openTree.filter(r => conv.turns.some(t => t.rid === r)));
   $('#dlg-log [data-sub]').textContent =
     `${conv.turns.length} requests · ${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`;
   await lvDraw({ scroll: true });
@@ -2148,9 +2177,9 @@ function lvSave(text, name, type) {
 // carries the timestamp it was measured at, so the outline reads as the
 // timeline it is.
 
-function lvNode({ level, rid, when, tag, snip, caret, cls = '', action = 'lv-jump' }) {
-  return `<div class="lv-node ${cls} l${level}${rid === LV.rid ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}">
-    <span class="car"${caret ? ` data-action="lv-toggle" data-rid="${rid}"` : ''}>${caret ?? ''}</span>
+function lvNode({ level, rid, idx, when, tag, snip, caret, cls = '', action = 'lv-jump', on = false }) {
+  return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}>
+    <span class="car"${caret ? ` data-action="lv-tree" data-rid="${rid}"` : ''}>${caret ?? ''}</span>
     <span class="when">${when ?? ''}</span><span class="tag">${esc(tag)}</span>
     <span class="snip">${esc(snip)}</span></div>`;
 }
@@ -2174,17 +2203,21 @@ function lvDrawRail() {
     items.push(lvNode({
       level: 1, rid: t.rid, when: fmtTime(t.at_ms), tag: `Request ${i + 1}`,
       snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ← ${lvFinish(t)}`,
-      cls: 'turn', caret: LV.open.has(t.rid) ? '▾' : '▸' }));
-    if (!LV.open.has(t.rid)) return;
+      cls: 'turn', caret: LV.openTree.has(t.rid) ? '▾' : '▸',
+      on: t.rid === LV.rid && !LV.focusMsg }));
+    if (!LV.openTree.has(t.rid)) return;
     const c = LV.content.get(t.rid);
     const msgs = lvMsgCount(t) || (c?.reqObj?.messages || []).length;
     items.push(lvNode({ level: 2, rid: t.rid, when: fmtTime(t.tl?.queue ?? t.at_ms), tag: 'req',
       snip: msgs ? `${msgs} messages`
         : t.req?.bytes != null ? `${fmtBytes(t.req.bytes)}${t.redacted ? ' \u00b7 no text' : ''}` : 'no body',
       caret: '' }));
-    for (const m of (c?.reqObj && c.reqObj.messages) || [])
-      items.push(lvNode({ level: 3, rid: t.rid, when: fmtTime(t.at_ms), tag: ROLE_LABEL[m.role] || 'MSG',
-        snip: lvSnip(m), cls: ROLE_CLS[m.role] || 'user' }));
+    for (const [i, m] of ((c?.reqObj && c.reqObj.messages) || []).entries())
+      // No stamp of its own: a message was sent with the request, and repeating
+      // the request's time on every line reads as a measurement that was never taken.
+      items.push(lvNode({ level: 3, rid: t.rid, idx: i, when: '',
+        tag: ROLE_LABEL[m.role] || 'MSG', snip: lvSnip(m), cls: ROLE_CLS[m.role] || 'user',
+        action: 'lv-msg', on: !!LV.focusMsg && LV.focusMsg[0] === t.rid && LV.focusMsg[1] === i }));
     items.push(lvNode({ level: 2, rid: t.rid, when: fmtTime(t.tl?.end ?? t.at_ms), tag: 'resp',
       snip: lvFinish(t) + (c?.resp ? '' : ' · no text'), caret: '' }));
   });
@@ -2281,12 +2314,12 @@ function toolCallBlock(name, args) {
   return `<div class="tc"><div class="tc-h"><span class="fn">${esc(name || 'tool call')}</span></div><pre>${esc(body)}</pre></div>`;
 }
 
-function msgBlock(m, toolNames) {
+function msgBlock(m, toolNames, id) {
   const role = String(m.role || 'message');
   const label = role === 'tool'
     ? `TOOL · ${esc(m.tool_name || m.name || (toolNames && toolNames.get(m.tool_call_id)) || m.tool_call_id || '?')}`
     : (ROLE_LABEL[role] || esc(role));
-  let html = `<div class="msg ${ROLE_CLS[role] || 'user'}"><span class="role">${label}</span>`;
+  let html = `<div class="msg ${ROLE_CLS[role] || 'user'}"${id ? ` id="${id}"` : ''}><span class="role">${label}</span>`;
   html += thinkBlock(m.reasoning_content || m.reasoning || '');
   const t = msgText(m.content, m.images);
   if (t) html += `<div class="mtext">${esc(t)}</div>`;
@@ -2958,11 +2991,29 @@ const actions = {
   // Conversation header -> the viewer on that whole conversation.
   'conv-open': el => openConv({ session: el.dataset.session, user: el.dataset.user })
     .catch(e => toast(e.message, false)),
-  // A turn header or a tree node: focus that request.
+  // A turn header or a tree request row: focus that request.
   'lv-toggle': el => lvToggle(+el.dataset.rid),
   'lv-jump': el => lvFocus(+el.dataset.rid),
-  'lv-expand': async () => { LV.open = new Set(lvTurns().map(t => t.rid)); await lvDraw(); },
-  'lv-collapse': async () => { LV.open = new Set(LV.rid != null ? [LV.rid] : []); await lvDraw({ scroll: true }); },
+  // The tree's own caret: fold/unfold one request without touching the others
+  // (expanding also opens that block in the body, so there is something to read).
+  'lv-tree': async el => {
+    const rid = +el.dataset.rid;
+    if (LV.openTree.has(rid)) LV.openTree.delete(rid);
+    else { LV.openTree.add(rid); LV.open.add(rid); }
+    await lvDraw({ scroll: false });
+  },
+  // A message row inside a request: jump to that message in the body.
+  'lv-msg': el => lvFocusMsg(+el.dataset.rid, +el.dataset.idx),
+  'lv-expand': async () => {
+    const rids = lvTurns().map(t => t.rid);
+    LV.open = new Set(rids); LV.openTree = new Set(rids);
+    await lvDraw();
+  },
+  'lv-collapse': async () => {
+    const keep = LV.rid != null ? [LV.rid] : [];
+    LV.open = new Set(keep); LV.openTree = new Set(keep);
+    await lvDraw({ scroll: true });
+  },
 };
 
 document.addEventListener('click', e => {
@@ -2992,16 +3043,6 @@ $('#lv-next').addEventListener('click', () => lvStep(1));
 $('#lv-last').addEventListener('click', () => lvFocus(lvTurns().at(-1)?.rid));
 $('#lv-reload').addEventListener('click', () => lvReload().catch(e => toast(e.message, false)));
 $('#lv-dl').addEventListener('click', () => lvDownload().catch(e => toast(e.message, false)));
-$('#lv-rail').addEventListener('click', e => {
-  const b = e.target.closest('.lv-item');
-  if (!b) return;
-  const t = $('#dlg-log [data-content]').querySelector(`[data-jmp="${b.dataset.jmp}"]`);
-  if (!t) return;
-  t.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  t.classList.add('flash');
-  setTimeout(() => t.classList.remove('flash'), 1200);
-  for (const x of $('#lv-rail').querySelectorAll('.lv-item')) x.classList.toggle('on', x === b);
-});
 $$('input[name="lv-fmt"]').forEach(r => r.addEventListener('change', () => { S.lv.fmt = r.value; saveLv(); lvDraw({ scroll: true }); }));
 $('#client-filter').addEventListener('change', e => { S.clientFilter = e.target.value; render(); });
 $('#model-search').addEventListener('input', e => { S.modelQuery = e.target.value.trim().toLowerCase(); render(); });
