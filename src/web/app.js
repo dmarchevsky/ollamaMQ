@@ -1890,7 +1890,9 @@ function lvMsgsHtml(obj, prevCount) {
   const msgs = (obj && obj.messages) || [];
   const toolNames = new Map();
   for (const m of msgs) for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
-  const hidden = prevCount > 0 && prevCount <= msgs.length ? prevCount : 0;
+  // A turn that carries exactly as many messages as the previous one added
+  // nothing comparable: show them all instead of folding the whole block away.
+  const hidden = prevCount > 0 && prevCount < msgs.length ? prevCount : 0;
   const earlier = msgs.slice(0, hidden).map(m => msgBlock(m, toolNames)).join('');
   const fresh = msgs.slice(hidden).map(m => msgBlock(m, toolNames)).join('');
   const collapse = hidden
@@ -2032,22 +2034,87 @@ async function lvDownload() {
     lvSave(line + '\n', base + '.jsonl', 'application/x-ndjson');
     return;
   }
-  const md = [
-    `# ${LV.conv.user}${LV.conv.session ? ` · #${LV.conv.session}` : ''}`,
-    LV.conv.session_label ? `\n${LV.conv.session_label}` : '',
-    LV.conv.redacted ? '\n_Text capture was switched off for this conversation; the timeline and sizes below are complete._\n' : '',
-    ...turns.map((t, i) => {
-      const c = LV.content.get(t.rid) || {};
-      const body = S.lv.fmt === 'fmt' && c.reqObj ? lvMsgsHtml(c.reqObj, i > 0 ? lvMsgCount(turns[i - 1]) : 0) : '';
-      return `## Request ${i + 1} — ${fmtTime(t.at_ms)}${t.tl?.end != null ? ` → ${fmtTime(t.tl.end)}` : ''}\n\n`
-        + `> ${lvStages(t).replace(/<[^>]*>/g, '')}${t.status != null ? ` · HTTP ${t.status}` : ''}${t.outcome && t.outcome !== 'ok' ? ` · ${t.outcome}` : ''}\n\n`
-        + `**Request** ${t.method || ''} ${t.path}${t.req?.bytes != null ? ` · ${fmtBytes(t.req.bytes)}` : ''}\n\n`
-        + (c.req ? '```\n' + c.req.slice(0, 4000) + '\n```\n' : '_capture turned off_\n')
-        + `**Response**${t.resp?.bytes != null ? ` · ${fmtBytes(t.resp.bytes)}` : ''}\n\n`
-        + (c.resp ? '```\n' + c.resp.slice(0, 4000) + '\n```\n' : '_capture turned off_\n');
-    }),
-  ].join('\n');
-  lvSave(md, base + '.md', 'text/markdown');
+  lvSave(lvMarkdown(LV.conv, LV.content, turns), base + '.md', 'text/markdown');
+}
+
+/**
+ * The conversation as a transcript: what the viewer shows, in a file. One
+ * section per request with its measured timeline, the messages the request
+ * actually added (the history it resent is named, not repeated), and the
+ * response reconstructed to text — thinking, answer, tool calls, usage.
+ */
+function lvMarkdown(conv, content, turns) {
+  const out = [`# ${conv.user}${conv.session ? ` · #${sessName(conv)}` : ''}`, ''];
+  if (conv.session_label) out.push(conv.session_label, '');
+  if (conv.redacted) out.push('_Body capture was switched off for part of this conversation; the timeline, sizes and roles below are complete._', '');
+  out.push(`_${turns.length} ${turns.length === 1 ? 'request' : 'requests'} · ${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}${conv.model ? ` · ${conv.model}` : ''}${conv.backend ? ` → ${conv.backend}` : ''}_`, '');
+  turns.forEach((t, i) => {
+    const c = content.get(t.rid) || {};
+    out.push(`## Request ${i + 1} — ${fmtTime(t.at_ms)}${t.tl?.end != null ? ` → ${fmtTime(t.tl.end)}` : ' (running)'}`, '',
+      `> ${lvStages(t).replace(/<[^>]*>/g, '')}${t.status != null ? ` · HTTP ${t.status}` : ''}${t.outcome && t.outcome !== 'ok' ? ` · ${t.outcome}` : ''}`, '');
+    out.push(`**Request** ${[t.method, t.path, t.req?.bytes != null ? fmtBytes(t.req.bytes) : null].filter(Boolean).join(' ')}`, '');
+    const prev = i > 0 ? lvMsgCount(turns[i - 1]) : 0;
+    if (c.req == null) out.push(t.redacted ? '_capture turned off — no text is stored for this client, key or backend_' : '_no request text stored_', '');
+    else if (c.reqObj?.messages) {
+      const cut = prev > 0 && prev < c.reqObj.messages.length ? prev : 0;
+      if (cut) out.push(`_${cut} earlier messages are unchanged from the previous request_`, '');
+      for (const m of c.reqObj.messages.slice(cut)) out.push(...lvMsgMd(m));
+    } else out.push('```', c.req, '```', '');
+    out.push(`**Response**${t.resp?.bytes != null ? ` · ${fmtBytes(t.resp.bytes)}` : ''}`, '');
+    if (c.resp == null) out.push(t.redacted ? '_capture turned off_' : '_no response text stored_', '');
+    else {
+      const st = streamState(c.resp) || lvPlainResp(c.resp);
+      if (!st) out.push('```', c.resp, '```', '');
+      else {
+        if (st.think) out.push('_thinking_', '', `> ${st.think.replace(/\n/g, '\n> ')}`, '');
+        if (st.text) out.push(st.text.trimEnd(), '');
+        for (const tc of st.tools || [])
+          out.push(`_tool call_ **${tc.name || '?'}**`, '', '```json', lvArgsText(tc.args), '```', '');
+        if (st.usage?.c != null)
+          out.push(`_${fmtNum(st.usage.c)} tokens generated${st.finish ? `, finished \`${st.finish}\`` : ''}${st.cutTail ? ', capture truncated' : ''}_`, '');
+      }
+    }
+  });
+  return out.join('\n');
+}
+
+/** One request message as markdown: role, text, then the calls it issues. */
+function lvMsgMd(m) {
+  const role = String(m.role || 'message').toLowerCase();
+  const label = ROLE_LABEL[role] || role.toUpperCase();
+  const who = role === 'tool' ? (m.name || m.tool_name || m.tool_call_id || '') : '';
+  const think = m.reasoning_content || m.reasoning || '';
+  const text = msgText(m.content, m.images);
+  const out = [`**${label}${who ? ` · ${who}` : ''}**`, ''];
+  if (think) out.push('_thinking_', `> ${String(think).replace(/\n/g, '\n> ')}`, '');
+  if (text) out.push(String(text).trimEnd(), '');
+  for (const tc of m.tool_calls || [])
+    out.push(`_tool call_ **${tc.function?.name ?? tc.name ?? '?'}**`, '', '```json', lvArgsText(tc.function?.arguments), '```', '');
+  return out;
+}
+
+/** A non-stream response has no SSE to rebuild, but reads out the same way. */
+function lvPlainResp(text) {
+  const o = tryJson(text);
+  const m = o?.choices?.[0]?.message || (o?.choices?.[0]?.text != null ? { content: o.choices[0].text } : null);
+  if (!m) return null;
+  return {
+    text: m.content || '', think: m.reasoning_content || m.reasoning || '',
+    tools: (m.tool_calls || []).map(tc => ({ name: tc.function?.name ?? tc.name, args: tc.function?.arguments })),
+    usage: o.usage ? { p: o.usage.prompt_tokens, c: o.usage.completion_tokens } : null,
+    finish: o.choices?.[0]?.finish_reason,
+  };
+}
+
+/** Tool-call arguments arrive as a JSON string (sometimes mid-stream, so
+ *  sometimes not yet valid); pretty-print what parses, pass through the rest. */
+function lvArgsText(args) {
+  if (args == null) return '';
+  if (typeof args === 'string') {
+    const o = tryJson(args);
+    return o === undefined ? args : JSON.stringify(o, null, 2);
+  }
+  return JSON.stringify(args, null, 2);
 }
 
 function lvSave(text, name, type) {
@@ -2234,9 +2301,11 @@ function transcriptView(body) {
     + (body.messages || []).map(m => msgBlock(m, toolNames)).join('');
 }
 
-/** Reconstruct one assistant message from a streamed response: OpenAI SSE
- *  (`data: {…}` lines + `[DONE]`) or Ollama-native line-delimited JSON. */
-function groupStream(text) {
+/** Parse a streamed capture into its parts — reconstructed text, thinking,
+ *  tool calls, finish reason, usage — or null when it is not a stream. OpenAI
+ *  SSE (`data: {…}` lines + `[DONE]`) or Ollama-native line-delimited JSON.
+ *  The viewer renders this to HTML; the markdown download writes it as text. */
+function streamState(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   if (!lines.length) return null;
   const sse = /^data:/.test(lines[0]);
@@ -2252,6 +2321,10 @@ function groupStream(text) {
     // parsed instead of dropping the whole view.
     if (!o || typeof o !== 'object') { if (trunc) { st.cutTail = true; continue; } return null; }
     st.chunks++;
+    // A single whole response object (`chat.completion`, not a chunk) is not a
+    // stream: let the caller fall back to the plain-response reader.
+    if (!sse && st.chunks === 1 && o.object !== 'chat.completion.chunk'
+        && !o.choices?.[0]?.delta && typeof o.response !== 'string') return null;
     if (o.error) { st.errs++; st.text += `\n[error: ${o.error.message ?? JSON.stringify(o.error)}]`; continue; }
     if (o.choices?.[0]?.finish_reason) st.finish = o.choices[0].finish_reason;
     if (o.done_reason) st.finish = o.done_reason;
@@ -2273,13 +2346,20 @@ function groupStream(text) {
     }
   }
   if (!st.chunks) return null;
-  const tools = st.tools.filter(Boolean);
+  st.tools = st.tools.filter(Boolean);
+  return st;
+}
+
+/** Render that reconstruction as one assistant message. */
+function groupStream(text) {
+  const st = streamState(text);
+  if (!st) return null;
   const foot = [`finish: ${st.finish || '?'}`];
   if (st.usage) foot.push(`prompt ${fmtTok(st.usage.p || 0)} → completion ${fmtTok(st.usage.c || 0)} tok`);
   foot.push(`${fmtNum(st.chunks)} chunks grouped${st.errs ? ` · ${st.errs} error payload(s)` : ''}${st.cutTail ? ' · tail truncated' : ''}`);
   return `<div class="msg asst"><span class="role">assistant</span>${thinkBlock(st.think)}`
     + (st.text ? `<div class="mtext">${esc(st.text)}</div>` : '')
-    + tools.map(t => toolCallBlock(t.name, t.args)).join('')
+    + st.tools.map(t => toolCallBlock(t.name, t.args)).join('')
     + `</div><div class="lv-foot">${esc(foot.join(' · '))}</div>`;
 }
 
