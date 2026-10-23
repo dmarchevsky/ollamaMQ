@@ -159,6 +159,7 @@ pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
         .route("/overview", get(overview::get_overview))
         .route("/logs", get(list_logs))
         .route("/logs/{seq}", get(get_log))
+        .route("/capture", get(capture_state))
         .route("/convs", get(list_convs))
         .route("/conv", get(get_conv))
         .route("/conv/content", get(get_conv_content))
@@ -762,15 +763,32 @@ async fn list_convs(
     Json(state.convlog.summaries(q.limit.unwrap_or(200).min(MAX_LOG_LIMIT)))
 }
 
+/// Whether body capture is actually running, and where it writes. The log path
+/// is opened at boot, so a path that cannot be opened (a missing `/data` on a
+/// host that expects it) leaves the whole capture silently off — the Logs page
+/// needs to say that rather than fail every row open with the same error an
+/// evicted conversation produces.
+async fn capture_state(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(json!({
+        "log": state.convlog.enabled(),
+        "path": state.convlog.path(),
+    }))
+}
+
 async fn get_conv(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ConvQuery>,
 ) -> ApiResult<crate::convlog::Conv> {
+    let missing = if state.convlog.enabled() {
+        "no such conversation in the log"
+    } else {
+        "body capture is off — set a writable Request log path in Settings and restart to store conversations"
+    };
     state
         .convlog
         .index(&find_of(&q))
         .map(Json)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no such conversation in the log"))
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, missing))
 }
 
 async fn get_conv_content(
@@ -1362,6 +1380,10 @@ mod tests {
     use crate::dispatcher::LogEvent;
 
     fn test_state() -> Arc<AppState> {
+        test_state_with(test_convlog())
+    }
+
+    fn test_state_with(convlog: crate::convlog::ConvLogger) -> Arc<AppState> {
         // A per-test temp-dir config path: the password-change test saves
         // appconf.yaml (and its .bak) there, never into the checkout. The
         // random suffix keeps parallel tests from clobbering one another.
@@ -1378,7 +1400,7 @@ mod tests {
             1,
             conf.to_string_lossy().into_owned(),
             Vec::new(),
-            test_convlog(),
+            convlog,
             65_536,
             512 * 1024 * 1024,
         ))
@@ -1494,6 +1516,45 @@ mod tests {
             waste_secs: None,
             redacted: false,
         })));
+    }
+
+    /// A log path that could not be opened at boot (the usual cause: a container
+    /// path that does not exist on this host) has to be visible as such. Before
+    /// this, every log row the operator clicked failed with the same message an
+    /// evicted conversation produces, which reads as a broken viewer.
+    #[tokio::test]
+    async fn capture_off_is_named_instead_of_blaming_the_conversation() {
+        let state = test_state_with(crate::convlog::ConvLogger::disabled());
+        let base = serve(state).await;
+        let c = http();
+
+        let cap: serde_json::Value = c
+            .get(format!("{base}/ui/api/capture"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cap["log"], false);
+        assert!(cap["path"].is_null(), "no path when nothing was opened");
+
+        let r = c
+            .get(format!("{base}/ui/api/conv?rid=1"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("capture is off"),
+            "an unopenable row blames capture, not the conversation: {body}"
+        );
     }
 
     #[tokio::test]

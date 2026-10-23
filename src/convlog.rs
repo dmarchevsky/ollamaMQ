@@ -770,6 +770,18 @@ impl ConvLogger {
         }
     }
 
+    /// `true` when a log file was opened at boot, i.e. bodies are being
+    /// captured. The UI says this out loud instead of letting every row fail to
+    /// open with the same error as an evicted conversation.
+    pub fn enabled(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// Where conversations are written, when capturing.
+    pub fn path(&self) -> Option<&str> {
+        self.file.as_ref().map(|f| f.path.as_str())
+    }
+
     /// Turns lost to the per-conversation cap (reported where the old logger's
     /// dropped-record counter was).
     pub fn dropped_count(&self) -> u64 {

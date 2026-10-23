@@ -15,6 +15,7 @@ const S = {
   page: 'overview',
   state: null,
   logs: [],
+  capture: null,             // { log, path } from api/capture: is body capture running
   clients: [],
   expanded: new Set(),       // backend URLs with their model list open
   showAll: new Set(),        // backend URLs showing every model
@@ -264,7 +265,9 @@ async function poll() {
     const needModels = S.page === 'models' || !S.modelPolicy;
     const needOverview = S.page === 'overview';
     const needSettings = S.page === 'settings' || S.page === 'backends';
-    const [state, logs, clients, models, overview, settings, me] = await Promise.all([
+    // Capture state only changes on restart (the log path is opened at boot),
+    // so ask once and keep the answer.
+    const [state, logs, clients, models, overview, settings, me, capture] = await Promise.all([
       api('GET', 'state'),
       needLogs && !$('#log-pause').checked ? api('GET', `logs?limit=${LOG_LIMIT}`) : null,
       needClients ? api('GET', 'clients') : null,
@@ -272,6 +275,7 @@ async function poll() {
       needOverview ? api('GET', overviewPath()) : null,
       needSettings ? api('GET', 'settings') : null,
       needSettings && !S.me ? api('GET', 'me') : null,
+      needLogs && !S.capture ? api('GET', 'capture') : null,
     ]);
     S.state = state;
     if (logs) S.logs = logs;
@@ -286,6 +290,7 @@ async function poll() {
     }
     if (settings) S.settings = settings;
     if (me) S.me = me;
+    if (capture) S.capture = capture;
     S.online = true;
   } catch (e) {
     S.online = false;
@@ -1728,6 +1733,7 @@ function roundSegs(r) {
 
 function logTable(rounds) {
   if (!rounds.length) return '<div class="empty">No matching log events</div>';
+  const off = captureOff();
   const ev = r => r.in || r.out || r.solo;
   return `<table class="logs">
     <tr><th>Time</th><th>User</th><th>Model</th><th>Backend</th><th>Round</th></tr>
@@ -1737,9 +1743,15 @@ function logTable(rounds) {
       <td class="mono">${esc(e.user)}</td>
       <td class="trunc ${e.model ? '' : 'none'}">${esc(e.model ?? '—')}</td>
       <td class="dim ${e.backend ? '' : 'none'}">${e.backend ? bkCell(e.backend) : '—'}</td>
-      <td class="round"><div class="rline">${roundSegs(r)}</div></td></tr>`; }).join('')}
+      <td class="round"><div class="rline">${roundSegs(r)}${off && rid ? NOCAP_BADGE : ''}</div></td></tr>`; }).join('')}
     </table>`;
 }
+
+// When the log file could not be opened at boot nothing is captured, so a row
+// has no conversation to open. The list still shows the requests (they come
+// from the live ring buffer), and saying so beats a bare “no such conversation”.
+const NOCAP_BADGE = '<span class="badge warn" title="body capture is off — no conversation is stored for this request">not captured</span>';
+const captureOff = () => S.capture && S.capture.log === false;
 
 function renderLogs() {
   const q = $('#log-filter').value.trim().toLowerCase();
@@ -1749,7 +1761,10 @@ function renderLogs() {
     (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.out?.user, r.out?.model, r.out?.backend, r.out?.session,
       r.in?.info, r.out?.info, r.solo?.user, r.solo?.model, r.solo?.backend, r.solo?.session, r.solo?.info]
       .some(v => v && String(v).toLowerCase().includes(q))));
-  setHTML($('#logs'), logTable(rounds));
+  const warn = captureOff()
+    ? `<div class="capnote">Body capture is <b>off</b> — these requests are listed from memory, but their conversations are not written to disk, so a row has nothing to open. Set a writable <b>Request log path</b> in Settings and restart to capture them${S.capture.path ? ` (current path: <code>${esc(S.capture.path)}</code>)` : ''}.</div>`
+    : '';
+  setHTML($('#logs'), warn + logTable(rounds));
 }
 
 // --- Conversation viewer

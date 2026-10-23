@@ -11,6 +11,14 @@
 addEventListener('load', () => {
   const A = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
   setTimeout(() => { location.hash = '#logs'; }, 400);
+  // The Logs page asks whether bodies are being captured: with capture on (the
+  // demo always has it on) there is no warning banner and no row badge.
+  setTimeout(() => {
+    A('capture-state-loaded', S.capture && S.capture.log === true,
+      JSON.stringify(S.capture));
+    A('capture-banner-hidden', !document.querySelector('.capnote')
+      && ![...document.querySelectorAll('#logs tbody')].some(t => /not captured/.test(t.textContent)));
+  }, 1000);
   // Open a turn that has stored text: a redacted turn legitimately has nothing
   // to scroll, so it cannot prove the body scrolls (see the capture switch).
   setTimeout(() => {

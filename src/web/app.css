@@ -286,6 +286,13 @@ input, select {
 input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 #log-filter { width: 300px; }
 .check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+// Shown on the Logs page when the conversation log could not be opened at boot:
+// the rows are real requests, but there is nothing behind them to open.
+.capnote {
+  margin: 0 0 10px; padding: 9px 12px; border-radius: 8px; font-size: 13px;
+  background: var(--warn-soft); color: var(--warn); border: 1px solid transparent;
+}
+.capnote code { font-family: var(--mono); font-size: 12px; }
 .logs td { font-size: 13px; }
 .logs td.time { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
 

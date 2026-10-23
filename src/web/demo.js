@@ -632,6 +632,7 @@
         return delay({ ...ev, content });
       }
       if (method === 'GET' && p === 'convs') return delay(convList());
+      if (method === 'GET' && p === 'capture') return delay({ log: true, path: 'demo-conversations.jsonl' });
       if (method === 'GET' && p === 'conv') return delay(convIndex(qs(path)));
       if (method === 'GET' && p === 'conv/content') return delay(convContent(qs(path)));
       if (method === 'POST' && p === 'config/reload') return delay({ models: 3 });
