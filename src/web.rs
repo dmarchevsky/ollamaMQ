@@ -737,6 +737,8 @@ async fn get_log(State(state): State<Arc<AppState>>, Path(seq): Path<u64>) -> Ap
 #[derive(Deserialize)]
 struct ConvQuery {
     limit: Option<usize>,
+    /// Conversation key verbatim (`client#session`).
+    key: Option<String>,
     session: Option<String>,
     user: Option<String>,
     rid: Option<u64>,
@@ -746,6 +748,7 @@ struct ConvQuery {
 
 fn find_of(q: &ConvQuery) -> crate::convlog::Find<'_> {
     crate::convlog::Find {
+        key: q.key.as_deref(),
         session: q.session.as_deref(),
         user: q.user.as_deref(),
         rid: q.rid,
@@ -1538,6 +1541,30 @@ mod tests {
         // The index carries sizes, never text — the viewer fetches per turn.
         assert!(conv["turns"][0].get("content").is_none());
         assert_eq!(conv["turns"][0]["req"]["chars"], 45);
+
+        // Reload re-reads by the key the viewer already holds: `#` is part of the
+        // key, so it must survive the query string (it does not — it separates a
+        // fragment — hence percent-encoded, as the client encodes it).
+        let by_key: serde_json::Value = c
+            .get(format!("{base}/ui/api/conv?key=alice%23a3f19c"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(by_key["key"], "alice#a3f19c");
+        assert_eq!(by_key["turns"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            c.get(format!("{base}/ui/api/conv?key=alice%23nope"))
+                .basic_auth("admin", Some("pw"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
 
         // Per-turn text, by rid, both directions.
         let out: serde_json::Value = c

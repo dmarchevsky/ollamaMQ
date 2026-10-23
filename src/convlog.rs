@@ -332,6 +332,9 @@ pub struct Resp {
 /// it when the caller knows the client, and `rid` jumps straight to a request.
 #[derive(Default)]
 pub struct Find<'a> {
+    /// The store key verbatim (`client#session`): what a viewer holds once it
+    /// has a conversation, and what reload re-reads by.
+    pub key: Option<&'a str>,
     pub session: Option<&'a str>,
     pub user: Option<&'a str>,
     pub rid: Option<u64>,
@@ -635,15 +638,20 @@ impl ConvStore {
         for (key, e) in &self.entries {
             let hit = match q {
                 Find {
+                    key: Some(want), ..
+                } => *want == key.as_str(),
+                Find {
                     rid: Some(rid),
                     session,
                     user,
+                    ..
                 } => {
                     e.conv.turns.iter().any(|t| t.rid == *rid)
                         && session.is_none_or(|s| e.conv.session.as_deref() == Some(s))
                         && user.is_none_or(|u| e.conv.user == u)
                 }
                 Find {
+                    key: None,
                     session: Some(s),
                     user,
                     ..
@@ -652,6 +660,7 @@ impl ConvStore {
                         && user.is_none_or(|u| e.conv.user == u)
                 }
                 Find {
+                    key: None,
                     user: Some(u),
                     session: None,
                     rid: None,
@@ -1369,6 +1378,11 @@ mod tests {
             });
         }
         assert_eq!(store.find(&Find { session: Some("s"), ..Default::default() }), Some("b#s"));
+        // A viewer that already holds a conversation re-reads it by key — the key
+        // is the one identifier that survives a restart and a rid reuse.
+        assert_eq!(store.find(&Find { key: Some("b#s"), ..Default::default() }), Some("b#s"));
+        assert_eq!(store.find(&Find { key: Some("a#s"), ..Default::default() }), Some("a#s"));
+        assert_eq!(store.find(&Find { key: Some("nope#s"), ..Default::default() }), None);
         assert_eq!(
             store.find(&Find { session: Some("s"), user: Some("a"), ..Default::default() }),
             Some("a#s")
