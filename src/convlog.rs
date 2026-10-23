@@ -20,6 +20,7 @@
 //! cannot say what was said.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +34,11 @@ use crate::lock::LockExt;
 /// Schema marker of a conversation line. Lines from the old per-request format
 /// (`{"dir":"IN"|"OUT", …}`) carry no `v` and are ignored when reading back.
 pub const SCHEMA_V: u64 = 2;
+
+/// Default conversation-log file name: used when no path is configured, and
+/// again by [`ConvLogger::open_candidates`] when the configured one is
+/// unusable on this host.
+pub const DEFAULT_LOG_FILE: &str = "ollamamq-requests.jsonl";
 
 /// Conversations kept in memory at once; the quietest are dropped past this.
 const MAX_CONVS: usize = 200;
@@ -726,15 +732,30 @@ struct FileTarget {
 
 impl ConvLogger {
     /// Open (or create) the log file, read its tail back into the store, and
-    /// start the writer task. The initial open is synchronous so a bad path or
-    /// permission error surfaces to the caller, which falls back to
-    /// [`Self::disabled`].
+    /// start the writer task. A missing parent directory is created: naming a
+    /// log path whose directory is not there yet is a normal setup step, not a
+    /// reason to run without capture. The initial open is synchronous so a bad
+    /// path or permission error surfaces to the caller, which tries
+    /// [`Self::open_candidates`] and then falls back to [`Self::disabled`].
     pub fn start(
         path: String,
         max_bytes: u64,
         max_files: usize,
         flush_idle: Duration,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), std::io::Error> {
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            if !dir.as_os_str().is_empty() {
+                // A directory in the way is as fatal as an unwritable parent:
+                // better to report the open failure than to log next to it.
+                if dir.exists() && !dir.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        format!("{} is not a directory", dir.display()),
+                    ));
+                }
+                std::fs::create_dir_all(dir)?;
+            }
+        }
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -768,6 +789,24 @@ impl ConvLogger {
             store: Arc::new(Mutex::new(ConvStore::new())),
             file: None,
         }
+    }
+
+    /// Paths worth trying, in order, when the configured one cannot be opened.
+    /// First the configured path itself (its directories are created by
+    /// [`Self::start`], so a plain missing directory already succeeded there),
+    /// then `<fallback_dir>/ollamamq-requests.jsonl` — the store directory next
+    /// to `appconf.yaml`, where every other state file lives. Without the
+    /// second try a host whose config still names a container path (`/data/…`)
+    /// runs with capture silently off, so nothing can be looked up later.
+    /// Duplicates (the default path already next to the config) are dropped.
+    pub fn open_candidates(configured: &str, fallback_dir: &Path) -> Vec<String> {
+        let mut out = vec![configured.to_string()];
+        let alt = fallback_dir.join(DEFAULT_LOG_FILE);
+        match alt.to_str() {
+            Some(s) if !out.iter().any(|c| c == s) => out.push(s.to_string()),
+            _ => {}
+        }
+        out
     }
 
     /// `true` when a log file was opened at boot, i.e. bodies are being
@@ -1452,6 +1491,46 @@ mod tests {
         for limit in 0..=data.len() + 2 {
             assert!(std::str::from_utf8(truncate_utf8(data, limit).as_bytes()).is_ok());
         }
+    }
+
+    /// A log path whose directory does not exist yet is a setup step, not a
+    /// reason to run without capture — the earlier failure mode left every log
+    /// row unopenable while looking like a broken viewer.
+    #[tokio::test]
+    async fn start_creates_the_log_directory_when_it_is_missing() {
+        let dir = std::env::temp_dir().join(format!("omq-convdir-{}", crate::clients::random_hex(6)));
+        let path = dir.join("nested").join("conv.jsonl");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (log, _h) = ConvLogger::start(
+            path.to_string_lossy().into_owned(),
+            1 << 20,
+            1,
+            Duration::from_secs(3600),
+        )
+        .expect("a missing directory is created");
+        assert!(log.enabled());
+        assert!(path.exists(), "the file is opened under the new directory");
+        assert_eq!(log.path(), Some(path.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A config that names a container path on a host without one still gets a
+    /// second try, in the store directory next to appconf.yaml.
+    #[test]
+    fn open_candidates_fall_back_to_the_store_dir() {
+        let store = Path::new("/etc/ollamamq");
+        assert_eq!(
+            ConvLogger::open_candidates("/data/ollamamq-requests.jsonl", store),
+            vec![
+                "/data/ollamamq-requests.jsonl".to_string(),
+                "/etc/ollamamq/ollamamq-requests.jsonl".to_string(),
+            ]
+        );
+        // Already next to the config: no duplicate second try.
+        assert_eq!(
+            ConvLogger::open_candidates("/etc/ollamamq/ollamamq-requests.jsonl", store),
+            vec!["/etc/ollamamq/ollamamq-requests.jsonl".to_string()]
+        );
     }
 
     #[test]

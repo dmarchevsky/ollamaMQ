@@ -23,6 +23,13 @@ since upstream `v0.5.0`.
   and timeline with *capture turned off* where the text would be. The TUI's Requests panel and the
   in-memory event ring are unchanged. **Breaking for log readers:** the JSONL format is `v: 2`, one
   line per conversation; `v: 1` files are still rotated and never rewritten.
+- **Capture failure is now loud instead of silent.** Missing directories inside `request_log_path`
+  are created at startup, and a path that still cannot be opened (a container path like `/data/…` on
+  a host without one) falls back to `ollamamq-requests.jsonl` next to `appconf.yaml` with a warning
+  naming both paths. Before, that config booted with the log disabled and every Logs row failed to
+  open with the same message an aged-out conversation gives. `GET /ui/api/capture` reports whether
+  capture runs and where it writes; the Logs page shows the path, badges rows `not captured` and
+  explains when nothing is captured.
 - **Developer playbook only, no product change.** Three stale lines of the dev-flow playbook were
   replaced with what actually works. Dark-mode screenshots were lying: the recipe rewrote
   `prefers-color-scheme: dark` to `all`, which is not a valid media query, so the dark block never
