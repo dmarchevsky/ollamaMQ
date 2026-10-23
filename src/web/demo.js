@@ -158,6 +158,80 @@
       backend: null, info: 'POST /v1/chat/completions body=651322B', has_content: true, rid: 900, session: 'a3f19c' },
   );
 
+  // Conversations as the log store keeps them: one entry each, every turn with
+  // the stage times measured when they happened, and text served separately per
+  // turn. Turn 2 of the codex conversation lands 62 s after turn 1 and carries
+  // the result of an `edit` call — the viewer names that stretch instead of
+  // leaving a hole where the text used to be.
+  const msgMeta = ms => {
+    const byCall = new Map();
+    for (const m of ms) for (const tc of m.tool_calls || []) byCall.set(tc.id, tc.function.name);
+    return ms.map(m => ({
+      role: m.role,
+      chars: String(m.content || '').length,
+      ...(m.name ? { name: m.name } : byCall.has(m.tool_call_id) ? { name: byCall.get(m.tool_call_id) } : {}),
+      ...(m.tool_calls ? { calls: m.tool_calls.map(tc => tc.function.name) } : {}),
+    }));
+  };
+  const bodyOf = ms => JSON.stringify({
+    model: 'Qwen3.8-Flash-Next', stream: true, temperature: 0.2, max_tokens: 8192,
+    tools: ['read', 'edit', 'bash', 'write', 'grep'].map(n => ({ function: { name: n } })),
+    messages: ms,
+  });
+  // Five minutes back, so the conversation sits behind the live traffic the
+  // demo also carries and the idle stretch between its turns is visible.
+  const T = now - 300_000;
+  const convA = chatMsgs.slice(0, 7);
+  const convB = chatMsgs.slice(0, 10);
+  const CONV_TEXT = { 900: { in: bodyOf(convA), out: prevOut }, 901: { in: bodyOf(convB), out: streamOut } };
+  const convs = [
+    {
+      v: 2, key: 'codex-laptop#a3f19c', user: 'codex-laptop', session: 'a3f19c',
+      session_label: 'dispatcher refactor', model: 'Qwen3.8-Flash-Next',
+      backend: 'http://192.168.6.11:8731', priority: 'normal', redacted: false,
+      start_ms: T, end_ms: T + 80_000,
+      turns: [
+        { rid: 900, at_ms: T, tl: { queue: T, dispatch: T + 800, first_token: T + 6_400, end: T + 7_000 },
+          method: 'POST', path: '/v1/chat/completions', model: 'Qwen3.8-Flash-Next',
+          backend: 'http://192.168.6.11:8731', status: 200, outcome: 'ok', priority: 'normal',
+          req: { bytes: 651_322, chars: bodyOf(convA).length }, resp: { bytes: 38_210, chars: prevOut.length },
+          prompt_tokens: 1152, completion_tokens: 96, msgs: msgMeta(convA) },
+        { rid: 901, at_ms: T + 62_000, tl: { queue: T + 62_000, dispatch: T + 62_600, first_token: T + 69_000, end: T + 80_000 },
+          method: 'POST', path: '/v1/chat/completions', model: 'Qwen3.8-Flash-Next',
+          backend: 'http://192.168.6.11:8731', status: 200, outcome: 'ok', priority: 'normal',
+          req: { bytes: 676_918, chars: bodyOf(convB).length }, resp: { bytes: 41_832, chars: streamOut.length },
+          prompt_tokens: 1204, completion_tokens: 345, msgs: msgMeta(convB) },
+      ],
+    },
+    {
+      // Text capture is switched off for this client: the record is complete,
+      // only the bodies are deliberately absent.
+      v: 2, key: 'n8n-agents#b7c2d9', user: 'n8n-agents', session: 'b7c2d9', model: 'BGE-M3',
+      backend: 'http://192.168.255.224:8001', priority: 'normal', redacted: true,
+      start_ms: now - 6_000, end_ms: now - 4_000,
+      turns: [
+        { rid: 903, at_ms: now - 6_000, tl: { queue: now - 6_000, dispatch: now - 5_600, end: now - 4_000 },
+          method: 'POST', path: '/v1/embeddings', model: 'BGE-M3',
+          backend: 'http://192.168.255.224:8001', status: 200, outcome: 'ok', priority: 'normal',
+          req: { bytes: 491_322 }, resp: { bytes: 51_208 }, redacted: true },
+      ],
+    },
+  ];
+  const convFind = q => convs.find(c => (q.key ? c.key === q.key
+    : q.rid ? c.turns.some(t => String(t.rid) === q.rid)
+    : (c.session || '') === (q.session || '') && (!q.user || c.user === q.user)));
+  const convList = () => convs.map(c => ({ key: c.key, user: c.user, session: c.session,
+    session_label: c.session_label, model: c.model, backend: c.backend, priority: c.priority,
+    turns: c.turns.length, start_ms: c.start_ms, end_ms: c.end_ms, redacted: c.redacted,
+    live: false, dropped_turns: 0 }));
+  const convIndex = q => convFind(q) || err('no such conversation in the log');
+  const convContent = q => {
+    const t = (convFind(q)?.turns || []).find(x => String(x.rid) === String(q.rid));
+    if (!t) err('no such request in the log');
+    const text = (CONV_TEXT[t.rid] || {})[q.dir === 'out' ? 'out' : 'in'];
+    return { content: text ?? err('no captured text for this request') };
+  };
+
   const SAMPLE_CONTENT = JSON.stringify({
     model: 'Qwen3.8-Flash-Next',
     stream: true,
@@ -227,6 +301,8 @@
       state: r.ttfb != null && elapsed >= r.ttfb ? 'generating' : 'prefill', waited_secs: r.waited,
       ttfb_secs: r.ttfb, ttft_secs: r.ttfb, tokens: Math.floor(gen * r.rate), tokens_per_sec: gen >= 1 ? r.rate : null,
       est_prompt_tokens: r.est, session: r.session,
+      // The live stage lines anchor on these measured instants, as in the real API.
+      dispatch_ms: r.started, first_token_ms: r.ttfb != null && elapsed >= r.ttfb ? r.started + r.ttfb * 1000 : null,
       session_label: r.label, priority: r.prio || 'normal', rid: r.rid };
   });
 
@@ -395,6 +471,25 @@
         gen_secs: err ? null : completion / (20 + noise(i + 7) * 40),
       };
     });
+    // Stage times as the proxy measures them: each row's own durations laid on
+    // a clock anchored at its finish. The codex row that opens the demo
+    // conversation takes the conversation's own measured times, so Details and
+    // the viewer agree when a row jumps to it; its tools name the idle line.
+    recent.forEach((r, i) => {
+      const pre = r.prefill_secs || 0;
+      const gen = r.gen_secs || 0;
+      const t0 = r.rid === 901 ? convs[0].turns[1].tl : null;
+      const dispatch = t0?.dispatch ?? r.at_ms - (pre + gen) * 1000;
+      if (t0) r.at_ms = t0.queue;
+      const firstTok = t0?.first_token ?? (r.ttft_secs != null ? dispatch + pre * 1000 : null);
+      r.stage = {
+        queue: t0?.queue ?? dispatch - (r.waited_secs || 0) * 1000,
+        dispatch,
+        ...(firstTok != null ? { first_token: firstTok } : {}),
+        end: t0?.end ?? r.at_ms,
+      };
+      r.tools = r.rid === 901 ? ['edit'] : [];
+    });
 
     const view = {
       window_secs: secs, now_ms: t, lane_from_ms: from, lane_span_ms: secs * 1000,
@@ -435,6 +530,7 @@
       F('sticky_routing', 'prompt', 'default'), F('sticky_ttl', 1800, 'default'), F('sticky_lag', 0, 'default'),
       F('sticky_max_entries', 10000, 'default'),
       F('allow_all_routes', false, 'file'), F('metrics_token', null, 'default'), F('log_content_limit', 1048576, 'default'),
+      F('request_log_flush_secs', 60, 'default'),
     ],
     startup: [
       F('host', '0.0.0.0', 'file', false), F('port', 11435, 'file', false),
@@ -481,6 +577,8 @@
     crypto.getRandomValues(b);
     return 'omq-' + [...b].map(x => x.toString(16).padStart(2, '0')).join('');
   }
+
+  const qs = p => Object.fromEntries(new URLSearchParams(p.includes('?') ? p.slice(p.indexOf('?') + 1) : ''));
 
   function handle(method, path, body) {
     try {
@@ -533,6 +631,9 @@
         if (content == null && ev.has_content) content = ev.dir === 'OUT' ? SAMPLE_RESPONSE : SAMPLE_CONTENT;
         return delay({ ...ev, content });
       }
+      if (method === 'GET' && p === 'convs') return delay(convList());
+      if (method === 'GET' && p === 'conv') return delay(convIndex(qs(path)));
+      if (method === 'GET' && p === 'conv/content') return delay(convContent(qs(path)));
       if (method === 'POST' && p === 'config/reload') return delay({ models: 3 });
       if (method === 'GET' && p === 'models') return delay(policyView());
       if (method === 'PUT' && p === 'models/mode') { policy.mode = body.mode; return delay({}); }

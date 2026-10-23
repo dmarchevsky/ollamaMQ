@@ -902,16 +902,27 @@ dialog.logview[open] { display: flex; }
 .lv-shell.railed .lv-body { margin-right: 292px; }
 .lv-rail h4 { margin: 0 4px 8px; font: 700 10.5px var(--mono); letter-spacing: .06em;
   text-transform: uppercase; color: var(--muted); }
-.lv-item { display: flex; gap: 8px; align-items: baseline; width: 100%; text-align: left;
-  border: 0; background: none; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
-.lv-item:hover, .lv-item.on { background: var(--accent-soft); }
-.lv-item .when { flex: none; width: 44px; text-align: right; font: 600 10px var(--mono); color: var(--faint); }
-.lv-item.sec .when { color: var(--muted); font-weight: 700; }
-.lv-item .tag { flex: none; width: 56px; font: 700 9.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
-.lv-item.user .tag { color: var(--accent); } .lv-item.asst .tag { color: var(--ok); }
-.lv-item.tool .tag { color: var(--warn); } .lv-item.sys .tag { color: var(--vip); }
-.lv-item.sec .tag { color: var(--muted); }
-.lv-item .snip { font: 12px var(--mono); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lv-rail-h { display: flex; align-items: center; gap: 6px; margin: 0 2px 8px; }
+.lv-rail-h h4 { margin: 0 auto 0 0; }
+.lv-rail-h .btn { height: 24px; padding: 2px 7px; font-size: 11px; }
+/* The jump tree: request -> request/response -> message -> tool call. Every
+   node carries the timestamp it was measured at, so the outline reads as the
+   timeline it is, and every level is click-through to the block it names. */
+.lv-node { display: flex; gap: 8px; align-items: baseline; width: 100%; text-align: left;
+  border: 0; background: none; padding: 5px 8px; border-radius: 6px; cursor: pointer;
+  font: 12px var(--mono); color: var(--text); }
+.lv-node:hover, .lv-node.on { background: var(--accent-soft); }
+.lv-node .car { flex: none; width: 12px; color: var(--faint); font-size: 10px; }
+.lv-node .when { flex: none; width: 46px; text-align: right; font: 600 10px var(--mono); color: var(--faint); }
+.lv-node .tag { flex: none; width: 58px; font: 700 9.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+.lv-node.user .tag { color: var(--accent); } .lv-node.asst .tag { color: var(--ok); }
+.lv-node.tool .tag { color: var(--warn); } .lv-node.sys .tag { color: var(--vip); }
+.lv-node.req .tag, .lv-node.resp .tag { color: var(--muted); }
+.lv-node.turn .tag { color: var(--text); }
+.lv-node.gapnode { color: var(--faint); } .lv-node.gapnode .tag { color: var(--faint); }
+.lv-node .snip { font: 12px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lv-node.l2 { padding-left: 20px; } .lv-node.l3 { padding-left: 34px; }
+.lv-node.l3 .tag { width: 46px; }
 #dlg-log .flash { outline: 2px solid var(--accent); outline-offset: 1px; }
 .lv-body::-webkit-scrollbar { width: 12px; }
 .lv-body::-webkit-scrollbar-track { background: transparent; }
@@ -929,6 +940,40 @@ dialog.logview[open] { display: flex; }
   padding: 8px 12px; font-size: 12.5px; margin-bottom: 14px; }
 .lv-foot { color: var(--muted); font-size: 12px; font-family: var(--mono); margin: 12px 2px 0; }
 .seg.off { opacity: .45; pointer-events: none; }
+
+/* One block per request, stacked on one timeline. The header always shows what
+   was measured; the bodies open only for the request being read. */
+.turn { border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  margin-bottom: 8px; }
+.turn.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft); }
+.turn-h { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; margin: 0;
+  padding: 9px 14px; font: 600 12px var(--mono); color: var(--muted); cursor: pointer; }
+.turn-h:hover { background: var(--surface-2); border-radius: 9px; }
+.turn-h .chev { color: var(--faint); }
+.turn-h .n { color: var(--text); font-weight: 700; }
+.turn.active .turn-h .n { color: var(--accent); }
+.turn-h .tail { margin-left: auto; }
+.turn .lv-sec { padding: 0 14px 14px; }
+.turn .lv-sec + .lv-sec { border-top: 1px solid var(--border); margin-top: 0; padding-top: 14px; }
+/* The quiet stretch between two turns, named by what ran inside it. */
+.lv-gap { display: flex; gap: 8px; align-items: baseline; color: var(--faint);
+  font: 12px var(--mono); margin: 0 0 8px; padding: 6px 10px 6px 12px;
+  border-left: 2px dotted var(--border); }
+.lv-gap .dot { color: var(--muted); }
+/* The messages a turn resent from the previous one: folded, never deleted. */
+.lv-hist > summary { cursor: pointer; margin-bottom: 10px; padding: 6px 12px; font: 12px var(--mono);
+  color: var(--muted); border: 1px dashed var(--border); border-radius: 8px; }
+.lv-hist[open] > summary { margin-bottom: 12px; }
+/* Capture switched off is a decision, so it reads as one and not as a hole. */
+.lv-off { background: var(--surface-2); border: 1px dashed var(--border); border-radius: 8px;
+  padding: 10px 12px; font: 12.5px/1.55 var(--mono); color: var(--muted); margin-bottom: 12px; }
+/* With no text to show, a turn still lists what it held: one chip per message. */
+.msg-slot { display: flex; gap: 10px; align-items: baseline; border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 10px; margin-bottom: 6px; font: 12px var(--mono); }
+.msg-slot .role { flex: none; width: 62px; font-weight: 700; letter-spacing: .05em; }
+.msg-slot.user .role { color: var(--accent); } .msg-slot.asst .role { color: var(--ok); }
+.msg-slot.tool .role { color: var(--warn); } .msg-slot.sys .role { color: var(--vip); }
+.msg-slot span:last-child { margin-left: auto; flex: none; color: var(--faint); }
 
 /* Transcript blocks (chat request, reconstructed response). */
 .msg { border: 1px solid var(--border); background: var(--surface); border-radius: 8px;

@@ -7,6 +7,22 @@ since upstream `v0.5.0`.
 
 ### Changed
 
+- **The request log is now one line per conversation (`v: 2`), and the log viewer follows it.**
+  A chat client resends its whole history every turn, so one line per request stored the same
+  messages over and over: `src/reqlog.rs` became `src/convlog.rs`, a conversation is one JSON
+  object that grows and is appended again once it has been quiet for `request_log_flush_secs`
+  (default 60 s) — the last line per `key` is the complete one, and startup re-seeds from the file's
+  tail. Every stage (queue, dispatch, first token, end) is now stamped with the unix time it happened,
+  so the Overview prints measured times instead of back-computing them from durations, and the idle
+  stretch between two turns can name the tools that ran in it. The viewer opens a **conversation**
+  (from a Logs row, or from any `≣ View` chip in Details), shows every turn as a block on one
+  timeline, folds the messages a turn resent from the previous one, walks request by request with
+  `⏮ ‹ › ⏭`, reloads, and downloads the conversation as a markdown transcript or as the log line;
+  `≡ Jump` is an expandable request tree. The `Whole / New only` switch is gone — the resent history
+  is folded per turn instead. Conversations whose capture was switched off render their full structure
+  and timeline with *capture turned off* where the text would be. The TUI's Requests panel and the
+  in-memory event ring are unchanged. **Breaking for log readers:** the JSONL format is `v: 2`, one
+  line per conversation; `v: 1` files are still rotated and never rewritten.
 - **Developer playbook only, no product change.** Three stale lines of the dev-flow playbook were
   replaced with what actually works. Dark-mode screenshots were lying: the recipe rewrote
   `prefers-color-scheme: dark` to `all`, which is not a valid media query, so the dark block never

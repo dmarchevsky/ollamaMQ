@@ -270,27 +270,27 @@
 
 <dialog id="dlg-log" class="logview">
   <div class="lv-head">
-    <div class="lv-title"><b data-title>Log</b><span class="lv-sub" data-sub></span></div>
+    <div class="lv-title"><b data-title>Conversation</b><span class="lv-sub" data-sub></span></div>
     <div class="lv-tools">
-      <div class="seg" id="lv-scope" role="radiogroup" aria-label="Request scope" title="Request only: everything the client sent, or only what is new since its previous round">
-        <label><input type="radio" name="lv-scope" value="whole"><span>Whole</span></label>
-        <label><input type="radio" name="lv-scope" value="new"><span>New only</span></label>
-      </div>
-      <div class="seg" id="lv-fmt" role="radiogroup" aria-label="Format">
+      <div class="seg" id="lv-fmt" role="radiogroup" aria-label="Format" title="Raw stores as captured, Formatted as a transcript">
         <label><input type="radio" name="lv-fmt" value="raw"><span>Raw</span></label>
         <label><input type="radio" name="lv-fmt" value="fmt"><span>Formatted</span></label>
       </div>
-      <button class="btn sm" id="lv-jump" title="show the message outline">≣ Jump</button>
+      <button class="btn sm" id="lv-dl" title="download this conversation (the format above decides which)">⤓ Download</button>
+      <button class="btn sm" id="lv-jump" title="show the request tree">≣ Jump</button>
+      <button class="btn sm" id="lv-reload" title="reload — pull in the newest turns">⟳</button>
       <div class="lv-nav">
-        <button class="btn sm" id="lv-prev" title="newer round" aria-label="newer round">↑</button>
-        <button class="btn sm" id="lv-next" title="older round" aria-label="older round">↓</button>
+        <button class="btn sm" id="lv-first" title="first request" aria-label="first request">⏮</button>
+        <button class="btn sm" id="lv-prev" title="previous request" aria-label="previous request">‹</button>
+        <button class="btn sm" id="lv-next" title="next request" aria-label="next request">›</button>
+        <button class="btn sm" id="lv-last" title="last request" aria-label="last request">⏭</button>
       </div>
     </div>
     <button class="btn sm lv-close" data-action="log-close" aria-label="Close">X</button>
   </div>
   <div class="lv-shell">
     <div class="lv-body"><div class="lv-wrap" data-content></div></div>
-    <aside class="lv-rail" id="lv-rail" aria-label="Jump to message" hidden></aside>
+    <aside class="lv-rail" id="lv-rail" aria-label="Jump to request" hidden></aside>
   </div>
 </dialog>
 

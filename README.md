@@ -342,10 +342,11 @@ settings:
                                  # models without max_concurrent_requests may then use all of them (default true)
   max_queued_bytes: 536870912    # total bytes of request bodies waiting in all queues, 503 beyond it
                                  # (default 512 MiB); a request is always admitted when the queues are empty
-  request_log_path: ollamamq-requests.jsonl   # request/response JSONL log file (default shown)
+  request_log_path: ollamamq-requests.jsonl   # conversation JSONL log file (default shown)
   request_log_max_bytes: 10485760             # rotate when the file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
-  log_content_limit: 1048576                  # max body bytes captured per record, min 1024 (default 1 MiB)
+  request_log_flush_secs: 60                  # quiet time after which a conversation is written out (default 60)
+  log_content_limit: 1048576                  # max body bytes captured per request, min 1024 (default 1 MiB)
   clients_file: clients.yaml   # clients and their API keys, managed from the web UI (default shown)
   models_file: models.yaml     # model filter rules, managed from the web UI (default shown)
   metrics_token: ""            # bearer token for GET /metrics; empty = open (default)
@@ -384,24 +385,36 @@ See [`appconf.yaml.example`](appconf.yaml.example) for a fully commented templat
 
 ## Request logging
 
-Every proxied request (`IN`) and upstream response (`OUT`) is written as JSON lines to `settings.request_log_path` (default `ollamamq-requests.jsonl`). Each line is one JSON object:
+The log keeps **one line per conversation**, not one per request. A chat client that sends twenty turns asks the same history twenty times over, and one line per request would store that repetition twenty times; a conversation is therefore one JSON object that grows in place and is appended again when it has more to say. `settings.request_log_path` (default `ollamamq-requests.jsonl`) holds these lines:
 
 | field | meaning |
 | --- | --- |
-| `ts` | unix time in milliseconds |
-| `dir` | `IN` (proxied request) or `OUT` (upstream response) |
-| `user` | client address |
-| `model` | model name, when resolvable (otherwise null) |
-| `backend` | upstream backend URL (may be null; `<all backends>` for aggregated model listings) |
-| `method` | HTTP method |
-| `path` | request path |
-| `status` | response status code (responses only) |
-| `bytes` | total body size in bytes |
-| `content_type` | body content type |
-| `content` | body preview, truncated to `log_content_limit` with a `...[truncated: N bytes total]` marker |
-| `redacted` | `true` when body text was deliberately not stored (see **Log capture**); the key is absent otherwise |
+| `v` | record format version — `2` |
+| `key` | the store key: `client#session` for conversation traffic, `client·rid` for a request with no conversation tag (one such request is one entry) |
+| `user`, `model`, `backend`, `priority` | who and what, as of the newest turn |
+| `session`, `session_label` | the sticky-routing conversation tag and the label the client sent (`X-Session-Name`) |
+| `start_ms`, `end_ms` | the first turn's arrival and the newest turn's last event, unix ms |
+| `redacted` | `true` when any turn had body capture switched off |
+| `dropped_turns` | turns trimmed from the front after a conversation hit the 500-turn cap |
+| `turns[]` | the requests, oldest first — below |
 
-**Log capture.** Every client, every API key and every backend carries a `redact_log` switch (web UI checkbox, `redact_log: true` in `clients.yaml` / `appconf.yaml`). When it is on, the request is served exactly as before and the log entry is still written — user, model, backend, status, byte counts, session, timing — but no body text is captured, so `content` is `null` and `redacted` is `true`. Nothing about the traffic changes: queues, priority, metrics and the response the client sees are untouched. Only *new* requests are affected; lines already in the file keep what they stored.
+Each turn is one proxied request and its response:
+
+| field | meaning |
+| --- | --- |
+| `rid` | correlation id, shared by a request and its response |
+| `at_ms` | when the request arrived, unix ms |
+| `tl` | `queue`, `dispatch`, `first_token`, `end` — unix ms, stamped at the moment each happens. Stages a turn never reached are absent, so a gap in `tl` is a fact and not a guess |
+| `method`, `path`, `status`, `outcome`, `model`, `backend`, `priority` | the request line, its answer, and how it ended (`ok`, `timeout`, `client_gone`, `dropped`, …) |
+| `req`, `resp` | `{bytes, chars, truncated}` per direction — sizes, never text |
+| `prompt_tokens`, `completion_tokens`, `waste_secs` | usage as reported, plus prefill seconds lost to a KV-cache eviction |
+| `msgs[]` | one entry per request message — `role`, `chars`, and `name`/`calls` when it carries a tool name or issues tool calls. Roles and sizes, never text |
+| `redacted` | body capture was switched off for this turn |
+| `content` | `req`/`resp` captured text, cut to `log_content_limit` with a `...[truncated: N bytes total]` marker; absent when nothing was stored |
+
+**When a line is written.** A conversation is appended once it has been quiet for `request_log_flush_secs` (default 60 s), and a longer line follows if it resumes, so **the last line for a `key` is the complete one** — readers take that and ignore earlier lines of the same key. At startup the log re-seeds from the file's tail, so open conversations survive a restart without reading the whole file. The in-memory log keeps the 200 most recent conversations and at most 64 MiB of captured text.
+
+**Log capture.** Every client, every API key and every backend carries a `redact_log` switch (web UI checkbox, `redact_log: true` in `clients.yaml` / `appconf.yaml`). When it is on, the request is served exactly as before and the turn is still written — timeline, sizes, message roles, status, token counts — with no body text, so `content` is absent and `redacted` is `true`. Nothing about the traffic changes: queues, priority, metrics and the response the client sees are untouched. Only *new* requests are affected; lines already in the file keep what they stored. The web viewer renders those conversations in full — turn blocks, gaps and timeline — and says *capture turned off* where the text would be, instead of pretending the structure is missing.
 
 - A **client** rule covers its requests in both directions and every key of that client.
 - A **key** rule covers that key's requests in both directions. Redaction is an opt-out: a key whose client is marked stays covered whatever the key says.
@@ -409,7 +422,7 @@ Every proxied request (`IN`) and upstream response (`OUT`) is written as JSON li
 
 **Rotation:** when the file exceeds `request_log_max_bytes` it is renamed to `.0` (existing `.0` → `.1`, etc.), at most `request_log_max_files` rotated files are kept and the oldest is deleted. The current file size is re-read at startup, so sizing/rotation survives restarts.
 
-**TUI:** the bottom "Requests" panel shows these newest-first with a one-line content preview; press **Enter** on a row for the full-content detail view (`j`/`k` or `PgUp`/`PgDn` scroll, `q`/`Esc`/`Enter` close).
+**TUI:** the bottom "Requests" panel shows the newest live log events (one line per request and per response, from the in-memory ring) with a one-line content preview; press **Enter** on a row for the full-content detail view (`j`/`k` or `PgUp`/`PgDn` scroll, `q`/`Esc`/`Enter` close). It is independent of the file format above.
 
 > **Note:** request/response headers are deliberately **not** logged — this keeps API keys out of the file.
 
@@ -525,7 +538,7 @@ It covers everything the TUI does:
 - **Clients** — every queue identity with its queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock** (TUI `p` `b` `x` `X` `u`). Registered clients are two levels: open a row to edit or delete its keys
 - **Models** — every model the backends list, with a switch per model and filter rules (below)
 - **Blocked** — disabled clients, blocked ids and blocked IPs
-- **Logs** — recent requests paired into rounds: one line per round (`→ request · ← response`), CTL and refused-before-dispatch events standalone. A round whose body text was switched off is marked `no text` instead of showing an empty body. Clicking a round opens a full-screen viewer: the request as a message transcript and the streamed reply reconstructed into one assistant message (thinking collapsed, tool calls rebuilt, token footer), with `Raw ↔ Formatted` and `Whole ↔ New only` switches (New only diffs the history against the round before it), a `≣ Jump` message outline stamped dmesg-style (the request time, `+18s` for what followed within a minute), `↑/↓` round navigation, and `X` to close. The page behind never scrolls while the viewer is open — the only scrollbars are the log's own and the outline's. Truncated captures are salvaged rather than shown as raw.
+- **Logs** — recent log events newest-first, one row per request round (`→ request · ← response`), CTL and refused-before-dispatch events standalone. A round whose body text was switched off is marked `no text`. Clicking a row opens the **conversation viewer** on the conversation that request belongs to, scrolled to that request: every turn of the conversation as a block on one timeline, each headed by what was measured — `queued 0.6s · prefill 6.4s · gen 11.0s · 31.4 t/s` — with the quiet stretch between two turns called out as `idle 55s · tool read (10:38:07 → 10:39:02)`, because those are the tool results the next request carries. The focused turn is expanded: its messages as a transcript (thinking collapsed, tool calls rebuilt, token footer) with the messages the previous request already sent folded away as `7 earlier messages, already sent in the previous request — expand`; other turns stay as header lines until opened. `Raw ↔ Formatted` switches between the transcript and the captured bytes; `⏮ ‹ › ⏭` walk request by request (the one you clicked from is where it starts), `⟳` reloads to pull in turns that arrived since, and `⤓ Download` saves the whole conversation — Formatted gives a markdown transcript, Raw gives the log line as the file holds it. `≡ Jump` opens the request tree: request → request/response → message → tool call, every node stamped with the time it was measured at, each level expandable on its own and click-through to the block it names. Capture turned off is rendered as structure, not absence: the blocks, timeline, sizes and message roles are all there, with *capture turned off* where the text would be. The page behind never scrolls while the viewer is open — the only scrollbars are the log's own and the tree's. Truncated captures are salvaged rather than shown as raw.
 - **Settings** — limits, model aliases, metrics token, the admin password, and the version you are running (see below)
 - **Reload config** — re-read `appconf.yaml` (TUI `r`)
 
@@ -536,7 +549,7 @@ The **Overview** page shows:
 - an **Activity** panel. The graph is one row per conversation, grouped under the backend it ran on: each request paints one block per stage — **waiting** (queued for a slot, hollow blue), **prefill** (yellow), **decode** (green) — placed at the moment that stage began and as wide as it ran, so a 40s decode reads as forty seconds next to a 1s prefill. Colours mean the stage and nothing else; the client's own colour is the swatch beside its name, and identity hues deliberately avoid every status hue so a swatch can never be misread as a stage. A conversation that goes quiet leaves a gap on its row, and a stage cut off by an edge of the window is clipped there and marked `‹`. Hovering a lane lights the whole row in its client's colour. Below the graph, a control row picks **List** or **Details** and how much to show (**Active**, or **All** which adds the recently finished ones); **⊞ / ⊟** beside them expand or collapse every conversation at once (Details view). The list gives running and waiting requests with wait, prefill size and time, prefix-cache use, first token, generation time and speed; **Details** threads each conversation instead — one line per stage event with its own timestamp, plus an `idle` line where the conversation sat quiet. Graph and Details list conversations by when each session **started** (newest first), one shared order, so a running session never jumps around; live rows wash in the client's colour (in Details it marks the live stage lines, and the conversation header carries its current state — `decode`, `prefill` or `waiting`), while the graph reserves that wash for hover. Clicking a graph row focuses that conversation in the list below. Sessions come from sticky routing: the client's `X-Session-Id` header, its `prompt_cache_key`, or a fingerprint of the conversation (see [Sticky Routing](#-sticky-routing-session-affinity))
 - **Backends** and **Clients** tables with requests, errors, first-token p50/p95, generation and prefill speed, and token totals
 
-Numbers cover the chosen interval and come from an in-memory history of the last 24 hours, newest 20 000 requests (finished requests, plus what is running or queued right now). The history starts empty on every restart. Request sizes are estimated as one token per four body bytes while queued or running — the exact prompt count only arrives with the finished response. Every stage line in **Details** and every conversation header carries a `≣ Logs` chip: the stage line opens the full-screen log viewer on that request's round, the header opens the Logs page filtered to that conversation's session.
+Numbers cover the chosen interval and come from an in-memory history of the last 24 hours, newest 20 000 requests (finished requests, plus what is running or queued right now). The history starts empty on every restart. Request sizes are estimated as one token per four body bytes while queued or running — the exact prompt count only arrives with the finished response. Every stage line in **Details** and every conversation header carries a `≣ View` chip: either opens the conversation viewer — the stage line on that request, the header on the whole conversation. Because stage times are stamped where they happen, an `idle` line between two turns can name what ran inside it (`idle 2m 30s · tool edit`) instead of leaving you to infer it from durations.
 - *First token* is measured from dispatch to the first generated token for streams, or is the prompt time the backend reports for non-streamed responses.
 - *Generation speed* is per stream (median).
 - *Share of slot time* is each client's part of the backend time used in the window, which is what fair scheduling divides.
