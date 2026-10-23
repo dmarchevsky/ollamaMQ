@@ -263,6 +263,10 @@ struct Recent {
     /// `None` for model-load records, which were never proxied requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     rid: Option<u64>,
+    /// Absolute stage times (unix ms) as they were measured. The Details
+    /// timeline and the log viewer draw from these and only fall back to
+    /// duration maths when a half is missing.
+    stage: crate::convlog::StageMs,
     /// Share of the prompt served from the prefix cache, 0–100.
     cache_pct: Option<u8>,
     /// Prefill seconds lost to cache eviction; `None` when unmeasurable.
@@ -690,6 +694,7 @@ pub async fn get_overview(
             session_label: f.session_label.clone(),
             priority: f.priority,
             rid: f.rid,
+            stage: f.stage.clone(),
             key: f.key.clone(),
             cache_pct: cache_pct(f.timing.prompt_tokens, f.timing.prefill.map(|(_, t)| t)),
             waste_secs: f.timing.waste_secs,
@@ -956,7 +961,7 @@ mod tests {
             1,
             conf.to_string_lossy().into_owned(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         ));
@@ -974,6 +979,7 @@ mod tests {
                 priority: "normal",
                 rid: None,
                 queue_wait: Some(0.0),
+                stage: Default::default(),
                 timing: crate::stats::Timing {
                     duration: Some(1.0),
                     completion_tokens: 10,

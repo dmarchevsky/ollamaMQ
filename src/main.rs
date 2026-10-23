@@ -23,7 +23,7 @@ mod dispatcher;
 mod lock;
 mod metrics;
 mod model_policy;
-mod reqlog;
+mod convlog;
 mod session;
 mod settings;
 mod snapshot;
@@ -282,6 +282,8 @@ async fn main() {
         .unwrap_or_else(|| "ollamamq-requests.jsonl".to_string());
     let request_log_max_bytes = eff.request_log_max_bytes.unwrap_or(10 * 1024 * 1024);
     let request_log_max_files = eff.request_log_max_files.unwrap_or(5);
+    let request_log_flush =
+        std::time::Duration::from_secs(eff.request_log_flush_secs.unwrap_or(60));
     let log_content_limit = eff
         .log_content_limit
         .map(|v| v.max(1024))
@@ -374,19 +376,20 @@ async fn main() {
             .init();
     }
 
-    // Start the size-rotated request log; fall back to a no-op logger when
+    // Start the size-rotated conversation log; fall back to a no-op logger when
     // the path is unwritable. The writer task handle is kept alive for the
     // process lifetime (same pattern as `_guard` above).
-    let (reqlog, _reqlog_guard) = match crate::reqlog::RequestLogger::start(
+    let (convlog, _convlog_guard) = match crate::convlog::ConvLogger::start(
         request_log_path,
         request_log_max_bytes,
         request_log_max_files,
+        request_log_flush,
     ) {
         Ok(x) => x,
         Err(e) => {
             tracing::error!("request log disabled: {e}");
             (
-                crate::reqlog::RequestLogger::disabled(),
+                crate::convlog::ConvLogger::disabled(),
                 tokio::task::spawn(async {}),
             )
         }
@@ -400,7 +403,7 @@ async fn main() {
         max_concurrent_per_backend,
         args.model_config.clone(),
         file_cfg.models,
-        reqlog,
+        convlog,
         log_content_limit,
         max_queued_bytes,
     ));
@@ -660,7 +663,7 @@ mod tests {
             1,
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         ))

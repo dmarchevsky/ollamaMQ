@@ -66,9 +66,6 @@ pub enum ResponsePart {
 pub struct Task {
     pub method: Method,
     pub path: String,
-    /// Client identity (ConnectInfo addr string) so OUT request-log records
-    /// carry the same user as their IN record.
-    pub user: String,
     pub headers: HeaderMap,
     pub body: Bytes,
     pub responder: mpsc::Sender<ResponsePart>,
@@ -79,6 +76,11 @@ pub struct Task {
     /// When the request was queued; used to fail fast (503) when no backend
     /// can ever serve it instead of letting the client hang forever.
     pub queued_at: std::time::Instant,
+    /// Queue-entry time (unix ms), recorded where it happens so the log and the
+    /// Overview print real clock times instead of back-computing them.
+    pub queue_ms: u64,
+    /// Conversation log key of this request (see [`crate::convlog::key_for`]).
+    pub conv_key: String,
     /// How many cache-hot dispatches this request was held behind by
     /// [`cold_hold`]; bounds the hold-back's delay.
     pub cache_passes: u8,
@@ -809,8 +811,9 @@ pub struct AppState {
     pub model_config_path: String,
     /// Ring buffer of recent request/control events for the TUI Logs panel.
     pub logs: Mutex<VecDeque<LogEvent>>,
-    /// Size-rotated request/response content logger (no-op when disabled).
-    pub reqlog: crate::reqlog::RequestLogger,
+    /// Conversation log: one line per conversation, written when it goes quiet
+    /// (no-op when disabled).
+    pub convlog: crate::convlog::ConvLogger,
     /// Max bytes of body content captured per record in the request log.
     pub log_content_limit: std::sync::atomic::AtomicUsize,
     /// Ceiling on `queued_bytes` (`settings.max_queued_bytes`).
@@ -1867,7 +1870,7 @@ impl AppState {
         max_concurrent_per_backend: u32,
         model_config_path: String,
         model_config: Vec<crate::config::ModelConfig>,
-        reqlog: crate::reqlog::RequestLogger,
+        convlog: crate::convlog::ConvLogger,
         log_content_limit: usize,
         max_queued_bytes: u64,
     ) -> Self {
@@ -1935,7 +1938,7 @@ impl AppState {
             model_config: Mutex::new(model_config),
             model_config_path,
             logs: Mutex::new(VecDeque::new()),
-            reqlog,
+            convlog,
             log_content_limit: std::sync::atomic::AtomicUsize::new(log_content_limit),
             max_queued_bytes: std::sync::atomic::AtomicU64::new(max_queued_bytes),
             allow_all_routes: std::sync::atomic::AtomicBool::new(false),
@@ -3515,8 +3518,32 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     priority: dropped.priority.as_str(),
                                     rid: Some(dropped.rid),
                                     queue_wait: Some(dropped.queued_at.elapsed().as_secs_f64()),
+                                    stage: crate::convlog::StageMs {
+                                        queue: Some(dropped.queue_ms),
+                                        dispatch: None,
+                                        first_token: None,
+                                        end: Some(crate::convlog::now_unix_millis()),
+                                    },
                                     timing: Default::default(),
                                 });
+                                // The turn was opened at arrival; close it here so
+                                // the conversation log never holds a stuck turn.
+                                state.convlog.note(crate::convlog::Note::Resp(Box::new(
+                                    crate::convlog::Resp {
+                                        key: dropped.conv_key.clone(),
+                                        rid: dropped.rid,
+                                        end_ms: crate::convlog::now_unix_millis(),
+                                        status: Some(503),
+                                        resp_bytes: None,
+                                        backend: None,
+                                        outcome: "timeout".into(),
+                                        prompt_tokens: None,
+                                        completion_tokens: None,
+                                        waste_secs: None,
+                                        first_token: None,
+                                        redacted: dropped.redact_text,
+                                    },
+                                )));
                                 state.log_event(LogEvent {
                                     at: std::time::SystemTime::now(),
                                     dir: "OUT",
@@ -3749,6 +3776,28 @@ pub async fn run_worker(state: Arc<AppState>) {
                     let session_label = task.session_label.clone();
                     let prio = task.priority.as_str();
                     let rid = task.rid;
+                    // The turn's timeline, stamped as each stage really happens
+                    // (never reconstructed from durations afterwards).
+                    let conv_key = task.conv_key.clone();
+                    let queue_ms = task.queue_ms;
+                    let dispatch_ms = crate::convlog::now_unix_millis();
+                    state_clone.convlog.note(crate::convlog::Note::Stage {
+                        key: conv_key.clone(),
+                        rid,
+                        queue: Some(queue_ms),
+                        dispatch: Some(dispatch_ms),
+                        first_token: None,
+                    });
+                    // Written by the stream loop, read by `outcome` below: an
+                    // atomic (0 = never measured) because both need it and this
+                    // future has to stay `Send`.
+                    let first_token_ms = std::sync::atomic::AtomicU64::new(0);
+                    let first_token_ms_at = || match first_token_ms
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        0 => None,
+                        ms => Some(ms),
+                    };
                     // Either side can switch body text off: the client/key that
                     // sent it, or the backend serving it (a backend cannot reach
                     // back into the IN record, already written at arrival).
@@ -3772,6 +3821,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                             priority: prio,
                             rid: Some(rid),
                             queue_wait: Some(queue_wait),
+                            stage: crate::convlog::StageMs {
+                                queue: Some(queue_ms),
+                                dispatch: Some(dispatch_ms),
+                                first_token: first_token_ms_at(),
+                                end: Some(crate::convlog::now_unix_millis()),
+                            },
                             timing,
                         });
                     };
@@ -3870,6 +3925,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             session_label.clone(),
                             prio,
                             rid,
+                            dispatch_ms,
                         );
                         // Completion tokens already counted from the stream.
                         let mut live_tokens: u64 = 0;
@@ -3944,6 +4000,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                 if est > 0 && streaming && first_token.is_none() {
                                                     let now = std::time::Instant::now();
                                                     first_token = Some(now);
+                                                    first_token_ms.store(
+                                                        crate::convlog::now_unix_millis(),
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
                                                     metrics.observe(
                                                         &crate::metrics::TTFT,
                                                         &[&user_id, &m_model, &m_backend],
@@ -4089,6 +4149,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             &mut timing,
                                         );
                                     }
+                                    let prompt_tokens = timing.prompt_tokens;
+                                    let completion_tokens = timing.completion_tokens;
+                                    let turn_end_ms = crate::convlog::now_unix_millis();
                                     outcome(
                                         if client_disconnected { "client_gone" } else { "ok" },
                                         timing,
@@ -4101,29 +4164,35 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         *counts.entry(user_id.clone()).or_insert(0) += 1;
                                         drop(counts);
                                         let content_str = (!redact).then(|| {
-                                            Arc::new(crate::reqlog::truncate_utf8(
+                                            Arc::new(crate::convlog::truncate_utf8(
                                                 &content_acc,
                                                 state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed),
                                             ))
                                         });
-                                        state_clone.reqlog.log(crate::reqlog::ReqRecord {
-                                            ts: crate::reqlog::now_unix_millis(),
-                                            dir: "OUT",
-                                            user: task.user.clone(),
-                                            model: log_model.clone(),
-                                            backend: Some(backend_url.clone()),
-                                            method: method_str.clone(),
-                                            path: path_str.clone(),
-                                            status: Some(status.as_u16()),
-                                            bytes: Some(total_bytes),
-                                            content_type: resp_content_type,
-                                            content: content_str.clone(),
-                                            redacted: redact,
-                                            session: session_tag.clone(),
-                                            session_label: session_label.clone(),
-                                            priority: prio,
-                                            waste_secs,
-                                        });
+                                        state_clone.convlog.note(crate::convlog::Note::Resp(
+                                            Box::new(crate::convlog::Resp {
+                                                key: conv_key.clone(),
+                                                rid,
+                                                end_ms: turn_end_ms,
+                                                first_token: first_token_ms_at(),
+                                                status: Some(status.as_u16()),
+                                                resp_bytes: Some(total_bytes),
+                                                backend: Some(backend_url.clone()),
+                                                outcome: "ok".into(),
+                                                prompt_tokens: Some(prompt_tokens),
+                                                completion_tokens: Some(completion_tokens),
+                                                waste_secs,
+                                                redacted: redact,
+                                            }),
+                                        ));
+                                        if let Some(text) = content_str.clone() {
+                                            state_clone.convlog.note(crate::convlog::Note::RespText {
+                                                key: conv_key.clone(),
+                                                rid,
+                                                bytes: Some(total_bytes),
+                                                text,
+                                            });
+                                        }
                                         log_out(
                                             format!(
                                                 "{} {} -> {} resp={}B",
@@ -4136,6 +4205,24 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         let mut dropped =
                                             state_clone.dropped_counts.lock_or_recover();
                                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
+                                        // The turn is over even though nothing was
+                                        // delivered: close it with what is known.
+                                        state_clone.convlog.note(crate::convlog::Note::Resp(
+                                            Box::new(crate::convlog::Resp {
+                                                key: conv_key.clone(),
+                                                rid,
+                                                end_ms: turn_end_ms,
+                                                first_token: first_token_ms_at(),
+                                                status: Some(status.as_u16()),
+                                                resp_bytes: Some(total_bytes),
+                                                backend: Some(backend_url.clone()),
+                                                outcome: "client_gone".into(),
+                                                prompt_tokens: Some(prompt_tokens),
+                                                completion_tokens: Some(completion_tokens),
+                                                waste_secs,
+                                                redacted: redact,
+                                            }),
+                                        ));
                                         log_out(
                                             "dropped (client gone)".into(),
                                             Some(backend_url.clone()),
@@ -4148,24 +4235,30 @@ pub async fn run_worker(state: Arc<AppState>) {
                             }
                             Err(e) => {
                                 let err_msg = Arc::new(format!("upstream error: {}", e));
-                                state_clone.reqlog.log(crate::reqlog::ReqRecord {
-                                    ts: crate::reqlog::now_unix_millis(),
-                                    dir: "OUT",
-                                    user: task.user.clone(),
-                                    model: log_model.clone(),
-                                    backend: Some(backend_url.clone()),
-                                    method: method_str,
-                                    path: path_str,
-                                    status: None,
-                                    bytes: Some(total_bytes),
-                                    content_type: None,
-                                    content: Some(err_msg.clone()),
-                                    redacted: false,
-                                    session: session_tag.clone(),
-                                    session_label: session_label.clone(),
-                                    priority: prio,
-                                    waste_secs: None,
-                                });
+                                state_clone.convlog.note(crate::convlog::Note::Resp(Box::new(
+                                    crate::convlog::Resp {
+                                        key: conv_key.clone(),
+                                        rid,
+                                        end_ms: crate::convlog::now_unix_millis(),
+                                        first_token: None,
+                                        status: None,
+                                        resp_bytes: Some(total_bytes),
+                                        backend: Some(backend_url.clone()),
+                                        outcome: "backend_error".into(),
+                                        prompt_tokens: None,
+                                        completion_tokens: None,
+                                        waste_secs: None,
+                                        redacted: redact,
+                                    },
+                                )));
+                                if !redact {
+                                    state_clone.convlog.note(crate::convlog::Note::RespText {
+                                        key: conv_key.clone(),
+                                        rid,
+                                        bytes: Some(total_bytes),
+                                        text: err_msg.clone(),
+                                    });
+                                }
                                 let _ = task.responder.send(ResponsePart::Error(e)).await;
                                 let mut dropped = state_clone.dropped_counts.lock_or_recover();
                                 *dropped.entry(user_id.clone()).or_insert(0) += 1;
@@ -4245,6 +4338,9 @@ pub async fn proxy_handler(
     // Olla-style paths (`/olla/openai/v1/...`, `/olla/proxy/api/...`) are the
     // plain routes under a prefix, so clients set up for Olla only change port.
     let path = strip_olla_prefix(uri.path()).to_string();
+    // The clock starts here: every stage timestamp the log and the Overview
+    // print is measured from a moment like this one, not back-computed.
+    let arrived_ms = crate::convlog::now_unix_millis();
     // Only known routes behind the prefix: the catch-all Olla routes must not
     // open what the explicit route list (allow_all_routes off) keeps closed.
     if path.len() != uri.path().len() && route_template(&path) == "other" {
@@ -4330,30 +4426,48 @@ pub async fn proxy_handler(
         && model_list_shapes(&path).is_some()
         && let Some(response) = aggregate_model_list(&state, &path).await
     {
-        let ts = crate::reqlog::now_unix_millis();
+        let ts = crate::convlog::now_unix_millis();
         let agg_rid = state.next_rid();
+        // An aggregated listing is a conversation of one turn, so the log holds
+        // it the same way as everything else: open it, close it, one line.
+        let agg_key = crate::convlog::key_for(&user_id, None, agg_rid);
+        state.convlog.note(crate::convlog::Note::Begin(Box::new(
+            crate::convlog::Begin {
+                key: agg_key.clone(),
+                rid: agg_rid,
+                user: user_id.clone(),
+                session_label: None,
+                model: None,
+                method: "GET".into(),
+                path: path.clone(),
+                bytes: Some(0),
+                priority: "normal".into(),
+                at_ms: ts,
+                queue_ms: None,
+                redacted: false,
+                msgs: vec![],
+            },
+        )));
+        state.convlog.note(crate::convlog::Note::Resp(Box::new(
+            crate::convlog::Resp {
+                key: agg_key,
+                rid: agg_rid,
+                end_ms: ts,
+                first_token: None,
+                status: Some(200),
+                resp_bytes: Some(0),
+                backend: Some("<all backends>".into()),
+                outcome: "ok".into(),
+                prompt_tokens: None,
+                completion_tokens: None,
+                waste_secs: None,
+                redacted: false,
+            },
+        )));
         for (dir, info) in [
             ("IN", format!("GET {} body=0B", path)),
             ("OUT", format!("GET {} -> 200 aggregated", path)),
         ] {
-            state.reqlog.log(crate::reqlog::ReqRecord {
-                ts,
-                dir,
-                user: addr.to_string(),
-                model: None,
-                backend: Some("<all backends>".to_string()),
-                method: "GET".to_string(),
-                path: path.clone(),
-                status: (dir == "OUT").then_some(200),
-                bytes: Some(0),
-                content_type: None,
-                content: None,
-                redacted: false,
-                session: None,
-                session_label: None,
-                priority: "normal",
-                waste_secs: None,
-            });
             state.log_event(LogEvent {
                 at: std::time::SystemTime::now(),
                 dir,
@@ -4455,7 +4569,7 @@ pub async fn proxy_handler(
     let body_len = body.len() as u64;
     let redact_text = client.as_ref().is_some_and(|c| c.redact_log);
     let content = (!redact_text).then(|| {
-        Arc::new(crate::reqlog::truncate_utf8(
+        Arc::new(crate::convlog::truncate_utf8(
             &body,
             state.log_content_limit.load(std::sync::atomic::Ordering::Relaxed),
         ))
@@ -4463,7 +4577,6 @@ pub async fn proxy_handler(
     let task = Task {
         path: path.clone(),
         method,
-        user: addr.to_string(),
         headers: task_headers,
         responder: tx,
         body,
@@ -4471,6 +4584,8 @@ pub async fn proxy_handler(
         stuck_warned: false,
         cache_passes: 0,
         queued_at: std::time::Instant::now(),
+        queue_ms: crate::convlog::now_unix_millis(),
+        conv_key: crate::convlog::key_for(&user_id, session_tag.as_deref(), rid),
         key_label: client.as_ref().map(|c| {
             if c.key_label.is_empty() {
                 c.key_id.clone()
@@ -4484,6 +4599,9 @@ pub async fn proxy_handler(
         rid,
         redact_text,
     };
+    // `task` moves into the queue below; the log needs its key afterwards too.
+    let conv_key = task.conv_key.clone();
+    let queue_ms = task.queue_ms;
 
     {
         let mut queues = state.queues.lock_or_recover();
@@ -4532,6 +4650,7 @@ pub async fn proxy_handler(
                 priority: priority.as_str(),
                 rid: Some(task.rid),
                 queue_wait: None,
+                stage: crate::convlog::StageMs::default(),
                 timing: Default::default(),
             });
             return (
@@ -4591,6 +4710,7 @@ pub async fn proxy_handler(
                 priority: priority.as_str(),
                 rid: Some(task.rid),
                 queue_wait: None,
+                stage: crate::convlog::StageMs::default(),
                 timing: Default::default(),
             });
             return (
@@ -4620,27 +4740,37 @@ pub async fn proxy_handler(
         .metrics
         .touch_histogram(&crate::metrics::QUEUE_WAIT, &[&user_id, &model_label]);
 
-    state.reqlog.log(crate::reqlog::ReqRecord {
-        ts: crate::reqlog::now_unix_millis(),
-        dir: "IN",
-        user: addr.to_string(),
-        model: requested_model.clone(),
-        backend: None,
-        method: task_method.clone(),
-        path: path.clone(),
-        status: None,
-        bytes: Some(body_len),
-        content_type: headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string),
-        content: content.clone(),
-        redacted: redact_text,
-        session: session_tag.clone(),
-        session_label: session_label.clone(),
-        priority: priority.as_str(),
-        waste_secs: None,
-    });
+    // Conversation log: open the turn (carrying the request's message roles and
+    // sizes, which survive even when text capture is off), then hand over the
+    // captured body text. Both notes only touch memory.
+    state.convlog.note(crate::convlog::Note::Begin(Box::new(
+        crate::convlog::Begin {
+            key: conv_key.clone(),
+            rid,
+            user: user_id.clone(),
+            session_label: session_label.clone(),
+            model: requested_model.clone(),
+            method: task_method.clone(),
+            path: path.clone(),
+            bytes: Some(body_len),
+            priority: priority.as_str().to_string(),
+            at_ms: arrived_ms,
+            queue_ms: Some(queue_ms),
+            redacted: redact_text,
+            msgs: content
+                .as_ref()
+                .map(|c| crate::convlog::msg_meta(c))
+                .unwrap_or_default(),
+        },
+    )));
+    if let Some(text) = content.clone() {
+        state.convlog.note(crate::convlog::Note::ReqText {
+            key: conv_key.clone(),
+            rid,
+            bytes: Some(body_len),
+            text,
+        });
+    }
 
     state.log_event(crate::dispatcher::LogEvent {
         at: std::time::SystemTime::now(),
@@ -5366,7 +5496,7 @@ mod tests {
             1,     // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         ));
@@ -5376,7 +5506,8 @@ mod tests {
             let mut queues = state.queues.lock_or_recover();
             queues.entry("tester".to_string()).or_default().push_back(Task {
                 method: Method::POST,
-                user: "127.0.0.1:41000".to_string(),
+                queue_ms: crate::convlog::now_unix_millis(),
+                conv_key: "t·1".into(),
                 path: "/api/chat".into(),
                 headers: HeaderMap::new(),
                 body: Bytes::from(r#"{"model":"no-such-model-xyz","messages":[]}"#),
@@ -5468,7 +5599,8 @@ mod tests {
             .or_default()
             .push_back(Task {
                 method: Method::POST,
-                user: "127.0.0.1:41000".to_string(),
+                queue_ms: crate::convlog::now_unix_millis(),
+                conv_key: "t·1".into(),
                 path: "/api/chat".into(),
                 headers,
                 body,
@@ -5756,7 +5888,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         state.queues.lock_or_recover().entry("old".into()).or_default().push_back(Task {
             method: Method::POST,
-            user: "127.0.0.1:41000".to_string(),
+            queue_ms: crate::convlog::now_unix_millis(),
+            conv_key: "t·1".into(),
             path: "/api/chat".into(),
             headers: HeaderMap::new(),
             body: Bytes::from_static(b"{}"),
@@ -6360,7 +6493,7 @@ mod tests {
             1,     // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             max_queued_bytes,
         ))
@@ -6384,7 +6517,8 @@ mod tests {
             .or_default()
             .push_back(Task {
                 method: Method::POST,
-                user: "127.0.0.1:41000".to_string(),
+                queue_ms: crate::convlog::now_unix_millis(),
+                conv_key: "t·1".into(),
                 path: "/v1/chat/completions".into(),
                 headers: HeaderMap::new(),
                 body,
@@ -7157,7 +7291,8 @@ mod tests {
                 keep_alive.push(rx);
                 q.push_back(Task {
                     method: Method::POST,
-                    user: "127.0.0.1:41000".to_string(),
+                    queue_ms: crate::convlog::now_unix_millis(),
+                    conv_key: "t·1".into(),
                     path: "/api/chat".into(),
                     headers: HeaderMap::new(),
                     body: Bytes::from_static(b"{}"),
@@ -7255,7 +7390,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         Task {
             method: Method::POST,
-            user: "127.0.0.1:41000".to_string(),
+            queue_ms: crate::convlog::now_unix_millis(),
+            conv_key: "t·1".into(),
             path: "/v1/chat/completions".into(),
             headers: HeaderMap::new(),
             body: Bytes::from_static(b"{}"),
@@ -7520,7 +7656,8 @@ mod tests {
             .or_default()
             .push_back(Task {
                 method: Method::POST,
-                user: "127.0.0.1:41000".to_string(),
+                queue_ms: crate::convlog::now_unix_millis(),
+                conv_key: "t·1".into(),
                 path: "/v1/chat/completions".into(),
                 headers: HeaderMap::new(),
                 body,
@@ -7946,7 +8083,8 @@ mod tests {
                 .or_default()
                 .push_back(Task {
                     method: Method::POST,
-                    user: "127.0.0.1:41000".to_string(),
+                    queue_ms: crate::convlog::now_unix_millis(),
+                    conv_key: "t·1".into(),
                     path: "/api/chat".into(),
                     headers: HeaderMap::new(),
                     body: Bytes::from_static(b"{}"),
@@ -8339,7 +8477,8 @@ mod tests {
             .or_default()
             .push_back(Task {
                 method: Method::GET,
-                user: "127.0.0.1:41000".to_string(),
+                queue_ms: crate::convlog::now_unix_millis(),
+                conv_key: "t·1".into(),
                 path: "/v1/models".into(),
                 headers: HeaderMap::new(),
                 body: Bytes::new(),
@@ -8505,7 +8644,8 @@ mod tests {
             .or_default()
             .push_back(Task {
                 method: Method::POST,
-                user: "127.0.0.1:41000".to_string(),
+                queue_ms: crate::convlog::now_unix_millis(),
+                conv_key: "t·1".into(),
                 path: "/v1/chat/completions".into(),
                 headers: HeaderMap::new(),
                 body: Bytes::from(format!(r#"{{"model":"{}","messages":[]}}"#, model)),
@@ -8559,7 +8699,7 @@ mod tests {
             cap,   // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         ))

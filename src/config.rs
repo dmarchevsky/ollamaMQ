@@ -178,6 +178,12 @@ pub struct Settings {
     /// Number of rotated request-log files to keep (default 5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_log_max_files: Option<usize>,
+    /// Seconds a conversation must be quiet for before it is written to the log
+    /// (default 60). A conversation that resumes is written again as one longer
+    /// line, so a smaller value costs file size and a larger one delays the
+    /// record of a finished conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_log_flush_secs: Option<u64>,
     /// Max bytes of request/response body content captured per record in the
     /// request log; values below 1024 are raised to 1024 (default 1048576).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -358,7 +364,8 @@ impl Settings {
             port, host, timeout, load_keep_alive, allow_all_routes, stuck_timeout,
             max_concurrent_per_backend, detect_backend_slots, model_aliases, ip_identity,
             sticky_routing, sticky_ttl, sticky_lag, sticky_max_entries, client_priority,
-            request_log_path, request_log_max_bytes, request_log_max_files, log_content_limit,
+            request_log_path, request_log_max_bytes, request_log_max_files,
+            request_log_flush_secs, log_content_limit,
             max_body_bytes, max_queued_bytes, clients_file, models_file,
             metrics_token, web_ui
         )
@@ -376,6 +383,7 @@ impl Settings {
         at_least(self.max_queued_bytes, 1024 * 1024, "max_queued_bytes")?;
         at_least(self.max_body_bytes.map(|v| v as u64), 1024, "max_body_bytes")?;
         at_least(self.log_content_limit.map(|v| v as u64), 1024, "log_content_limit")?;
+        at_least(self.request_log_flush_secs, 5, "request_log_flush_secs")?;
         at_least(self.sticky_ttl, 1, "sticky_ttl")?;
         at_least(self.sticky_max_entries.map(|v| v as u64), 1, "sticky_max_entries")?;
         if self.load_keep_alive.is_some_and(|v| v < -1) {

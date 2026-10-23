@@ -70,6 +70,10 @@ pub struct Finished {
     pub rid: Option<u64>,
     /// Seconds it waited in the queue; `None` when refused before queuing.
     pub queue_wait: Option<f64>,
+    /// Absolute stage times (unix ms) of this request, measured as they happened.
+    /// The Overview draws its timeline from these; `None` halves (an old record,
+    /// or a stage that never happened) fall back to duration maths.
+    pub stage: crate::convlog::StageMs,
     pub timing: Timing,
 }
 
@@ -257,6 +261,7 @@ mod tests {
             priority: "normal",
             rid: None,
             queue_wait: Some(1.0),
+            stage: Default::default(),
             timing,
         }
     }

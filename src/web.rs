@@ -159,6 +159,9 @@ pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
         .route("/overview", get(overview::get_overview))
         .route("/logs", get(list_logs))
         .route("/logs/{seq}", get(get_log))
+        .route("/convs", get(list_convs))
+        .route("/conv", get(get_conv))
+        .route("/conv/content", get(get_conv_content))
         .route("/users/{id}/{op}", post(user_action))
         .route("/sessions/{tag}/priority", post(session_priority))
         .route("/blocked/unblock", post(unblock))
@@ -415,6 +418,10 @@ struct RunView {
     priority: &'static str,
     /// Log correlation id, so the row can jump to the request's log round.
     rid: u64,
+    /// Absolute dispatch time (unix ms), measured at dispatch.
+    dispatch_ms: u64,
+    /// Absolute first-token time (unix ms); `None` while prefilling.
+    first_token_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -611,6 +618,8 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
                     session_label: r.session_label,
                     priority: r.priority,
                     rid: r.rid,
+                    dispatch_ms: r.dispatch_ms,
+                    first_token_ms: r.first_token_ms,
                     client: r.client,
                     key: r.key,
                     model: r.model,
@@ -715,6 +724,65 @@ async fn get_log(State(state): State<Arc<AppState>>, Path(seq): Path<u64>) -> Ap
         .and_then(|i| logs.get(i as usize))
         .map(|ev| Json(log_view(seq, ev, true)))
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "log event has expired"))
+}
+
+// --------------------------------------------------------- conversations
+//
+// The log viewer's data: one conversation (all of its turns, with real
+// timestamps) rather than one request round. The index carries no body text —
+// a conversation resends its whole history every turn, so sending the text with
+// the index would refetch hundreds of kilobytes on every navigation step; text
+// is fetched per turn on demand.
+
+#[derive(Deserialize)]
+struct ConvQuery {
+    limit: Option<usize>,
+    session: Option<String>,
+    user: Option<String>,
+    rid: Option<u64>,
+    /// `in` (request) or `out` (response); anything else means the request.
+    dir: Option<String>,
+}
+
+fn find_of(q: &ConvQuery) -> crate::convlog::Find<'_> {
+    crate::convlog::Find {
+        session: q.session.as_deref(),
+        user: q.user.as_deref(),
+        rid: q.rid,
+    }
+}
+
+async fn list_convs(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ConvQuery>,
+) -> Json<Vec<crate::convlog::ConvSummary>> {
+    Json(state.convlog.summaries(q.limit.unwrap_or(200).min(MAX_LOG_LIMIT)))
+}
+
+async fn get_conv(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ConvQuery>,
+) -> ApiResult<crate::convlog::Conv> {
+    state
+        .convlog
+        .index(&find_of(&q))
+        .map(Json)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no such conversation in the log"))
+}
+
+async fn get_conv_content(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ConvQuery>,
+) -> ApiResult<serde_json::Value> {
+    let dir = match q.dir.as_deref() {
+        Some("out") => crate::convlog::Dir::Resp,
+        _ => crate::convlog::Dir::Req,
+    };
+    let content = state
+        .convlog
+        .content(&find_of(&q), dir)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no captured text for this request"))?;
+    Ok(Json(json!({ "content": content })))
 }
 
 // ------------------------------------------------------- users & blocking
@@ -1307,10 +1375,211 @@ mod tests {
             1,
             conf.to_string_lossy().into_owned(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            test_convlog(),
             65_536,
             512 * 1024 * 1024,
         ))
+    }
+
+    /// A real conversation log in a temp file: the conversation endpoints are
+    /// worth testing against the store the dispatcher would fill, not a stub.
+    fn test_convlog() -> crate::convlog::ConvLogger {
+        let path = std::env::temp_dir().join(format!(
+            "omq-web-conv-{}-{}.jsonl",
+            std::process::id(),
+            crate::clients::random_hex(6)
+        ));
+        crate::convlog::ConvLogger::start(
+            path.to_string_lossy().into_owned(),
+            1 << 20,
+            1,
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap()
+        .0
+    }
+
+    /// Two turns of one agent conversation, as the request path would record it.
+    fn record_two_turns(state: &AppState) {
+        use crate::convlog::{Begin, MsgMeta, Note, Resp};
+        let key = "alice#a3f19c".to_string();
+        state.convlog.note(Note::Begin(Box::new(Begin {
+            key: key.clone(),
+            rid: 7,
+            user: "alice".into(),
+            session_label: Some("refactor-auth".into()),
+            model: Some("qwen".into()),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            bytes: Some(10),
+            priority: "normal".into(),
+            at_ms: 1000,
+            queue_ms: Some(1001),
+            redacted: false,
+            msgs: vec![MsgMeta { role: "user".into(), chars: 4, name: None, calls: vec![] }],
+        })));
+        state.convlog.note(Note::Stage {
+            key: key.clone(),
+            rid: 7,
+            queue: Some(1001),
+            dispatch: Some(1050),
+            first_token: None,
+        });
+        state.convlog.note(Note::ReqText {
+            key: key.clone(),
+            rid: 7,
+            bytes: Some(10),
+            text: std::sync::Arc::new("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}".into()),
+        });
+        state.convlog.note(Note::Resp(Box::new(Resp {
+            key: key.clone(),
+            rid: 7,
+            end_ms: 2000,
+            first_token: Some(1500),
+            status: Some(200),
+            resp_bytes: Some(5),
+            backend: Some("gpu:11434".into()),
+            outcome: "ok".into(),
+            prompt_tokens: Some(3),
+            completion_tokens: Some(2),
+            waste_secs: None,
+            redacted: false,
+        })));
+        state.convlog.note(Note::RespText {
+            key: key.clone(),
+            rid: 7,
+            bytes: Some(5),
+            text: std::sync::Arc::new("hello back".into()),
+        });
+        state.convlog.note(Note::Begin(Box::new(Begin {
+            key: key.clone(),
+            rid: 8,
+            user: "alice".into(),
+            session_label: None,
+            model: Some("qwen".into()),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            bytes: Some(20),
+            priority: "high".into(),
+            at_ms: 5000,
+            queue_ms: Some(5001),
+            redacted: false,
+            msgs: vec![MsgMeta {
+                role: "tool".into(),
+                chars: 6,
+                name: Some("read_file".into()),
+                calls: vec![],
+            }],
+        })));
+        state.convlog.note(Note::ReqText {
+            key: key.clone(),
+            rid: 8,
+            bytes: Some(20),
+            text: std::sync::Arc::new("{\"messages\":[\"older\",\"tool result\"]}".into()),
+        });
+        state.convlog.note(Note::Resp(Box::new(Resp {
+            key,
+            rid: 8,
+            end_ms: 6000,
+            first_token: None,
+            status: Some(200),
+            resp_bytes: Some(5),
+            backend: Some("gpu:11434".into()),
+            outcome: "ok".into(),
+            prompt_tokens: None,
+            completion_tokens: None,
+            waste_secs: None,
+            redacted: false,
+        })));
+    }
+
+    #[tokio::test]
+    async fn conversation_api_serves_one_conversation_and_per_turn_text() {
+        let state = test_state();
+        record_two_turns(&state);
+        let base = serve(state).await;
+        let c = http();
+
+        let list: Vec<serde_json::Value> = c
+            .get(format!("{base}/ui/api/convs"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["key"], "alice#a3f19c");
+        assert_eq!(list[0]["turns"], 2);
+        assert_eq!(list[0]["session_label"], "refactor-auth");
+        assert_eq!(list[0]["priority"], "high", "the highest level the conversation saw");
+        assert_eq!(list[0]["live"], false);
+
+        let conv: serde_json::Value = c
+            .get(format!("{base}/ui/api/conv?session=a3f19c&user=alice"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(conv["v"], 2);
+        assert_eq!(conv["turns"].as_array().unwrap().len(), 2);
+        // Turn order is oldest first, and every stage carries its measured time.
+        assert_eq!(conv["turns"][0]["rid"], 7);
+        assert_eq!(conv["turns"][0]["tl"]["queue"], 1001);
+        assert_eq!(conv["turns"][0]["tl"]["dispatch"], 1050);
+        assert_eq!(conv["turns"][0]["tl"]["first_token"], 1500);
+        assert_eq!(conv["turns"][0]["tl"]["end"], 2000);
+        assert_eq!(conv["turns"][1]["tl"]["queue"], 5001);
+        assert_eq!(conv["turns"][1]["msgs"][0]["name"], "read_file");
+        // The index carries sizes, never text — the viewer fetches per turn.
+        assert!(conv["turns"][0].get("content").is_none());
+        assert_eq!(conv["turns"][0]["req"]["chars"], 45);
+
+        // Per-turn text, by rid, both directions.
+        let out: serde_json::Value = c
+            .get(format!("{base}/ui/api/conv/content?rid=7&dir=out"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(out["content"], "hello back");
+        let req: serde_json::Value = c
+            .get(format!("{base}/ui/api/conv/content?session=a3f19c&dir=in"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(req["content"].as_str().unwrap().starts_with("{\"messages\""));
+
+        // Unknown conversation and a turn without text are 404, not empty 200s.
+        assert_eq!(
+            c.get(format!("{base}/ui/api/conv?session=deadbe"))
+                .basic_auth("admin", Some("pw"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            c.get(format!("{base}/ui/api/conv/content?rid=8&dir=out"))
+                .basic_auth("admin", Some("pw"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     async fn serve(state: Arc<AppState>) -> String {

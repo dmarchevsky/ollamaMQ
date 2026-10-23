@@ -44,6 +44,7 @@ pub const STARTUP_ONLY: &[&str] = &[
     "request_log_path",
     "request_log_max_bytes",
     "request_log_max_files",
+    "request_log_flush_secs",
     "clients_file",
     "models_file",
 ];
@@ -69,6 +70,7 @@ pub fn defaults() -> Settings {
         request_log_path: Some("ollamamq-requests.jsonl".into()),
         request_log_max_bytes: Some(10 * 1024 * 1024),
         request_log_max_files: Some(5),
+        request_log_flush_secs: Some(60),
         log_content_limit: Some(1024 * 1024),
         max_body_bytes: Some(64 * 1024 * 1024),
         max_queued_bytes: Some(512 * 1024 * 1024),
@@ -451,7 +453,7 @@ mod tests {
             1,
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         ));

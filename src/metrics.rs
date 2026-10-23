@@ -927,6 +927,11 @@ pub struct Run {
     pub model: String,
     pub backend: String,
     pub started: std::time::Instant,
+    /// Absolute dispatch and first-token times (unix ms), captured where they
+    /// happen. The live Overview prints these instead of back-computing stage
+    /// times from elapsed seconds, so a stage line in the UI is a measured fact.
+    pub dispatch_ms: u64,
+    pub first_token_ms: Option<u64>,
     /// Seconds it waited in the queue before dispatch.
     pub waited_secs: f64,
     pub first_byte: Option<std::time::Instant>,
@@ -973,6 +978,7 @@ impl Runs {
         session_label: Option<String>,
         priority: &'static str,
         rid: u64,
+        dispatch_ms: u64,
     ) -> RunGuard<'_> {
         let id = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.lock_or_recover().insert(
@@ -983,6 +989,8 @@ impl Runs {
                 model: model.to_string(),
                 backend: backend.to_string(),
                 started: std::time::Instant::now(),
+                dispatch_ms,
+                first_token_ms: None,
                 waited_secs,
                 first_byte: None,
                 first_token: None,
@@ -1138,7 +1146,7 @@ mod tests {
     fn runs_clear_on_drop_and_show_as_gauges() {
         let runs = Runs::default();
         {
-            let g = runs.start("dm", "laptop", "qwen", "b:1", 0.5, 1_000, None, None, "normal", 1);
+            let g = runs.start("dm", "laptop", "qwen", "b:1", 0.5, 1_000, None, None, "normal", 1, 1_700_000_000_000);
             g.update(|r| r.tokens += 5);
             let l = runs.list();
             assert_eq!((l.len(), l[0].tokens), (1, 5));
