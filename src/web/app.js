@@ -16,6 +16,7 @@ const S = {
   state: null,
   logs: [],
   capture: null,             // { log, path } from api/capture: is body capture running
+  logGroup: 'session',       // Logs page: one row per conversation, or per request
   clients: [],
   expanded: new Set(),       // backend URLs with their model list open
   showAll: new Set(),        // backend URLs showing every model
@@ -1736,7 +1737,7 @@ function logTable(rounds) {
   const off = captureOff();
   const ev = r => r.in || r.out || r.solo;
   return `<table class="logs">
-    <tr><th>Time</th><th>User</th><th>Model</th><th>Backend</th><th>Round</th></tr>
+    <tr><th>Time</th><th>Client</th><th>Model</th><th>Backend</th><th>Round</th></tr>
     ${rounds.map(r => { const e = ev(r); const rid = r.in?.rid ?? r.out?.rid;
       return `<tr class="clickable" ${rid ? `data-action="log-round" data-rid="${rid}"` : `data-action="log-detail" data-seq="${e.seq}"`}>
       <td class="time">${fmtTime(e.at_ms)}</td>
@@ -1745,6 +1746,93 @@ function logTable(rounds) {
       <td class="dim ${e.backend ? '' : 'none'}">${e.backend ? bkCell(e.backend) : '—'}</td>
       <td class="round"><div class="rline">${roundSegs(r)}${off && rid ? NOCAP_BADGE : ''}</div></td></tr>`; }).join('')}
     </table>`;
+}
+
+// The other view of the same ring: one row per conversation. A chat session
+// makes twenty calls, and twenty rows that each repeat part of the previous one
+// hide that; a control action and traffic with no session belong to no
+// conversation, so they stand alone in both views.
+const storedLogGroup = () => {
+  try { return localStorage.getItem('omq.logGroup') === 'request' ? 'request' : 'session'; } catch { return 'session'; }
+};
+
+const listSome = set => {
+  const v = [...set];
+  return v.length ? esc(v[0]) + (v.length > 1 ? ` +${v.length - 1}` : '') : null;
+};
+
+/** Rounds grouped into conversations: same client + session tag is one row. */
+function logConvs(rounds) {
+  const items = [];
+  const byKey = new Map();
+  const num = (re, s) => { const m = re.exec(s || ''); return m ? +m[1] : 0; };
+  for (const r of rounds) {
+    const e = r.in || r.out || r.solo;
+    if (r.ctl || !e.session) { items.push({ kind: 'solo', at: e.at_ms, r }); continue; }
+    const key = `${e.user}#${e.session}`;
+    let g = byKey.get(key);
+    if (!g) {
+      g = { kind: 'conv', key, user: e.user, session: e.session, label: e.session_label || null,
+        models: new Set(), backends: new Set(), reqs: 0, inBytes: 0, outBytes: 0, errors: 0,
+        first: e.at_ms, at: e.at_ms, rid: e.rid ?? null, lastStatus: null,
+        statusAt: 0, redacted: false, waiting: false };
+      byKey.set(key, g);
+      items.push(g);
+    }
+    g.first = Math.min(g.first, e.at_ms);
+    if (e.at_ms >= g.at) { g.at = e.at_ms; if (e.rid != null) g.rid = e.rid; }
+    if (e.model) g.models.add(e.model);
+    if (e.backend) g.backends.add(e.backend);
+    if (e.redacted) g.redacted = true;
+    if (r.in) { g.reqs++; g.inBytes += num(/body=(\d+)B/, r.in.info); }
+    if (r.out) {
+      g.outBytes += num(/resp=(\d+)B/, r.out.info);
+      const st = num(/-> (\d{3})/, r.out.info);
+      if (st && r.out.at_ms >= g.statusAt) { g.lastStatus = st; g.statusAt = r.out.at_ms; if (st >= 400) g.errors++; }
+    }
+    if (r.in && !r.out) g.waiting = true;
+  }
+  items.sort((a, b) => b.at - a.at);
+  return items;
+}
+
+/** The Activity cell: what the session sent and got, plus what it is doing. */
+function convSegs(g) {
+  return `<span class="rl in"><span class="ar">\u2192</span>${g.reqs} req \u00b7 ${fmtBytes(g.inBytes)}</span>`
+    + ` <span class="rl out${g.errors ? ' err' : ''}"><span class="ar">\u2190</span>${g.lastStatus ?? '…'} \u00b7 ${fmtBytes(g.outBytes)}</span>`
+    + (g.waiting ? ' <span class="badge q">waiting</span>' : '')
+    + (g.errors ? ` <span class="badge bad">${g.errors} failed</span>` : '')
+    + (g.redacted ? ' ' + REDACT_BADGE : '')
+    + (captureOff() ? ' ' + NOCAP_BADGE : '');
+}
+
+/** A session as the client named it (`#cache-warmup`), else the tag the store
+ *  keys on — the label is what makes one row per conversation recognisable. */
+const sessTag = g => `<span class="sess" title="session tag ${esc(g.session)} — this is what the log keys on">#${esc(g.label || g.session)}</span>`;
+
+function convTable(rounds) {
+  const items = logConvs(rounds);
+  if (!items.length) return '<div class="empty">No matching log events</div>';
+  const rows = items.map(it => {
+    if (it.kind === 'solo') {
+      const e = it.r.in || it.r.out || it.r.solo;
+      return `<tr class="clickable" data-action="log-detail" data-seq="${e.seq}">
+        <td class="time">${fmtTime(e.at_ms)}</td>
+        <td><span class="mono">${esc(e.user)}</span> <span class="dim">\u00b7 no session</span></td>
+        <td class="trunc none">\u2014</td><td class="dim none">\u2014</td>
+        <td class="round"><div class="rline">${roundSegs(it.r)}</div></td></tr>`;
+    }
+    const g = it, model = listSome(g.models), bk = listSome(g.backends);
+    return `<tr class="clickable" data-action="conv-open" data-session="${esc(g.session)}" data-user="${esc(g.user)}"${g.rid != null ? ` data-rid="${g.rid}"` : ''}
+      title="${esc(g.user)} \u00b7 ${fmtTime(g.first)} \u2192 ${fmtTime(g.at)} \u00b7 ${g.reqs} requests">
+      <td class="time">${fmtTime(g.at)}</td>
+      <td><span class="mono">${esc(g.user)}</span>${sessTag(g)}</td>
+      <td class="trunc ${model ? '' : 'none'}">${model ?? '—'}</td>
+      <td class="dim ${bk ? '' : 'none'}">${bk ?? '—'}</td>
+      <td class="round"><div class="rline">${convSegs(g)}</div></td></tr>`;
+  }).join('');
+  return `<table class="logs">
+    <tr><th>Time</th><th>Conversation</th><th>Model</th><th>Backend</th><th>Activity</th></tr>${rows}</table>`;
 }
 
 // When the log file could not be opened at boot nothing is captured, so a row
@@ -1758,13 +1846,14 @@ function renderLogs() {
   const dir = $('#log-dir').value;
   const rounds = logRounds(S.logs).filter(r =>
     (dir === '' || (dir === 'awaiting' ? r.in && !r.out : r.ctl)) &&
-    (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.out?.user, r.out?.model, r.out?.backend, r.out?.session,
+    (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.in?.session_label, r.out?.user, r.out?.model,
+      r.out?.backend, r.out?.session, r.out?.session_label,
       r.in?.info, r.out?.info, r.solo?.user, r.solo?.model, r.solo?.backend, r.solo?.session, r.solo?.info]
       .some(v => v && String(v).toLowerCase().includes(q))));
   const warn = captureOff()
     ? `<div class="capnote">Body capture is <b>off</b> — these requests are listed from memory, but their conversations are not written to disk, so a row has nothing to open. Set a writable <b>Request log path</b> in Settings and restart to capture them${S.capture.path ? ` (current path: <code>${esc(S.capture.path)}</code>)` : ''}.</div>`
     : '';
-  setHTML($('#logs'), warn + logTable(rounds));
+  setHTML($('#logs'), warn + (S.logGroup === 'request' ? logTable(rounds) : convTable(rounds)));
 }
 
 // --- Conversation viewer
@@ -2990,10 +3079,11 @@ const actions = {
   'log-detail': el => openSeq(+el.dataset.seq),
   'log-round': el => openConv({ rid: +el.dataset.rid }),
   'log-close': () => $('#dlg-log').close(),
-  // Overview row -> the conversation that request belongs to, opened on it.
+  // A log row -> the conversation that request belongs to, opened on it.
   'log-jump': el => { const rid = +el.dataset.rid; if (rid) openConv({ rid }).catch(e => toast(e.message, false)); },
-  // Conversation header -> the viewer on that whole conversation.
-  'conv-open': el => openConv({ session: el.dataset.session, user: el.dataset.user })
+  // A conversation row in the grouped list, or an Overview header chip: open the
+  // whole conversation, focused on the newest request when the row names one.
+  'conv-open': el => openConv({ rid: +el.dataset.rid || null, session: el.dataset.session, user: el.dataset.user })
     .catch(e => toast(e.message, false)),
   // A turn header or a tree request row: focus that request.
   'lv-toggle': el => lvToggle(+el.dataset.rid),
@@ -3039,6 +3129,17 @@ document.addEventListener('keydown', e => {
 $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close('cancel'); }));
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
+// Grouped or per-request: which view of the same ring, remembered like the
+// other view choices.
+S.logGroup = storedLogGroup();
+$$('#log-group input[name="log-group"]').forEach(r => {
+  r.checked = S.logGroup === r.value;
+  r.addEventListener('change', () => {
+    S.logGroup = r.value;
+    try { localStorage.setItem('omq.logGroup', r.value); } catch { /* storage blocked */ }
+    renderLogs();
+  });
+});
 // Round-viewer controls: choices persist like the other view preferences.
 $('#lv-jump').addEventListener('click', () => { S.lv.rail = !S.lv.rail; saveLv(); lvDrawRail(); $('#lv-jump').classList.toggle('active', S.lv.rail); });
 $('#lv-first').addEventListener('click', () => lvFocus(lvTurns()[0]?.rid));

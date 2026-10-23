@@ -22,8 +22,18 @@ addEventListener('load', () => {
   // Open a turn that has stored text: a redacted turn legitimately has nothing
   // to scroll, so it cannot prove the body scrolls (see the capture switch).
   setTimeout(() => {
-    const tr = [...document.querySelectorAll('#logs tbody tr[data-action]')]
-      .find(r => !/no text/.test(r.textContent));
+    // The Logs page opens grouped by conversation: one row per session. A row
+    // whose text was never stored cannot prove the body scrolls, and a control
+    // row is not a conversation, so pick a conversation row with stored text.
+    const convRows = [...document.querySelectorAll('#logs tbody tr[data-action="conv-open"]')];
+    A('logs-grouped-by-conversation', convRows.length >= 2, `${convRows.length} conversation rows`);
+    const pairs = convRows.map(r => `${r.dataset.user}#${r.dataset.session}`);
+    A('logs-one-row-per-conversation', new Set(pairs).size === pairs.length, pairs.join(' '));
+    A('logs-row-sums-requests', convRows.every(r => /\d+ req ·/.test(r.textContent)),
+      convRows.map(r => r.querySelector('.rline')?.textContent.trim().slice(0, 28)).join(' | '));
+    A('logs-row-names-session', convRows.some(r => /#dispatcher refactor/.test(r.textContent)),
+      convRows.map(r => r.querySelector('.sess')?.textContent).join(' '));
+    const tr = convRows.find(r => !/no text/.test(r.textContent));
     if (tr) tr.click();
   }, 1500);
   setTimeout(() => {
@@ -115,3 +125,17 @@ addEventListener('load', () => {
     }, 600);
   }, 3000);
 });
+
+// The other view of the same ring. Runs last, after the viewer chain is done:
+// the segmented control splits the grouped rows back into one row per request,
+// and the choice is remembered like the other view choices.
+addEventListener('load', () => setTimeout(() => {
+  const A2 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  const before = document.querySelectorAll('#logs tbody tr[data-action="conv-open"]').length;
+  const radio = document.querySelector('#log-group input[value="request"]');
+  radio.checked = true;
+  radio.dispatchEvent(new Event('change'));
+  const rounds = document.querySelectorAll('#logs tbody tr[data-action="log-round"]').length;
+  A2('logs-request-view-splits-rounds', rounds >= before && localStorage.getItem('omq.logGroup') === 'request',
+    `${rounds} request rows vs ${before} conversation rows`);
+}, 12000));

@@ -149,13 +149,13 @@
       backend: null, info: 'POST /v1/embeddings body=491322B', has_content: false,
       redacted: true, rid: 903, session: 'b7c2d9' },
     { seq: 1202, at_ms: now - 8_000, dir: 'OUT', user: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
-      backend: 'http://192.168.6.11:8731', info: 'POST /v1/chat/completions -> 200 resp=41832B', has_content: true, rid: 901, session: 'a3f19c' },
+      backend: 'http://192.168.6.11:8731', info: 'POST /v1/chat/completions -> 200 resp=41832B', has_content: true, rid: 901, session: 'a3f19c', session_label: 'dispatcher refactor' },
     { seq: 1201, at_ms: now - 26_000, dir: 'IN', user: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
-      backend: null, info: 'POST /v1/chat/completions body=676918B', has_content: true, rid: 901, session: 'a3f19c' },
+      backend: null, info: 'POST /v1/chat/completions body=676918B', has_content: true, rid: 901, session: 'a3f19c', session_label: 'dispatcher refactor' },
     { seq: 1200, at_ms: now - 88_000, dir: 'OUT', user: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
-      backend: 'http://192.168.6.11:8731', info: 'POST /v1/chat/completions -> 200 resp=38210B', has_content: true, rid: 900, session: 'a3f19c' },
+      backend: 'http://192.168.6.11:8731', info: 'POST /v1/chat/completions -> 200 resp=38210B', has_content: true, rid: 900, session: 'a3f19c', session_label: 'dispatcher refactor' },
     { seq: 1199, at_ms: now - 95_000, dir: 'IN', user: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
-      backend: null, info: 'POST /v1/chat/completions body=651322B', has_content: true, rid: 900, session: 'a3f19c' },
+      backend: null, info: 'POST /v1/chat/completions body=651322B', has_content: true, rid: 900, session: 'a3f19c', session_label: 'dispatcher refactor' },
   );
 
   // Conversations as the log store keeps them: one entry each, every turn with

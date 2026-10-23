@@ -293,6 +293,9 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
   background: var(--warn-soft); color: var(--warn); border: 1px solid transparent;
 }
 .capnote code { font-family: var(--mono); font-size: 12px; }
+// The session a grouped Logs row belongs to, next to its client.
+.logs .sess { margin-left: 5px; font: 600 11px var(--mono); color: var(--accent);
+  background: var(--accent-soft); border-radius: 8px; padding: 1px 6px; white-space: nowrap; }
 .logs td { font-size: 13px; }
 .logs td.time { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
 

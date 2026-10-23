@@ -7,6 +7,15 @@ since upstream `v0.5.0`.
 
 ### Changed
 
+- **The Logs page is one row per conversation by default.** A chat session makes twenty calls, and
+  twenty rows that each repeat part of the previous one hid what the session was doing. The table now
+  switches between **By conversation** — one row per client and session, naming the session as its
+  client labelled it and summing what it sent and got (`→ 4 req · 1.3 MB ← 200 · 92 KB`, with `waiting`
+  or `2 failed` when either is true) — and **By request**, the old one row per round, which is what a
+  single call that misbehaved needs. Control actions and traffic that sent no session token stand alone
+  in either view, and the choice is remembered across sessions. `GET /ui/api/logs` gained
+  `session_label`, so a row reads `#cache-warmup` instead of the six-hex tag. Clicking a grouped row
+  opens that conversation on its newest request, so the turns are walked without going back to the list.
 - **The request log is now one line per conversation (`v: 2`), and the log viewer follows it.**
   A chat client resends its whole history every turn, so one line per request stored the same
   messages over and over: `src/reqlog.rs` became `src/convlog.rs`, a conversation is one JSON

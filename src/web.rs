@@ -19,7 +19,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{info, warn};
@@ -668,9 +668,19 @@ struct LogView {
     /// rounds and find the previous round for the "new only" view.
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<String>,
+    /// The label the client sent for that session, when the conversation log
+    /// knows it. The grouped Logs list reads `#cache-warmup` instead of the
+    /// six-hex tag, which is what makes one row per conversation recognisable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_label: Option<String>,
 }
 
-fn log_view(seq: u64, ev: &crate::dispatcher::LogEvent, with_content: bool) -> LogView {
+fn log_view(
+    seq: u64,
+    ev: &crate::dispatcher::LogEvent,
+    with_content: bool,
+    session_label: Option<String>,
+) -> LogView {
     LogView {
         seq,
         at_ms: ev
@@ -687,12 +697,25 @@ fn log_view(seq: u64, ev: &crate::dispatcher::LogEvent, with_content: bool) -> L
         redacted: ev.redacted,
         rid: ev.rid,
         session: ev.session.clone(),
+        session_label,
         content: if with_content {
             ev.content.as_deref().map(|c| c.to_string())
         } else {
             None
         },
     }
+}
+
+/// Session tag -> the label its client sent, from what the log has recorded.
+/// Nothing here reads the ring: an uncaptured or label-less session simply has
+/// no entry, and the UI shows the tag.
+fn session_labels(state: &AppState) -> HashMap<String, String> {
+    state
+        .convlog
+        .summaries(MAX_LOG_LIMIT)
+        .into_iter()
+        .filter_map(|c| Some((c.session?, c.session_label?)))
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -708,22 +731,36 @@ async fn list_logs(
     let limit = q.limit.unwrap_or(300).min(MAX_LOG_LIMIT);
     let logs = state.logs.lock_or_recover();
     let base = state.logs_evicted.load(Ordering::Relaxed);
+    let labels = session_labels(&state);
     Json(
         logs.iter()
             .enumerate()
             .rev()
             .take(limit)
-            .map(|(i, ev)| log_view(base + i as u64, ev, false))
+            .map(|(i, ev)| {
+                let label = ev
+                    .session
+                    .as_ref()
+                    .and_then(|s| labels.get(s).cloned());
+                log_view(base + i as u64, ev, false, label)
+            })
             .collect(),
     )
 }
 
 async fn get_log(State(state): State<Arc<AppState>>, Path(seq): Path<u64>) -> ApiResult<LogView> {
+    let labels = session_labels(&state);
     let logs = state.logs.lock_or_recover();
     let base = state.logs_evicted.load(Ordering::Relaxed);
     seq.checked_sub(base)
         .and_then(|i| logs.get(i as usize))
-        .map(|ev| Json(log_view(seq, ev, true)))
+        .map(|ev| {
+            let label = ev
+                .session
+                .as_ref()
+                .and_then(|s| labels.get(s).cloned());
+            Json(log_view(seq, ev, true, label))
+        })
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "log event has expired"))
 }
 

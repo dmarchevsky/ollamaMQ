@@ -138,6 +138,10 @@
         <h1>Logs</h1>
         <div class="toolbar">
           <input type="search" id="log-filter" placeholder="Filter by user, model, backend, info…" autocomplete="off">
+          <div class="seg" id="log-group" role="radiogroup" aria-label="One row per conversation or per request">
+            <label><input type="radio" name="log-group" value="session" checked><span>By conversation</span></label>
+            <label><input type="radio" name="log-group" value="request"><span>By request</span></label>
+          </div>
           <select id="log-dir">
             <option value="">All</option><option value="awaiting">Awaiting response</option><option value="CTL">Control</option>
           </select>
