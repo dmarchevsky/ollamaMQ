@@ -267,6 +267,8 @@ struct Recent {
     /// timeline and the log viewer draw from these and only fall back to
     /// duration maths when a half is missing.
     stage: crate::convlog::StageMs,
+    /// Tools the request's messages named; names the idle line before it.
+    tools: Vec<String>,
     /// Share of the prompt served from the prefix cache, 0–100.
     cache_pct: Option<u8>,
     /// Prefill seconds lost to cache eviction; `None` when unmeasurable.
@@ -695,6 +697,7 @@ pub async fn get_overview(
             priority: f.priority,
             rid: f.rid,
             stage: f.stage.clone(),
+            tools: f.tools.clone(),
             key: f.key.clone(),
             cache_pct: cache_pct(f.timing.prompt_tokens, f.timing.prefill.map(|(_, t)| t)),
             waste_secs: f.timing.waste_secs,
@@ -979,6 +982,7 @@ mod tests {
                 priority: "normal",
                 rid: None,
                 queue_wait: Some(0.0),
+                tools: vec![],
                 stage: Default::default(),
                 timing: crate::stats::Timing {
                     duration: Some(1.0),

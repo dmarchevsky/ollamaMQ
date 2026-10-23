@@ -101,6 +101,11 @@ pub struct Task {
     /// True when its client or key switched body-text capture off: this
     /// request's log entries keep their metadata and carry no content.
     pub redact_text: bool,
+    /// The request's messages as roles and sizes (empty when capture is off).
+    pub msgs: Vec<crate::convlog::MsgMeta>,
+    /// Tools the request's messages name — what the agent did between the
+    /// previous turn and this one. Names the idle line in the Overview.
+    pub tools: Vec<String>,
 }
 
 /// Which API flavours a backend speaks — and, on the route side of the
@@ -3518,6 +3523,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     priority: dropped.priority.as_str(),
                                     rid: Some(dropped.rid),
                                     queue_wait: Some(dropped.queued_at.elapsed().as_secs_f64()),
+                                    tools: dropped.tools.clone(),
                                     stage: crate::convlog::StageMs {
                                         queue: Some(dropped.queue_ms),
                                         dispatch: None,
@@ -3779,6 +3785,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                     // The turn's timeline, stamped as each stage really happens
                     // (never reconstructed from durations afterwards).
                     let conv_key = task.conv_key.clone();
+                    let tools = task.tools.clone();
                     let queue_ms = task.queue_ms;
                     let dispatch_ms = crate::convlog::now_unix_millis();
                     state_clone.convlog.note(crate::convlog::Note::Stage {
@@ -3821,6 +3828,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             priority: prio,
                             rid: Some(rid),
                             queue_wait: Some(queue_wait),
+                            tools: tools.clone(),
                             stage: crate::convlog::StageMs {
                                 queue: Some(queue_ms),
                                 dispatch: Some(dispatch_ms),
@@ -4574,6 +4582,13 @@ pub async fn proxy_handler(
             state.log_content_limit.load(std::sync::atomic::Ordering::Relaxed),
         ))
     });
+    // Message roles and sizes are read once here and shared by the log record
+    // and the Overview's idle line (which names the tools the agent ran).
+    let msgs = content
+        .as_ref()
+        .map(|c| crate::convlog::msg_meta(c))
+        .unwrap_or_default();
+    let tools = crate::convlog::tool_names(&msgs);
     let task = Task {
         path: path.clone(),
         method,
@@ -4598,6 +4613,10 @@ pub async fn proxy_handler(
         priority,
         rid,
         redact_text,
+        // The same roles are needed by the log record below, which runs after
+        // the task moves into the queue.
+        msgs: msgs.clone(),
+        tools: tools.clone(),
     };
     // `task` moves into the queue below; the log needs its key afterwards too.
     let conv_key = task.conv_key.clone();
@@ -4649,6 +4668,7 @@ pub async fn proxy_handler(
                 session_label: session_label.clone(),
                 priority: priority.as_str(),
                 rid: Some(task.rid),
+                tools: task.tools.clone(),
                 queue_wait: None,
                 stage: crate::convlog::StageMs::default(),
                 timing: Default::default(),
@@ -4709,6 +4729,7 @@ pub async fn proxy_handler(
                 session_label: session_label.clone(),
                 priority: priority.as_str(),
                 rid: Some(task.rid),
+                tools: task.tools.clone(),
                 queue_wait: None,
                 stage: crate::convlog::StageMs::default(),
                 timing: Default::default(),
@@ -4757,10 +4778,7 @@ pub async fn proxy_handler(
             at_ms: arrived_ms,
             queue_ms: Some(queue_ms),
             redacted: redact_text,
-            msgs: content
-                .as_ref()
-                .map(|c| crate::convlog::msg_meta(c))
-                .unwrap_or_default(),
+            msgs,
         },
     )));
     if let Some(text) = content.clone() {
@@ -5508,6 +5526,8 @@ mod tests {
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
+                msgs: vec![],
+                tools: vec![],
                 path: "/api/chat".into(),
                 headers: HeaderMap::new(),
                 body: Bytes::from(r#"{"model":"no-such-model-xyz","messages":[]}"#),
@@ -5601,6 +5621,8 @@ mod tests {
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
+                msgs: vec![],
+                tools: vec![],
                 path: "/api/chat".into(),
                 headers,
                 body,
@@ -5890,6 +5912,8 @@ mod tests {
             method: Method::POST,
             queue_ms: crate::convlog::now_unix_millis(),
             conv_key: "t·1".into(),
+            msgs: vec![],
+            tools: vec![],
             path: "/api/chat".into(),
             headers: HeaderMap::new(),
             body: Bytes::from_static(b"{}"),
@@ -6519,6 +6543,8 @@ mod tests {
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
+                msgs: vec![],
+                tools: vec![],
                 path: "/v1/chat/completions".into(),
                 headers: HeaderMap::new(),
                 body,
@@ -7293,6 +7319,8 @@ mod tests {
                     method: Method::POST,
                     queue_ms: crate::convlog::now_unix_millis(),
                     conv_key: "t·1".into(),
+                    msgs: vec![],
+                    tools: vec![],
                     path: "/api/chat".into(),
                     headers: HeaderMap::new(),
                     body: Bytes::from_static(b"{}"),
@@ -7392,6 +7420,8 @@ mod tests {
             method: Method::POST,
             queue_ms: crate::convlog::now_unix_millis(),
             conv_key: "t·1".into(),
+            msgs: vec![],
+            tools: vec![],
             path: "/v1/chat/completions".into(),
             headers: HeaderMap::new(),
             body: Bytes::from_static(b"{}"),
@@ -7658,6 +7688,8 @@ mod tests {
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
+                msgs: vec![],
+                tools: vec![],
                 path: "/v1/chat/completions".into(),
                 headers: HeaderMap::new(),
                 body,
@@ -8085,6 +8117,8 @@ mod tests {
                     method: Method::POST,
                     queue_ms: crate::convlog::now_unix_millis(),
                     conv_key: "t·1".into(),
+                    msgs: vec![],
+                    tools: vec![],
                     path: "/api/chat".into(),
                     headers: HeaderMap::new(),
                     body: Bytes::from_static(b"{}"),
@@ -8479,6 +8513,8 @@ mod tests {
                 method: Method::GET,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
+                msgs: vec![],
+                tools: vec![],
                 path: "/v1/models".into(),
                 headers: HeaderMap::new(),
                 body: Bytes::new(),
@@ -8646,6 +8682,8 @@ mod tests {
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
+                msgs: vec![],
+                tools: vec![],
                 path: "/v1/chat/completions".into(),
                 headers: HeaderMap::new(),
                 body: Bytes::from(format!(r#"{{"model":"{}","messages":[]}}"#, model)),

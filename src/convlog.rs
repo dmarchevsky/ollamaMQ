@@ -361,6 +361,26 @@ pub struct ConvSummary {
     pub dropped_turns: usize,
 }
 
+/// Names of the tools a request's messages carry — the results the agent ran
+/// between the previous turn and this one, and any calls it is now asking for.
+/// The Overview names these on the idle line between two turns, which is what
+/// the quiet stretch in a conversation actually was.
+pub fn tool_names(msgs: &[MsgMeta]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in msgs {
+        for n in m.calls.iter().chain(m.name.iter()) {
+            if !out.iter().any(|x| x == n) {
+                out.push(n.clone());
+            }
+        }
+        if out.len() >= 3 {
+            out.truncate(3);
+            break;
+        }
+    }
+    out
+}
+
 /// The store key of a request: its conversation tag when it has one, otherwise
 /// the request itself, so session-less traffic becomes a one-turn conversation
 /// instead of being merged with unrelated requests.

@@ -68,6 +68,10 @@ pub struct Finished {
     /// so the Overview can jump to its log round; `None` for actions that were
     /// never proxied requests (model load/unload records).
     pub rid: Option<u64>,
+    /// Tools this request's messages named (see [`crate::convlog::tool_names`]):
+    /// what the client did between the previous turn and this request. The
+    /// Overview names its idle line with these.
+    pub tools: Vec<String>,
     /// Seconds it waited in the queue; `None` when refused before queuing.
     pub queue_wait: Option<f64>,
     /// Absolute stage times (unix ms) of this request, measured as they happened.
@@ -260,6 +264,7 @@ mod tests {
             session_label: None,
             priority: "normal",
             rid: None,
+            tools: vec![],
             queue_wait: Some(1.0),
             stage: Default::default(),
             timing,
