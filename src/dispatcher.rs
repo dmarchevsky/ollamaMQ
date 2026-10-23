@@ -101,8 +101,6 @@ pub struct Task {
     /// True when its client or key switched body-text capture off: this
     /// request's log entries keep their metadata and carry no content.
     pub redact_text: bool,
-    /// The request's messages as roles and sizes (empty when capture is off).
-    pub msgs: Vec<crate::convlog::MsgMeta>,
     /// Tools the request's messages name — what the agent did between the
     /// previous turn and this one. Names the idle line in the Overview.
     pub tools: Vec<String>,
@@ -4613,10 +4611,7 @@ pub async fn proxy_handler(
         priority,
         rid,
         redact_text,
-        // The same roles are needed by the log record below, which runs after
-        // the task moves into the queue.
-        msgs: msgs.clone(),
-        tools: tools.clone(),
+        tools,
     };
     // `task` moves into the queue below; the log needs its key afterwards too.
     let conv_key = task.conv_key.clone();
@@ -5526,7 +5521,6 @@ mod tests {
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
-                msgs: vec![],
                 tools: vec![],
                 path: "/api/chat".into(),
                 headers: HeaderMap::new(),
@@ -5621,7 +5615,6 @@ mod tests {
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
-                msgs: vec![],
                 tools: vec![],
                 path: "/api/chat".into(),
                 headers,
@@ -5912,7 +5905,6 @@ mod tests {
             method: Method::POST,
             queue_ms: crate::convlog::now_unix_millis(),
             conv_key: "t·1".into(),
-            msgs: vec![],
             tools: vec![],
             path: "/api/chat".into(),
             headers: HeaderMap::new(),
@@ -6543,7 +6535,6 @@ mod tests {
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
-                msgs: vec![],
                 tools: vec![],
                 path: "/v1/chat/completions".into(),
                 headers: HeaderMap::new(),
@@ -7319,7 +7310,6 @@ mod tests {
                     method: Method::POST,
                     queue_ms: crate::convlog::now_unix_millis(),
                     conv_key: "t·1".into(),
-                    msgs: vec![],
                     tools: vec![],
                     path: "/api/chat".into(),
                     headers: HeaderMap::new(),
@@ -7420,7 +7410,6 @@ mod tests {
             method: Method::POST,
             queue_ms: crate::convlog::now_unix_millis(),
             conv_key: "t·1".into(),
-            msgs: vec![],
             tools: vec![],
             path: "/v1/chat/completions".into(),
             headers: HeaderMap::new(),
@@ -7688,7 +7677,6 @@ mod tests {
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
-                msgs: vec![],
                 tools: vec![],
                 path: "/v1/chat/completions".into(),
                 headers: HeaderMap::new(),
@@ -8117,7 +8105,6 @@ mod tests {
                     method: Method::POST,
                     queue_ms: crate::convlog::now_unix_millis(),
                     conv_key: "t·1".into(),
-                    msgs: vec![],
                     tools: vec![],
                     path: "/api/chat".into(),
                     headers: HeaderMap::new(),
@@ -8513,7 +8500,6 @@ mod tests {
                 method: Method::GET,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
-                msgs: vec![],
                 tools: vec![],
                 path: "/v1/models".into(),
                 headers: HeaderMap::new(),
@@ -8682,7 +8668,6 @@ mod tests {
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
-                msgs: vec![],
                 tools: vec![],
                 path: "/v1/chat/completions".into(),
                 headers: HeaderMap::new(),

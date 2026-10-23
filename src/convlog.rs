@@ -707,7 +707,6 @@ pub struct ConvLogger {
     /// `None` when the log is disabled (unwritable path): notes are dropped and
     /// the store stays empty, so the API reports "no conversations".
     file: Option<Arc<FileTarget>>,
-    flush_idle: Duration,
 }
 
 struct FileTarget {
@@ -749,7 +748,6 @@ impl ConvLogger {
         let logger = Self {
             store: Arc::clone(&store),
             file: Some(Arc::clone(&target)),
-            flush_idle,
         };
         let handle = tokio::spawn(writer_loop(target, store, flush_idle));
         Ok((logger, handle))
@@ -760,12 +758,7 @@ impl ConvLogger {
         Self {
             store: Arc::new(Mutex::new(ConvStore::new())),
             file: None,
-            flush_idle: SWEEP,
         }
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.file.is_some()
     }
 
     /// Turns lost to the per-conversation cap (reported where the old logger's
@@ -1438,7 +1431,6 @@ mod tests {
     #[test]
     fn disabled_logger_notes_nothing() {
         let log = ConvLogger::disabled();
-        assert!(!log.enabled());
         log.note(begin("x#y", 1, 1));
         assert!(log.summaries(10).is_empty());
         assert_eq!(log.dropped_count(), 0);
