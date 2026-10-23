@@ -75,10 +75,15 @@ addEventListener('load', () => {
       setTimeout(() => {
         A('nav-last', LV.rid === LV.conv.turns.at(-1).rid, `focused ${LV.rid}`);
         A('nav-last-disabled', document.querySelector('#lv-last').disabled);
-        // The Whole/New switch is gone: a turn folds its resent history instead.
+        // The Whole/New switch is gone, and so is the fold that replaced it: the
+        // earlier turns already show the resent messages, so a turn simply shows
+        // what it added and says how many the earlier requests already sent.
         A('no-scope-switch', !document.querySelector('#lv-scope'));
-        A('history-folded', !!document.querySelector('.lv-hist > summary'),
-          'a later turn collapses the messages the previous one already sent');
+        A('no-history-fold', !document.querySelector('.lv-hist')
+          && !/already sent|earlier messages/.test(document.querySelector('#dlg-log').textContent),
+          'a later turn shows only the messages it added, with no fold line');
+        A('resent-prefix-counted', /· \d+ new this turn/.test(document.querySelector('#dlg-log').textContent),
+          'the omitted prefix survives as a count in the request line');
         // Capture turned off reads as a decision, in the tree and in the turn.
         const off = document.querySelector('.turn-h [title*="no body text"]');
         A('redacted-labelled', !!off || !LV.conv.redacted, 'capture-off turns are labelled');
@@ -101,13 +106,24 @@ addEventListener('load', () => {
           A('tree-expand-independent', before.every(r => openTree.includes(r))
             && openTree.includes(+other.dataset.rid) && expanded >= 2,
             `open ${openTree.join(',')} (was ${before.join(',')}), ${expanded} request blocks readable`);
-          // Inside a request only two stamps exist: when it arrived and when it
-          // finished. Repeating the request's second on every child row would be
-          // precision the capture never measured.
-          const inner = [...document.querySelectorAll('#lv-rail .lv-node.l2, #lv-rail .lv-node.l3')]
-            .map(n => n.querySelector('.when').textContent).filter(Boolean);
-          A('tree-no-duplicate-stamps', new Set(inner).size === inner.length,
-            inner.length ? inner.join(', ') : 'no inner stamps');
+          // A message has no clock instant of its own, but the window that
+          // produced it is measured: a tool result is the stretch since the
+          // previous answer ended, an assistant message that answer's own
+          // generation. Rows with nothing measured stay blank and say so.
+          const DUR = /^\d+(\.\d)?s$|^\d+m \d{2}s$/;
+          const rows = [...document.querySelectorAll('#lv-rail .lv-node.l3')];
+          const stamped = rows.filter(n => n.querySelector('.when').textContent.trim());
+          A('tree-message-windows', stamped.length > 0
+            && stamped.every(n => DUR.test(n.querySelector('.when').textContent.trim()))
+            && stamped.every(n => /produced between|generated/.test(n.title)),
+            stamped.map(n => `${n.querySelector('.tag').textContent} ${n.querySelector('.when').textContent}`).join(', ')
+            || 'no message row carries a window');
+          A('tree-unmeasured-explained', rows.filter(n => !n.querySelector('.when').textContent.trim())
+            .every(n => /no instant of its own|never was captured/.test(n.title)),
+            `${rows.length - stamped.length} row(s) with no window, all explained`);
+          A('tree-response-delta', [...document.querySelectorAll('#lv-rail .lv-node.resp')]
+            .every(n => /^\+\d+(\.\d)?s$|^$|^\d{2}:\d{2}:\d{2}$/.test(n.querySelector('.when').textContent)),
+            [...document.querySelectorAll('#lv-rail .lv-node.resp')].map(n => n.querySelector('.when').textContent).join(' '));
           A('tree-single-highlight', document.querySelectorAll('#lv-rail .lv-node.on').length <= 1,
             `${document.querySelectorAll('#lv-rail .lv-node.on').length} row(s) highlighted`);
           const msg = document.querySelector('#lv-rail .lv-node.l3');
@@ -120,6 +136,20 @@ addEventListener('load', () => {
             fl ? `focused ${fl.id}` : `nothing focused, wanted ${want}`);
           A('tree-child-marked', document.querySelector('#lv-rail .lv-node.on')?.dataset.idx
             === msg.dataset.idx, 'the tree row shows which message is in view');
+          // A resent message is drawn in the turn that first sent it, so clicking
+          // it in a later request has to land there rather than on nothing.
+          const hid = lvHidden(1);
+          const resent = [...document.querySelectorAll('#lv-rail .lv-node.l3')]
+            .find(n => +n.dataset.rid === LV.conv.turns[1].rid && +n.dataset.idx < hid);
+          if (!resent) { A('tree-resent-click-lands', false, `no resent row in request 2 (hidden ${hid})`); return; }
+          resent.click();
+          await wait(700);
+          // (No .flash check: the previous click's 1.3 s timer can clear it on
+          // the same element; what must hold is where the click resolved.)
+          const want2 = `lv-m-${LV.conv.turns[0].rid}-${resent.dataset.idx}`;
+          A('tree-resent-click-lands', LV.focusMsg?.[0] === LV.conv.turns[0].rid
+            && String(LV.focusMsg[1]) === resent.dataset.idx && !!document.getElementById(want2),
+            `${resent.querySelector('.tag').textContent} of request 2 -> ${want2} (turn 1 is where it is drawn)`);
         })();
       }, 600);
     }, 600);

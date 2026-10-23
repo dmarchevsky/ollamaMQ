@@ -7,6 +7,20 @@ since upstream `v0.5.0`.
 
 ### Changed
 
+- **The conversation viewer stops repeating itself, and the jump tree grew real timings.**
+  A turn no longer shows the messages the previous request already sent — those are on screen in
+  the turns above — so the `7 earlier messages, already sent in the previous request — expand`
+  fold is gone and the request line says `7 messages · 3 new this turn` instead; the downloaded
+  transcript does the same. In the `≡ Jump` tree each request carries one absolute clock (when it
+  arrived) and everything after it is a delta from that, dmesg `-H` style: the response row is
+  `+18.4s`, and a message row carries the measured window that produced it — a `TOOL` result is the
+  stretch between the previous answer ending and this request arriving, an `ASSIST` row the answer
+  that wrote it. System and user rows stay blank, because a message that arrives inside a request has
+  no instant of its own, and the tooltip says so instead of inventing a time. The tree is also
+  indented far tighter (34 px → 18 px per level), leaving the snippet the room it needs.
+  Along the way: three `//` comments in `app.css` — not CSS comments — were swallowing the rules for
+  `.capnote`, `.logs .sess` and `.lv-node` whole, so the capture banner, the session chip and the
+  tree layout were silently unstyled.
 - **The Logs page is one row per conversation by default.** A chat session makes twenty calls, and
   twenty rows that each repeat part of the previous one hid what the session was doing. The table now
   switches between **By conversation** — one row per client and session, naming the session as its

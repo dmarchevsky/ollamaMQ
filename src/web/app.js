@@ -1888,6 +1888,15 @@ const lvIdxOf = rid => lvTurns().findIndex(t => t.rid === rid);
  *  before them — then the viewer cannot tell which messages are new). */
 const lvMsgCount = t => (t && t.msgs ? t.msgs.length : 0);
 
+/** How many of turn i's messages an earlier request already sent — the prefix a
+ *  turn does not repeat in its body. 0 when there is nothing comparable: the
+ *  first turn, or a request whose message count did not grow. */
+function lvHidden(i) {
+  const turns = lvTurns();
+  const prev = i > 0 ? lvMsgCount(turns[i - 1]) : 0;
+  return prev > 0 && prev < lvMsgCount(turns[i]) ? prev : 0;
+}
+
 /** Open the viewer on a conversation: by request id (a row) or by the client
  *  and conversation tag (a conversation header). Either way the server picks
  *  the conversation, because it owns the keys. */
@@ -1998,16 +2007,14 @@ function lvMsgsHtml(obj, prevCount, rid) {
   const msgs = (obj && obj.messages) || [];
   const toolNames = new Map();
   for (const m of msgs) for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
-  // A turn that carries exactly as many messages as the previous one added
-  // nothing comparable: show them all instead of folding the whole block away.
+  // The conversation is one view: what the earlier turns sent is already on
+  // screen, so a turn shows only the messages it added. A turn carrying exactly
+  // as many messages as the previous one added nothing comparable — show them
+  // all rather than hide the whole block.
   const hidden = prevCount > 0 && prevCount < msgs.length ? prevCount : 0;
   const mid = (i) => (rid != null ? `lv-m-${rid}-${i}` : undefined);
-  const earlier = msgs.slice(0, hidden).map((m, i) => msgBlock(m, toolNames, mid(i))).join('');
   const fresh = msgs.slice(hidden).map((m, i) => msgBlock(m, toolNames, mid(hidden + i))).join('');
-  const collapse = hidden
-    ? `<details class="lv-hist"><summary>${hidden} earlier messages, already sent in the previous request — expand</summary>${earlier}</details>`
-    : '';
-  return collapse + (fresh || (hidden ? '' : '<div class="empty">No messages in this request.</div>'));
+  return fresh || (hidden ? '' : '<div class="empty">No messages in this request.</div>');
 }
 
 function lvReqHtml(t, c) {
@@ -2016,7 +2023,11 @@ function lvReqHtml(t, c) {
   if (S.lv.fmt === 'raw')
     return (c.req.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(c.req);
   if (!c.reqObj) return rawView(c.req);
-  return `<div class="lv-meta">${esc(reqMeta(c.reqObj))}</div>` + lvMsgsHtml(c.reqObj, prevCount, t.rid);
+  const msgs = (c.reqObj.messages || []).length;
+  // The count stays on the line so the omitted prefix is visible as a number,
+  // without a fold line repeating what the turns above already show.
+  const sent = prevCount > 0 && prevCount < msgs ? ` · ${msgs - prevCount} new this turn` : '';
+  return `<div class="lv-meta">${esc(reqMeta(c.reqObj) + sent)}</div>` + lvMsgsHtml(c.reqObj, prevCount, t.rid);
 }
 
 function lvRespHtml(t, c) {
@@ -2105,14 +2116,25 @@ async function lvFocus(rid) {
  *  focus that message, not just its request — open the turn, unfold the history
  *  block if the message lives in it, scroll it into view and flash it. */
 async function lvFocusMsg(rid, idx) {
-  if (lvIdxOf(rid) < 0) return;
-  const needed = !LV.open.has(rid) || !LV.content.has(rid);
-  LV.rid = rid;
-  LV.open.add(rid);
-  LV.openTree.add(rid);
-  LV.focusMsg = [rid, idx];
+  const turns = lvTurns();
+  const i = turns.findIndex(t => t.rid === rid);
+  if (i < 0) return;
+  // A message this request only resent is drawn in the turn that first sent it,
+  // so that is the one to open and flash.
+  let k = i, tgt = { rid: turns[i].rid, idx };
+  while (k > 0) {
+    const hid = lvHidden(k);
+    if (!(hid && tgt.idx < hid)) break;
+    k--;
+    tgt = { rid: turns[k].rid, idx: Math.min(tgt.idx, Math.max(lvMsgCount(turns[k]) - 1, 0)) };
+  }
+  const needed = !LV.open.has(tgt.rid) || !LV.content.has(tgt.rid);
+  LV.rid = tgt.rid;
+  LV.open.add(tgt.rid);
+  LV.openTree.add(tgt.rid);
+  LV.focusMsg = [tgt.rid, tgt.idx];
   if (needed) await lvDraw({ scroll: false });
-  const el = document.getElementById(`lv-m-${rid}-${idx}`);
+  const el = document.getElementById(`lv-m-${tgt.rid}-${tgt.idx}`);
   if (!el) { lvScroll(); lvDrawRail(); return; }
   for (const d of [el.closest('details'), ...el.querySelectorAll('details')]) if (d) d.open = true;
   el.scrollIntoView({ block: 'center' });
@@ -2187,12 +2209,15 @@ function lvMarkdown(conv, content, turns) {
       `> ${lvStages(t).replace(/<[^>]*>/g, '')}${t.status != null ? ` · HTTP ${t.status}` : ''}${t.outcome && t.outcome !== 'ok' ? ` · ${t.outcome}` : ''}`, '');
     out.push(`**Request** ${[t.method, t.path, t.req?.bytes != null ? fmtBytes(t.req.bytes) : null].filter(Boolean).join(' ')}`, '');
     const prev = i > 0 ? lvMsgCount(turns[i - 1]) : 0;
+    const msgs = c.reqObj?.messages || [];
+    // What an earlier turn already sent is not repeated here; the count says so.
+    const cut = prev > 0 && prev < msgs.length ? prev : 0;
+    out.push(`**Request** ${[t.method, t.path, t.req?.bytes != null ? fmtBytes(t.req.bytes) : null,
+      msgs.length ? `${msgs.length} messages${cut ? `, ${msgs.length - cut} new` : ''}` : null]
+      .filter(Boolean).join(' ')}`, '');
     if (c.req == null) out.push(t.redacted ? '_capture turned off — no text is stored for this client, key or backend_' : '_no request text stored_', '');
-    else if (c.reqObj?.messages) {
-      const cut = prev > 0 && prev < c.reqObj.messages.length ? prev : 0;
-      if (cut) out.push(`_${cut} earlier messages are unchanged from the previous request_`, '');
-      for (const m of c.reqObj.messages.slice(cut)) out.push(...lvMsgMd(m));
-    } else out.push('```', c.req, '```', '');
+    else if (msgs.length) for (const m of msgs.slice(cut)) out.push(...lvMsgMd(m));
+    else out.push('```', c.req, '```', '');
     out.push(`**Response**${t.resp?.bytes != null ? ` · ${fmtBytes(t.resp.bytes)}` : ''}`, '');
     if (c.resp == null) out.push(t.redacted ? '_capture turned off_' : '_no response text stored_', '');
     else {
@@ -2266,11 +2291,45 @@ function lvSave(text, name, type) {
 // carries the timestamp it was measured at, so the outline reads as the
 // timeline it is.
 
-function lvNode({ level, rid, idx, when, tag, snip, caret, cls = '', action = 'lv-jump', on = false }) {
-  return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}>
+function lvNode({ level, rid, idx, when, tip, tag, snip, caret, cls = '', action = 'lv-jump', on = false }) {
+  return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}
+    ${tip ? `title="${esc(tip)}"` : ''}>
     <span class="car"${caret ? ` data-action="lv-tree" data-rid="${rid}"` : ''}>${caret ?? ''}</span>
     <span class="when">${when ?? ''}</span><span class="tag">${esc(tag)}</span>
     <span class="snip">${esc(snip)}</span></div>`;
+}
+
+/** A message has no clock instant of its own: it arrives inside one request, and
+ *  the capture never timed it separately. What IS measured is the window that
+ *  produced it — a tool result is the stretch since the previous answer ended,
+ *  an assistant message is that answer's own generation. The tree names those
+ *  windows the way dmesg -H names a delta, and leaves the rows that truly have
+ *  no time of their own (system, user) blank, with the reason in the tooltip.
+ *  A message an earlier request already sent resolves back to the turn that
+ *  first carried it, so one message never claims two different windows. */
+function lvMsgWhen(i, idx) {
+  const turns = lvTurns();
+  let k = i;
+  while (k > 0) {
+    const hid = lvHidden(k);
+    if (!(hid && idx < hid)) break;
+    k--;
+  }
+  if (idx < lvHidden(k)) return null;          // older than the log: no window to name
+  const t = turns[k], before = turns[k - 1];
+  const role = (t.msgs?.[idx] || {}).role;
+  if (before && role === 'tool' && before.tl?.end != null)
+    return { when: fmtDur((t.at_ms - before.tl.end) / 1000),
+      tip: `tool result sent with request ${k + 1} — produced between ${fmtTime(before.tl.end)} and ${fmtTime(t.at_ms)}` };
+  // A streamed answer is timed from its first token; a single-shot one has no
+  // first token, so its whole model-side window (dispatch to end) is what the
+  // message took to be produced.
+  if (before && role === 'assistant' && (before.tl?.first_token ?? before.tl?.dispatch) != null && before.tl?.end != null) {
+    const from = before.tl.first_token ?? before.tl.dispatch;
+    return { when: fmtDur((before.tl.end - from) / 1000),
+      tip: `the answer to request ${k} — generated ${fmtTime(from)} → ${fmtTime(before.tl.end)}` };
+  }
+  return { when: '', tip: `sent inside request ${k + 1} at ${fmtTime(t.at_ms)} — a message has no instant of its own` };
 }
 
 const lvFinish = t => `${t.status ?? '…'}${t.outcome && t.outcome !== 'ok' ? ` ${t.outcome}` : ''}`;
@@ -2288,30 +2347,36 @@ function lvDrawRail() {
     const prev = turns[i - 1];
     if (prev && prev.tl?.end != null && t.at_ms - prev.tl.end >= 30_000)
       items.push(lvNode({ level: 1, rid: t.rid, when: `+${fmtDur((t.at_ms - prev.tl.end) / 1000)}`, tag: 'idle',
+        tip: `the proxy waited ${fmtTime(prev.tl.end)} → ${fmtTime(t.at_ms)}`,
         snip: ((t.msgs || []).filter(m => m.name).map(m => m.name).join(', ') || 'agent side'), cls: 'gapnode', caret: '' }));
     items.push(lvNode({
       level: 1, rid: t.rid, when: fmtTime(t.at_ms), tag: `Request ${i + 1}`,
       snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ← ${lvFinish(t)}`,
-      cls: 'turn', caret: LV.openTree.has(t.rid) ? '▾' : '▸',
+      cls: 'turn', caret: LV.openTree.has(t.rid) ? '▾' : '▸', tip: `arrived ${fmtTime(t.at_ms)}`,
       on: t.rid === LV.rid && !LV.focusMsg }));
     if (!LV.openTree.has(t.rid)) return;
     const c = LV.content.get(t.rid);
     const msgs = lvMsgCount(t) || (c?.reqObj?.messages || []).length;
-    // The request row owns the start time and the response row the end time.
-    // The two child rows get no stamp of their own: the request arrived as one
-    // piece and its messages were part of it, so repeating the parent's second
-    // on every line would be a precision the capture never measured.
-    items.push(lvNode({ level: 2, rid: t.rid, when: '', tag: 'req',
+    // The request row owns the arrival time; the response row carries the delta
+    // from it, so one turn reads as a span instead of two clock times.
+    items.push(lvNode({ level: 2, rid: t.rid, cls: 'req', when: '', tag: 'req',
+      tip: `arrived ${fmtTime(t.at_ms)} with the request — the body carries no time of its own`,
       snip: msgs ? `${msgs} messages`
         : t.req?.bytes != null ? `${fmtBytes(t.req.bytes)}${t.redacted ? ' \u00b7 no text' : ''}` : 'no body',
       caret: '' }));
-    for (const [i, m] of ((c?.reqObj && c.reqObj.messages) || []).entries())
-      // No stamp of its own: a message was sent with the request, and repeating
-      // the request's time on every line reads as a measurement that was never taken.
-      items.push(lvNode({ level: 3, rid: t.rid, idx: i, when: '',
+    for (const [i, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
+      const w = lvMsgWhen(lvIdxOf(t.rid), i)
+        || { when: '', tip: 'older than this log \u2014 the request that produced it was never captured' };
+      items.push(lvNode({ level: 3, rid: t.rid, idx: i, when: w.when, tip: w.tip,
         tag: ROLE_LABEL[m.role] || 'MSG', snip: lvSnip(m), cls: ROLE_CLS[m.role] || 'user',
         action: 'lv-msg', on: !!LV.focusMsg && LV.focusMsg[0] === t.rid && LV.focusMsg[1] === i }));
-    items.push(lvNode({ level: 2, rid: t.rid, when: t.tl?.end != null ? fmtTime(t.tl.end) : '', tag: 'resp',
+    }
+    // dmesg -H style: one absolute clock per turn (its arrival), then the delta
+    // from it while the turn is short enough for the delta to be the point.
+    const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
+    items.push(lvNode({ level: 2, rid: t.rid, cls: 'resp', tag: 'resp',
+      when: dur == null ? '' : dur < 60_000 ? `+${fmtDur(dur / 1000)}` : fmtTime(t.tl.end),
+      tip: t.tl?.end != null ? `arrived ${fmtTime(t.at_ms)} · finished ${fmtTime(t.tl.end)}` : 'no response recorded yet',
       snip: lvFinish(t) + (c?.resp ? '' : ' · no text'), caret: '' }));
   });
   if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');
