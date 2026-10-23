@@ -91,6 +91,13 @@ addEventListener('load', () => {
           A('tree-expand-independent', before.every(r => openTree.includes(r))
             && openTree.includes(+other.dataset.rid) && expanded >= 2,
             `open ${openTree.join(',')} (was ${before.join(',')}), ${expanded} request blocks readable`);
+          // Inside a request only two stamps exist: when it arrived and when it
+          // finished. Repeating the request's second on every child row would be
+          // precision the capture never measured.
+          const inner = [...document.querySelectorAll('#lv-rail .lv-node.l2, #lv-rail .lv-node.l3')]
+            .map(n => n.querySelector('.when').textContent).filter(Boolean);
+          A('tree-no-duplicate-stamps', new Set(inner).size === inner.length,
+            inner.length ? inner.join(', ') : 'no inner stamps');
           A('tree-single-highlight', document.querySelectorAll('#lv-rail .lv-node.on').length <= 1,
             `${document.querySelectorAll('#lv-rail .lv-node.on').length} row(s) highlighted`);
           const msg = document.querySelector('#lv-rail .lv-node.l3');

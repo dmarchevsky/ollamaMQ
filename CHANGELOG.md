@@ -50,7 +50,9 @@ since upstream `v0.5.0`.
   state, each request opens and closes independently, and only the row in view is marked. Clicking a
   message row (`USER` / `ASSIST` / `TOOL`) now focuses *that message* — opening the turn, unfolding
   the resent-history block if the message lives in it, scrolling it into view and flashing it —
-  instead of only scrolling to the request header.
+  instead of only scrolling to the request header. Only the request row and the response row carry a
+  clock time now (arrival and finish); the `req` row and the message rows dropped the request's
+  second repeated on every line, which read as a measurement that was never taken.
 - **`≡ View conversation` in Overview → Details failed for keyed traffic.** The chip sent the display
   name (which becomes `client:key` when the identity filter is by key) where the store matches on the
   client, so the viewer answered *no such conversation in the log*. It sends the client identity now.

@@ -2208,7 +2208,11 @@ function lvDrawRail() {
     if (!LV.openTree.has(t.rid)) return;
     const c = LV.content.get(t.rid);
     const msgs = lvMsgCount(t) || (c?.reqObj?.messages || []).length;
-    items.push(lvNode({ level: 2, rid: t.rid, when: fmtTime(t.tl?.queue ?? t.at_ms), tag: 'req',
+    // The request row owns the start time and the response row the end time.
+    // The two child rows get no stamp of their own: the request arrived as one
+    // piece and its messages were part of it, so repeating the parent's second
+    // on every line would be a precision the capture never measured.
+    items.push(lvNode({ level: 2, rid: t.rid, when: '', tag: 'req',
       snip: msgs ? `${msgs} messages`
         : t.req?.bytes != null ? `${fmtBytes(t.req.bytes)}${t.redacted ? ' \u00b7 no text' : ''}` : 'no body',
       caret: '' }));
@@ -2218,7 +2222,7 @@ function lvDrawRail() {
       items.push(lvNode({ level: 3, rid: t.rid, idx: i, when: '',
         tag: ROLE_LABEL[m.role] || 'MSG', snip: lvSnip(m), cls: ROLE_CLS[m.role] || 'user',
         action: 'lv-msg', on: !!LV.focusMsg && LV.focusMsg[0] === t.rid && LV.focusMsg[1] === i }));
-    items.push(lvNode({ level: 2, rid: t.rid, when: fmtTime(t.tl?.end ?? t.at_ms), tag: 'resp',
+    items.push(lvNode({ level: 2, rid: t.rid, when: t.tl?.end != null ? fmtTime(t.tl.end) : '', tag: 'resp',
       snip: lvFinish(t) + (c?.resp ? '' : ' · no text'), caret: '' }));
   });
   if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');
