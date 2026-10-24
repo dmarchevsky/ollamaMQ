@@ -3,7 +3,7 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
-## Unreleased
+## v0.17.0 — 2026-10-23
 
 ### Changed
 
@@ -124,6 +124,11 @@ since upstream `v0.5.0`.
 
 ### Fixed
 
+- **A downloaded transcript wrote every request twice.** Each request section opened with two
+  `**Request**` lines — the plain one and the one carrying the message count — so the file a reviewer
+  got held a duplicated heading per request. The viewer never showed it (the duplicate lived only in
+  the markdown writer), and nothing looked at that file; the transcript is checked heading by heading
+  now.
 - **The jump tree folded everything else whenever you opened one request.** Body blocks and tree
   nodes shared one open-set, and focusing a request replaced it (`LV.open = new Set([rid])`), so
   expanding a node collapsed the rest — and because every node of the focused request was marked as
