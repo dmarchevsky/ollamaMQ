@@ -8,8 +8,7 @@ use axum::{
 };
 use clap::Parser;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -28,14 +27,11 @@ mod session;
 mod settings;
 mod snapshot;
 mod stats;
-mod tui;
 mod web;
 
 use crate::control::{admin_model_load, admin_model_unload, admin_models_state};
 use crate::dispatcher::{AppState, proxy_handler, run_worker};
 use crate::lock::LockExt;
-
-use std::io::IsTerminal;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -62,7 +58,9 @@ struct Args {
     #[arg(short, long)]
     timeout: Option<u64>,
 
-    /// Disable TUI dashboard
+    /// Deprecated and ignored. The terminal dashboard was removed; the web UI
+    /// at `/ui` is the only dashboard. The flag is still accepted so existing
+    /// Docker, systemd and CI command lines keep starting.
     #[arg(long)]
     no_tui: bool,
 
@@ -79,14 +77,10 @@ struct Args {
     load_keep_alive: Option<i64>,
 
     /// Path to the central configuration file: backends, settings and the
-    /// models to load onto them. Applied at startup; reload with 'r' in the TUI.
+    /// models to load onto them. Applied at startup; re-read with **Reload
+    /// config** in the web UI (or `POST /ui/api/config/reload`).
     #[arg(short = 'c', long, default_value = config::DEFAULT_CONFIG_FILE)]
     model_config: String,
-}
-
-struct TuiState {
-    visible: bool,
-    toggle_notify: Arc<Notify>,
 }
 
 /// Build the 401 response with JSON content type and a Bearer challenge hint.
@@ -351,31 +345,21 @@ async fn main() {
         .map(|b| (settings::normalize_url(&b.url), b.token.clone()))
         .collect();
 
-    // Determine if we should run TUI
-    let use_tui = !args.no_tui && std::io::stdout().is_terminal();
+    // Logs go to stderr, at `debug` by default — the stream the journal, Docker
+    // and CI have always captured (`--no-tui` used to select it). The terminal
+    // dashboard swapped it for an `ollamamq.log` file to keep the screen clear;
+    // with the dashboard gone there is no second sink. Set RUST_LOG=info for a
+    // quieter console.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+        )
+        .init();
 
-    // Keep the guard alive for the duration of main
-    let _guard: Option<tracing_appender::non_blocking::WorkerGuard>;
-
-    if use_tui {
-        let file_appender = tracing_appender::rolling::never(".", "ollamamq.log");
-        let (non_blocking, g) = tracing_appender::non_blocking(file_appender);
-        _guard = Some(g);
-
-        tracing_subscriber::fmt()
-            .with_writer(non_blocking)
-            .with_ansi(false)
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
-            .init();
-    } else {
-        _guard = None;
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
-            )
-            .init();
+    if args.no_tui {
+        tracing::warn!(
+            "--no-tui is deprecated and ignored: the terminal dashboard was removed, the web UI at /ui is the only dashboard"
+        );
     }
 
     // Start the size-rotated conversation log. Each candidate path gets its
@@ -383,8 +367,8 @@ async fn main() {
     // store directory next to appconf.yaml: a config that still names a
     // container path (`/data/…`) on a host without one used to run with capture
     // silently off, so no conversation could be looked up later. The writer
-    // task handle is kept alive for the process lifetime (same pattern as
-    // `_guard` above).
+    // task handle is kept alive for the process lifetime, bound to
+    // `_convlog_guard` below.
     let store_dir = std::path::Path::new(&args.model_config)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -645,60 +629,12 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Dispatcher running on http://{}", addr);
 
-    if use_tui {
-        let tui_state = Arc::new(Mutex::new(TuiState {
-            visible: true,
-            toggle_notify: Arc::new(Notify::new()),
-        }));
-
-        tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        });
-
-        // Run TUI on the main thread
-        tui_loop(tui_state, state).await;
-    } else {
-        // Just run the server on the main thread
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    }
-}
-
-async fn tui_loop(tui_state: Arc<Mutex<TuiState>>, state: Arc<AppState>) {
-    let mut dashboard = tui::TuiDashboard::new();
-    let toggle_notify = Arc::new(tui_state.lock_or_recover().toggle_notify.clone());
-
-    loop {
-        let visible = {
-            let tui_state = tui_state.lock_or_recover();
-            tui_state.visible
-        };
-
-        if visible {
-            match dashboard.run(&state) {
-                Ok(continue_loop) => {
-                    if !continue_loop {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("TUI error: {}", e);
-                    return;
-                }
-            }
-        } else {
-            toggle_notify.notified().await;
-        }
-    }
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -718,6 +654,15 @@ mod tests {
             65_536,
             512 * 1024 * 1024,
         ))
+    }
+
+    #[test]
+    fn deprecated_no_tui_flag_still_parses() {
+        // Docker, systemd and CI command lines kept passing --no-tui when the
+        // terminal dashboard was removed; clap must go on accepting it (and
+        // ignoring it) or every existing deployment fails to start.
+        let args = Args::try_parse_from(["ollamaMQ", "--no-tui"]).expect("--no-tui must parse");
+        assert!(args.no_tui);
     }
 
     #[test]

@@ -27,9 +27,9 @@ services:
     # Bypass the image entrypoint: it always passes --backend-urls, which
     # would override the backends in appconf.yaml.
     entrypoint: ["/app/ollamaMQ"]
-    # No terminal dashboard: the service log goes to `docker logs ollamamq`,
-    # and the web UI at /ui shows what the TUI did.
-    command: ["--no-tui", "-c", "/config/appconf.yaml"]
+    # The container has no terminal: the service log goes to
+    # `docker logs ollamamq`, and the web UI at /ui is the dashboard.
+    command: ["-c", "/config/appconf.yaml"]
     working_dir: /data
     # OLLAMA_MQ_UI_USER / OLLAMA_MQ_UI_PASSWORD: the web UI's first-run (and
     # recovery) password; a password changed in the UI is kept as a hash in

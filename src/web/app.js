@@ -1,4 +1,4 @@
-// ollamaMQ web UI — the TUI's functions in a browser, plus client/API-key
+// ollamaMQ web UI — the dashboard: live proxy state plus client/API-key
 // management. No framework, no build step: the server embeds this file.
 //
 // Every second the page polls `api/state` (plus logs/clients when the open
@@ -1212,7 +1212,7 @@ function renderBackends(st) {
       <td>${b.loaded_known ? `<b>${loaded.size}</b> <span class="dim">loaded ·</span> ` : ''}${b.models_available.length} <span class="dim">available</span></td>
       <td>${opCell(b)}</td>${bkActions(b, c, editable)}</tr>`;
     if (open) {
-      // Loaded first, then alphabetical — the TUI's order.
+      // Loaded first, then alphabetical — the order the queue uses.
       const models = [...b.models_available].sort((x, y) =>
         (loaded.has(y) - loaded.has(x)) || x.localeCompare(y));
       const all = S.showAll.has(b.url);
@@ -1344,11 +1344,11 @@ function clientRow(r, st) {
       : [u?.ip ? `last IP ${esc(u.ip)}` : '', 'identified by X-User-ID only, so any request can use this id'];
   const sub = parts.filter(Boolean).join(' · ');
   const prio = `
-    <button class="btn sm iconly ${st.vip === r.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Always served first (TUI: p)" aria-label="VIP">★<span class="w"> VIP</span></button>
-    <button class="btn sm iconly ${st.boost === r.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Extra share of turns (TUI: b)" aria-label="Boost">⚡<span class="w"> Boost</span></button>`;
+    <button class="btn sm iconly ${st.vip === r.id ? 'on-vip' : ''}" data-action="user" data-op="vip" data-id="${id}" title="Always served first" aria-label="VIP">★<span class="w"> VIP</span></button>
+    <button class="btn sm iconly ${st.boost === r.id ? 'on-boost' : ''}" data-action="user" data-op="boost" data-id="${id}" title="Extra share of turns" aria-label="Boost">⚡<span class="w"> Boost</span></button>`;
   const ipBtn = !u?.ip ? '' : ipBlocked
     ? `<button class="btn sm" data-action="unblock" data-kind="ip" data-value="${esc(u.ip)}">Unblock IP</button>`
-    : `<button class="btn sm danger" data-action="user" data-op="block-ip" data-id="${id}" title="Block ${esc(u.ip)} (TUI: X)">Block IP</button>`;
+    : `<button class="btn sm danger" data-action="user" data-op="block-ip" data-id="${id}" title="Block ${esc(u.ip)}">Block IP</button>`;
   const actions = c
     ? `${prio}
        <button class="btn sm" data-action="add-key" data-name="${id}">+ Key</button>
@@ -1360,7 +1360,7 @@ function clientRow(r, st) {
        <button class="btn sm primary" data-action="register" data-id="${id}" ${NAME_RE.test(r.id) ? '' : 'disabled title="Not a valid client name"'}>Register</button>
        ${u?.blocked && !ipBlocked
          ? `<button class="btn sm" data-action="user" data-op="unblock" data-id="${id}">Unblock</button>`
-         : `<button class="btn sm danger" data-action="user" data-op="block" data-id="${id}" title="Block this id (TUI: x)">Block</button>`}
+         : `<button class="btn sm danger" data-action="user" data-op="block" data-id="${id}" title="Block this id">Block</button>`}
        ${ipBtn}`;
   return `<tr class="clickable ${open ? 'open' : ''}" data-action="toggle-keys" data-name="${id}">
       <td><span class="caret">${c ? (open ? '▾' : '▸') : ''}</span>

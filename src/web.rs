@@ -1,5 +1,5 @@
-//! Web UI at `/ui`: the TUI's functions in a browser, plus client and API-key
-//! management. Off unless a password is configured.
+//! Web UI at `/ui`: the dashboard — live queue, backend and request state, plus
+//! client and API-key management. Off unless a password is configured.
 //!
 //! Browsers sign in on `/ui/login` and get a session cookie (see
 //! [`crate::session`]); scripts may instead send the same user and password
@@ -935,7 +935,7 @@ async fn user_action(
             })?;
             state.block_ip(ip);
         }
-        // Like the TUI's 'u' on a user row: lift both blocks.
+        // Unblock on a user row: lift both blocks.
         "unblock" => {
             state.unblock_user(&id);
             if let Some(ip) = ip {

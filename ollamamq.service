@@ -11,9 +11,9 @@ User=root
 Group=root
 
 # Path to the ollamaMQ binary — adjust to your install location (e.g. ~/.cargo/bin/ollamaMQ)
-# --no-tui sends verbose logs to stderr, which systemd captures into the journal
+# Logs go to stderr at debug level by default, which systemd captures into the journal
 # WorkingDirectory=
-ExecStart=/usr/local/bin/ollamaMQ -p 11436 -b http://localhost:1234 --no-tui
+ExecStart=/usr/local/bin/ollamaMQ -p 11436 -b http://localhost:1234
 
 Restart=on-failure
 RestartSec=5
