@@ -3,6 +3,31 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.19.0 — 2026-10-24
+
+### Breaking
+
+- **The terminal dashboard is gone; `/ui` is the dashboard.** `src/tui.rs` (1695 lines) and the three
+  crates only it used (`ratatui`, `crossterm`, `tracing-appender`) are deleted, and with them the two
+  startup paths the dashboard needed. Logs now always go to **stderr at `debug`** — what `--no-tui`
+  used to select — instead of an `ollamamq.log` file at `info`, and there is one server start path.
+  `--no-tui` is still accepted and ignored (one `WARN` at startup), so existing Docker, systemd and CI
+  command lines keep starting and can drop the flag at leisure. Everything the dashboard's keys did is
+  already a control in the web UI: model **Load**/**Unload**, **Reload config**, VIP/Boost/Block/Block
+  IP/Unblock, session pins, and the live log with its conversation viewer.
+- **One dashboard key had no web equivalent and is removed with it:** `P` on a client raised the level
+  of every request that client had waiting *and* pinned the conversations behind them, so their next
+  turn kept it (`AppState::pin_user_sessions`). VIP and Boost change standing priority but leave what
+  is already queued where it is, and the web UI pins one conversation at a time, so "lift this
+  client's whole backlog right now" is no longer a single action. It was deleted rather than carried
+  as dead code; bringing it back means a button and an API op, not a hidden function.
+
+### Removed
+
+- The dashboard's own demo recordings (`demo.gif`, `demo-linkedin.gif` and their `.tape` scripts) and
+  the README hero image pointing at them — both showed the terminal UI. The Logging section now
+  describes one sink instead of two modes.
+
 ## v0.18.0 — 2026-10-24
 
 ### Breaking

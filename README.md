@@ -251,6 +251,10 @@ RUST_LOG=info ollamaMQ
 RUST_LOG=debug ollamaMQ
 ```
 
+> `--no-tui` is still accepted and does nothing: it used to turn off the terminal
+> dashboard, which is gone. When it is passed the proxy logs one `WARN` line at
+> startup, so drop the flag from your command line whenever convenient.
+
 ### Running as a systemd Service
 
 To run `ollamaMQ` as a background service with full log visibility in the journal:
