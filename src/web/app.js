@@ -971,7 +971,7 @@ function renderDetails(rows) {
       ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}${chip}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
       ${sum}
-      ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(head.o.client)}" title="open this conversation in the viewer">\u2263 view conversation</span>` : ''}</button>`);
+      ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(head.o.client)}" title="open this conversation in the viewer">\u2263 View</span>` : ''}</button>`);
     if (shut) continue;
     const lines = [];
     for (let i = 0; i < asc.length; i++) {
@@ -1761,7 +1761,10 @@ const storedLv = () => {
 const saveLv = () => { try { localStorage.setItem('omq.lv', JSON.stringify(S.lv)); } catch { /* storage blocked */ } };
 S.lv = storedLv();
 
-const LV = { conv: null, rid: null, open: new Set(), openTree: new Set(), focusMsg: null, content: new Map() };
+/** Viewer state. `open` is the one fold for a request: the tree caret and the
+ *  turn header fold the same block, in either direction. `hist` remembers which
+ *  requests also show the messages an earlier request already delivered. */
+const LV = { conv: null, rid: null, open: new Set(), hist: new Set(), focusMsg: null, content: new Map() };
 let lvToken = 0;
 
 const tryJson = s => { try { return JSON.parse(s); } catch { return undefined; } };
@@ -1796,7 +1799,7 @@ async function openConv({ rid, session, user } = {}) {
   LV.conv = conv;
   LV.rid = rid || (resuming && LV.rid) || conv.turns.at(-1)?.rid || null;
   LV.open = new Set(LV.rid != null ? [LV.rid] : []);
-  LV.openTree = new Set(LV.open);
+  LV.hist = new Set();
   LV.focusMsg = null;
   LV.content = new Map();
   $('#dlg-log [data-title]').textContent =
@@ -1824,7 +1827,7 @@ async function openSeq(seq) {
   };
   LV.rid = seq;
   LV.open = new Set([seq]);
-  LV.openTree = new Set([seq]);
+  LV.hist = new Set();
   LV.focusMsg = null;
   LV.content = new Map([[seq, { req: null, resp: ev.content ?? null, reqObj: null }]]);
   $('#dlg-log [data-title]').textContent = `control \u00b7 ${ev.user}`;
@@ -1887,22 +1890,52 @@ const lvSec = (cls, title, info, html) =>
 /** Capture switched off is a decision, not a gap: say so and show what was kept. */
 const lvOff = () => '<div class="lv-off">capture turned off — no request or response text is stored for this client, key or backend. Its timeline, sizes and message roles are still recorded.</div>';
 
-function lvMsgsHtml(obj, prevCount, rid) {
+/** What a turn re-sent that an earlier request already delivered, as one line:
+ *  how many, where they first appeared, and what they were (roles, size). The
+ *  conversation is one view, so by default they show only on the turn that first
+ *  sent them and every later turn names them instead of repeating them. */
+function lvCarry(i) {
+  const turns = lvTurns();
+  const hidden = lvHidden(i);
+  if (!hidden) return null;
+  const held = ((turns[i] || {}).msgs || []).slice(0, hidden);
+  const counts = {};
+  let chars = 0;
+  for (const m of held) { counts[m.role] = (counts[m.role] || 0) + 1; chars += m.chars || 0; }
+  const roles = ['system', 'user', 'assistant', 'tool'].concat(Object.keys(counts))
+    .filter((r, k, all) => counts[r] && all.indexOf(r) === k).map(r => `${r} ${counts[r]}`).join(' · ');
+  // The request that first carried them: the first one whose body reached that
+  // many messages.
+  let from = i;
+  for (let k = 0; k <= i; k++) if (lvMsgCount(turns[k]) >= hidden) { from = k; break; }
+  return { hidden, from, roles, bytes: chars ? `≈${fmtBytes(chars)}` : null };
+}
+
+const lvCarryText = (c, open, short = false) =>
+  short ? `${c.hidden} from #${c.from + 1}${c.roles ? ` · ${c.roles}` : ''}${c.bytes ? ` · ${c.bytes}` : ''}`
+    : `${c.hidden} ${c.hidden === 1 ? 'message' : 'messages'} held from request ${c.from + 1}`
+      + [c.roles, c.bytes].filter(Boolean).map(x => ` · ${x}`).join('')
+      + ` — ${open ? 'hide' : 'show'} them here too`;
+
+function lvMsgsHtml(obj, i, rid) {
   const msgs = (obj && obj.messages) || [];
   const toolNames = new Map();
   for (const m of msgs) for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
-  // The conversation is one view: what the earlier turns sent is already on
-  // screen, so a turn shows only the messages it added. A turn carrying exactly
-  // as many messages as the previous one added nothing comparable — show them
-  // all rather than hide the whole block.
-  const hidden = prevCount > 0 && prevCount < msgs.length ? prevCount : 0;
-  const mid = (i) => (rid != null ? `lv-m-${rid}-${i}` : undefined);
-  const fresh = msgs.slice(hidden).map((m, i) => msgBlock(m, toolNames, mid(hidden + i))).join('');
-  return fresh || (hidden ? '' : '<div class="empty">No messages in this request.</div>');
+  // A turn carrying exactly as many messages as the previous one added nothing
+  // comparable — show them all rather than hide the whole block.
+  const carry = lvCarry(i);
+  const open = !!carry && LV.hist.has(rid);
+  const from = carry && !open ? carry.hidden : 0;
+  const mid = (k) => (rid != null ? `lv-m-${rid}-${k}` : undefined);
+  const body = msgs.slice(from).map((m, k) => msgBlock(m, toolNames, mid(from + k))).join('');
+  const line = carry ? `<div class="lv-carry" data-action="lv-carry" data-rid="${rid}" role="button" tabindex="0"
+      aria-expanded="${open}" title="these arrived with this request, but an earlier request already sent them">${open ? '▾' : '▸'} ${esc(lvCarryText(carry, open))}</div>` : '';
+  return line + (body || (from ? '' : '<div class="empty">No messages in this request.</div>'));
 }
 
 function lvReqHtml(t, c) {
-  const prevCount = lvIdxOf(t.rid) > 0 ? lvMsgCount(lvTurns()[lvIdxOf(t.rid) - 1]) : 0;
+  const i = lvIdxOf(t.rid);
+  const prevCount = i > 0 ? lvMsgCount(lvTurns()[i - 1]) : 0;
   if (c.req == null) return (t.redacted ? lvOff() : '<div class="lv-note">No request text was stored for this request.</div>') + lvMsgChips(t);
   if (S.lv.fmt === 'raw')
     return (c.req.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(c.req);
@@ -1911,7 +1944,7 @@ function lvReqHtml(t, c) {
   // The count stays on the line so the omitted prefix is visible as a number,
   // without a fold line repeating what the turns above already show.
   const sent = prevCount > 0 && prevCount < msgs ? ` · ${msgs - prevCount} new this turn` : '';
-  return `<div class="lv-meta">${esc(reqMeta(c.reqObj) + sent)}</div>` + lvMsgsHtml(c.reqObj, prevCount, t.rid);
+  return `<div class="lv-meta">${esc(reqMeta(c.reqObj) + sent)}</div>` + lvMsgsHtml(c.reqObj, i, t.rid);
 }
 
 function lvRespHtml(t, c) {
@@ -1992,7 +2025,6 @@ async function lvFocus(rid) {
   LV.rid = rid;
   LV.focusMsg = null;
   LV.open.add(rid);
-  LV.openTree.add(rid);
   await lvDraw({ scroll: true });
 }
 
@@ -2004,9 +2036,10 @@ async function lvFocusMsg(rid, idx) {
   const i = turns.findIndex(t => t.rid === rid);
   if (i < 0) return;
   // A message this request only resent is drawn in the turn that first sent it,
-  // so that is the one to open and flash.
+  // so that is the one to open and flash — unless this turn has its re-sent
+  // history unfolded, in which case the copy on screen is the one to land on.
   let k = i, tgt = { rid: turns[i].rid, idx };
-  while (k > 0) {
+  while (k > 0 && !LV.hist.has(turns[i].rid)) {
     const hid = lvHidden(k);
     if (!(hid && tgt.idx < hid)) break;
     k--;
@@ -2015,7 +2048,6 @@ async function lvFocusMsg(rid, idx) {
   const needed = !LV.open.has(tgt.rid) || !LV.content.has(tgt.rid);
   LV.rid = tgt.rid;
   LV.open.add(tgt.rid);
-  LV.openTree.add(tgt.rid);
   LV.focusMsg = [tgt.rid, tgt.idx];
   if (needed) await lvDraw({ scroll: false });
   const el = document.getElementById(`lv-m-${tgt.rid}-${tgt.idx}`);
@@ -2034,8 +2066,10 @@ async function lvStep(delta) {
 
 async function lvToggle(rid) {
   // Each request opens and closes on its own: opening one never folds the others.
-  if (LV.open.has(rid)) { LV.open.delete(rid); LV.openTree.delete(rid); }
-  else { LV.open.add(rid); LV.openTree.add(rid); }
+  // One set drives both views, so folding from the tree folds the block and
+  // folding the block folds the tree.
+  if (LV.open.has(rid)) LV.open.delete(rid);
+  else LV.open.add(rid);
   LV.rid = rid;
   LV.focusMsg = null;
   await lvDraw({ scroll: false });
@@ -2048,11 +2082,12 @@ async function lvReload() {
   try { conv = await api('GET', 'conv?key=' + encodeURIComponent(key)); }
   catch (e) { return toast(e.message, false); }
   // Turn text is refetched too: a finished response may have arrived since.
-  const open = [...LV.open], openTree = [...LV.openTree];
+  const keep = r => conv.turns.some(t => t.rid === r);
+  const open = [...LV.open], hist = [...LV.hist];
   LV.conv = conv;
   LV.content = new Map();
-  LV.open = new Set(open.filter(r => conv.turns.some(t => t.rid === r)));
-  LV.openTree = new Set(openTree.filter(r => conv.turns.some(t => t.rid === r)));
+  LV.open = new Set(open.filter(keep));
+  LV.hist = new Set(hist.filter(keep));
   $('#dlg-log [data-sub]').textContent =
     `${conv.turns.length} requests · ${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`;
   await lvDraw({ scroll: true });
@@ -2175,10 +2210,10 @@ function lvSave(text, name, type) {
 // carries the timestamp it was measured at, so the outline reads as the
 // timeline it is.
 
-function lvNode({ level, rid, idx, when, tip, tag, snip, caret, cls = '', action = 'lv-jump', on = false }) {
+function lvNode({ level, rid, idx, when, tip, tag, snip, caret, caretAction = 'lv-tree', cls = '', action = 'lv-jump', on = false }) {
   return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}
     ${tip ? `title="${esc(tip)}"` : ''}>
-    <span class="car"${caret ? ` data-action="lv-tree" data-rid="${rid}"` : ''}>${caret ?? ''}</span>
+    <span class="car"${caret ? ` data-action="${caretAction}" data-rid="${rid}"` : ''}>${caret ?? ''}</span>
     <span class="when">${when ?? ''}</span><span class="tag">${esc(tag)}</span>
     <span class="snip">${esc(snip)}</span></div>`;
 }
@@ -2236,19 +2271,28 @@ function lvDrawRail() {
     items.push(lvNode({
       level: 1, rid: t.rid, when: fmtTime(t.at_ms), tag: `Request ${i + 1}`,
       snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ← ${lvFinish(t)}`,
-      cls: 'turn', caret: LV.openTree.has(t.rid) ? '▾' : '▸', tip: `arrived ${fmtTime(t.at_ms)}`,
+      cls: 'turn', caret: LV.open.has(t.rid) ? '▾' : '▸', tip: `arrived ${fmtTime(t.at_ms)}`,
       on: t.rid === LV.rid && !LV.focusMsg }));
-    if (!LV.openTree.has(t.rid)) return;
+    if (!LV.open.has(t.rid)) return;
+    const carry = lvCarry(i);
     const c = LV.content.get(t.rid);
     const msgs = lvMsgCount(t) || (c?.reqObj?.messages || []).length;
     // The request row owns the arrival time; the response row carries the delta
     // from it, so one turn reads as a span instead of two clock times.
     items.push(lvNode({ level: 2, rid: t.rid, cls: 'req', when: '', tag: 'req',
       tip: `arrived ${fmtTime(t.at_ms)} with the request — the body carries no time of its own`,
-      snip: msgs ? `${msgs} messages`
+      snip: msgs ? (carry ? `${msgs - carry.hidden} new · ${carry.hidden} held` : `${msgs} messages`)
         : t.req?.bytes != null ? `${fmtBytes(t.req.bytes)}${t.redacted ? ' \u00b7 no text' : ''}` : 'no body',
       caret: '' }));
+    // The messages this request re-sent fold into one line — the same line the
+    // body shows, and clicking either one opens both.
+    const showHist = LV.hist.has(t.rid);
+    if (carry && (c?.reqObj?.messages || []).length)
+      items.push(lvNode({ level: 3, rid: t.rid, when: '', tag: 'held', cls: 'carry', action: 'lv-carry',
+        caret: showHist ? '▾' : '▸', caretAction: 'lv-carry',
+        tip: lvCarryText(carry, showHist), snip: lvCarryText(carry, showHist, true) }));
     for (const [i, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
+      if (carry && !showHist && i < carry.hidden) continue;
       const w = lvMsgWhen(lvIdxOf(t.rid), i)
         || { when: '', tip: 'older than this log \u2014 the request that produced it was never captured' };
       items.push(lvNode({ level: 3, rid: t.rid, idx: i, when: w.when, tip: w.tip,
@@ -3037,24 +3081,27 @@ const actions = {
   // A turn header or a tree request row: focus that request.
   'lv-toggle': el => lvToggle(+el.dataset.rid),
   'lv-jump': el => lvFocus(+el.dataset.rid),
-  // The tree's own caret: fold/unfold one request without touching the others
-  // (expanding also opens that block in the body, so there is something to read).
-  'lv-tree': async el => {
+  // The tree's caret is the turn header's caret: one fold, and it moves the
+  // same way whichever side you click it on.
+  'lv-tree': el => lvToggle(+el.dataset.rid),
+  // The line standing in for re-sent history: show those messages here too, in
+  // the body and in the tree at once.
+  'lv-carry': async el => {
     const rid = +el.dataset.rid;
-    if (LV.openTree.has(rid)) LV.openTree.delete(rid);
-    else { LV.openTree.add(rid); LV.open.add(rid); }
+    if (LV.hist.has(rid)) LV.hist.delete(rid);
+    else LV.hist.add(rid);
     await lvDraw({ scroll: false });
   },
   // A message row inside a request: jump to that message in the body.
   'lv-msg': el => lvFocusMsg(+el.dataset.rid, +el.dataset.idx),
   'lv-expand': async () => {
     const rids = lvTurns().map(t => t.rid);
-    LV.open = new Set(rids); LV.openTree = new Set(rids);
+    LV.open = new Set(rids); LV.hist = new Set(rids);
     await lvDraw();
   },
   'lv-collapse': async () => {
     const keep = LV.rid != null ? [LV.rid] : [];
-    LV.open = new Set(keep); LV.openTree = new Set(keep);
+    LV.open = new Set(keep); LV.hist = new Set(keep);
     await lvDraw({ scroll: true });
   },
 };

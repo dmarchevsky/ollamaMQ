@@ -900,7 +900,7 @@ dialog.logview[open] { display: flex; }
    timeline it is, and every level is click-through to the block it names. */
 /* Tight columns: the rail is a timeline outline, not a file tree — the indent
    only has to show three levels, and every pixel of it is taken from the snippet. */
-.lv-node { display: flex; gap: 6px; align-items: baseline; width: 100%; text-align: left;
+.lv-node { display: flex; gap: 6px; align-items: baseline; width: 100%; text-align: left; cursor: pointer;
   border: 0; background: none; padding: 5px 8px; border-radius: 6px; cursor: pointer;
   font: 12px var(--mono); color: var(--text); }
 .lv-node:hover, .lv-node.on { background: var(--accent-soft); }
@@ -915,6 +915,13 @@ dialog.logview[open] { display: flex; }
 .lv-node .snip { font: 12px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lv-node.l2 { padding-left: 10px; } .lv-node.l3 { padding-left: 18px; }
 .lv-node.l3 .tag { width: 40px; }
+/* One row (and one body line) stands in for the messages this request re-sent
+   and an earlier one already delivered. Clicking either opens both. */
+.lv-node.carry, .lv-node.carry .tag { color: var(--faint); }
+.lv-carry { display: inline-flex; align-items: center; gap: 6px; margin: 2px 0 10px; padding: 4px 11px;
+  border: 1px dashed var(--border); border-radius: 999px; background: var(--surface-2); color: var(--muted);
+  font: 11.5px var(--mono); cursor: pointer; }
+.lv-carry:hover { color: var(--text); border-color: var(--accent); }
 #dlg-log .flash { outline: 2px solid var(--accent); outline-offset: 1px; animation: lv-flash 1.3s ease-out; }
 @keyframes lv-flash { from { outline-color: var(--accent); } to { outline-color: transparent; } }
 .lv-body::-webkit-scrollbar { width: 12px; }

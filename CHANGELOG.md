@@ -7,6 +7,18 @@ since upstream `v0.5.0`.
 
 ### Changed
 
+- **A request in the viewer shows what it added, not the whole conversation again.** Every turn after the
+  first re-sends the entire history, so the viewer used to repeat it: turn 4 reprinted the messages turns
+  1–3 had already drawn. Each turn now collapses what it merely re-sent into one line —
+  `▸ 7 messages held from request 1 · system 1 · user 2 · assistant 2 · tool 2 · ≈799 B — show them here
+  too` — and clicking it (in the body or in the jump tree, which share the fold) puts those messages inside
+  that request too. The request line keeps both halves: `10 messages · 3 new this turn`.
+- **The jump tree and the log body are now one fold.** The caret on a request row in the tree and the caret
+  on the request's header in the body are the same control: folding either folds both, so the tree no
+  longer claims a request is open while the body has it shut. The tree's request row also says
+  `3 new · 7 held` now instead of a bare message count.
+- **Conversation headers and stage lines carry one and the same `≣ View` chip** (it said
+  `≣ view conversation` on the header), at the same right edge of the row.
 - **The Overview has one list now — Details — and it says how fast you are being served.**
   The **List / Details** switch is gone (with it the phone's card layout and the wide twelve-column
   table): the Activity panel always threads conversations, one line per stage event. A conversation
