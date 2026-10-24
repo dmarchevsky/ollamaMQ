@@ -2833,7 +2833,7 @@ fn apply_family_learning(state: &AppState, backend_idx: usize, route: ApiSet, re
 /// Saturating, so a task queued outside the normal enqueue path can never wrap
 /// the counter and lock out every later request.
 fn release_queued_bytes(state: &AppState, bytes: u64) {
-    let _ = state.queued_bytes.fetch_update(
+    let _ = state.queued_bytes.try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |held| Some(held.saturating_sub(bytes)),
@@ -7620,26 +7620,6 @@ mod tests {
             sanitize_label(Some("Refaktor äuth")),
             Some("refaktor-äuth".into())
         );
-    }
-
-    /// True once the conversation is remembered on `url` — polled, because the
-    /// mapping is rewritten when the response finishes, not at dispatch.
-    async fn affinity_is(state: &Arc<AppState>, k: &SessionKey, url: &str) -> bool {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let hit = state
-                    .affinity
-                    .lock_or_recover()
-                    .get(k)
-                    .is_some_and(|a| a.backend_url == url);
-                if hit {
-                    return true;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap_or(false)
     }
 
     /// The conversation id used by the routing tests below, as the scheduler

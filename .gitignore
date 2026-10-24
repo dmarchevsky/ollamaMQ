@@ -9,6 +9,12 @@ ollamamq-requests.jsonl
 __pycache__/
 *.pyc
 
-# local analysis inputs (raw request logs; never commit server logs)
+# local analysis inputs and ad-hoc backups (raw request logs and config
+# archives with real keys in them — never one `git add -A` away from a commit)
 logs.tar.gz
 logs-remote/
+logs*/
+*.tar.gz
+*.tgz
+config-backup*/
+ollamamq-config-*/
