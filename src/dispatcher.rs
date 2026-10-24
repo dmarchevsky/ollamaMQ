@@ -130,7 +130,11 @@ impl ApiSet {
     /// /v1/systemone`, plus a `{"models":[{"name":…}]}` model list on all of
     /// them except Laya. No `/api/*` route at all.
     pub const SYSTEMONE: ApiSet = ApiSet(1 << 2);
-    /// Ollama + OpenAI: what a backend serving both flavours is tagged with.
+    /// Ollama + OpenAI: the set a backend serving both flavours is tagged with.
+    /// Test-only since the terminal dashboard went: the proxy builds this set by
+    /// merging probe results and never needed to name it, and the dashboard that
+    /// used to spell it out in a legend is gone.
+    #[cfg(test)]
     pub const BOTH: ApiSet = ApiSet(1 << 0 | 1 << 1);
     /// Every known family — the set of a route that any backend may serve.
     pub const ALL: ApiSet = ApiSet(1 << 0 | 1 << 1 | 1 << 2);
@@ -234,6 +238,7 @@ impl ApiSet {
     pub const Unknown: ApiSet = ApiSet::EMPTY;
     pub const Ollama: ApiSet = ApiSet::OLLAMA;
     pub const OpenAi: ApiSet = ApiSet::OPENAI;
+    #[cfg(test)]
     pub const Both: ApiSet = ApiSet::BOTH;
 }
 
