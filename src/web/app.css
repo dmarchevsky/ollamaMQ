@@ -650,7 +650,6 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
   .sparkcell { width: auto; }
   .sparkcell .spark { width: 120px; margin-left: auto; }
   #page-overview .tscroll { overflow: visible; }
-  #page-overview td.ph-hide { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
 
