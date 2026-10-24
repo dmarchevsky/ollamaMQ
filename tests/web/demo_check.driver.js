@@ -212,6 +212,20 @@ addEventListener('load', () => {
           A('raw-keeps-the-wire', /data: ?\{/.test(raw) && raw.includes('[DONE]'), `${raw.length} chars of captured bytes`);
           document.querySelector('#lv-fmt label:has(input[value="fmt"])').click();
           await wait(500);
+          // The download is a shipped artefact and nothing else looks at it: the
+          // transcript gets exactly one Request and one Response heading per
+          // turn, written as prose rather than as the wire.
+          for (const t of lvTurns()) await lvLoad(t.rid);
+          const md = lvMarkdown(LV.conv, LV.content, lvTurns());
+          const lines = md.split('\n');
+          const reqL = lines.filter(l => l.startsWith('**Request**'));
+          A('transcript-headings', reqL.length === lvTurns().length
+            && lines.filter(l => l.startsWith('**Response**')).length === lvTurns().length,
+            `${reqL.length} request headings for ${lvTurns().length} turns: ${reqL.join(' / ').slice(0, 72)}`);
+          A('transcript-is-prose', !/data: ?\{|\[DONE\]/.test(md)
+            && /rotate\(\) loop shifts files/.test(md)
+            && /messages, \d+ new/.test(md),
+            `${md.length} chars, stream read back as text, the held history named as a count`);
           // The tree's width is yours: drag, keys, double-click to reset, and it
           // is remembered like the other viewer choices.
           const grip = document.querySelector('#lv-grip');

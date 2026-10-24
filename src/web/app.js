@@ -1162,14 +1162,6 @@ function renderClientStats(st, ov) {
     </table>` : `<div class="empty">No requests in the last ${winLabel(S.filters.win)}</div>`);
 }
 
-/** Time to first token; until then the run is waiting for the backend or
- *  evaluating the prompt. A non-streamed response never shows a first token. */
-function firstToken(r) {
-  if (r.ttft_secs != null) return fmtDur(r.ttft_secs);
-  if (r.ttfb_secs == null) return '<span class="st-warn">waiting…</span>';
-  return r.tokens ? '<span class="dim">—</span>' : '<span class="st-warn">prefill…</span>';
-}
-
 // --- Backends
 
 function typeBadge(t) {
@@ -1769,7 +1761,9 @@ const lvRailClamp = w => {
   const n = Math.round(+w);
   return Number.isFinite(n) && n >= LV_RAIL_MIN && n <= 900 ? Math.min(n, lvRailMax()) : 0;
 };
-const lvRailW = () => (S.lv && S.lv.railW) || LV_RAIL_DEF;
+// What is stored is what a previous session wrote: a value that is not a sane
+// width falls back to the default instead of poisoning the CSS variable.
+const lvRailW = () => lvRailClamp(S.lv && S.lv.railW) || LV_RAIL_DEF;
 function lvApplyRail() {
   const shell = $('#dlg-log .lv-shell');
   if (shell) shell.style.setProperty('--lv-w', lvRailW() + 'px');
@@ -1902,11 +1896,11 @@ function lvStages(t) {
 }
 const nowish = () => (S.overview && S.overview.now_ms) || Date.now();
 
-/** The quiet stretch before a turn, named by what ran in it: the turn's own
- *  tool results are exactly what the agent did while the proxy was idle. */
 /** A gap this long between one answer ending and the next request arriving is
  *  worth a line of its own: that is a tool (or a human) working, not network
- *  turnaround. The request row already carries the gap as a `+Xs` stamp. */
+ *  turnaround. The gap is a length, so it is written without the `+` a moment
+ *  carries, and named by what ran in it — the turn's own tool results are
+ *  exactly what the agent did while the proxy was idle. */
 const LV_IDLE_MS = 5_000;
 
 function lvGap(t, prev) {
@@ -1917,9 +1911,6 @@ function lvGap(t, prev) {
   return `<div class="lv-gap"><span class="dot">◌</span>idle ${fmtDur((t.at_ms - end) / 1000)} · ${esc(what)} (${fmtTime(end)} → ${fmtTime(t.at_ms)})</div>`;
 }
 
-/** The first request of a conversation owns the clock; every later one is written
- *  as the delta from the request before it, the way `dmesg -H` stamps a log —
- *  the spacing is the point, and the absolute pair stays one hover away. */
 /**
  * The first request of a conversation owns the absolute clock; every one after
  * it counts continuously from the conversation's own start, the way `dmesg -H`
@@ -2015,7 +2006,7 @@ function lvMsgChips(t) {
   const chips = (t.msgs || []).map(m =>
     `<div class="msg-slot ${ROLE_CLS[m.role] || 'user'}"><span class="role">${ROLE_LABEL[m.role] || 'MSG'}</span>`
     + `<span>${esc(m.name || (m.calls || []).join(', ') || '—')}</span><span>${fmtBytes(m.chars)}</span></div>`).join('');
-  return chips || (t.msgs || []).length === 0 ? chips : '';
+  return chips;
 }
 
 function lvRespChips(t) {
@@ -2183,7 +2174,6 @@ function lvMarkdown(conv, content, turns) {
     const c = content.get(t.rid) || {};
     out.push(`## Request ${i + 1} — ${fmtTime(t.at_ms)}${t.tl?.end != null ? ` → ${fmtTime(t.tl.end)}` : ' (running)'}`, '',
       `> ${lvStages(t).replace(/<[^>]*>/g, '')}${t.status != null ? ` · HTTP ${t.status}` : ''}${t.outcome && t.outcome !== 'ok' ? ` · ${t.outcome}` : ''}`, '');
-    out.push(`**Request** ${[t.method, t.path, t.req?.bytes != null ? fmtBytes(t.req.bytes) : null].filter(Boolean).join(' ')}`, '');
     const prev = i > 0 ? lvMsgCount(turns[i - 1]) : 0;
     const msgs = c.reqObj?.messages || [];
     // What an earlier turn already sent is not repeated here; the count says so.
@@ -2338,8 +2328,8 @@ function lvDrawRail() {
     const carry = lvCarry(i);
     const c = LV.content.get(t.rid);
     const msgs = lvMsgCount(t) || (c?.reqObj?.messages || []).length;
-    // The request row owns the arrival time; the response row carries the delta
-    // from it, so one turn reads as a span instead of two clock times.
+    // The request row owns the arrival time and the response row its duration:
+    // one turn reads as a moment and a length, never two clock times.
     items.push(lvNode({ level: 2, rid: t.rid, cls: 'req', when: '', tag: 'req',
       tip: `arrived ${fmtTime(t.at_ms)} with the request — the body carries no time of its own`,
       snip: msgs ? (carry ? `${msgs - carry.hidden} new · ${carry.hidden} held` : `${msgs} messages`)
@@ -2349,16 +2339,15 @@ function lvDrawRail() {
     // already drawn under their own request. The request row says `3 new · 7
     // held`, and unfolding the body adds them here too.
     const showHist = LV.hist.has(t.rid);
-    for (const [i, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
-      if (carry && !showHist && i < carry.hidden) continue;
-      const w = lvMsgWhen(lvIdxOf(t.rid), i)
+    for (const [mi, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
+      if (carry && !showHist && mi < carry.hidden) continue;
+      const w = lvMsgWhen(lvIdxOf(t.rid), mi)
         || { when: '', tip: 'older than this log \u2014 the request that produced it was never captured' };
-      items.push(lvNode({ level: 3, rid: t.rid, idx: i, when: w.when, tip: w.tip,
+      items.push(lvNode({ level: 3, rid: t.rid, idx: mi, when: w.when, tip: w.tip,
         tag: ROLE_LABEL[m.role] || 'MSG', snip: lvSnip(m), cls: ROLE_CLS[m.role] || 'user',
-        action: 'lv-msg', on: !!LV.focusMsg && LV.focusMsg[0] === t.rid && LV.focusMsg[1] === i }));
+        action: 'lv-msg', on: !!LV.focusMsg && LV.focusMsg[0] === t.rid && LV.focusMsg[1] === mi }));
     }
-    // dmesg -H style: one absolute clock per turn (its arrival), then the delta
-    // from it while the turn is short enough for the delta to be the point.
+    // A response is a length: how long it took, not when it ended.
     const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
     items.push(lvNode({ level: 2, rid: t.rid, cls: 'resp', tag: 'resp',
       when: dur == null ? '' : fmtDur(dur / 1000),
