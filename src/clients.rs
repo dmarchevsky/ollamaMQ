@@ -261,6 +261,11 @@ impl ClientStore {
         })
     }
 
+    /// Whether no client is registered at all (the admin gate asks this).
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.clients.len()
     }

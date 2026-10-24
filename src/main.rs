@@ -530,6 +530,17 @@ async fn main() {
     let api_key = std::env::var("OLLAMA_MQ_API_KEY")
         .ok()
         .filter(|k| !k.is_empty());
+    // The dashboard's credentials and sessions, as a handle shared with the
+    // admin gate: a password changed in the UI is a new credential for both.
+    let web_state = web_auth.clone().map(web::auth_state);
+    let admin_gate = Arc::new(admin::AdminGate::new(api_key.clone(), web_state.clone()));
+    // Say up front who may drive the admin API: when nothing can identify a
+    // caller, `/admin/*` answers 403, and the operator needs to be told that is
+    // why rather than find it out from a failing curl.
+    info!(
+        "Admin API (/admin/*): {}",
+        admin_gate.describe(state.clients.lock_or_recover().len())
+    );
 
     let mut app = Router::new()
         // Ollama API Endpoints (Explicitly listed)
@@ -568,12 +579,7 @@ async fn main() {
         .route("/v1/systemone", any(proxy_handler))
         // Olla-style prefixes (`proxy_handler` strips them).
         .route("/olla/openai/{*rest}", any(proxy_handler))
-        .route("/olla/proxy/{*rest}", any(proxy_handler))
-        // Local admin API (model load/unload control) — never proxied to
-        // backends, protected by the same optional API-key auth.
-        .route("/admin/models", get(admin_models_state))
-        .route("/admin/models/load", post(admin_model_load))
-        .route("/admin/models/unload", post(admin_model_unload));
+        .route("/olla/proxy/{*rest}", any(proxy_handler));
 
     // Unknown routes: proxied while `allow_all_routes` is on (live setting).
     app = app.fallback(fallback_handler);
@@ -605,11 +611,29 @@ async fn main() {
             ),
         )
         .merge(app);
+    // The admin API (model load/unload control) — never proxied to backends,
+    // and deliberately outside the proxy's own key rule: it answers to the
+    // admin gate instead (see `admin.rs`), which knows the dashboard login and
+    // treats a client key as a last resort rather than as the norm.
+    app = app.merge(
+        Router::new()
+            .route("/admin/models", get(admin_models_state))
+            .route("/admin/models/load", post(admin_model_load))
+            .route("/admin/models/unload", post(admin_model_unload))
+            .layer(middleware::from_fn_with_state(
+                (state.clone(), admin_gate),
+                admin::guard,
+            )),
+    );
     // The web UI has its own (basic) auth, so it sits outside the API-key layer.
-    match web_auth {
+    match web_state {
         Some(auth) => {
-            info!("Web UI enabled at /ui (user '{}', password from {})", auth.username, auth.source);
-            app = app.merge(web::router(auth));
+            let creds = web_auth.clone().expect("credentials come from the same decision");
+            info!(
+                "Web UI enabled at /ui (user '{}', password from {})",
+                creds.username, creds.source
+            );
+            app = app.merge(web::router_with_state(auth));
         }
         None => info!("Web UI disabled (set OLLAMA_MQ_UI_PASSWORD or settings.web_ui.password)"),
     }

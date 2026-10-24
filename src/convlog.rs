@@ -1179,7 +1179,7 @@ async fn rotate(path: &str, max_files: usize) -> Result<(), String> {
         return Ok(());
     }
     let mut failed: Option<String> = None;
-    let mut note = |what: &str, e: std::io::Error, failed: &mut Option<String>| {
+    let note = |what: &str, e: std::io::Error, failed: &mut Option<String>| {
         if failed.is_none() {
             *failed = Some(format!("{what}: {e}"));
         }

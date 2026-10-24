@@ -136,21 +136,65 @@ impl WebAuth {
     }
 }
 
-struct AuthState {
+pub(crate) struct AuthState {
     /// Replaced when the password is changed in the UI.
     creds: std::sync::Mutex<WebAuth>,
     sessions: crate::session::Sessions,
     limiter: crate::session::LoginLimiter,
 }
 
-/// Routes for `/ui` and `/ui/api/*`; all but the login page need a session
-/// (or basic-auth credentials).
-pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
-    let auth = Arc::new(AuthState {
+impl AuthState {
+    /// Whether the request speaks for the operator: a live dashboard session
+    /// cookie, or the UI's username and password as Basic auth (so `curl -u`
+    /// uses the same credentials as the browser). The admin gate asks this.
+    fn signed_in(&self, headers: &axum::http::HeaderMap) -> bool {
+        let cookie = headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| crate::session::cookie_value(c, crate::session::COOKIE));
+        if cookie.is_some_and(|t| self.sessions.user(t).is_some()) {
+            return true;
+        }
+        let creds = self.creds.lock_or_recover().clone();
+        basic_credentials(headers).is_some_and(|(u, p)| creds.check(&u, &p))
+    }
+}
+
+/// The dashboard's credentials and its live sessions as one shared handle: the
+/// router owns it, and the admin gate (see `admin.rs`) reads the same pair, so
+/// "signed in" means the same thing on both sides — including after a password
+/// change, which replaces the credentials inside this same handle.
+pub fn auth_state(auth: WebAuth) -> Arc<AuthState> {
+    Arc::new(AuthState {
         creds: std::sync::Mutex::new(auth),
         sessions: Default::default(),
         limiter: Default::default(),
-    });
+    })
+}
+
+/// Whether `auth` lets this request act as the operator.
+pub(crate) fn signed_in(auth: &AuthState, headers: &axum::http::HeaderMap) -> bool {
+    auth.signed_in(headers)
+}
+
+/// Test hook: sign in as the dashboard would and hand back the cookie's token,
+/// so a test outside this module can prove the session door works.
+#[cfg(test)]
+pub(crate) fn test_session(auth: &AuthState) -> String {
+    let user = auth.creds.lock_or_recover().username.clone();
+    auth.sessions.create(&user)
+}
+
+/// Routes for `/ui` and `/ui/api/*`; all but the login page need a session
+/// (or basic-auth credentials).
+/// Only the tests build a whole router from credentials; the binary goes
+/// through `auth_state` so the admin gate can share the handle.
+#[cfg(test)]
+pub fn router(auth: WebAuth) -> Router<Arc<AppState>> {
+    router_with_state(auth_state(auth))
+}
+
+pub fn router_with_state(auth: Arc<AuthState>) -> Router<Arc<AppState>> {
     let api = Router::new()
         .route("/login", post(login))
         .route("/logout", post(logout))
