@@ -46,7 +46,7 @@ clients:
       - key: e2e-redact-key
 YAML
 
-./target/debug/ollamaMQ --no-tui --port 11999 --model-config "$SCRATCH/appconf.yaml" --backend-urls http://127.0.0.1:11990,http://127.0.0.1:11991 > "$SCRATCH/proxy.log" 2>&1 &
+./target/debug/ollamaMQ --port 11999 --model-config "$SCRATCH/appconf.yaml" --backend-urls http://127.0.0.1:11990,http://127.0.0.1:11991 > "$SCRATCH/proxy.log" 2>&1 &
 PROXY_PID=$!
 sleep 2.5
 

@@ -11,10 +11,10 @@
 - **Multi-Backend Load Balancing**: Distribute requests across multiple Ollama or LM Studio instances using a **Least Connections + Round Robin** strategy. Automatically detects backend API type (Ollama `/api/*` vs OpenAI `/v1/*`) and routes each request only to a compatible backend — even when a specific model is requested, so an Ollama-family call never reaches an LM Studio server that merely lists the same model.
 - **Model-Aware Routing**: Automatically identifies the requested model from the request body and routes it only to backends that list that model. Among those, selection is load-aware: first to backends where the model is already loaded and ready (Ollama `/api/ps`, LM Studio loaded instances; vLLM-style backends that don't report loaded state count as ready when they list the model), then to cold backends with nothing loaded, and only as a last resort to a backend that would have to evict a different loaded model — so a request for `qwen3.8-27b` goes to the server that has it in GPU memory instead of making a busy server with another model load it. Name matching is deterministic and bounded — exact, `:tag`/case-insensitive, or publisher-/quant-suffixed variants of the same id (`qwen3.8-27b` reaches `unsloth/qwen3.8-27b@q8_0`) — but never arbitrary substrings (so it will not be routed to an unrelated `...-abliterated` build).
 - **Smart Model Matching**: Robust matching that handles common variations like `:latest` tags and case-insensitivity. For example, a request for `llama3` will correctly match `llama3:latest` on the backend.
-- **Model Control**: Load and unload models on connected backends (Ollama and LM Studio 0.3.6+) directly from the TUI (`L`/`U`) or the admin HTTP API — without touching the backend servers themselves.
+- **Model Control**: Load and unload models on connected backends (Ollama and LM Studio 0.3.6+) directly from the web UI or the admin HTTP API — without touching the backend servers themselves.
 - **Parallel Processing**: Unlike basic proxies, `ollamaMQ` can process multiple requests simultaneously (one per available backend), significantly increasing throughput for multiple users.
 - **Aggregated Model Listings**: `GET /api/tags` and `GET /v1/models` are answered by the proxy from **every** compatible backend at once, not routed to one of them. Each backend's own listing is merged (so per-model metadata like `size`, `digest` and `details` is preserved exactly as that backend reported it) and deduplicated by name/id. Clients therefore see everything the proxy can route to, and the list no longer changes from one poll to the next depending on which backend happened to answer.
-- **Backend Health Checks**: Automatically monitors backend status every 10 seconds. All backends are probed **concurrently**, each request bounded by its own 5-second timeout, so one unresponsive backend can't hold up everyone else's status. Probes cover both API type (Ollama vs OpenAI) and the list of currently available models (via `/api/tags` and `/v1/models`). Endpoints a backend rejects are remembered and skipped until re-checked, so incompatible backends don't spam warnings. Offline instances are temporarily skipped and marked in the TUI.
+- **Backend Health Checks**: Automatically monitors backend status every 10 seconds. All backends are probed **concurrently**, each request bounded by its own 5-second timeout, so one unresponsive backend can't hold up everyone else's status. Probes cover both API type (Ollama vs OpenAI) and the list of currently available models (via `/api/tags` and `/v1/models`). Endpoints a backend rejects are remembered and skipped until re-checked, so incompatible backends don't spam warnings. Offline instances are temporarily skipped and marked in the dashboard.
 - **Fail-Fast for Unsatisfiable Requests**: If no online backend can ever serve a queued request (wrong API family or model absent everywhere), it is answered with `503` after `stuck_timeout` seconds instead of hanging forever. Requests merely waiting for a busy or loading backend are unaffected.
 - **Per-Model Concurrency Limits**: Each model entry's `max_concurrent_requests` caps how many in-flight requests one backend may serve for that model, bounded globally by `settings.max_concurrent_per_backend` (default 1 — the historical one-request-per-backend behavior; raise it to let a single backend handle several requests at once). The limit is keyed on the model's base name, so it applies no matter how the client spells it — `qwen3.8-27b`, `qwen/qwen3.8-27b` and `unsloth/qwen3.8-27b@q8_0` all draw on the same budget as the configured entry.
 - **Metadata Reads Never Queue**: `/`, `/api/tags`, `/api/ps`, `/api/version`, `/api/show`, `/v1/models` and `/v1/models/{model}` don't run inference, so they neither wait for a free backend slot nor occupy one — a chat UI polling `/api/tags` on a timer is answered immediately instead of queueing behind a multi-minute generation (or a model load) with the default `max_concurrent_per_backend: 1`.
@@ -23,17 +23,14 @@
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends. A user's turn is decided by their **recent** load: every dispatched request adds to a score that halves every 5 minutes, so a long-idle user isn't punished for past traffic and a newcomer can't monopolize the proxy while "catching up". Requests are charged when dispatched regardless of outcome, so a client whose requests always fail or disconnect can't keep jumping the queue.
 - **Cache-Aware Hold-Back**: On a backend that reports KV-cache telemetry (llama.cpp/halogen with `--metrics`), a conversation whose last turn mostly *missed* that cache — and whose estimated next-turn prefill does not fit the free KV — lines up behind the conversations served most recently instead of forcing a context switch and a full re-prefill every round. A session that just finished a turn also keeps queue priority for its follow-up for ~5 s (adaptive: 1.5x the session's own worst recent pause, 2–30 s), so an agent runs its whole cycle on its backend undisturbed; at most 64 reserved wins in a row, and any held request yields at most 16 times, so neither mechanism can starve anyone. Plain Ollama (no telemetry) keeps the plain fair order.
 - **Sticky Routing (Session Affinity)**: A conversation goes back to the backend that served its previous turn, so a long multi-turn prompt is not re-prefilled on a backend with no KV slot for it. The key is an explicit session id when the client sends one, else a fingerprint of the conversation's first turn (see [Sticky Routing](#-sticky-routing-session-affinity)).
-- **Session Labels & Priority**: A client can name its conversation (`X-Session-Name`) so it reads as `#refactor-auth` instead of `#a3f19c`, and ask for it to jump the queue (`X-Session-Priority: high|top`) as far as `settings.client_priority` allows. The operator can pin any live session from the icon beside it, the TUI or the API. `top` goes first on the whole board and may overbook its own backend by one slot (see [Session Labels & Priority](#-session-labels--priority)).
+- **Session Labels & Priority**: A client can name its conversation (`X-Session-Name`) so it reads as `#refactor-auth` instead of `#a3f19c`, and ask for it to jump the queue (`X-Session-Priority: high|top`) as far as `settings.client_priority` allows. The operator can pin any live session from the icon beside it or from the API. `top` goes first on the whole board and may overbook its own backend by one slot (see [Session Labels & Priority](#-session-labels--priority)).
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
-- **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
 - **Prometheus Metrics**: `GET /metrics` reports requests, outcomes, tokens, bytes and latency **per client and per model**, plus live queue and backend state — including `ollamamq_cache_waste_seconds_total`, the prefill time lost re-evaluating a conversation's context after it was evicted from a backend's KV cache (the waste share is `rate(cache_waste_seconds_total) / rate(prompt_seconds_total)`; only backends reporting per-request prefill telemetry contribute).
-- **Web UI**: Everything the TUI does, in a browser at `/ui` behind a sign-in page — plus management of clients and their API keys.
+- **Web Dashboard**: live backend health, active requests, queue depths, throughput and the request log in a browser at `/ui` behind a sign-in page — plus model control and management of clients and their API keys.
 - **Clients & API Keys**: Give each client one or more keys (generated or any string you choose). A request with a client key queues under the client's name, so a key holder can't hop queues by changing `X-User-ID`.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
 - **Async Architecture**: Built on `tokio` and `axum` for high concurrency.
-
-![ollamaMQ TUI Dashboard](demo.gif)
 
 ## 🛠️ Installation
 
@@ -205,7 +202,7 @@ Optional fields (load only):
 
 - `num_ctx` — max context window, sent as Ollama `options.num_ctx` or LM Studio `context_length` (omitted = backend default).
 - `keep_alive` — overrides `--load-keep-alive` (seconds) for this load. `-1` = keep forever.
-- `identifier` — free-form label shown with the operation in the TUI and API responses.
+- `identifier` — free-form label shown with the operation in the dashboard and API responses.
 
 Responses:
 
@@ -242,19 +239,16 @@ curl -s -u admin:change-me http://localhost:11435/admin/models | python3 -m json
 
 ### Logging
 
-`ollamaMQ` uses [`tracing`](https://docs.rs/tracing) and behaves differently depending on the mode:
-
-- **TUI mode** (default, interactive terminal): Logs are written to the `ollamamq.log` file in the current working directory. This keeps the terminal clear for the dashboard. Default level is `info`.
-- **`--no-tui` mode** (Docker/CI/service): Logs are written to **stderr** at a default level of `debug`, so you can see everything — backend health checks, per-request routing, backend detection, and errors. This is ideal for capturing output via the systemd journal, Docker, or piping to a file.
+`ollamaMQ` uses [`tracing`](https://docs.rs/tracing). Logs go to **stderr** at a default level of `debug`, so you see everything — backend health checks, per-request routing, backend detection, and errors. That makes the systemd journal, the Docker log, or a piped file the only log you need; there is no separate log file.
 
 Override the level at any time with the standard `RUST_LOG` environment variable:
 
 ```bash
-# Most verbose (all debug detail)
-RUST_LOG=debug ollamaMQ --no-tui
+# Quieter console (info + errors only)
+RUST_LOG=info ollamaMQ
 
-# Quieter (info + errors only)
-RUST_LOG=info ollamaMQ --no-tui
+# Everything, including per-request dispatcher detail
+RUST_LOG=debug ollamaMQ
 ```
 
 ### Running as a systemd Service
@@ -270,7 +264,7 @@ To run `ollamaMQ` as a background service with full log visibility in the journa
 2. Edit the file and set the correct `ExecStart` path to your installed binary (e.g. `~/.cargo/bin/ollamaMQ`) and your backend URLs:
 
    ```ini
-   ExecStart=/usr/local/bin/ollamaMQ --no-tui --port 11435 --backend-urls http://localhost:11434
+   ExecStart=/usr/local/bin/ollamaMQ --port 11435 --backend-urls http://localhost:11434
    ```
 
    > **Note:** If you installed `ollamaMQ` with `cargo install`, the binary is at `~/.cargo/bin/ollamaMQ`, **not** `/usr/local/bin/ollamaMQ`. Point `ExecStart` at the real path, or create a symlink so the default path works:
@@ -303,7 +297,7 @@ To run `ollamaMQ` as a background service with full log visibility in the journa
    journalctl -u ollamamq -n 100
    ```
 
-Because `--no-tui` defaults to `debug` logging on stderr, **all** dispatcher events (backend health, request routing, errors) are captured in the journal — no separate log file needed.
+Because logs default to `debug` on stderr, **all** dispatcher events (backend health, request routing, errors) are captured in the journal — no separate log file needed.
 
 ## ⚙️ Configuration (`appconf.yaml`)
 
@@ -344,7 +338,7 @@ settings:
   client_priority: global        # how far a client's own X-Session-Priority claim reaches:
                                  # off (operator only) | self (high, within its own client) |
                                  # global (high and top anywhere). Keyless clients never get a
-                                 # say, and a pin set in the UI/TUI/API always wins (default global)
+                                 # say, and a pin set in the UI/API always wins (default global)
   detect_backend_slots: true     # use the parallel slots a backend reports (llama.cpp /props total_slots,
                                  # halogen /health slots) as its capacity instead of max_concurrent_per_backend;
                                  # models without max_concurrent_requests may then use all of them (default true)
@@ -367,7 +361,7 @@ settings:
 # --- Models to load on startup / reload, via the model-control logic
 models:
   - name: "gpt-oss:120b"        # model name as the backend knows it
-    identifier: "my-gpt"        # label attached to this entry's load op (TUI / admin API)
+    identifier: "my-gpt"        # label attached to this entry's load op (dashboard / admin API)
     max_ctx: 128000             # context window — Ollama num_ctx / LM Studio context_length
     keep_alive: 86400           # seconds the model stays resident after load (Ollama; -1 = forever)
     max_concurrent_requests: 3  # in-flight requests allowed for this model on one backend (default 1)
@@ -383,7 +377,7 @@ models:
 
 - `backends` and `settings` are read at **startup only** — restart to change them.
 - A backend's optional `token` is sent as `Authorization: Bearer <token>` on every request the proxy makes to that backend — proxied inference, model listings/metadata reads, health probes and model load/unload. It's meant for backends behind an authenticated reverse proxy (LM Studio, vLLM, …). A client's own `Authorization`/`X-Api-Key` header is always forwarded untouched: the token only fills in when the request carries no credentials of its own.
-- `models` is applied automatically at startup (once backend probes have run) and re-applied any time you press **`r`** in the TUI. Application is additive: each target endpoint is checked live first (Ollama `/api/ps`, LM Studio loaded instances), so models already resident there — e.g. still loaded from an earlier run because of long `keep_alive` — are skipped instead of being loaded twice; everything else gets a load started. It never unloads anything, and loads for the same backend run one at a time (backends reject parallel control ops). Every attempt, including skips, is reported in the TUI Logs panel (`⟳ CTL`) and in the log output.
+- `models` is applied automatically at startup (once backend probes have run) and re-applied any time you click **Reload config** in the web UI. Application is additive: each target endpoint is checked live first (Ollama `/api/ps`, LM Studio loaded instances), so models already resident there — e.g. still loaded from an earlier run because of long `keep_alive` — are skipped instead of being loaded twice; everything else gets a load started. It never unloads anything, and loads for the same backend run one at a time (backends reject parallel control ops). Every attempt, including skips, is reported in the dashboard Logs panel (`⟳ CTL`) and in the log output.
 - A backend won't accept a load while it is serving requests, so each entry **waits for that backend to go idle** (up to 5 minutes) before loading. Without this, restarting the proxy under live traffic meant every configured model was refused on the spot and never retried — leaving models unloaded, or loaded with the wrong `max_ctx`.
 - Explicit CLI flags override file values when given (e.g. `--backend-urls` over `backends`, `--port`/`--host`/`--timeout` over `settings`).
 - A non-empty `models[].backends` list also **pins routing**: requests for that model are only sent to the listed backends (case-insensitive substring URL match, the same rule as load targeting) and never to other suitable ones. If none of the pinned backends is online/eligible, the request fails with HTTP 503 after `stuck_timeout` (error: `no configured backend available for model '<model>'`) instead of being routed elsewhere. If `backends` is empty/omitted, or the model is not in the config at all, the existing behavior applies — any online backend that lists the model may serve it.
@@ -432,7 +426,7 @@ Each turn is one proxied request and its response:
 
 **Rotation:** when the file exceeds `request_log_max_bytes` it is renamed to `.0` (existing `.0` → `.1`, etc.), at most `request_log_max_files` rotated files are kept and the oldest is deleted. The current file size is re-read at startup, so sizing/rotation survives restarts. When a rotation cannot happen at all (a read-only mount), the writer says so and keeps appending to the current file, tracking its real size so the ceiling stays honest rather than silently resetting to zero.
 
-**TUI:** the bottom "Requests" panel shows the newest live log events (one line per request and per response, from the in-memory ring) with a one-line content preview; press **Enter** on a row for the full-content detail view (`j`/`k` or `PgUp`/`PgDn` scroll, `q`/`Esc`/`Enter` close). It is independent of the file format above.
+**Web UI:** the **Logs** page shows the newest live log events (one line per request and per response, from the in-memory ring); clicking a row opens the conversation viewer. It is independent of the file format above.
 
 > **Note:** request/response headers are deliberately **not** logged — this keeps API keys out of the file.
 
@@ -468,7 +462,7 @@ Set `build.context` to where the source is:
 
 **Moving to another server:** stop the service and copy the folder. The files in `config/` are written by the container as root with mode 600, so copy them with `sudo` (or `docker run --rm -v "$PWD":/s alpine tar …`).
 
-**Where store files go:** relative paths for `clients_file` and `models_file` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. Logs (`request_log_path`, and `ollamamq.log` when the TUI runs) stay relative to the working directory — except that a conversation log whose configured path cannot be opened lands in the `appconf.yaml` folder (see [Request logging](#request-logging)).
+**Where store files go:** relative paths for `clients_file` and `models_file` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. Logs (`request_log_path`) stay relative to the working directory — except that a conversation log whose configured path cannot be opened lands in the `appconf.yaml` folder (see [Request logging](#request-logging)).
 
 Older setups also had a `settings.json` (the web UI's overlay) and an `admin.json` (the password changed in the UI). At startup their values are merged into `appconf.yaml` once and both files retire to `.bak`.
 
@@ -510,7 +504,7 @@ The key of any enabled client (see *Web UI, Clients & API Keys* below) is accept
 
 ```bash
 # Enable auth
-OLLAMA_MQ_API_KEY=supersecret ollamaMQ --no-tui
+OLLAMA_MQ_API_KEY=supersecret ollamaMQ
 
 # Call the API with the key (either header works)
 curl -X POST http://localhost:11435/api/chat \
@@ -538,21 +532,21 @@ docker run -d --name ollamamq -p 11435:11435 \
 Set a password and open `http://<host>:11435/ui/`:
 
 ```bash
-OLLAMA_MQ_UI_PASSWORD=change-me ollamaMQ --no-tui     # user defaults to "admin"
+OLLAMA_MQ_UI_PASSWORD=change-me ollamaMQ     # user defaults to "admin"
 ```
 
 The web UI is **off** unless a password is configured (`OLLAMA_MQ_UI_PASSWORD`, or `settings.web_ui.password` in `appconf.yaml`). Browsers sign in on `/ui/login`, which sets a session cookie (`HttpOnly`, `SameSite=Strict`, `Secure` when the proxy in front sends `X-Forwarded-Proto: https`) valid for 7 days; **Sign out** is in the sidebar. Sessions are kept in memory, so restarting ollamaMQ signs everyone out. After 10 failed sign-ins within 10 minutes further attempts get `429` until the window passes. Scripts can skip the page and send the same user and password as HTTP basic auth to `/ui/api/*`. This is all independent of `OLLAMA_MQ_API_KEY`. The password crosses the network at sign-in, so put the UI behind TLS (a reverse proxy) when it is reachable from beyond a trusted network.
 
-It covers everything the TUI does:
+The dashboard covers:
 
 - **Overview** — status at a glance over a selectable interval (default 15 min, up to 24 h — see below)
-- **Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload** (TUI `L` / `U`); also where backends are configured: **Add** (with **Test connection**), name, token, **Disable/Enable**, **Remove**, and whether the backend's response text is stored in the log (see [Request logging](#request-logging))
-- **Clients** — every queue identity with its queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock** (TUI `p` `b` `x` `X` `u`). Registered clients are two levels: open a row to edit or delete its keys
+- **Backends** — health, API type, load, and per-backend model lists with **Load** / **Unload**; also where backends are configured: **Add** (with **Test connection**), name, token, **Disable/Enable**, **Remove**, and whether the backend's response text is stored in the log (see [Request logging](#request-logging))
+- **Clients** — every queue identity with its queue depth and counters; **VIP**, **Boost**, **Block**, **Block IP**, **Unblock**. Registered clients are two levels: open a row to edit or delete its keys
 - **Models** — every model the backends list, with a switch per model and filter rules (below)
 - **Blocked** — disabled clients, blocked ids and blocked IPs
 - **Logs** — recent log events newest-first, with a switch between the two ways to read them. **By conversation** (default): one row per conversation — what a session did, instead of twenty rows that each repeat part of the last one. The row names the client and the session as its client named it (`#cache-warmup`, or the six-hex tag when nothing labelled it) and sums the traffic in an Activity line (`→ 4 req · 1.3 MB ← 200 · 92 KB`, with `waiting` or `2 failed` when either is true). **By request**: one row per request round (`→ request · ← response`), which is what you need when a single call misbehaved. In both views a CTL action and traffic that sent no session token stand alone as their own rows, and a round whose body text was switched off is marked `no text`. The choice is remembered like the other view choices. Clicking a row opens the **conversation viewer** on that conversation — a grouped row lands on its newest request, a per-request row on the request clicked: every turn of the conversation as a block on one timeline, each headed by what was measured — `queued 0.6s · prefill 6.4s · gen 11.0s · 31.4 t/s` — with any quiet stretch of 5 s or more between two turns called out as `idle 55s · tool read (10:38:07 → 10:39:02)`, because those are the tool results the next request carries. The focused turn is expanded: its messages as a transcript (thinking collapsed, tool calls rebuilt, token footer), showing only what the request added. Everything it merely re-sent collapses into one line — `▸ 7 messages held from request 1 · system 1 · user 2 · assistant 2 · tool 2 · ≈799 B — show them here too` — because the turns above already drew those messages; click the line to see them inside this request as well. The request line counts both halves: `10 messages · 3 new this turn`. Other turns stay as header lines until opened. A streamed response is read back as the answer it produced, not as the wire it came over: `Formatted` reassembles the SSE (or Ollama line-JSON) chunks into one assistant message — text, collapsed thinking, rebuilt tool calls, finish reason and usage — and drops keep-alive comments, empty deltas and the `[DONE]` marker; `Raw` shows the captured bytes as stored. A stream that opens with `: keepalive` is still a stream. `⏮ ‹ › ⏭` walk request by request (the one you clicked from is where it starts), `⟳` reloads to pull in turns that arrived since, and `⤓ Download` saves the whole conversation — Formatted gives a markdown transcript, Raw gives the log line as the file holds it. `≡ Jump` opens the request tree — drag its left edge to make it wide or narrow (double-click, or focus the edge and use `←`/`→`, to reset), and the width is remembered like the other viewer choices — request → request/response → message → tool call, each request folding on its own — and it is the *same* fold as the request's header in the body: closing it in the tree closes the block, closing the block closes the tree, and `Expand all` / `Collapse all` move both. A request row reads `3 new · 7 held` and lists only the messages that request added — the re-sent ones live under their own request, and the body's one-line history is where you open them. It is stamped the way `dmesg -H` stamps a log: the conversation's first request owns the absolute clock (`17:30:14`), and every stamp after it counts **continuously from the conversation's start** — request 2 at `+18s`, request 3 at `+31s`, never the same number twice — and the one rule for the whole column is **`+` means a moment, a plain number means a length** — a request row is a moment (`+31s` after the conversation began), a response row is how long that response took (`18.4s`), an idle row how long it sat quiet (`6.2s`), a message row the window that produced it. Hover any of them and it says which it is. There is no third kind: a `TOOL` result is the stretch between the previous answer ending and this request arriving (`2.0s`, tooltip `produced between 14:53:02 and 14:53:57`), an `ASSIST` row is the generation that wrote it. The absolute time of any later row stays one hover away. `SYS` and `USER` rows stay blank and say why on hover: they arrive inside the request, so they have no instant of their own, and inventing one per line would be a precision the capture never measured. Clicking a request row focuses it in the body; clicking a message row (`USER`, `ASSIST`, `TOOL`) jumps to that message and highlights the row you are looking at — for a message the request merely re-sent, that is the earlier turn where it is drawn, unless this request has its held history unfolded, in which case the copy in front of you is the one you land on. Capture turned off is rendered as structure, not absence: the blocks, timeline, sizes and message roles are all there, with *capture turned off* where the text would be. The page behind never scrolls while the viewer is open — the only scrollbars are the log's own and the tree's. Truncated captures are salvaged rather than shown as raw.
 - **Settings** — limits, model aliases, metrics token, the admin password, and the version you are running (see below)
-- **Reload config** — re-read `appconf.yaml` (TUI `r`)
+- **Reload config** — re-read `appconf.yaml`
 
 The **Overview** page shows:
 - a one-line health summary
@@ -604,7 +598,7 @@ It also manages **clients and their API keys**. The Clients page is one list wit
 - Each client row carries **VIP**, **boost**, **Block IP**, **+ Key** and **Disable**/**Enable**; each key row carries **Edit** and **Delete**.
 - A request carrying a client key (`Authorization: Bearer <key>` or `X-Api-Key: <key>`) queues under that client's name, **whatever `X-User-ID` it sends**. The key is removed before the request is forwarded, so it never reaches a backend (the backend's own `token` applies instead).
 - Requests with no key, or a key no client owns, are queued by `X-User-ID` — **except that registered names are reserved**: a keyless request claiming one (e.g. `X-User-ID: alice` without alice's key) is queued apart as `unverified:alice`, with none of alice's queue position, priority or stats.
-- **Blocking a registered client disables it** (TUI `x`, web *Block* / *Disable*): its keys get `403` and its queued requests are dropped. That is the client's one block switch, saved with it; a user block on a client name from before this rule is converted to *disabled* at startup. Unregistered ids and IPs are blocked as before (`blocked_items.json`).
+- **Blocking a registered client disables it** (*Block* / *Disable* in the web UI): its keys get `403` and its queued requests are dropped. That is the client's one block switch, saved with it; a user block on a client name from before this rule is converted to *disabled* at startup. Unregistered ids and IPs are blocked as before (`blocked_items.json`).
 - **VIP and boost on a registered client are saved** with it and restored at startup; on an unregistered id they last until restart.
 - **Renaming a client moves its live state** — queued requests, counters, last IP, fair-share position, VIP/boost — to the new name. Requests already being served finish under the old name. Deleting a client turns its name back into an ordinary id and clears its VIP/boost.
 - Keys are stored in plaintext in `settings.clients_file` (default `clients.yaml` next to `appconf.yaml`) so they can be looked up again; the file is written owner-only (`0600`). Changes are saved immediately (atomic replace). A clients file that exists but cannot be parsed stops the proxy at startup rather than being overwritten. The file is hand-editable YAML — a key may be written as just its string (`- omq-…`); ids and timestamps are filled in when the proxy saves it.
@@ -629,7 +623,7 @@ The **Models** page decides which models the proxy serves. Rules are case-insens
 - A model's switch adds or removes an exact-name rule. A model still hidden by a pattern rule cannot be switched on from the list — remove or narrow the pattern.
 - Hidden models are left out of the merged `/v1/models` and `/api/tags`, and a request naming one (in the body, or the path of `/v1/models/{id}`) gets **`404 model not found`** at once, in OpenAI or Ollama error shape. Matching follows routing, so `llama3` cannot reach a hidden `llama3:latest`.
 - A rule limited to some backends hides the model there only; requests route to the backends that still serve it.
-- Model load/unload from the TUI or web UI still works on hidden models (to warm one before serving it). `/api/ps` is not filtered.
+- Model load/unload from the web UI still works on hidden models (to warm one before serving it). `/api/ps` is not filtered.
 - Rules are stored in `settings.models_file` (default `models.yaml`), written atomically. A file that exists but cannot be parsed stops the proxy at startup rather than serving everything. It is hand-editable YAML — a plain hide rule may be written as just its pattern (`- unsloth/Qwen3.8-27B-GGUF:*`).
 
 ### 📈 Prometheus Metrics
@@ -780,9 +774,6 @@ configuration):
   nothing yet — every live conversation carries one in its Details header, on
   any screen width). The status line counts the conversations sitting above
   normal, and the Filters modal can show only those.
-- **TUI** — `P` on a client cycles the level of everything that client has waiting and pins
-  the conversations behind them, so their next turn keeps it. `[HGH]` / `[TOP]` mark the
-  client while it holds.
 - **API** — `POST /ui/api/sessions/<tag>/priority` with `{"level":"top"}` (`high` and
   `normal` too), same auth as everything under `/ui/api/`. `400` if the tag is not six hex
   digits or the level is not one of the three.

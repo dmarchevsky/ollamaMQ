@@ -13,7 +13,7 @@
 #     override `settings`
 #
 # The models section is applied automatically at startup (once backends are
-# probed) and whenever you press 'r' in the TUI. Applying is additive: each
+# probed) and whenever you click Reload config in the web UI. Applying is additive: each
 # endpoint is checked live first, so models that are already resident on a
 # target backend — e.g. still loaded from an earlier run because of long
 # keep_alive — are skipped instead of being loaded twice. It never unloads
@@ -82,7 +82,7 @@ settings:
                                 #   global  high and top honoured anywhere (default)
                                 # Two limits in every mode: only authenticated clients (an API key)
                                 # get a say — keyless ip-<address> traffic never does — and a level
-                                # pinned in the UI, TUI or API always beats what the client claims.
+                                # pinned in the UI or API always beats what the client claims.
                                 # On a proxy shared between tenants, prefer self or off.
   detect_backend_slots: true   # capacity = slots a backend reports (llama.cpp /props total_slots,
                                # halogen /health slots); unreported backends use max_concurrent_per_backend.
@@ -118,7 +118,7 @@ settings:
 # Fields per model:
 #   name                     model name as the backend knows it (smart-matched:
 #                            ':latest' / case-insensitive / unique substring)
-#   identifier               label attached to the load op (shown in TUI + admin API)
+#   identifier               label attached to the load op (shown in the UI + admin API)
 #   max_ctx                  max context window (Ollama num_ctx / LM Studio context_length)
 #   keep_alive               seconds to stay resident after load (Ollama only;
 #                            default: settings.load_keep_alive; -1 = forever)
