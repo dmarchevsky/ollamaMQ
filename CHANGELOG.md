@@ -3,6 +3,16 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## Unreleased
+
+- **Developer playbook only, no product changes.** The live-walk recipe now runs the worktree
+  binary against the repo's own `config/appconf.yaml` by absolute path — the v0.17.0 log-path
+  fallback (capture lands next to appconf.yaml when `request_log_path` is unwritable) makes the
+  old `live/` config-copy workaround obsolete, and a copy risked a login the operator could not
+  use. Two checks the dev-flow gates now enforce explicitly: the test instance on :8081 is killed
+  before `flow finish`, and the worktree is free of uncommitted paths before `flow release`
+  (v0.17.0 shipped with a review fix to `app.css` left uncommitted).
+
 ## v0.17.0 — 2026-10-23
 
 ### Changed
