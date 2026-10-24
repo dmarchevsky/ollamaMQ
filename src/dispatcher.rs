@@ -6202,6 +6202,39 @@ mod tests {
         assert!(text.contains(r#"ollamamq_backend_free_slots{backend="127.0.0.1:9"} 0"#));
     }
 
+    /// The TUI's Waste column reads the snapshot's per-backend pairs, in backend
+    /// order, straight from the accumulated counters — no history walk.
+    #[test]
+    fn capture_reports_waste_per_backend_in_backend_order() {
+        let state = new_test_state(vec![
+            "http://127.0.0.1:9".into(),
+            "http://127.0.0.1:10".into(),
+        ]);
+        let mut timing = crate::stats::Timing::default();
+        timing.prefill = Some((20.0, 500));
+        timing.waste_secs = Some(5.0);
+        state.stats.record(crate::stats::Finished {
+            at_ms: crate::stats::now_ms(),
+            client: "tester".into(),
+            key: "none".into(),
+            model: "llama3".into(),
+            backend: Some("127.0.0.1:10".into()),
+            outcome: "ok",
+            session: None,
+            session_label: None,
+            priority: "normal",
+            rid: None,
+            tools: vec![],
+            queue_wait: Some(0.1),
+            stage: Default::default(),
+            timing,
+        });
+        let snap = crate::snapshot::capture(&state, 0);
+        assert_eq!(snap.backend_waste.len(), 2);
+        assert_eq!(snap.backend_waste[0], (0.0, 0.0));
+        assert_eq!(snap.backend_waste[1], (20.0, 5.0));
+    }
+
     /// A backend that reports 2 slots runs two requests for the same
     /// (unlisted) model at once; with detection off it runs one at a time.
     #[tokio::test]

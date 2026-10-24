@@ -5,7 +5,7 @@
 //! keeps the last hour in memory: one record per finished request. Nothing
 //! here survives a restart.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -108,16 +108,46 @@ impl Finished {
 #[derive(Default)]
 pub struct Stats {
     finished: Mutex<VecDeque<Finished>>,
+    /// Per backend label: `(prefill secs, waste secs)` summed over every request
+    /// that had a measurable cache waste (see [`Stats::record`]). Accumulated as
+    /// requests finish rather than recomputed from `finished`, because a metrics
+    /// scrape or a UI poll used to copy the whole 20k-record history and search
+    /// it per backend on every call.
+    waste: Mutex<HashMap<String, (f64, f64)>>,
 }
 
 impl Stats {
     pub fn record(&self, f: Finished) {
+        if let Some(waste_secs) = f.timing.waste_secs {
+            if let Some(backend) = f.backend.as_deref() {
+                // Same rule the TUI's Waste column always used: a turn only
+                // counts when its waste was measurable, and its prefill time
+                // joins the denominator at that moment.
+                let prefill = f.timing.prefill.map(|(secs, _)| secs).unwrap_or(0.0);
+                let mut waste = self.waste.lock_or_recover();
+                let acc = waste
+                    .entry(backend.to_string())
+                    .or_insert((0.0, 0.0));
+                acc.0 += prefill;
+                acc.1 += waste_secs;
+            }
+        }
         let cutoff = f.at_ms.saturating_sub(HISTORY.as_millis() as u64);
         let mut q = self.finished.lock_or_recover();
         while q.front().is_some_and(|x| x.at_ms < cutoff) || q.len() >= MAX_FINISHED {
             q.pop_front();
         }
         q.push_back(f);
+    }
+
+    /// Lifetime `(prefill secs, waste secs)` remembered for one backend label,
+    /// `(0.0, 0.0)` where nothing was measurable.
+    pub fn backend_waste(&self, backend_label: &str) -> (f64, f64) {
+        self.waste
+            .lock_or_recover()
+            .get(backend_label)
+            .copied()
+            .unwrap_or((0.0, 0.0))
     }
 
     /// Requests finished at or after `from_ms`, oldest first.
@@ -269,6 +299,59 @@ mod tests {
             stage: Default::default(),
             timing,
         }
+    }
+
+    #[test]
+    fn waste_is_tallied_per_backend_as_requests_finish() {
+        let s = Stats::default();
+        // A turn with measurable waste carries its prefill into the denominator.
+        s.record(fin(
+            1_000,
+            "a",
+            "gpu1",
+            "ok",
+            Timing {
+                prefill: Some((30.0, 1000)),
+                waste_secs: Some(6.0),
+                ..Default::default()
+            },
+        ));
+        // A turn without waste adds nothing — not even its prefill.
+        s.record(fin(
+            1_100,
+            "a",
+            "gpu1",
+            "ok",
+            Timing {
+                prefill: Some((20.0, 900)),
+                ..Default::default()
+            },
+        ));
+        s.record(fin(
+            1_200,
+            "a",
+            "gpu1",
+            "ok",
+            Timing {
+                prefill: Some((10.0, 500)),
+                waste_secs: Some(1.5),
+                ..Default::default()
+            },
+        ));
+        s.record(fin(
+            1_300,
+            "b",
+            "gpu2",
+            "ok",
+            Timing {
+                prefill: Some((5.0, 100)),
+                waste_secs: Some(0.5),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(s.backend_waste("gpu1"), (40.0, 7.5));
+        assert_eq!(s.backend_waste("gpu2"), (5.0, 0.5));
+        assert_eq!(s.backend_waste("never-seen"), (0.0, 0.0));
     }
 
     #[test]

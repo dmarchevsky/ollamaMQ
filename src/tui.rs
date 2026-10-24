@@ -1110,7 +1110,7 @@ impl TuiDashboard {
                 let height = name_lines.len() as u16;
 
                 // Share of this backend's prefill time lost to cache eviction
-                // over the retained history; `—` where nothing is measurable.
+                // over everything served so far; `—` where nothing is measurable.
                 let (prefill_secs, waste_secs) =
                     snapshot.backend_waste.get(idx).copied().unwrap_or((0.0, 0.0));
                 let (waste_str, waste_style) = if prefill_secs > 0.0 {
