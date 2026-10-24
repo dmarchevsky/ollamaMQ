@@ -169,7 +169,13 @@ Models can be loaded and unloaded on connected backends without touching the bac
 - Plain OpenAI backends (vLLM, etc.) have no control API and are rejected with a clear error.
 - **System One decision-model servers (CLM, Laya, Kev)** have no model-control API either — no load/unload, no `keep_alive`, not even `/api/ps`. Residency is configured on the server itself (e.g. `LAYA_PRELOAD`, `LAYA_MAX_LOADED`), so a `models:` entry for these backends only makes the name routable and pins it; it never starts a load.
 
-All three endpoints are served by the proxy itself (they are never proxied to a backend) and are protected by the same optional `OLLAMA_MQ_API_KEY` auth as the proxy routes.
+All three endpoints are served by the proxy itself (they are never proxied to a backend). They are **not** open by default: an admin call is accepted from
+
+1. the proxy key, when `OLLAMA_MQ_API_KEY` is set (`Authorization: Bearer <key>` or `X-API-Key`),
+2. otherwise the dashboard's own credential — a live session cookie, or the same user and password as HTTP basic auth (`curl -u admin:…`). This works whether or not the dashboard is listening on this interface: the credential is what counts, so an operator can keep `settings.web_ui.listen` on `127.0.0.1` and still administer over the network,
+3. otherwise — and only when neither of the above exists — any **enabled** client key from `keys.toml`.
+
+Anything else gets `403` with a body naming what to configure, and the startup log says which door is open (or that the control is closed). A client key is the last resort rather than the rule: a box full of client keys is not a box whose clients may reconfigure it. The dashboard's own model controls go through `/ui/api/*` and follow the dashboard's login.
 
 #### `GET /admin/models`
 
@@ -211,23 +217,25 @@ Responses:
 | `409`  | Conflict — another control operation is already in flight on that backend, or the backend is busy with active requests. |
 
 ```bash
-# Load (llama3 resolves to llama3:latest)
+# Load (llama3 resolves to llama3:latest). ADMIN stands for the credential the
+# box accepts — the proxy key, or `-u admin:<password>` for the dashboard's.
+ADMIN='Authorization: Bearer supersecret'
 curl -s -X POST http://localhost:11435/admin/models/load \
-  -H "Content-Type: application/json" \
+  -H "$ADMIN" -H "Content-Type: application/json" \
   -d '{"backend": 0, "model": "llama3"}'
 
 # Unload by URL (frees GPU memory on Ollama)
 curl -s -X POST http://localhost:11435/admin/models/unload \
-  -H "Content-Type: application/json" \
+  -H "$ADMIN" -H "Content-Type: application/json" \
   -d '{"backend": "http://10.0.0.2:11434", "model": "qwen2.5:7b"}'
 
 # Let the proxy pick a backend
 curl -s -X POST http://localhost:11435/admin/models/load \
-  -H "Content-Type: application/json" \
+  -H "$ADMIN" -H "Content-Type: application/json" \
   -d '{"backend": "any", "model": "llama3:latest"}'
 
-# With API-key auth enabled
-curl -s http://localhost:11435/admin/models -H "Authorization: Bearer supersecret"
+# The inventory, with the dashboard's credential instead
+curl -s -u admin:change-me http://localhost:11435/admin/models | python3 -m json.tool
 ```
 
 **Note:** Ollama keeps a model loaded for `keep_alive` seconds only (its own default is 5 minutes). A control "load" sends the `--load-keep-alive` value (default 24 h) so the model actually stays resident; an "unload" sends `keep_alive: 0`.
@@ -498,6 +506,8 @@ When a key is set, every request **except `/health`** must present it via one of
 
 The key of any enabled client (see *Web UI, Clients & API Keys* below) is accepted too. Requests with a missing or wrong key get `401 Unauthorized` (`{"error":"unauthorized"}`). The `/health` endpoint always stays unauthenticated so health checks and Docker healthchecks keep working.
 
+`/admin/*` keeps its own rule and does **not** inherit this one — see [Model Control](#model-control-admin-api). It fails closed: with no proxy key and no dashboard password it answers `403` to everyone, client keys included, until you create a credential. `/health` and `/metrics` are outside both rules.
+
 ```bash
 # Enable auth
 OLLAMA_MQ_API_KEY=supersecret ollamaMQ --no-tui
@@ -588,7 +598,7 @@ The **Settings** page edits `appconf.yaml` itself while the proxy runs.
 It also manages **clients and their API keys**. The Clients page is one list with two levels (filter with *All / Registered / Unregistered*): a row per id, and — while that row is open — the client's keys beneath it. *Expand all / Collapse all* works over the whole list.
 
 - **Registered clients** are created in the UI and saved in `clients.yaml`. They authenticate with their API keys and are listed even when idle.
-- **Unregistered ids** are what requests without a key are queued under: their `X-User-ID`, or the IP a front proxy fills in, else `anonymous`. They live in memory and drop off the list after an hour idle. **Register** turns one into a client of the same name and opens the add-key dialog.
+- **Unregistered ids** are what requests without a key are queued under: their `X-User-ID`, or the IP a front proxy fills in, else `anonymous`. The value is sanitised before it is used — clipped to 64 characters, control characters and runs of whitespace collapsed to `-`, and anything outside printable ASCII dropped — because it arrives from the client and is shown in the dashboard and in metrics labels verbatim otherwise. `:` is stripped so no caller can forge the namespace the proxy reserves for its own identities. The header itself still reaches the backend unchanged. They live in memory and drop off the list after an hour idle. **Register** turns one into a client of the same name and opens the add-key dialog.
 
 - Create a client (its name becomes its queue id), then add keys — **generated** (`omq-…`) or **any string you choose** (8–256 printable characters, unique across clients). A key is opened from its row to **edit** (label, log capture) or **delete**; a client can be renamed, disabled (its keys get `403`) or deleted. A key always belongs to the client it was created for — moving one means deleting it and handing out a new one.
 - Each client row carries **VIP**, **boost**, **Block IP**, **+ Key** and **Disable**/**Enable**; each key row carries **Edit** and **Delete**.
@@ -832,15 +842,10 @@ docker run -d \
 
 ## 🧪 Development
 
-### Stress Testing
-
-You can use the provided `test_dispatcher.sh` script to simulate multiple users and verify the dispatcher's behavior under load:
-
 ```bash
-./test_dispatcher.sh
+cargo test                    # unit tests: routing, sessions, queueing, the log
+bash tests/e2e/run.sh         # model load/unload and the admin gate, against mock backends
 ```
-
-![ollamaMQ Stress Test](demo-test.gif)
 
 ## 📝 License
 
