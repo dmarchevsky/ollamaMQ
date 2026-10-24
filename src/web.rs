@@ -2024,14 +2024,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let mut st = state.clients.lock_or_recover();
-        assert!(st.list().iter().any(|cl| cl.name == "alice" && cl.redact_log));
-        assert_eq!(
-            st.resolve("my-own-key-1").unwrap().redact_log,
-            true,
-            "a client with capture off covers its keys"
-        );
-        drop(st);
+        {
+            let mut st = state.clients.lock_or_recover();
+            assert!(st.list().iter().any(|cl| cl.name == "alice" && cl.redact_log));
+            assert!(
+                st.resolve("my-own-key-1").unwrap().redact_log,
+                "a client with capture off covers its keys"
+            );
+        }
         // And back off again.
         let res = c
             .patch(format!("{base}/ui/api/clients/alice"))

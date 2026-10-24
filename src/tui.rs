@@ -794,12 +794,13 @@ impl TuiDashboard {
         // Manually pre-wrap the content: split it into lines, then split each
         // line into chunks of `inner.width` chars, collecting the visual
         // lines. (No ratatui `Wrap`: it can't be scrolled by visual line.)
-        let raw = match detail.text.as_deref().filter(|c| !c.is_empty()) {
-            Some(t) => t,
-            // Captured when the row went by, but the conversation log
-            // has since dropped it (or capture is off).
-            None => "(no captured text available for this event)",
-        };
+        // Captured when the row went by, but the conversation log may since
+        // have dropped it (or capture may be off).
+        let raw = detail
+            .text
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .unwrap_or("(no captured text available for this event)");
         let mut visual: Vec<String> = Vec::new();
         if inner.width > 0 {
             for line in raw.lines() {

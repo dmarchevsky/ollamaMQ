@@ -118,19 +118,17 @@ pub struct Stats {
 
 impl Stats {
     pub fn record(&self, f: Finished) {
-        if let Some(waste_secs) = f.timing.waste_secs {
-            if let Some(backend) = f.backend.as_deref() {
-                // Same rule the TUI's Waste column always used: a turn only
-                // counts when its waste was measurable, and its prefill time
-                // joins the denominator at that moment.
-                let prefill = f.timing.prefill.map(|(secs, _)| secs).unwrap_or(0.0);
-                let mut waste = self.waste.lock_or_recover();
-                let acc = waste
-                    .entry(backend.to_string())
-                    .or_insert((0.0, 0.0));
-                acc.0 += prefill;
-                acc.1 += waste_secs;
-            }
+        if let Some(waste_secs) = f.timing.waste_secs
+            && let Some(backend) = f.backend.as_deref()
+        {
+            // Same rule the TUI's Waste column always used: a turn only
+            // counts when its waste was measurable, and its prefill time
+            // joins the denominator at that moment.
+            let prefill = f.timing.prefill.map(|(secs, _)| secs).unwrap_or(0.0);
+            let mut waste = self.waste.lock_or_recover();
+            let acc = waste.entry(backend.to_string()).or_insert((0.0, 0.0));
+            acc.0 += prefill;
+            acc.1 += waste_secs;
         }
         let cutoff = f.at_ms.saturating_sub(HISTORY.as_millis() as u64);
         let mut q = self.finished.lock_or_recover();

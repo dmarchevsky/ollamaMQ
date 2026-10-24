@@ -1114,9 +1114,11 @@ pub fn sanitize_identity(raw: &str) -> String {
         out.push(ch);
     }
     let trimmed = out.trim_matches('-');
-    (!trimmed.is_empty())
-        .then(|| trimmed.to_string())
-        .unwrap_or_else(|| "anonymous".to_string())
+    if trimmed.is_empty() {
+        "anonymous".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 
@@ -3132,6 +3134,20 @@ async fn health_check_round(
     }
 }
 
+/// One dispatch decision: user id, the task, the index it was taken from in
+/// that user's queue, the backend that will serve it and its token, whether
+/// that backend's traffic is kept out of the log, and the session metadata
+/// collected on the way.
+type Selection = (
+    String,
+    Task,
+    usize,
+    String,
+    Option<String>,
+    bool,
+    bool,
+);
+
 pub async fn run_worker(state: Arc<AppState>) {
     let client = state.client.clone();
     let mut current_idx = 0;
@@ -3254,13 +3270,13 @@ pub async fn run_worker(state: Arc<AppState>) {
                 }) {
                     order.push(ui);
                 }
-                if let Some(i) = vip.as_ref().and_then(&position_of)
+                if let Some(i) = vip.as_ref().and_then(position_of)
                     && !order.contains(&i)
                 {
                     order.push(i);
                 }
                 if counter.is_multiple_of(2)
-                    && let Some(i) = boost.as_ref().and_then(&position_of)
+                    && let Some(i) = boost.as_ref().and_then(position_of)
                     && !order.contains(&i)
                 {
                     order.push(i);
@@ -3345,9 +3361,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                 // the FIRST routable task (not just the front) so an
                 // unroutable request — e.g. an Ollama-family call with every
                 // Ollama backend offline — can't starve everything behind it.
-                let mut selection: Option<
-                    (String, Task, usize, String, Option<String>, bool, bool),
-                > = None;
+                let mut selection: Option<Selection> = None;
                 'users: for &ui in &order {
                     let user_id = &active_users[ui];
                     let queue_len = queues.get(user_id).map(|q| q.len()).unwrap_or(0);
@@ -3356,10 +3370,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                     // stable). `pos` stays the queue index, so the pin lookup
                     // above and the removal below still line up with it.
                     let mut positions: Vec<usize> = (0..queue_len).collect();
-                    if queue_len > 1 {
-                        if let Some(q) = queues.get(user_id) {
-                            positions.sort_by_key(|&p| std::cmp::Reverse(q[p].priority));
-                        }
+                    if queue_len > 1
+                        && let Some(q) = queues.get(user_id)
+                    {
+                        positions.sort_by_key(|&p| std::cmp::Reverse(q[p].priority));
                     }
                     for pos in positions {
                         let task_ref = match queues.get(user_id).and_then(|q| q.get(pos)) {
@@ -3738,10 +3752,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                         // being held back stays bounded (see `cold_hold`).
                         if !cold_users.is_empty() && !cold_users.contains(user_id) {
                             for cu in &cold_users {
-                                if let Some(q) = queues.get_mut(cu) {
-                                    if let Some(p) = next_pos(q) {
-                                        q[p].cache_passes = q[p].cache_passes.saturating_add(1);
-                                    }
+                                if let Some(q) = queues.get_mut(cu)
+                                    && let Some(p) = next_pos(q)
+                                {
+                                    q[p].cache_passes = q[p].cache_passes.saturating_add(1);
                                 }
                             }
                         }
@@ -4179,7 +4193,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     // entry below overwrites it.
                                     let served = status.is_success() && !client_disconnected;
                                     let prior = served
-                                        .then(|| task.session_key.as_ref())
+                                        .then_some(task.session_key.as_ref())
                                         .flatten()
                                         .and_then(|k| conv_cache_prior(&state_clone, k, &backend_url));
                                     let waste_secs = served
@@ -6271,9 +6285,11 @@ mod tests {
             "http://127.0.0.1:9".into(),
             "http://127.0.0.1:10".into(),
         ]);
-        let mut timing = crate::stats::Timing::default();
-        timing.prefill = Some((20.0, 500));
-        timing.waste_secs = Some(5.0);
+        let timing = crate::stats::Timing {
+            prefill: Some((20.0, 500)),
+            waste_secs: Some(5.0),
+            ..Default::default()
+        };
         state.stats.record(crate::stats::Finished {
             at_ms: crate::stats::now_ms(),
             client: "tester".into(),

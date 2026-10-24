@@ -83,6 +83,7 @@ pub fn defaults() -> Settings {
 
 /// Every source of settings, kept so the UI can show where a value comes
 /// from.
+#[derive(Default)]
 pub struct Layers {
     /// `appconf.yaml` as last read or saved.
     pub file: AppConfig,
@@ -100,20 +101,6 @@ pub struct Layers {
     pub startup: Settings,
     /// Where each store file was found (setting name -> path), for display.
     pub resolved: BTreeMap<&'static str, String>,
-}
-
-impl Default for Layers {
-    fn default() -> Self {
-        Self {
-            file: AppConfig::default(),
-            pinned: Settings::default(),
-            pinned_by: BTreeMap::new(),
-            backends_from_cli: false,
-            fallback_backends: Vec::new(),
-            startup: Settings::default(),
-            resolved: BTreeMap::new(),
-        }
-    }
 }
 
 impl Layers {

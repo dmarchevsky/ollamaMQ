@@ -416,7 +416,7 @@ pub fn clamp_queue_budget(asked: u64, limit: Option<u64>) -> u64 {
     }
 }
 
-    impl Settings {
+impl Settings {
     /// `self` with every value `top` sets replacing this one's.
     pub fn overlay(&self, top: &Settings) -> Settings {
         macro_rules! pick {
@@ -433,7 +433,7 @@ pub fn clamp_queue_budget(asked: u64, limit: Option<u64>) -> u64 {
         )
     }
 
-/// Values a person could set that would break the proxy.
+    /// Values a person could set that would break the proxy.
     pub fn validate(&self) -> Result<(), String> {
         let at_least = |v: Option<u64>, min: u64, what: &str| match v {
             Some(v) if v < min => Err(format!("{what} must be at least {min}")),

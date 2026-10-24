@@ -598,7 +598,7 @@ impl ConvStore {
             .map(|(k, e)| (e.last_ms, e.dirty, k.clone()))
             .collect();
         // Clean before dirty, quietest first.
-        quiet_first.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+        quiet_first.sort_by_key(|a| (a.1, a.0));
         for (_, dirty, key) in quiet_first {
             if self.content_bytes <= MAX_CONTENT_BYTES && self.entries.len() <= MAX_CONVS {
                 break;
@@ -685,7 +685,7 @@ impl ConvStore {
 
     fn summaries(&self, limit: usize) -> Vec<ConvSummary> {
         let mut rows: Vec<&Conv> = self.entries.values().map(|e| &e.conv).collect();
-        rows.sort_by(|a, b| b.end_ms.cmp(&a.end_ms));
+        rows.sort_by_key(|c| std::cmp::Reverse(c.end_ms));
         rows.into_iter()
             .take(limit)
             .map(|c| ConvSummary {
@@ -743,18 +743,18 @@ impl ConvLogger {
         max_files: usize,
         flush_idle: Duration,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), std::io::Error> {
-        if let Some(dir) = std::path::Path::new(&path).parent() {
-            if !dir.as_os_str().is_empty() {
-                // A directory in the way is as fatal as an unwritable parent:
-                // better to report the open failure than to log next to it.
-                if dir.exists() && !dir.is_dir() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotADirectory,
-                        format!("{} is not a directory", dir.display()),
-                    ));
-                }
-                std::fs::create_dir_all(dir)?;
+        if let Some(dir) = std::path::Path::new(&path).parent()
+            && !dir.as_os_str().is_empty()
+        {
+            // A directory in the way is as fatal as an unwritable parent:
+            // better to report the open failure than to log next to it.
+            if dir.exists() && !dir.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!("{} is not a directory", dir.display()),
+                ));
             }
+            std::fs::create_dir_all(dir)?;
         }
         std::fs::OpenOptions::new()
             .create(true)
@@ -1054,11 +1054,7 @@ fn seed_from_tail(path: &str) -> Vec<Conv> {
 }
 
 /// Writer task: every `SWEEP`, append the conversations that have gone quiet.
-async fn writer_loop(
-    file: Arc<FileTarget>,
-    store: Arc<Mutex<ConvStore>>,
-    flush_idle: Duration,
-) {
+async fn writer_loop(file: Arc<FileTarget>, store: Arc<Mutex<ConvStore>>, flush_idle: Duration) {
     // Continue sizing from the existing file so restarts keep rotation honest.
     let mut current_size = tokio::fs::metadata(&file.path)
         .await

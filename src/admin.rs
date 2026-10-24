@@ -4,8 +4,8 @@
 //! and `settings.web_ui.password`, which stay the first-run password and the
 //! way back in (delete the hash and restart).
 
-use argon2::Argon2;
 use crate::lock::LockExt;
+use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -103,14 +103,18 @@ impl AdminGate {
                 .is_some_and(|c| !c.disabled)
     }
 
-    /// Which door let this request in, or the answer to give when none may.
-    pub fn check(
+    /// Which door let this request in — `None` when none may, and the caller
+    /// answers with [`AdminGate::refusal`]. A `Response` in an `Err` would be a
+    /// 128-byte payload on the happy path for nothing.
+    pub fn door(
         &self,
         state: &crate::dispatcher::AppState,
         headers: &axum::http::HeaderMap,
-    ) -> Result<&'static str, axum::response::Response> {
-        if let Some(key) = crate::auth::extract_api_key(headers) && self.key_ok(state, &key) {
-            return Ok(if self.api_key.is_some() {
+    ) -> Option<&'static str> {
+        if let Some(key) = crate::auth::extract_api_key(headers)
+            && self.key_ok(state, &key)
+        {
+            return Some(if self.api_key.is_some() {
                 "proxy key"
             } else {
                 "client key"
@@ -121,15 +125,15 @@ impl AdminGate {
             .as_ref()
             .is_some_and(|auth| crate::web::signed_in(auth, headers))
         {
-            return Ok("dashboard login");
+            return Some("dashboard login");
         }
-        Err(self.refusal(state))
+        None
     }
 
     /// 403, never 401: `WWW-Authenticate` would make browsers pop their own
     /// credentials box (the dashboard avoids it for the same reason), and the
     /// answer has to name what to configure rather than just ask again.
-    fn refusal(&self, state: &crate::dispatcher::AppState) -> axum::response::Response {
+    pub fn refusal(&self, state: &crate::dispatcher::AppState) -> axum::response::Response {
         let mut doors = Vec::new();
         if self.api_key.is_some() {
             doors.push("the proxy key as `Authorization: Bearer <key>`");
@@ -168,9 +172,10 @@ pub async fn guard(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    match gate.check(&state, request.headers()) {
-        Ok(_door) => next.run(request).await,
-        Err(res) => res,
+    if gate.door(&state, request.headers()).is_some() {
+        next.run(request).await
+    } else {
+        gate.refusal(&state)
     }
 }
 
@@ -239,42 +244,39 @@ mod tests {
     async fn nothing_to_check_means_403_naming_what_to_configure() {
         let state = state_with_clients(&[]);
         let gate = AdminGate::new(None, None);
-        let err = gate
-            .check(&state, &headers(&[]))
-            .expect_err("no door is configured");
+        assert!(
+            gate.door(&state, &headers(&[])).is_none(),
+            "no door is configured"
+        );
+        let err = gate.refusal(&state);
         assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
         let text = body(err).await;
         assert!(text.contains("admin control is closed"), "{text}");
-        assert!(text.contains("password"), "the hint says what to set: {text}");
+        assert!(
+            text.contains("password"),
+            "the hint says what to set: {text}"
+        );
         assert!(gate.describe(0).starts_with("CLOSED"));
         // A client key does not help either once it is the only door and there
         // are no clients: the answer explains how to make one.
         let with_client = state_with_clients(&["alice"]);
-        let err = gate
-            .check(&with_client, &headers(&[("authorization", "Bearer nope")]))
-            .expect_err("a wrong key is not a door");
-        assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            gate.door(&with_client, &headers(&[("authorization", "Bearer nope")]))
+                .is_none(),
+            "a wrong key is not a door"
+        );
     }
 
     #[tokio::test]
     async fn the_proxy_key_is_enough() {
         let state = state_with_clients(&[]);
         let gate = AdminGate::new(Some("proxy-key".into()), None);
-        assert!(
-            gate.check(&state, &headers(&[("authorization", "Bearer proxy-key")]))
-                .is_ok()
-        );
-        assert!(
-            gate.check(
-                &state,
-                &headers(&[("x-api-key", "proxy-key")]),
-            )
-            .is_ok()
-        );
-        assert!(
-            gate.check(&state, &headers(&[("authorization", "Bearer other")]))
-                .is_err()
-        );
+        let bearer = headers(&[("authorization", "Bearer proxy-key")]);
+        assert_eq!(gate.door(&state, &bearer), Some("proxy key"));
+        let api = headers(&[("x-api-key", "proxy-key")]);
+        assert_eq!(gate.door(&state, &api), Some("proxy key"));
+        let wrong = headers(&[("authorization", "Bearer other")]);
+        assert_eq!(gate.door(&state, &wrong), None);
         assert!(gate.describe(0).contains("OLLAMA_MQ_API_KEY"));
     }
 
@@ -286,36 +288,23 @@ mod tests {
         let auth = web::auth_state(WebAuth::plain("admin", "a-long-enough-password"));
         let gate = AdminGate::new(None, Some(auth.clone()));
 
-        assert!(
-            gate.check(
-                &state,
-                &headers(&[("authorization", &basic("admin", "a-long-enough-password"))])
-            )
-            .is_ok()
-        );
-        assert!(
-            gate.check(
-                &state,
-                &headers(&[("authorization", &basic("admin", "wrong"))])
-            )
-            .is_err()
-        );
+        let ok = headers(&[("authorization", &basic("admin", "a-long-enough-password"))]);
+        assert_eq!(gate.door(&state, &ok), Some("dashboard login"));
+        let wrong = headers(&[("authorization", &basic("admin", "wrong"))]);
+        assert_eq!(gate.door(&state, &wrong), None);
 
         let token = web::test_session(&auth);
         let cookie = format!("{}={token}", crate::session::COOKIE);
-        assert!(
-            gate.check(&state, &headers(&[("cookie", &cookie)])).is_ok(),
+        let cookie = headers(&[("cookie", &cookie)]);
+        assert_eq!(
+            gate.door(&state, &cookie),
+            Some("dashboard login"),
             "a signed-in browser is the operator"
         );
         // The client key that drives the chat is not enough while a dashboard
         // credential exists.
-        assert!(
-            gate.check(
-                &state,
-                &headers(&[("authorization", "Bearer alice-key-0001")])
-            )
-            .is_err()
-        );
+        let client = headers(&[("authorization", "Bearer alice-key-0001")]);
+        assert_eq!(gate.door(&state, &client), None);
     }
 
     /// With no credential of its own the box still has to be drivable, and the
@@ -324,25 +313,21 @@ mod tests {
     async fn a_client_key_drives_admin_only_when_nothing_better_exists() {
         let state = state_with_clients(&["alice"]);
         let gate = AdminGate::new(None, None);
-        assert_eq!(
-            gate.check(&state, &headers(&[("authorization", "Bearer alice-key-0001")])).ok(),
-            Some("client key")
-        );
-        assert_eq!(
-            gate.check(&state, &headers(&[("x-api-key", "alice-key-0001")])).ok(),
-            Some("client key")
-        );
+        let bearer = headers(&[("authorization", "Bearer alice-key-0001")]);
+        assert_eq!(gate.door(&state, &bearer), Some("client key"));
+        let api = headers(&[("x-api-key", "alice-key-0001")]);
+        assert_eq!(gate.door(&state, &api), Some("client key"));
         // The same key is refused as soon as the operator has a credential: a
         // client must not be able to reconfigure the box it chats to.
         let with_ui = AdminGate::new(
             None,
-            Some(web::auth_state(WebAuth::plain("admin", "a-long-enough-password"))),
+            Some(web::auth_state(WebAuth::plain(
+                "admin",
+                "a-long-enough-password",
+            ))),
         );
-        assert!(
-            with_ui
-                .check(&state, &headers(&[("authorization", "Bearer alice-key-0001")]))
-                .is_err()
-        );
+        let client = headers(&[("authorization", "Bearer alice-key-0001")]);
+        assert_eq!(with_ui.door(&state, &client), None);
     }
 
     #[tokio::test]
@@ -354,10 +339,8 @@ mod tests {
             .set_disabled("bob", true)
             .unwrap();
         let gate = AdminGate::new(None, None);
-        assert!(
-            gate.check(&state, &headers(&[("authorization", "Bearer bob-key-0001")]))
-                .is_err()
-        );
+        let bob = headers(&[("authorization", "Bearer bob-key-0001")]);
+        assert_eq!(gate.door(&state, &bob), None);
     }
 
     #[test]
