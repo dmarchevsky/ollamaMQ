@@ -283,7 +283,7 @@ async fn main() {
     let request_log_max_bytes = eff.request_log_max_bytes.unwrap_or(10 * 1024 * 1024);
     let request_log_max_files = eff.request_log_max_files.unwrap_or(5);
     let request_log_flush =
-        std::time::Duration::from_secs(eff.request_log_flush_secs.unwrap_or(60));
+        std::time::Duration::from_secs(eff.request_log_flush_secs.unwrap_or(5));
     let log_content_limit = eff
         .log_content_limit
         .map(|v| v.max(1024))

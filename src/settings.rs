@@ -70,7 +70,7 @@ pub fn defaults() -> Settings {
         request_log_path: Some("ollamamq-requests.jsonl".into()),
         request_log_max_bytes: Some(10 * 1024 * 1024),
         request_log_max_files: Some(5),
-        request_log_flush_secs: Some(60),
+        request_log_flush_secs: Some(5),
         log_content_limit: Some(1024 * 1024),
         max_body_bytes: Some(64 * 1024 * 1024),
         max_queued_bytes: Some(512 * 1024 * 1024),
@@ -442,6 +442,14 @@ fn set_disabled(b: &mut BackendStatus, disabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A crash should cost the last few seconds of a conversation, not the last
+    /// minute — and the default has to stay inside `validate()`'s floor.
+    #[test]
+    fn the_conversation_log_flushes_after_five_seconds_by_default() {
+        assert_eq!(defaults().request_log_flush_secs, Some(5));
+        defaults().validate().expect("the defaults validate");
+    }
 
     /// A backend's capture switch follows the file, in both directions.
     #[test]

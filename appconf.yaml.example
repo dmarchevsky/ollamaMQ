@@ -97,6 +97,7 @@ settings:
   request_log_path: ollamamq-requests.jsonl   # request/response JSONL log file (default shown)
   request_log_max_bytes: 10485760             # rotate when file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
+  request_log_flush_secs: 5                     # write a conversation out after this much quiet (default 5 s)
   log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
   # Files the web UI writes. A relative path is resolved from the folder
   # holding this file, so by default they sit next to it (logs above stay
