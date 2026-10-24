@@ -1754,11 +1754,39 @@ function renderLogs() {
 const storedLv = () => {
   try {
     const v = JSON.parse(localStorage.getItem('omq.lv') || '{}');
-    return { fmt: v.fmt === 'raw' ? 'raw' : 'fmt', rail: !!v.rail };
+    return { fmt: v.fmt === 'raw' ? 'raw' : 'fmt', rail: !!v.rail,
+      railW: lvRailClamp(v.railW) };
   } catch { /* storage blocked */ }
-  return { fmt: 'fmt', rail: false };
+  return { fmt: 'fmt', rail: false, railW: LV_RAIL_DEF };
 };
 const saveLv = () => { try { localStorage.setItem('omq.lv', JSON.stringify(S.lv)); } catch { /* storage blocked */ } };
+/* The jump tree is a side column you may want wide (tool names, message text) or
+   narrow (a glance beside the log), so its width is yours and remembered. The
+   dialog is full-viewport, so the ceiling keeps a strip of log readable. */
+const LV_RAIL_DEF = 292, LV_RAIL_MIN = 200;
+const lvRailMax = () => Math.max(LV_RAIL_MIN + 80, Math.round(window.innerWidth * 0.62));
+const lvRailClamp = w => {
+  const n = Math.round(+w);
+  return Number.isFinite(n) && n >= LV_RAIL_MIN && n <= 900 ? Math.min(n, lvRailMax()) : 0;
+};
+const lvRailW = () => (S.lv && S.lv.railW) || LV_RAIL_DEF;
+function lvApplyRail() {
+  const shell = $('#dlg-log .lv-shell');
+  if (shell) shell.style.setProperty('--lv-w', lvRailW() + 'px');
+  const grip = $('#lv-grip');
+  if (grip) {
+    grip.hidden = !(S.lv.rail && !isPhone());
+    grip.setAttribute('aria-valuenow', String(lvRailW()));
+    grip.setAttribute('aria-valuetext', `${lvRailW()} pixels wide`);
+  }
+}
+function lvSetRail(w) {
+  const next = lvRailClamp(w);
+  if (!next || next === lvRailW()) return false;
+  S.lv.railW = next;
+  lvApplyRail();
+  return true;
+}
 S.lv = storedLv();
 
 /** Viewer state. `open` is the one fold for a request: the tree caret and the
@@ -1892,15 +1920,23 @@ function lvGap(t, prev) {
 /** The first request of a conversation owns the clock; every later one is written
  *  as the delta from the request before it, the way `dmesg -H` stamps a log —
  *  the spacing is the point, and the absolute pair stays one hover away. */
-function lvSpan(t, prev) {
+/**
+ * The first request of a conversation owns the absolute clock; every one after
+ * it counts continuously from the conversation's own start, the way `dmesg -H`
+ * counts from the boot it describes — a turn is a point on one line, so turn 3
+ * never repeats turn 2's number. Anything that is a length rather than a moment
+ * (a response's duration, an idle gap, the window that produced a message)
+ * stays a length. The absolute pair of any delta stays one hover away.
+ */
+function lvSpan(t, first) {
   const end = t.tl?.end;
-  if (!prev)
+  if (first == null)
     return { txt: `${fmtTime(t.at_ms)}${end != null ? ` → ${fmtTime(end)}` : ''}`, tip: '' };
-  const from = prev.at_ms;
+  const on = ms => `+${fmtDur((ms - first) / 1000)}`;
   return {
-    txt: `+${fmtDur((t.at_ms - from) / 1000)}${end != null ? ` → +${fmtDur((end - from) / 1000)}` : ''}`,
+    txt: on(t.at_ms) + (end != null ? ` → ${on(end)}` : ''),
     tip: `arrived ${fmtTime(t.at_ms)}${end != null ? ` · finished ${fmtTime(end)}` : ''}`
-      + ` · ${fmtDur((t.at_ms - from) / 1000)} after the request before it`,
+      + ` · ${fmtDur((t.at_ms - first) / 1000)} into this conversation`,
   };
 }
 
@@ -2012,7 +2048,7 @@ async function lvDraw({ scroll = false } = {}) {
   for (let i = 0; i < turns.length; i++) {
     const t = turns[i];
     parts.push(lvGap(t, turns[i - 1]));
-    const sp = lvSpan(t, turns[i - 1]);
+    const sp = lvSpan(t, i === 0 ? null : turns[0].at_ms);
     parts.push(`<section class="turn${t.rid === LV.rid ? ' active' : ''}" id="lv-t-${t.rid}" data-rid="${t.rid}">
       <h3 class="turn-h" data-action="lv-toggle" data-rid="${t.rid}" title="expand or collapse this request">
         <span class="chev">${LV.open.has(t.rid) ? '▾' : '▸'}</span>
@@ -2278,6 +2314,7 @@ function lvDrawRail() {
   const rail = $('#lv-rail');
   $('#dlg-log .lv-shell').classList.toggle('railed', S.lv.rail);
   rail.hidden = !S.lv.rail;
+  lvApplyRail();
   if (!S.lv.rail) return;
   const turns = lvTurns();
   const items = [`<div class="lv-rail-h"><h4>Jump to request</h4>
@@ -2291,10 +2328,11 @@ function lvDrawRail() {
         snip: ((t.msgs || []).filter(m => m.name).map(m => m.name).join(', ') || 'agent side'), cls: 'gapnode', caret: '' }));
     items.push(lvNode({
       level: 1, rid: t.rid, tag: `Request ${i + 1}`,
-      when: prev ? `+${fmtDur((t.at_ms - prev.at_ms) / 1000)}` : fmtTime(t.at_ms),
+      when: i === 0 ? fmtTime(t.at_ms) : `+${fmtDur((t.at_ms - turns[0].at_ms) / 1000)}`,
       snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ← ${lvFinish(t)}`,
       cls: 'turn', caret: LV.open.has(t.rid) ? '▾' : '▸',
-      tip: `arrived ${fmtTime(t.at_ms)}${prev ? ` · ${fmtDur((t.at_ms - prev.at_ms) / 1000)} after request ${i}` : ''}`,
+      tip: `arrived ${fmtTime(t.at_ms)}${i ? ` · ${fmtDur((t.at_ms - turns[0].at_ms) / 1000)} into this conversation` : ''}`
+        + `${prev ? ` · ${fmtDur((t.at_ms - prev.at_ms) / 1000)} after request ${i}` : ''}`,
       on: t.rid === LV.rid && !LV.focusMsg }));
     if (!LV.open.has(t.rid)) return;
     const carry = lvCarry(i);
@@ -3162,6 +3200,38 @@ $$('#log-group input[name="log-group"]').forEach(r => {
 });
 // Round-viewer controls: choices persist like the other view preferences.
 $('#lv-jump').addEventListener('click', () => { S.lv.rail = !S.lv.rail; saveLv(); lvDrawRail(); $('#lv-jump').classList.toggle('active', S.lv.rail); });
+// Drag the tree wider or narrower; the width is remembered, double-click (or
+// Home) puts it back, arrow keys nudge it for anyone not using a mouse.
+(() => {
+  const grip = $('#lv-grip');
+  const edge = () => $('#dlg-log .lv-shell').getBoundingClientRect().right;
+  let dragging = false;
+  grip.addEventListener('pointerdown', e => {
+    dragging = true;
+    document.body.classList.add('lv-resizing');
+    try { grip.setPointerCapture(e.pointerId); } catch { /* synthetic events */ }
+    e.preventDefault();
+  });
+  grip.addEventListener('pointermove', e => { if (dragging) lvSetRail(edge() - e.clientX); });
+  const end = () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('lv-resizing');
+    saveLv();
+  };
+  grip.addEventListener('pointerup', end);
+  grip.addEventListener('pointercancel', end);
+  grip.addEventListener('dblclick', () => { lvSetRail(LV_RAIL_DEF); saveLv(); });
+  grip.addEventListener('keydown', e => {
+    const step = e.shiftKey ? 64 : 24;
+    if (e.key === 'ArrowLeft') lvSetRail(lvRailW() + step);
+    else if (e.key === 'ArrowRight') lvSetRail(lvRailW() - step);
+    else if (e.key === 'Home') lvSetRail(LV_RAIL_DEF);
+    else return;
+    e.preventDefault();
+    saveLv();
+  });
+})();
 $('#lv-first').addEventListener('click', () => lvFocus(lvTurns()[0]?.rid));
 $('#lv-prev').addEventListener('click', () => lvStep(-1));
 $('#lv-next').addEventListener('click', () => lvStep(1));

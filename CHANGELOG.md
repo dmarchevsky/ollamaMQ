@@ -14,6 +14,16 @@ since upstream `v0.5.0`.
   raw dump — a 156 KB wall of `data: {"id":…}` for one answer. Detection now looks at the first line
   that carries payload, and the keep-alives, empty deltas and `[DONE]` are dropped from the view (`Raw`
   still shows everything as captured).
+- **Conversation timestamps count from its start, not from the turn before.** Each request used to be
+  stamped with the gap since the previous one, so three turns spaced a steady 7 s apart read
+  `+7.0s | +7.0s` — a number that says nothing and repeats itself. Now the first request keeps the
+  absolute clock and every stamp after it counts continuously from the conversation's start
+  (`+7.0s`, `+14.0s`, `+21.0s`), in the log and the jump tree alike. Things that are lengths rather than
+  moments keep their length: a response's duration, an idle gap, the window that produced a message.
+- **The jump tree is resizable.** Drag its left edge — it widens to show tool names and message text, or
+  narrows to a glance beside the log — with `←`/`→` for the keyboard and double-click (or `Home`) to
+  reset to 292 px. The width is remembered, and on a phone, where the tree is a sheet across the top,
+  there is nothing to drag.
 - **The timeline reads like `dmesg -H` all the way down.** A conversation's first request keeps the
   absolute clock (`17:30:14`); every request and node after it is a delta — `+18s` between two requests,
   `+6.2s` for an idle gap, `+18.4s` for how long a response took — with the absolute time on hover. Idle

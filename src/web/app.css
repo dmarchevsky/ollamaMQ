@@ -892,11 +892,20 @@ dialog.logview[open] { display: flex; }
 .lv-title .lv-sub { display: block; color: var(--muted); font-size: 12px; font-family: var(--mono);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lv-body { flex: 1; overflow: auto; padding: 18px 22px; min-height: 0; scrollbar-gutter: stable; }
-.lv-shell { position: relative; flex: 1; display: flex; min-height: 0; }
-.lv-rail { position: absolute; top: 0; right: 0; bottom: 0; width: 292px; background: var(--surface);
+/* One variable carries the tree's width so the rail and the body's margin can
+   never drift apart; the grip on its left edge lets you set it (remembered). */
+.lv-shell { position: relative; flex: 1; display: flex; min-height: 0; --lv-w: 292px; }
+.lv-rail { position: absolute; top: 0; right: 0; bottom: 0; width: var(--lv-w); background: var(--surface);
   border-left: 1px solid var(--border); overflow: auto; padding: 14px 10px; }
 .lv-rail[hidden] { display: none; }
-.lv-shell.railed .lv-body { margin-right: 292px; }
+.lv-shell.railed .lv-body { margin-right: var(--lv-w); }
+.lv-grip { position: absolute; top: 0; bottom: 0; right: calc(var(--lv-w) - 3px); width: 7px;
+  cursor: col-resize; z-index: 3; touch-action: none; }
+.lv-grip::after { content: ''; position: absolute; inset: 0 2px; border-radius: 3px; }
+.lv-grip:hover::after, .lv-grip:focus-visible::after {
+  background: color-mix(in srgb, var(--accent) 45%, transparent); }
+.lv-grip[hidden] { display: none; }
+body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-select: none; }
 .lv-rail h4 { margin: 0 4px 8px; font: 700 10.5px var(--mono); letter-spacing: .06em;
   text-transform: uppercase; color: var(--muted); }
 .lv-rail-h { display: flex; align-items: center; gap: 6px; margin: 0 2px 8px; }
@@ -1017,4 +1026,6 @@ pre.raw { font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-w
   .lv-rail { left: 0; right: 0; bottom: auto; width: auto; max-height: 62%; border-left: 0;
     border-bottom: 1px solid var(--border); box-shadow: 0 12px 24px rgba(0,0,0,.25); }
   .lv-shell.railed .lv-body { margin-right: 0; }
+  /* the tree is a sheet across the top here — nothing to resize sideways */
+  .lv-grip { display: none; }
 }

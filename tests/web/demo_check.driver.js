@@ -174,15 +174,19 @@ addEventListener('load', () => {
           await wait(500);
           A('unfolded-resent-stays', LV.focusMsg?.[0] === rid2 && LV.focusMsg?.[1] === 0
             && !!document.getElementById(`lv-m-${rid2}-0`), 'idx 0 of request 2 stays in request 2');
-          // One absolute clock per conversation; every later request and node is
-          // a delta from the one before it.
+          // The first request keeps the clock; every stamp after it counts
+          // continuously from the conversation's own start, not from the turn
+          // before it, so a turn is a point on one line.
           const tw = [...document.querySelectorAll('#lv-rail .lv-node.turn .when')].map(n => n.textContent.trim());
-          const DELTA = /^\+\d+(\.\d)?s$|^\+\d+m \d{2}s$/;
-          A('tree-first-clock-rest-delta', /^\d{2}:\d{2}:\d{2}$/.test(tw[0])
-            && tw.slice(1).every(w => DELTA.test(w)), tw.join(' '));
+          const t1 = LV.conv.turns[0], t2 = LV.conv.turns[1];
+          const on = ms => `+${fmtDur((ms - t1.at_ms) / 1000)}`;
+          A('tree-clock-counts-from-start', tw[0] === fmtTime(t1.at_ms)
+            && tw.slice(1).every((w, k) => w === on(LV.conv.turns[k + 1].at_ms)), tw.join(' '));
           const bw = [...document.querySelectorAll('#dlg-log .turn-h .ts')].map(n => n.textContent.trim());
-          A('body-first-clock-rest-delta', /^\d{2}:\d{2}:\d{2} \u2192 \d{2}:\d{2}:\d{2}$/.test(bw[0])
-            && bw.slice(1).every(w => DELTA.test(w.split(' \u2192 ')[0])), bw.join(' | '));
+          A('body-clock-counts-from-start', bw[0].startsWith(fmtTime(t1.at_ms))
+            && bw[1] === `${on(t2.at_ms)} \u2192 ${on(t2.tl.end)}`
+            && document.querySelector('#dlg-log .turn-h .ts[title]').title.includes('into this conversation'),
+            bw.join(' | '));
           A('idle-gap-named', !!document.querySelector('#dlg-log .lv-gap')
             && !!document.querySelector('#lv-rail .lv-node.gapnode'),
             document.querySelector('#dlg-log .lv-gap')?.textContent.trim().slice(0, 64));
@@ -200,6 +204,26 @@ addEventListener('load', () => {
           A('raw-keeps-the-wire', /data: ?\{/.test(raw) && raw.includes('[DONE]'), `${raw.length} chars of captured bytes`);
           document.querySelector('#lv-fmt label:has(input[value="fmt"])').click();
           await wait(500);
+          // The tree's width is yours: drag, keys, double-click to reset, and it
+          // is remembered like the other viewer choices.
+          const grip = document.querySelector('#lv-grip');
+          const railW = () => Math.round(document.querySelector('#lv-rail').getBoundingClientRect().width);
+          const stored = () => JSON.parse(localStorage.getItem('omq.lv') || '{}').railW;
+          const fire = (type, x) => grip.dispatchEvent(new PointerEvent(type, { pointerId: 7, clientX: x, bubbles: true }));
+          const g0 = grip.getBoundingClientRect().left, w0 = railW();
+          fire('pointerdown', g0 + 3);
+          fire('pointermove', g0 + 3 - 120);
+          fire('pointerup', g0 + 3 - 120);
+          await wait(400);
+          const w1 = railW();
+          A('rail-resize-drag', Math.abs(w1 - (w0 + 120)) <= 2 && stored() === w1,
+            `${w0}px \u2192 ${w1}px, stored ${stored()}`);
+          grip.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+          await wait(300);
+          A('rail-resize-keys', Math.abs(railW() - (w1 + 24)) <= 1, `ArrowLeft \u2192 ${railW()}px`);
+          grip.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+          await wait(300);
+          A('rail-resize-reset', railW() === 292 && stored() === 292, `double-click \u2192 ${railW()}px`);
         })();
       }, 600);
     }, 600);
