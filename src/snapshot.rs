@@ -135,7 +135,7 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
     for u in &mut users {
         u.registered = registered.contains(&u.id);
     }
-    let reqlog_dropped = state.reqlog.dropped_count();
+    let reqlog_dropped = state.convlog.dropped_count();
     let blocked_ips = state.blocked_ips.lock_or_recover().clone();
     let mut blocked_users = state.blocked_users.lock_or_recover().clone();
     blocked_users.extend(disabled_clients.iter().cloned());

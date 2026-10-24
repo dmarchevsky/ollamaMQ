@@ -285,7 +285,22 @@ input, select {
 }
 input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 #log-filter { width: 300px; }
+/* The group switch shares the toolbar row with the filter box, the select and
+   Pause, so it drops the margin that spaces a standalone switch and matches
+   their height instead of riding above the row. */
+.toolbar .seg { margin-bottom: 0; }
+.toolbar .seg span { padding: 4px 12px; }
 .check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+/* Shown on the Logs page when the conversation log could not be opened at boot:
+   the rows are real requests, but there is nothing behind them to open. */
+.capnote {
+  margin: 0 0 10px; padding: 9px 12px; border-radius: 8px; font-size: 13px;
+  background: var(--warn-soft); color: var(--warn); border: 1px solid transparent;
+}
+.capnote code { font-family: var(--mono); font-size: 12px; }
+/* The session a grouped Logs row belongs to, next to its client. */
+.logs .sess { margin-left: 5px; font: 600 11px var(--mono); color: var(--accent);
+  background: var(--accent-soft); border-radius: 8px; padding: 1px 6px; white-space: nowrap; }
 .logs td { font-size: 13px; }
 .logs td.time { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
 
@@ -635,7 +650,6 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
   .sparkcell { width: auto; }
   .sparkcell .spark { width: 120px; margin-left: auto; }
   #page-overview .tscroll { overflow: visible; }
-  #page-overview td.ph-hide { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
 
@@ -698,23 +712,6 @@ tr.is-off td { color: var(--muted); }
   #page-overview .panel-h { flex-wrap: wrap; }
 }
 
-/* --- Request cards (phone). Replaces the table-reflow for #ov-now: three tight
-   lines, no repeated field labels (their names stay in title= tooltips, and the
-   desktop table keeps them as columns). Gen time is left out — tokens and tok/s
-   on line 2 give it. --- */
-#ov-now .rq { padding: 9px 0; border-bottom: 1px solid var(--border); }
-#ov-now .rq:last-child { border-bottom: none; }
-.rq-1 { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 12.5px; }
-.rq-1 .sw { margin-right: 0; }
-.rq-1 .who { font-weight: 600; white-space: nowrap; }
-.rq-1 .t { font: 12px var(--mono); color: var(--muted); }
-/* model → backend share the first line with the client; the model is what gives
-   way first, so the backend is always readable. */
-.rq-1 .mb { margin-left: auto; display: flex; align-items: baseline; gap: 5px; min-width: 0;
-  color: var(--muted); font-size: 12px; white-space: nowrap; }
-.rq-1 .mb .mo { color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.rq-2 { margin-top: 2px; font: 12px var(--mono); color: var(--muted); }
-.rq-m { margin-top: 2px; font: 11px var(--mono); color: var(--muted); }
 /* --- Merged Activity panel: the session timeline and the Details list.
    One panel: a session-per-row timeline on top, the request list below.
    Bars are positioned in % of the window (no SVG scaling tricks), so a row
@@ -781,17 +778,16 @@ tr.is-off td { color: var(--muted); }
 .det-h .sum i { font-style: normal; min-width: 52px; text-align: right; }
 .det-h .sum i:nth-child(2) { min-width: 66px; }
 .det-h .sum i:last-child { min-width: 0; }
-/* Live rows — List table, phone cards, Details stage lines — wash in the
-   conversation's own client colour (the graph stays clean: there, the client
-   wash means hover). Yellow means prefill and nothing else. */
-#ov-now tr.is-live > td { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent); }
-#ov-now .rq.is-live { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent); border-radius: 6px; }
+/* The lines of a running request wash in the conversation's own client colour
+   (the graph stays clean: there, the client wash means hover). */
 #ov-now .det-row.live { background: color-mix(in srgb, var(--c, var(--accent)) 16%, transparent); border-radius: 4px; }
 /* Details: every stage is its own event line with its
    own timestamp, threaded down the left by the session colour. */
 .det-body { border-left: 2px dotted color-mix(in srgb, var(--c, var(--accent)) 45%, var(--border));
   margin: 2px 0 6px 7px; padding-left: 10px; }
-.det-row { display: flex; align-items: baseline; gap: 9px; padding: 3px 0;
+/* 9px of right padding, the header's own inset: the View chips at the end of a
+   header and of a stage line then fall on one edge instead of a ragged one. */
+.det-row { display: flex; align-items: baseline; gap: 9px; padding: 3px 9px 3px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
   font: 12px var(--mono); }
 .det-row:last-child { border-bottom: none; }
@@ -812,6 +808,9 @@ tr.is-off td { color: var(--muted); }
   .det-h .sub { flex: 1 1 auto; min-width: 0; }
   .det-h .sum { margin-left: 0; }
   .det-h .sum i { min-width: 0; }
+  /* when the header wraps, the log chip still ends the line it lands on, as the
+     stage lines below do */
+  .det-h .logs-link { margin-left: auto; }
   /* one line per stage event, so the columns stay tight on a narrow screen */
   .det-row { font-size: 10.5px; gap: 7px; }
   .det-row .when { flex-basis: 46px; }
@@ -834,16 +833,11 @@ tr.is-off td { color: var(--muted); }
   outline: 1px dashed color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
   outline-offset: -1px; border-radius: 6px; }
 .det-h.flash { animation: detflash 1.2s ease-out; }
-#ov-now tr.flash, #ov-now .rq.flash { animation: rowflash 1.2s ease-out; }
-@keyframes rowflash {
-  from { outline: 2px solid var(--accent); }
-  to { outline: 2px solid transparent; }
-}
 @keyframes detflash {
   from { box-shadow: 0 0 0 2px var(--c, var(--accent)); }
   to { box-shadow: 0 0 0 2px transparent; }
 }
-@media (prefers-reduced-motion: reduce) { .det-h.flash, #ov-now tr.flash, #ov-now .rq.flash { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .det-h.flash { animation: none; } }
 
 /* ---------------------------------------------------------------- rounds */
 /* One compact line per request round on the Logs page: IN segment then OUT
@@ -859,12 +853,16 @@ table.logs td.round { padding-right: 16px; }
 .rl.err, .rl.err .ar { color: var(--bad); }
 .rl.ctl .ar { color: var(--vip); }
 
-/* Overview rows jumping to their log round — permanent chips, not hover-only. */
+/* Overview rows jumping to their log round — permanent chips, not hover-only,
+   and clickable-looking: they sit in text rows whose cursor is the text one. */
 .det-row .jump { margin-left: auto; }
-tr[data-action="log-jump"] { cursor: pointer; }
+.det-row[data-action], .jump-chip { cursor: pointer; }
+.det-h .logs-link { flex: none; }
+/* Same widget in the header and in the stage lines: the stage row is monospace,
+   so the chip names its own face instead of inheriting two looks. */
 .jump-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 9px;
   border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2);
-  color: var(--muted); font-size: 11px; white-space: nowrap; }
+  color: var(--muted); font: 11px var(--sans); white-space: nowrap; }
 .jump-chip:hover { color: var(--accent); border-color: var(--accent); }
 
 /* ------------------------------------------------------------ round view */
@@ -895,24 +893,54 @@ dialog.logview[open] { display: flex; }
 .lv-title .lv-sub { display: block; color: var(--muted); font-size: 12px; font-family: var(--mono);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lv-body { flex: 1; overflow: auto; padding: 18px 22px; min-height: 0; scrollbar-gutter: stable; }
-.lv-shell { position: relative; flex: 1; display: flex; min-height: 0; }
-.lv-rail { position: absolute; top: 0; right: 0; bottom: 0; width: 292px; background: var(--surface);
+/* One variable carries the tree's width so the rail and the body's margin can
+   never drift apart; the grip on its left edge lets you set it (remembered). */
+.lv-shell { position: relative; flex: 1; display: flex; min-height: 0; --lv-w: 292px; }
+.lv-rail { position: absolute; top: 0; right: 0; bottom: 0; width: var(--lv-w); background: var(--surface);
   border-left: 1px solid var(--border); overflow: auto; padding: 14px 10px; }
 .lv-rail[hidden] { display: none; }
-.lv-shell.railed .lv-body { margin-right: 292px; }
+.lv-shell.railed .lv-body { margin-right: var(--lv-w); }
+.lv-grip { position: absolute; top: 0; bottom: 0; right: calc(var(--lv-w) - 3px); width: 7px;
+  cursor: col-resize; z-index: 3; touch-action: none; }
+.lv-grip::after { content: ''; position: absolute; inset: 0 2px; border-radius: 3px; }
+.lv-grip:hover::after, .lv-grip:focus-visible::after {
+  background: color-mix(in srgb, var(--accent) 45%, transparent); }
+.lv-grip[hidden] { display: none; }
+body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-select: none; }
 .lv-rail h4 { margin: 0 4px 8px; font: 700 10.5px var(--mono); letter-spacing: .06em;
   text-transform: uppercase; color: var(--muted); }
-.lv-item { display: flex; gap: 8px; align-items: baseline; width: 100%; text-align: left;
-  border: 0; background: none; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
-.lv-item:hover, .lv-item.on { background: var(--accent-soft); }
-.lv-item .when { flex: none; width: 44px; text-align: right; font: 600 10px var(--mono); color: var(--faint); }
-.lv-item.sec .when { color: var(--muted); font-weight: 700; }
-.lv-item .tag { flex: none; width: 56px; font: 700 9.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
-.lv-item.user .tag { color: var(--accent); } .lv-item.asst .tag { color: var(--ok); }
-.lv-item.tool .tag { color: var(--warn); } .lv-item.sys .tag { color: var(--vip); }
-.lv-item.sec .tag { color: var(--muted); }
-.lv-item .snip { font: 12px var(--mono); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#dlg-log .flash { outline: 2px solid var(--accent); outline-offset: 1px; }
+.lv-rail-h { display: flex; align-items: center; gap: 6px; margin: 0 2px 8px; }
+.lv-rail-h h4 { margin: 0 auto 0 0; }
+.lv-rail-h .btn { height: 24px; padding: 2px 7px; font-size: 11px; }
+/* The jump tree: request -> request/response -> message -> tool call. Every
+   node carries the timestamp it was measured at, so the outline reads as the
+   timeline it is, and every level is click-through to the block it names. */
+/* Tight columns: the rail is a timeline outline, not a file tree — the indent
+   only has to show three levels, and every pixel of it is taken from the snippet. */
+.lv-node { display: flex; gap: 6px; align-items: baseline; width: 100%; text-align: left; cursor: pointer;
+  border: 0; background: none; padding: 5px 8px; border-radius: 6px; cursor: pointer;
+  font: 12px var(--mono); color: var(--text); }
+.lv-node:hover, .lv-node.on { background: var(--accent-soft); }
+.lv-node .car { flex: none; width: 10px; color: var(--faint); font-size: 10px; }
+.lv-node .when { flex: none; width: 44px; text-align: right; font: 600 9.5px var(--mono); color: var(--faint); }
+.lv-node .tag { flex: none; width: 58px; white-space: nowrap; font: 700 9.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+.lv-node.user .tag { color: var(--accent); } .lv-node.asst .tag { color: var(--ok); }
+.lv-node.tool .tag { color: var(--warn); } .lv-node.sys .tag { color: var(--vip); }
+.lv-node.req .tag, .lv-node.resp .tag { color: var(--muted); }
+.lv-node.turn .tag { color: var(--text); }
+.lv-node.gapnode { color: var(--faint); } .lv-node.gapnode .tag { color: var(--faint); }
+.lv-node .snip { font: 12px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lv-node.l2 { padding-left: 10px; } .lv-node.l3 { padding-left: 18px; }
+.lv-node.l3 .tag { width: 40px; }
+/* One row (and one body line) stands in for the messages this request re-sent
+   and an earlier one already delivered. Clicking either opens both. */
+.lv-node.carry, .lv-node.carry .tag { color: var(--faint); }
+.lv-carry { display: inline-flex; align-items: center; gap: 6px; margin: 2px 0 10px; padding: 4px 11px;
+  border: 1px dashed var(--border); border-radius: 999px; background: var(--surface-2); color: var(--muted);
+  font: 11.5px var(--mono); cursor: pointer; }
+.lv-carry:hover { color: var(--text); border-color: var(--accent); }
+#dlg-log .flash { outline: 2px solid var(--accent); outline-offset: 1px; animation: lv-flash 1.3s ease-out; }
+@keyframes lv-flash { from { outline-color: var(--accent); } to { outline-color: transparent; } }
 .lv-body::-webkit-scrollbar { width: 12px; }
 .lv-body::-webkit-scrollbar-track { background: transparent; }
 .lv-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 7px; border: 3px solid var(--bg); }
@@ -929,6 +957,36 @@ dialog.logview[open] { display: flex; }
   padding: 8px 12px; font-size: 12.5px; margin-bottom: 14px; }
 .lv-foot { color: var(--muted); font-size: 12px; font-family: var(--mono); margin: 12px 2px 0; }
 .seg.off { opacity: .45; pointer-events: none; }
+
+/* One block per request, stacked on one timeline. The header always shows what
+   was measured; the bodies open only for the request being read. */
+.turn { border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  margin-bottom: 8px; }
+.turn.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft); }
+.turn-h { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; margin: 0;
+  padding: 9px 14px; font: 600 12px var(--mono); color: var(--muted); cursor: pointer; }
+.turn-h:hover { background: var(--surface-2); border-radius: 9px; }
+.turn-h .chev { color: var(--faint); }
+.turn-h .n { color: var(--text); font-weight: 700; }
+.turn.active .turn-h .n { color: var(--accent); }
+.turn-h .tail { margin-left: auto; }
+.turn .lv-sec { padding: 0 14px 14px; }
+.turn .lv-sec + .lv-sec { border-top: 1px solid var(--border); margin-top: 0; padding-top: 14px; }
+/* The quiet stretch between two turns, named by what ran inside it. */
+.lv-gap { display: flex; gap: 8px; align-items: baseline; color: var(--faint);
+  font: 12px var(--mono); margin: 0 0 8px; padding: 6px 10px 6px 12px;
+  border-left: 2px dotted var(--border); }
+.lv-gap .dot { color: var(--muted); }
+/* Capture switched off is a decision, so it reads as one and not as a hole. */
+.lv-off { background: var(--surface-2); border: 1px dashed var(--border); border-radius: 8px;
+  padding: 10px 12px; font: 12.5px/1.55 var(--mono); color: var(--muted); margin-bottom: 12px; }
+/* With no text to show, a turn still lists what it held: one chip per message. */
+.msg-slot { display: flex; gap: 10px; align-items: baseline; border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 10px; margin-bottom: 6px; font: 12px var(--mono); }
+.msg-slot .role { flex: none; width: 62px; font-weight: 700; letter-spacing: .05em; }
+.msg-slot.user .role { color: var(--accent); } .msg-slot.asst .role { color: var(--ok); }
+.msg-slot.tool .role { color: var(--warn); } .msg-slot.sys .role { color: var(--vip); }
+.msg-slot span:last-child { margin-left: auto; flex: none; color: var(--faint); }
 
 /* Transcript blocks (chat request, reconstructed response). */
 .msg { border: 1px solid var(--border); background: var(--surface); border-radius: 8px;
@@ -969,4 +1027,6 @@ pre.raw { font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-w
   .lv-rail { left: 0; right: 0; bottom: auto; width: auto; max-height: 62%; border-left: 0;
     border-bottom: 1px solid var(--border); box-shadow: 0 12px 24px rgba(0,0,0,.25); }
   .lv-shell.railed .lv-body { margin-right: 0; }
+  /* the tree is a sheet across the top here — nothing to resize sideways */
+  .lv-grip { display: none; }
 }

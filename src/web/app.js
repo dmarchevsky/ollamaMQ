@@ -15,6 +15,8 @@ const S = {
   page: 'overview',
   state: null,
   logs: [],
+  capture: null,             // { log, path } from api/capture: is body capture running
+  logGroup: 'session',       // Logs page: one row per conversation, or per request
   clients: [],
   expanded: new Set(),       // backend URLs with their model list open
   showAll: new Set(),        // backend URLs showing every model
@@ -27,8 +29,7 @@ const S = {
   modelQuery: "",
   overview: null,            // api/overview for the chosen window and filters
   filters: storedFilters(),  // the filter modal's selection (time, identity, lists)
-  reqShow: storedReqShow(),  // List under the graph: active | all
-  reqView: storedReqView(),  // List under the graph: list | details
+  reqShow: storedReqShow(),  // the Activity list: active rows only, or the window too
   collapsed: storedCollapsed(),// conversation headers the operator folded shut
   pins: {},                // session tag -> operator-pinned priority level
   colorOf: new Map(),        // client id -> colour slot 1..4
@@ -62,17 +63,6 @@ function storedReqShow() {
     if (localStorage.getItem('omq.reqShow') === 'all') return 'all';
   } catch { /* storage blocked */ }
   return 'active';
-}
-
-/** The list view from the last visit; a folded Thread becomes Details. */
-function storedReqView() {
-  try {
-    const v = localStorage.getItem('omq.reqView');
-    if (v === 'details') return 'details';
-    if (v === 'list') return 'list';
-    if (localStorage.getItem('omq.reqGroup') === 'threads') return 'details';
-  } catch { /* storage blocked */ }
-  return 'list';
 }
 
 /** Session tags folded shut in Threads, per browser. */
@@ -264,7 +254,9 @@ async function poll() {
     const needModels = S.page === 'models' || !S.modelPolicy;
     const needOverview = S.page === 'overview';
     const needSettings = S.page === 'settings' || S.page === 'backends';
-    const [state, logs, clients, models, overview, settings, me] = await Promise.all([
+    // Capture state only changes on restart (the log path is opened at boot),
+    // so ask once and keep the answer.
+    const [state, logs, clients, models, overview, settings, me, capture] = await Promise.all([
       api('GET', 'state'),
       needLogs && !$('#log-pause').checked ? api('GET', `logs?limit=${LOG_LIMIT}`) : null,
       needClients ? api('GET', 'clients') : null,
@@ -272,6 +264,7 @@ async function poll() {
       needOverview ? api('GET', overviewPath()) : null,
       needSettings ? api('GET', 'settings') : null,
       needSettings && !S.me ? api('GET', 'me') : null,
+      needLogs && !S.capture ? api('GET', 'capture') : null,
     ]);
     S.state = state;
     if (logs) S.logs = logs;
@@ -286,6 +279,7 @@ async function poll() {
     }
     if (settings) S.settings = settings;
     if (me) S.me = me;
+    if (capture) S.capture = capture;
     S.online = true;
   } catch (e) {
     S.online = false;
@@ -869,7 +863,9 @@ function stagePlan(row, now) {
     return done([ev('w', at, o.waited_secs, `${fmtDur(o.waited_secs)} · prompt ${fmtTok(o.est_prompt_tokens)} tok · queue #${o.pos}`, true)], at, now);
   }
   if (row.kind === 'run') {
-    const dispatch = now - o.elapsed_secs * 1000;
+    // The proxy stamped dispatch and first token when they happened, so the
+    // live line is anchored on measured instants, not on back-computed ones.
+    const dispatch = o.dispatch_ms ?? now - o.elapsed_secs * 1000;
     const w = o.waited_secs || 0;
     const out = [];
     if (w >= .05) out.push(ev('w', dispatch - w * 1000, w, `${fmtDur(w)} · prompt ${fmtTok(o.est_prompt_tokens)} tok`));
@@ -877,7 +873,7 @@ function stagePlan(row, now) {
       out.push(ev('p', dispatch, o.elapsed_secs, `≈${fmtTok(o.est_prompt_tokens)} tok · ${fmtDur(o.elapsed_secs)} prefilling`, true));
     } else {
       if (o.ttft_secs >= .05) out.push(ev('p', dispatch, o.ttft_secs, `${fmtTok(o.est_prompt_tokens)} tok · ${fmtSec1(o.ttft_secs)}`));
-      out.push(ev('g', dispatch + o.ttft_secs * 1000, Math.max(0, o.elapsed_secs - o.ttft_secs),
+      out.push(ev('g', o.first_token_ms ?? dispatch + o.ttft_secs * 1000, Math.max(0, o.elapsed_secs - o.ttft_secs),
         `${fmtNum(o.tokens)} tok · ${fmtDur(Math.max(0, o.elapsed_secs - o.ttft_secs))} · `
         + `${o.tokens_per_sec == null ? '…' : o.tokens_per_sec.toFixed(1)} t/s<span class="more"> · <b>now</b></span>`, true));
     }
@@ -887,21 +883,31 @@ function stagePlan(row, now) {
   const w = o.waited_secs || 0;
   const gen = o.gen_secs || 0;
   const pre = o.prefill_secs ?? o.ttft_secs ?? 0;
-  const dispatch = finish - (pre + gen) * 1000;
-  const at = dispatch - w * 1000;
+  // A finished request carries its stage times as they were measured; the
+  // durations only fill in for what the proxy could not observe.
+  const sg = o.stage || {};
+  const end = sg.end ?? finish;
+  const dispatch = sg.dispatch ?? end - (pre + gen) * 1000;
+  const at = sg.queue ?? dispatch - w * 1000;
+  const firstTok = sg.first_token ?? (pre ? dispatch + pre * 1000 : null);
+  // Where both ends of a stage were stamped, its length is the distance between
+  // them — the durations in `o` are the fallback, not the number to print.
+  const wM = sg.queue != null && sg.dispatch != null ? (sg.dispatch - sg.queue) / 1000 : w;
+  const preM = sg.dispatch != null && sg.first_token != null ? (sg.first_token - sg.dispatch) / 1000 : pre;
+  const genM = sg.first_token != null && sg.end != null ? (sg.end - sg.first_token) / 1000 : gen;
   if (o.error) {
     const out = [];
-    if (w >= .05) out.push(ev('w', at, w, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
-    out.push(ev('e', finish, 0, `${outcomePhrase(o)}${o.backend ? '' : '<span class="more"> · never dispatched</span>'}`));
-    return done(out, at, finish);
+    if (wM >= .05) out.push(ev('w', at, wM, `${fmtDur(wM)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
+    out.push(ev('e', end, 0, `${outcomePhrase(o)}${o.backend ? '' : '<span class="more"> · never dispatched</span>'}`));
+    return done(out, at, end);
   }
   const out = [];
   // A request that left without an error and without serving cleanly (the
   // client hung up, the queue refused it) still has to say so here.
-  if (o.outcome && o.outcome !== 'ok') out.push(ev('e', finish, 0, outcomePhrase(o)));
-  if (w >= .05) out.push(ev('w', at, w, `${fmtDur(w)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
-  if (pre >= .05) {
-    out.push(ev('p', dispatch, pre, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(pre)}`
+  if (o.outcome && o.outcome !== 'ok') out.push(ev('e', end, 0, outcomePhrase(o)));
+  if (wM >= .05) out.push(ev('w', at, wM, `${fmtDur(wM)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
+  if (preM >= .05) {
+    out.push(ev('p', dispatch, preM, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(preM)}`
       + (o.cache_pct != null ? ` · cache ${o.cache_pct}%` : '')
       // Time this turn burned re-reading context the backend had evicted.
       + (o.waste_secs ? `<span class="st-bad"> · waste ${fmtSec1(o.waste_secs)}</span>` : '')
@@ -910,11 +916,11 @@ function stagePlan(row, now) {
       // cached prefill invented impossible speeds.
       + (o.prefill_secs && o.prefill_tokens ? `<span class="more"> · ${fmtRate(o.prefill_tokens / o.prefill_secs)}</span>` : '')));
   }
-  if (gen > 0) {
-    out.push(ev('g', finish - gen * 1000, gen,
-      `${fmtTok(o.completion_tokens)} tok · ${fmtSec1(gen)} · ${(o.gen_tps ?? 0).toFixed(1)} t/s`));
+  if (genM > 0) {
+    out.push(ev('g', firstTok ?? end - genM * 1000, genM,
+      `${fmtTok(o.completion_tokens)} tok · ${fmtSec1(genM)} · ${(o.gen_tps ?? 0).toFixed(1)} t/s`));
   }
-  return done(out, at, finish);
+  return done(out, at, end);
 }
 
 const stripTags = s => s.replace(/<[^>]*>/g, '');
@@ -943,9 +949,16 @@ function renderDetails(rows) {
     // until the first token, decode after), else a queued one; an idle
     // conversation carries no chip at all.
     const run = unit.find(x => x.kind === 'run'), wait = unit.find(x => x.kind === 'wait');
+    // An active conversation says how it is being served, not only that it is.
+    // Decode is the live stream's own rate; prefill is measured on the newest
+    // finished request here, because a request cannot time its own prefill — by
+    // the time the first token proves anything, it is already decoding.
+    const pre = run ? prefillRate(unit) : null;
     const chip = run
-      ? (run.o.state === 'generating' ? '<span class="badge dec">decode</span>'
-        : '<span class="badge warn">prefill</span>')
+      ? (run.o.state === 'generating'
+        ? `${pre ? `<span class="badge warn" title="${pre.tip}">prefill ${pre.txt} tok/s</span>` : ''}`
+          + `<span class="badge dec" title="tokens generated per second, this request">${run.o.tokens_per_sec != null ? `decode ${fmtRate(run.o.tokens_per_sec)} t/s` : 'decode \u2026'}</span>`
+        : `<span class="badge warn" title="the first token has not arrived${pre ? ` \u2014 prefill runs at ${pre.txt} tok/s here (${pre.tip})` : ''}">prefill ${fmtDur(run.o.elapsed_secs)}</span>`)
       : wait ? `<span class="badge q" title="Position in this client's own queue">waiting #${wait.o.pos}</span>`
       : '';
     // The summary is three right-aligned columns so the numbers line up
@@ -957,26 +970,29 @@ function renderDetails(rows) {
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(fmtWho(head.o))}</span>
       ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}${chip}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
-      ${head.s ? `<span class="logs-link jump-chip" data-action="logs-for" data-session="${esc(head.s)}" title="show this conversation in the Logs page">≣ logs</span>` : ''}
-      ${sum}</button>`);
+      ${sum}
+      ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(head.o.client)}" title="open this conversation in the viewer">\u2263 View</span>` : ''}</button>`);
     if (shut) continue;
     const lines = [];
     for (let i = 0; i < asc.length; i++) {
       if (i > 0) {
         const gap = (asc[i].plan.at - asc[i - 1].plan.end) / 1000;
-        // Just before the newer request it separates the two from.
+        // Just before the newer request it separates the two from. The tools
+        // the newer request carries are what ran during the quiet stretch.
         if (gap > 30) {
+          const tools = (asc[i].o.tools || []).join(', ');
           lines.push({ t: asc[i].plan.at - 1, html: `<div class="det-row dim"><span class="when">${fmtTime(asc[i - 1].plan.end)}</span>`
-            + '<span class="st i">idle</span><span class="val">' + fmtDur(gap) + '</span></div>' });
+            + '<span class="st i">idle</span><span class="val">' + fmtDur(gap)
+            + (tools ? ` <span class="dim">\u00b7 tool ${esc(tools)}</span>` : '') + '</span></div>' });
         }
       }
       for (const e of asc[i].plan.events) {
         // Live stage lines (the running request's now-still-unfinished ones)
-        // wear the client-colour wash the List gives live rows. The line
-        // belongs to one request, so it can open that request's log round.
+        // wear the client's own colour wash. The line
+        // belongs to one request, so it opens the conversation on that request.
         const rid = asc[i].o.rid;
-        lines.push({ t: e.at, html: `<div class="det-row${e.live ? ' live' : ''}"${rid ? ` data-action="log-jump" data-rid="${rid}" title="open this request's log round"` : ''}><span class="when">${fmtTime(e.at)}</span>`
-          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span>${rid ? '<span class="jump jump-chip">≣ Logs</span>' : ''}</div>` });
+        lines.push({ t: e.at, html: `<div class="det-row${e.live ? ' live' : ''}"${rid ? ` data-action="log-jump" data-rid="${rid}" title="open this conversation at this request"` : ''}><span class="when">${fmtTime(e.at)}</span>`
+          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span>${rid ? '<span class="jump jump-chip">\u2263 View</span>' : ''}</div>` });
       }
     }
     lines.sort((a, b) => b.t - a.t);
@@ -997,10 +1013,32 @@ function segCount(sel, i, n) {
 /** `--c1`…`--c8` name of a client's hue slot. */
 const cvar = cls => cls === 'cother' ? 'c-other' : cls;
 
+/** Prefill speed of one finished request: prompt tokens over the time the
+ *  backend spent reading them (dispatch to first token). Null when either half
+ *  is missing — a response that never streamed has no first token to measure. */
+function prefillOf(o) {
+  const secs = o.prefill_secs ?? (o.stage?.first_token != null && o.stage?.dispatch != null
+    ? (o.stage.first_token - o.stage.dispatch) / 1000 : null);
+  const tok = o.prefill_tokens ?? o.prompt_tokens;
+  if (!secs || !tok || secs <= 0) return null;
+  return { tps: tok / secs, tok, secs };
+}
+
+/** The prefill speed a running conversation is being served at, from the newest
+ *  finished request in it whose prefill was measurable. */
+function prefillRate(unit) {
+  const done = unit.filter(x => x.kind === 'done').sort((a, b) => (b.o.at_ms || 0) - (a.o.at_ms || 0));
+  for (const d of done) {
+    const p = prefillOf(d.o);
+    if (p) return { txt: fmtRate(p.tps), tip: `measured on the last finished request here: ${fmtTok(p.tok)} tok in ${fmtSec1(p.secs)}` };
+  }
+  return null;
+}
+
 /** Generated tokens of a row, however the row is shaped. */
 const rowTokens = row => row.kind === 'done' ? row.o.completion_tokens : row.kind === 'run' ? row.o.tokens : 0;
 
-/** Running and waiting rows share one treatment in both views. */
+/** Running and waiting rows share one treatment wherever they are listed. */
 const liveCls = row => row.kind === 'run' || row.kind === 'wait' ? ' is-live' : '';
 
 /** Conversations ordered by when each **started** — newest start first, so a
@@ -1035,73 +1073,6 @@ function wireFold() {
 }
 
 
-/**
- * What a phone row says about one request: its status, its own numbers, one
- * timing line. Field names live in the tooltips — the desktop table has columns
- * for them — and Gen time is left out, since tokens and tok/s give it away.
- */
-function phoneParts(row, ov) {
-  const o = row.o;
-  if (row.kind === 'run') {
-    return {
-      head: o.state === 'generating' ? '<span class="badge dec">generating</span>'
-        : `<span class="badge warn" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(o.elapsed_secs)}</span>`,
-      nums: `${fmtNum(o.tokens)} tok · ${o.tokens_per_sec == null ? '…' : o.tokens_per_sec.toFixed(1)} t/s`,
-      timing: `<span title="prompt size, estimated">pre ≈${fmtTok(o.est_prompt_tokens)}</span>`
-        + (o.ttft_secs != null ? ` · <span title="time to the first token">ttft ${fmtSec1(o.ttft_secs)}</span>` : ''),
-      bk: bkName(o.backend),
-    };
-  }
-  if (row.kind === 'wait') {
-    return {
-      head: `<span class="badge q" title="Position in this client's own queue">waiting #${o.pos}</span>`,
-      nums: `<span class="dim">≈${fmtTok(o.est_prompt_tokens)} tok</span>`,
-      timing: `<span title="waiting for a free slot">wait ${fmtDur(o.waited_secs)}</span>`,
-      bk: o.backends.length === 1 ? bkName(ov.backends[o.backends[0]]?.label) : 'any',
-    };
-  }
-  if (o.error) {
-    return {
-      head: `<span class="badge bad" title="${esc(o.outcome)}">${esc(o.status && o.status >= 500 ? `HTTP ${o.status}` : o.outcome.replace(/_/g, ' '))}</span>`,
-      nums: `<span class="st-bad">${esc(o.outcome.replace(/_/g, ' '))}</span>`,
-      timing: o.backend ? '' : '<span class="dim">never dispatched</span>',
-      bk: o.backend ? bkName(o.backend) : '—',
-    };
-  }
-  const timing = [
-    o.waited_secs > 0 ? `<span title="waiting for a free slot">wait ${fmtDur(o.waited_secs)}</span>` : '',
-    o.prefill_tokens != null || o.prefill_secs != null
-      ? `<span title="prompt size · prefill time">pre ${fmtTok(o.prompt_tokens)}${o.prefill_secs != null ? ` · ${fmtSec1(o.prefill_secs)}` : ''}</span>` : '',
-    o.cache_pct != null ? `<span title="prefix-cache hit">cache ${o.cache_pct}%</span>` : '',
-    o.waste_secs ? `<span class="st-bad" title="prefill time lost to cache eviction">waste ${fmtSec1(o.waste_secs)}</span>` : '',
-    o.ttft_secs != null ? `<span title="time to the first token">ttft ${fmtSec1(o.ttft_secs)}</span>` : '',
-  ].filter(Boolean).join(' · ');
-  return {
-    head: o.outcome === 'ok' ? `<span class="t">${fmtTime(row.t)}</span>`
-      : `<span class="badge">${esc(o.outcome.replace(/_/g, ' '))}</span>`,
-    nums: `${fmtTok(o.completion_tokens)} tok · ${o.gen_tps == null ? '—' : o.gen_tps.toFixed(1)} t/s`,
-    timing,
-    bk: o.backend ? bkName(o.backend) : '—',
-  };
-}
-
-/** Phone card: the first line names the conversation *and* where it ran — model
- *  and backend belong together, so the model gives way (ellipsis) before the
- *  backend does. Then the counts, then the timing. */
-function cardPhone(row, ov) {
-  const p = phoneParts(row, ov);
-  return `<div class="rq${liveCls(row)}" data-key="${esc(row.key)}" style="--c:var(--${cvar(colorClass(fmtWho(row.o)))})"><div class="rq-1">${p.head}${swatch(fmtWho(row.o))}`
-    + `<span class="who">${esc(fmtWho(row.o))}</span>${row.o.session_label || row.o.session ? priMark(row.o) : ''}`
-    + `<span class="mb"><span class="mo">${esc(row.o.model)}</span><span class="ar">→</span>${esc(p.bk)}</span></div>`
-    + `<div class="rq-2">${p.nums}</div>`
-    + ((sessName(row.o) ? `<span title="conversation">#${esc(sessName(row.o))}</span>${p.timing ? ' · ' : ''}` : '') + p.timing ? `<div class="rq-m">${sessName(row.o) ? `<span title="conversation">#${esc(sessName(row.o))}</span>${p.timing ? ' · ' : ''}` : ''}${p.timing}</div>` : '') + '</div>';
-}
-
-/** Phone layout of the List: cards instead of the reflowed table. */
-function requestsPhone(rows, ov) {
-  if (!rows.length) return '<div class="empty">Nothing running or waiting</div>';
-  return rows.map(r => cardPhone(r, ov)).join('');
-}
 
 
 /**
@@ -1132,89 +1103,23 @@ function reqRows(st, ov, all) {
 }
 
 /**
- * The List under the timeline. Show: Active = running + waiting; All also lists
- * recently finished (live rows carry a yellow tint, no section divider).
- * View: List = newest first (cards on a
- * phone, a table here); Details = one block per conversation with a line per
- * stage event. Prefill is size · seconds (≈ while estimated), Gen time the
- * generation seconds (for running: since the first token), Cache the
- * prefix-cache share of finished prompts.
+ * The list under the timeline: one block per conversation, one line per stage
+ * event. Show: Active = running + waiting; All also lists recently finished
+ * (live lines carry the client's colour wash). Prefill is size · seconds
+ * (≈ while estimated), Gen time the generation seconds (for a running request:
+ * since its first token), Cache the prefix-cache share of finished prompts.
  */
 function renderRequests(st, ov) {
-  const dash = '<span class="dim">—</span>';
   const now = ov.now_ms;
   const { rows, activeN } = reqRows(st, ov, S.reqShow === 'all');
-  // The counts that used to be a sentence above the table sit in the toggle —
+  // The counts that used to be a sentence above the list sit in the toggle —
   // the All count is the whole window even while Active is selected.
   segCount('#ov-req-show', 0, activeN);
   segCount('#ov-req-show', 1, activeN + ov.recent.length);
-
-  const el = $('#ov-now');
-  $('#ov-fold').hidden = S.reqView !== 'details';
-  if (S.reqView === 'details') {
-    for (const r of rows) r.plan = stagePlan(r, now);
-    setHTML(el, renderDetails(rows));
-    wireFold();
-    return;
-  }
-  const pill = r => r.state === 'generating'
-    ? '<span class="badge dec">generating</span>'
-    : `<span class="badge warn" title="Waiting for the first token (prefill, or a response that is not streamed)">prefill ${fmtDur(r.elapsed_secs)}</span>`;
-  // A phone gets cards, not a reflowed table: three tight lines per request.
-  if (isPhone()) { setHTML(el, requestsPhone(rows, ov)); return; }
-
-  const backendCell = row => row.kind === 'run' ? `<td>${bkCell(row.o.backend)}</td>`
-    : row.kind === 'wait'
-      ? `<td class="dim ph-hide">${row.o.backends.length === 1 ? bkName(ov.backends[row.o.backends[0]]?.label) : 'any'}</td>`
-      : row.o.backend ? `<td>${bkCell(row.o.backend)}</td>` : `<td>${dash}</td>`;
-
-  const tds = row => {
-    const head = `<td>${row.kind === 'run' ? pill(row.o)
-      : row.kind === 'wait'
-        ? `<span class="badge q" title="Position in this client's own queue">waiting #${row.o.pos}</span>`
-        : row.o.error ? `<span class="badge bad" title="${esc(row.o.outcome)}">${esc(row.o.status && row.o.status >= 500 ? `HTTP ${row.o.status}` : row.o.outcome.replace(/_/g, ' '))}</span>`
-          : row.o.outcome === 'ok' ? `<span class="dim mono" title="finished">${fmtTime(row.t)}</span>`
-          : `<span class="badge">${esc(row.o.outcome.replace(/_/g, ' '))}</span>`}</td>
-      <td>${swatch(fmtWho(row.o))}<span class="mono">${esc(fmtWho(row.o))}</span>${sessName(row.o) ? ` <span class="mono dim">#${esc(sessName(row.o))}</span>` : ''} ${priCtl(row.o, row.o.session)}</td>
-      <td class="trunc">${esc(row.o.model)}</td>`;
-    if (row.kind === 'run') {
-      const r = row.o;
-      return head + backendCell(row) + `
-      <td class="num">${fmtDur(r.waited_secs ?? 0)}</td>
-      <td class="num"><span class="mono">≈${fmtTok(r.est_prompt_tokens)} · ${r.ttft_secs != null ? fmtSec1(r.ttft_secs) : '…'}</span></td>
-      <td class="num">${dash}</td>
-      <td class="num">${firstToken(r)}</td>
-      <td class="num">${fmtNum(r.tokens)}</td>
-      <td class="num">${r.ttft_secs != null && r.state === 'generating' ? `<span class="mono">${fmtSec1(Math.max(0, r.elapsed_secs - r.ttft_secs))}</span>` : dash}</td>
-      <td class="num">${r.tokens_per_sec == null ? dash : r.tokens_per_sec.toFixed(1)}</td>`;
-    }
-    if (row.kind === 'wait') {
-      const w = row.o;
-      return head + backendCell(row) + `
-      <td class="num st-warn">${fmtDur(w.waited_secs)}</td>
-      <td class="num"><span class="mono">≈${fmtTok(w.est_prompt_tokens)} · —</span></td>
-      <td class="num">${dash}</td><td class="num">${dash}</td><td class="num">${dash}</td><td class="num">${dash}</td><td class="num">${dash}</td>`;
-    }
-    const x = row.o;
-    const pre = x.prefill_secs == null && x.prefill_tokens == null ? dash
-      : `<span class="mono">${fmtTok(x.prompt_tokens)} · ${x.prefill_secs == null ? '—' : fmtSec1(x.prefill_secs)}</span>`;
-    return head + backendCell(row) + `
-      <td class="num">${x.waited_secs == null ? dash : fmtDur(x.waited_secs)}</td>
-      <td class="num">${pre}</td>
-      <td class="num">${x.cache_pct == null ? dash : x.cache_pct + '%'}</td>
-      <td class="num">${x.waste_secs ? `<span class="${x.prefill_secs && x.waste_secs / x.prefill_secs >= .15 ? 'st-bad' : 'st-warn'} mono">${fmtSec1(x.waste_secs)}</span>` : dash}</td>
-      <td class="num">${x.ttft_secs == null ? dash : `<span class="mono">${fmtSec1(x.ttft_secs)}</span>`}</td>
-      <td class="num">${fmtTok(x.completion_tokens)}</td>
-      <td class="num">${x.gen_secs == null ? dash : `<span class="mono">${fmtSec1(x.gen_secs)}</span>`}</td>
-      <td class="num">${x.gen_tps == null ? dash : x.gen_tps.toFixed(1)}</td>`;
-  };
-
-  const body = rows.map(r => `<tr${liveCls(r)} data-key="${esc(r.key)}"${r.o.rid ? ` data-action="log-jump" data-rid="${r.o.rid}" title="open this request's log round"` : ''} style="--c:var(--${cvar(colorClass(fmtWho(r.o)))})">${tds(r)}</tr>`).join('');
-
-  const head = `<tr><th>State</th><th>Client</th><th>Model</th><th>Backend</th><th class="num">Waited</th><th class="num">Prefill</th><th class="num">Cache</th><th class="num" title="prefill time lost re-reading evicted context">Waste</th><th class="num">First token</th><th class="num">Tokens</th><th class="num">Gen time</th><th class="num">tok/s</th></tr>`;
-  setHTML(el, rows.length ? `<table>${head}${body}</table>` : '<div class="empty">Nothing running or waiting</div>');
+  for (const r of rows) r.plan = stagePlan(r, now);
+  setHTML($('#ov-now'), renderDetails(rows));
+  wireFold();
 }
-
 
 function renderBackendStats(ov) {
   setHTML($('#ov-backends'), ov.backends.length ? `<table>
@@ -1255,14 +1160,6 @@ function renderClientStats(st, ov) {
       <td class="num">${fmtTok(c.prompt_tokens)} / ${fmtTok(c.completion_tokens)}</td>
       <td class="num">${wasteCell(c)}</td></tr>`).join('')}
     </table>` : `<div class="empty">No requests in the last ${winLabel(S.filters.win)}</div>`);
-}
-
-/** Time to first token; until then the run is waiting for the backend or
- *  evaluating the prompt. A non-streamed response never shows a first token. */
-function firstToken(r) {
-  if (r.ttft_secs != null) return fmtDur(r.ttft_secs);
-  if (r.ttfb_secs == null) return '<span class="st-warn">waiting…</span>';
-  return r.tokens ? '<span class="dim">—</span>' : '<span class="st-warn">prefill…</span>';
 }
 
 // --- Backends
@@ -1713,203 +1610,763 @@ function roundSegs(r) {
 
 function logTable(rounds) {
   if (!rounds.length) return '<div class="empty">No matching log events</div>';
+  const off = captureOff();
   const ev = r => r.in || r.out || r.solo;
   return `<table class="logs">
-    <tr><th>Time</th><th>User</th><th>Model</th><th>Backend</th><th>Round</th></tr>
+    <tr><th>Time</th><th>Client</th><th>Model</th><th>Backend</th><th>Round</th></tr>
     ${rounds.map(r => { const e = ev(r); const rid = r.in?.rid ?? r.out?.rid;
       return `<tr class="clickable" ${rid ? `data-action="log-round" data-rid="${rid}"` : `data-action="log-detail" data-seq="${e.seq}"`}>
       <td class="time">${fmtTime(e.at_ms)}</td>
       <td class="mono">${esc(e.user)}</td>
       <td class="trunc ${e.model ? '' : 'none'}">${esc(e.model ?? '—')}</td>
       <td class="dim ${e.backend ? '' : 'none'}">${e.backend ? bkCell(e.backend) : '—'}</td>
-      <td class="round"><div class="rline">${roundSegs(r)}</div></td></tr>`; }).join('')}
+      <td class="round"><div class="rline">${roundSegs(r)}${off && rid ? NOCAP_BADGE : ''}</div></td></tr>`; }).join('')}
     </table>`;
 }
+
+// The other view of the same ring: one row per conversation. A chat session
+// makes twenty calls, and twenty rows that each repeat part of the previous one
+// hide that; a control action and traffic with no session belong to no
+// conversation, so they stand alone in both views.
+const storedLogGroup = () => {
+  try { return localStorage.getItem('omq.logGroup') === 'request' ? 'request' : 'session'; } catch { return 'session'; }
+};
+
+const listSome = set => {
+  const v = [...set];
+  return v.length ? esc(v[0]) + (v.length > 1 ? ` +${v.length - 1}` : '') : null;
+};
+
+/** Rounds grouped into conversations: same client + session tag is one row. */
+function logConvs(rounds) {
+  const items = [];
+  const byKey = new Map();
+  const num = (re, s) => { const m = re.exec(s || ''); return m ? +m[1] : 0; };
+  for (const r of rounds) {
+    const e = r.in || r.out || r.solo;
+    if (r.ctl || !e.session) { items.push({ kind: 'solo', at: e.at_ms, r }); continue; }
+    const key = `${e.user}#${e.session}`;
+    let g = byKey.get(key);
+    if (!g) {
+      g = { kind: 'conv', key, user: e.user, session: e.session, label: e.session_label || null,
+        models: new Set(), backends: new Set(), reqs: 0, inBytes: 0, outBytes: 0, errors: 0,
+        first: e.at_ms, at: e.at_ms, rid: e.rid ?? null, lastStatus: null,
+        statusAt: 0, redacted: false, waiting: false };
+      byKey.set(key, g);
+      items.push(g);
+    }
+    g.first = Math.min(g.first, e.at_ms);
+    if (e.at_ms >= g.at) { g.at = e.at_ms; if (e.rid != null) g.rid = e.rid; }
+    if (e.model) g.models.add(e.model);
+    if (e.backend) g.backends.add(e.backend);
+    if (e.redacted) g.redacted = true;
+    if (r.in) { g.reqs++; g.inBytes += num(/body=(\d+)B/, r.in.info); }
+    if (r.out) {
+      g.outBytes += num(/resp=(\d+)B/, r.out.info);
+      const st = num(/-> (\d{3})/, r.out.info);
+      if (st && r.out.at_ms >= g.statusAt) { g.lastStatus = st; g.statusAt = r.out.at_ms; if (st >= 400) g.errors++; }
+    }
+    if (r.in && !r.out) g.waiting = true;
+  }
+  items.sort((a, b) => b.at - a.at);
+  return items;
+}
+
+/** The Activity cell: what the session sent and got, plus what it is doing. */
+function convSegs(g) {
+  return `<span class="rl in"><span class="ar">\u2192</span>${g.reqs} req \u00b7 ${fmtBytes(g.inBytes)}</span>`
+    + ` <span class="rl out${g.errors ? ' err' : ''}"><span class="ar">\u2190</span>${g.lastStatus ?? '…'} \u00b7 ${fmtBytes(g.outBytes)}</span>`
+    + (g.waiting ? ' <span class="badge q">waiting</span>' : '')
+    + (g.errors ? ` <span class="badge bad">${g.errors} failed</span>` : '')
+    + (g.redacted ? ' ' + REDACT_BADGE : '')
+    + (captureOff() ? ' ' + NOCAP_BADGE : '');
+}
+
+/** A session as the client named it (`#cache-warmup`), else the tag the store
+ *  keys on — the label is what makes one row per conversation recognisable. */
+const sessTag = g => `<span class="sess" title="session tag ${esc(g.session)} — this is what the log keys on">#${esc(g.label || g.session)}</span>`;
+
+function convTable(rounds) {
+  const items = logConvs(rounds);
+  if (!items.length) return '<div class="empty">No matching log events</div>';
+  const rows = items.map(it => {
+    if (it.kind === 'solo') {
+      const e = it.r.in || it.r.out || it.r.solo;
+      return `<tr class="clickable" data-action="log-detail" data-seq="${e.seq}">
+        <td class="time">${fmtTime(e.at_ms)}</td>
+        <td><span class="mono">${esc(e.user)}</span> <span class="dim">\u00b7 no session</span></td>
+        <td class="trunc none">\u2014</td><td class="dim none">\u2014</td>
+        <td class="round"><div class="rline">${roundSegs(it.r)}</div></td></tr>`;
+    }
+    const g = it, model = listSome(g.models), bk = listSome(g.backends);
+    return `<tr class="clickable" data-action="conv-open" data-session="${esc(g.session)}" data-user="${esc(g.user)}"${g.rid != null ? ` data-rid="${g.rid}"` : ''}
+      title="${esc(g.user)} \u00b7 ${fmtTime(g.first)} \u2192 ${fmtTime(g.at)} \u00b7 ${g.reqs} requests">
+      <td class="time">${fmtTime(g.at)}</td>
+      <td><span class="mono">${esc(g.user)}</span>${sessTag(g)}</td>
+      <td class="trunc ${model ? '' : 'none'}">${model ?? '—'}</td>
+      <td class="dim ${bk ? '' : 'none'}">${bk ?? '—'}</td>
+      <td class="round"><div class="rline">${convSegs(g)}</div></td></tr>`;
+  }).join('');
+  return `<table class="logs">
+    <tr><th>Time</th><th>Conversation</th><th>Model</th><th>Backend</th><th>Activity</th></tr>${rows}</table>`;
+}
+
+// When the log file could not be opened at boot nothing is captured, so a row
+// has no conversation to open. The list still shows the requests (they come
+// from the live ring buffer), and saying so beats a bare “no such conversation”.
+const NOCAP_BADGE = '<span class="badge warn" title="body capture is off — no conversation is stored for this request">not captured</span>';
+const captureOff = () => S.capture && S.capture.log === false;
 
 function renderLogs() {
   const q = $('#log-filter').value.trim().toLowerCase();
   const dir = $('#log-dir').value;
   const rounds = logRounds(S.logs).filter(r =>
     (dir === '' || (dir === 'awaiting' ? r.in && !r.out : r.ctl)) &&
-    (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.out?.user, r.out?.model, r.out?.backend, r.out?.session,
+    (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.in?.session_label, r.out?.user, r.out?.model,
+      r.out?.backend, r.out?.session, r.out?.session_label,
       r.in?.info, r.out?.info, r.solo?.user, r.solo?.model, r.solo?.backend, r.solo?.session, r.solo?.info]
       .some(v => v && String(v).toLowerCase().includes(q))));
-  setHTML($('#logs'), logTable(rounds));
+  const warn = captureOff()
+    ? `<div class="capnote">Body capture is <b>off</b> — these requests are listed from memory, but their conversations are not written to disk, so a row has nothing to open. Set a writable <b>Request log path</b> in Settings and restart to capture them${S.capture.path ? ` (current path: <code>${esc(S.capture.path)}</code>)` : ''}.</div>`
+    : '';
+  setHTML($('#logs'), warn + (S.logGroup === 'request' ? logTable(rounds) : convTable(rounds)));
 }
 
-// --- Round viewer
+// --- Conversation viewer
 //
-// Full-screen dialog over one round: Request/Response tabs, Raw (captured
-// bytes) vs Formatted (transcript / reconstructed stream / JSON tree), and
-// Whole vs New only (this round's request minus its predecessor's prefix).
-// All formatting is view-only — the server always serves the raw capture.
+// Full-screen dialog over one conversation. Every turn is a block on one
+// timeline carrying the timestamps the proxy measured (queue, dispatch, first
+// token, end), the quiet stretch between two turns is named by the tools that
+// ran in it, and Raw/Formatted, download, reload and request navigation
+// (⏮ ‹ › ⏭) work over the whole conversation instead of one request round.
+// The index arrives without body text — a conversation resends its whole
+// history every turn, so sending text with it would refetch hundreds of
+// kilobytes per navigation step — and text is fetched per expanded turn.
 
 const storedLv = () => {
   try {
     const v = JSON.parse(localStorage.getItem('omq.lv') || '{}');
-    return { scope: v.scope === 'new' ? 'new' : 'whole', fmt: v.fmt === 'raw' ? 'raw' : 'fmt', rail: !!v.rail };
+    return { fmt: v.fmt === 'raw' ? 'raw' : 'fmt', rail: !!v.rail,
+      railW: lvRailClamp(v.railW) };
   } catch { /* storage blocked */ }
-  return { scope: 'whole', fmt: 'fmt', rail: false };
+  return { fmt: 'fmt', rail: false, railW: LV_RAIL_DEF };
 };
 const saveLv = () => { try { localStorage.setItem('omq.lv', JSON.stringify(S.lv)); } catch { /* storage blocked */ } };
+/* The jump tree is a side column you may want wide (tool names, message text) or
+   narrow (a glance beside the log), so its width is yours and remembered. The
+   dialog is full-viewport, so the ceiling keeps a strip of log readable. */
+const LV_RAIL_DEF = 292, LV_RAIL_MIN = 200;
+const lvRailMax = () => Math.max(LV_RAIL_MIN + 80, Math.round(window.innerWidth * 0.62));
+const lvRailClamp = w => {
+  const n = Math.round(+w);
+  return Number.isFinite(n) && n >= LV_RAIL_MIN && n <= 900 ? Math.min(n, lvRailMax()) : 0;
+};
+// What is stored is what a previous session wrote: a value that is not a sane
+// width falls back to the default instead of poisoning the CSS variable.
+const lvRailW = () => lvRailClamp(S.lv && S.lv.railW) || LV_RAIL_DEF;
+function lvApplyRail() {
+  const shell = $('#dlg-log .lv-shell');
+  if (shell) shell.style.setProperty('--lv-w', lvRailW() + 'px');
+  const grip = $('#lv-grip');
+  if (grip) {
+    grip.hidden = !(S.lv.rail && !isPhone());
+    grip.setAttribute('aria-valuenow', String(lvRailW()));
+    grip.setAttribute('aria-valuetext', `${lvRailW()} pixels wide`);
+  }
+}
+function lvSetRail(w) {
+  const next = lvRailClamp(w);
+  if (!next || next === lvRailW()) return false;
+  S.lv.railW = next;
+  lvApplyRail();
+  return true;
+}
 S.lv = storedLv();
 
-const LV = { inEv: null, outEv: null, seqOnly: false, prevEv: null, prevText: undefined,
-  rounds: [], roundKey: null };
+/** Viewer state. `open` is the one fold for a request: the tree caret and the
+ *  turn header fold the same block, in either direction. `hist` remembers which
+ *  requests also show the messages an earlier request already delivered. */
+const LV = { conv: null, rid: null, open: new Set(), hist: new Set(), focusMsg: null, content: new Map() };
 let lvToken = 0;
 
 const tryJson = s => { try { return JSON.parse(s); } catch { return undefined; } };
 
-/** Find a round's events in `list` (the newest-first log list) and open the
- *  viewer. rid pairs them; seq opens one standalone event's side only. */
-async function openRound({ rid, seq }) {
-  let list = S.logs;
-  if (!list.some(l => (rid && l.rid === rid) || (seq && l.seq === seq))) {
-    list = await api('GET', `logs?limit=${LOG_LIMIT}`).catch(() => list);
-  }
-  const inEv = rid ? list.find(l => l.rid === rid && l.dir === 'IN') || null
-    : seq && list.find(l => l.seq === seq)?.dir === 'IN' ? list.find(l => l.seq === seq) : null;
-  const outEv = rid ? list.find(l => l.rid === rid && l.dir === 'OUT') || null
-    : !inEv && seq ? list.find(l => l.seq === seq) || null : null;
-  if (!inEv && !outEv) return toast('log record expired', false);
-  LV.inEv = inEv;
-  LV.outEv = outEv;
-  LV.seqOnly = !rid;
-  LV.rounds = logRounds(list);
-  LV.roundKey = rid ? `r${rid}` : `s${(inEv || outEv).seq}`;
-  // The conversation's previous IN (for New only): nearest older same-session
-  // request still in the ring.
-  const s = (inEv || outEv).session;
-  LV.prevEv = s ? list.find(l => l.session === s && l.dir === 'IN' && l.seq < (inEv || outEv).seq) || null : null;
-  LV.prevText = undefined;
+const lvTurns = () => (LV.conv && LV.conv.turns) || [];
+const lvIdxOf = rid => lvTurns().findIndex(t => t.rid === rid);
+/** How many messages a turn's request carried (0 when the capture was cut
+ *  before them — then the viewer cannot tell which messages are new). */
+const lvMsgCount = t => (t && t.msgs ? t.msgs.length : 0);
+
+/** How many of turn i's messages an earlier request already sent — the prefix a
+ *  turn does not repeat in its body. 0 when there is nothing comparable: the
+ *  first turn, or a request whose message count did not grow. */
+function lvHidden(i) {
+  const turns = lvTurns();
+  const prev = i > 0 ? lvMsgCount(turns[i - 1]) : 0;
+  return prev > 0 && prev < lvMsgCount(turns[i]) ? prev : 0;
+}
+
+/** Open the viewer on a conversation: by request id (a row) or by the client
+ *  and conversation tag (a conversation header). Either way the server picks
+ *  the conversation, because it owns the keys. */
+async function openConv({ rid, session, user } = {}) {
+  const q = new URLSearchParams();
+  if (rid) q.set('rid', rid);
+  if (session) q.set('session', session);
+  if (user) q.set('user', user);
+  let conv;
+  try { conv = await api('GET', 'conv?' + q.toString()); }
+  catch (e) { return toast(e.message, false); }
+  const resuming = LV.conv && LV.conv.key === conv.key;
+  LV.conv = conv;
+  LV.rid = rid || (resuming && LV.rid) || conv.turns.at(-1)?.rid || null;
+  LV.open = new Set(LV.rid != null ? [LV.rid] : []);
+  LV.hist = new Set();
+  LV.focusMsg = null;
+  LV.content = new Map();
   $('#dlg-log [data-title]').textContent =
-    `${(inEv || outEv).model || 'control'} · ${(inEv || outEv).user}${outEv?.backend ? ` → ${bkName(outEv.backend)}` : ''}`;
-  const sub = [];
-  if (inEv) sub.push(`→ ${fmtTime(inEv.at_ms)} ${inSeg(inEv.info)}`);
-  if (outEv) sub.push(`← ${fmtTime(outEv.at_ms)} ${outSeg(outEv.info)}`);
-  if (!outEv && inEv) sub.push('← awaiting response');
-  if (s) sub.push(`session #${s}`);
+    `${conv.model || 'traffic'} · ${conv.user}${conv.backend ? ` → ${bkName(conv.backend)}` : ''}`;
+  const sub = [`#${sessName(conv) || conv.key}`];
+  sub.push(`${conv.turns.length} ${conv.turns.length === 1 ? 'request' : 'requests'}`);
+  if (conv.turns.length) sub.push(`${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`);
+  if (conv.redacted) sub.push('no text');
   $('#dlg-log [data-sub]').textContent = sub.join(' · ');
-  $$('input[name="lv-scope"]').forEach(r => { r.checked = S.lv.scope === r.value; });
   $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
-  drawLv();
-  // Round navigation (↑/↓) re-enters with the dialog already open — showModal
-  // on an open dialog throws.
   const dlg = $('#dlg-log');
   if (!dlg.open) dlg.showModal();
-  dlg.querySelector('.lv-body').scrollTop = 0;
+  await lvDraw({ scroll: true });
 }
 
-/** Fetch one event's captured content (cached on the list entry). */
-async function evContent(ev) {
-  if (!ev || !ev.has_content) return null;
-  if (ev._content === undefined) {
-    try { ev._content = (await api('GET', `logs/${ev.seq}`)).content ?? ''; }
-    catch { ev._content = null; }
+/** A log event with no proxied request behind it (a control action): the same
+ *  dialog with a single turn, its text taken from the event ring. */
+async function openSeq(seq) {
+  let ev;
+  try { ev = await api('GET', `logs/${seq}`); } catch (e) { return toast(e.message, false); }
+  LV.conv = {
+    key: 'ctl:' + seq, user: ev.user || '\u2014', model: 'control', session: null,
+    start_ms: ev.at_ms, end_ms: ev.at_ms,
+    turns: [{ rid: seq, at_ms: ev.at_ms, path: ev.info || 'event', tl: { end: ev.at_ms }, redacted: !!ev.redacted }],
+  };
+  LV.rid = seq;
+  LV.open = new Set([seq]);
+  LV.hist = new Set();
+  LV.focusMsg = null;
+  LV.content = new Map([[seq, { req: null, resp: ev.content ?? null, reqObj: null }]]);
+  $('#dlg-log [data-title]').textContent = `control \u00b7 ${ev.user}`;
+  $('#dlg-log [data-sub]').textContent = `${fmtTime(ev.at_ms)} \u00b7 ${ev.info}`;
+  $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
+  const dlg = $('#dlg-log');
+  if (!dlg.open) dlg.showModal();
+  await lvDraw({ scroll: true });
+}
+
+/** Captured text of one turn, fetched once and kept for the session. */
+async function lvLoad(rid) {
+  if (LV.content.has(rid)) return LV.content.get(rid);
+  const one = async dir => {
+    try { return (await api('GET', `conv/content?rid=${rid}&dir=${dir}`)).content ?? null; }
+    catch { return null; }
+  };
+  const c = { req: await one('in'), resp: await one('out') };
+  c.reqObj = c.req ? tryJson(c.req) || salvageChat(c.req) : null;
+  LV.content.set(rid, c);
+  return c;
+}
+
+/** The turn's own measured timeline, in the same words Details uses. */
+function lvStages(t) {
+  const tl = t.tl || {};
+  const out = [];
+  if (tl.queue != null && tl.dispatch != null) out.push(`queued ${fmtDur((tl.dispatch - tl.queue) / 1000)}`);
+  else if (tl.queue != null) out.push(`queued ${fmtDur(((tl.end || nowish()) - tl.queue) / 1000)}`);
+  if (tl.dispatch != null) {
+    const to = tl.first_token ?? tl.end;
+    if (to != null) out.push(`prefill ${fmtSec1((to - tl.dispatch) / 1000)}`);
+    if (tl.first_token == null && tl.end == null) out.push('prefilling');
   }
-  return ev._content;
-}
-
-function lvScopeUsable() {
-  return S.lv.fmt === 'fmt' && !!(LV.inEv?.session && LV.prevEv);
-}
-
-async function drawLv() {
-  const tk = ++lvToken;
-  // New only and Raw interact: the diff needs the parsed body, so the scope
-  // control only applies to the formatted request.
-  $('#lv-scope').classList.toggle('off', !lvScopeUsable());
-  const html = await lvBody();
-  if (tk !== lvToken) return; // a newer click beat us
-  setHTML($('#dlg-log [data-content]'), html);
-  renderRail();
-  const i = lvRoundIdx();
-  $('#lv-prev').disabled = i <= 0;
-  $('#lv-next').disabled = i < 0 || i >= LV.rounds.length - 1;
-  $('#lv-jump').classList.toggle('active', S.lv.rail);
-}
-
-/** One scrollable view: the request section first, then the response. */
-async function lvBody() {
-  const secs = [];
-  if (LV.inEv) {
-    secs.push(lvSec('req', 'Request', inSeg(LV.inEv.info), await lvPart(LV.inEv, 'req')));
-  } else if (!LV.seqOnly) {
-    secs.push(lvSec('req', 'Request', '', '<div class="lv-note">No request was logged — this round was refused before its body arrived.</div>'));
+  if (tl.first_token != null && tl.end != null) {
+    out.push(`gen ${fmtSec1((tl.end - tl.first_token) / 1000)}`);
+    if (t.completion_tokens != null && tl.end > tl.first_token)
+      out.push(`${(t.completion_tokens / ((tl.end - tl.first_token) / 1000)).toFixed(1)} t/s`);
   }
-  if (LV.outEv) {
-    secs.push(lvSec('out', 'Response', outSeg(LV.outEv.info), await lvPart(LV.outEv, 'out')));
-  } else if (!LV.seqOnly) {
-    secs.push(lvSec('out', 'Response', '', '<div class="lv-note">No response recorded yet — still queued, running, or disconnected.</div>'));
-  }
-  return secs.join('');
+  if (t.prompt_tokens != null) out.push(`prompt ${fmtTok(t.prompt_tokens)} tok`);
+  if (t.waste_secs) out.push(`<span class="st-bad">waste ${fmtSec1(t.waste_secs)}</span>`);
+  if (tl.end == null) out.push('<b>running</b>');
+  return out.filter(Boolean).join(' · ');
+}
+const nowish = () => (S.overview && S.overview.now_ms) || Date.now();
+
+/** A gap this long between one answer ending and the next request arriving is
+ *  worth a line of its own: that is a tool (or a human) working, not network
+ *  turnaround. The gap is a length, so it is written without the `+` a moment
+ *  carries, and named by what ran in it — the turn's own tool results are
+ *  exactly what the agent did while the proxy was idle. */
+const LV_IDLE_MS = 5_000;
+
+function lvGap(t, prev) {
+  const end = prev && prev.tl && prev.tl.end;
+  if (!end || t.at_ms - end < LV_IDLE_MS) return '';
+  const tools = (t.msgs || []).filter(m => m.name).map(m => m.name);
+  const what = tools.length ? `tool ${tools.join(', ')}` : 'agent side';
+  return `<div class="lv-gap"><span class="dot">◌</span>idle ${fmtDur((t.at_ms - end) / 1000)} · ${esc(what)} (${fmtTime(end)} → ${fmtTime(t.at_ms)})</div>`;
+}
+
+/**
+ * The first request of a conversation owns the absolute clock; every one after
+ * it counts continuously from the conversation's own start, the way `dmesg -H`
+ * counts from the boot it describes — a turn is a point on one line, so turn 3
+ * never repeats turn 2's number. Anything that is a length rather than a moment
+ * (a response's duration, an idle gap, the window that produced a message)
+ * stays a length. The absolute pair of any delta stays one hover away.
+ */
+function lvSpan(t, first) {
+  const end = t.tl?.end;
+  if (first == null)
+    return { txt: `${fmtTime(t.at_ms)}${end != null ? ` → ${fmtTime(end)}` : ''}`, tip: '' };
+  const on = ms => `+${fmtDur((ms - first) / 1000)}`;
+  return {
+    txt: on(t.at_ms) + (end != null ? ` → ${on(end)}` : ''),
+    tip: `arrived ${fmtTime(t.at_ms)}${end != null ? ` · finished ${fmtTime(end)}` : ''}`
+      + ` · ${fmtDur((t.at_ms - first) / 1000)} into this conversation`,
+  };
 }
 
 const lvSec = (cls, title, info, html) =>
   `<section class="lv-sec"><h3 class="lv-sec-h ${cls}"><span class="ar">${cls === 'req' ? '→' : '←'}</span>${esc(title)}${info ? ` · ${esc(info)}` : ''}</h3>${html}</section>`;
 
-async function lvPart(ev, kind) {
-  const text = await evContent(ev);
-  if (text == null) return ev.redacted
-    ? '<div class="lv-note">Text capture is switched off for this client, key or backend. The entry keeps the size, status, session and timing; no body text was ever stored.</div>'
-    : `<div class="empty">No content captured${ev.has_content ? ' (or it left the log ring)' : ''}.</div>`;
+/** Capture switched off is a decision, not a gap: say so and show what was kept. */
+const lvOff = () => '<div class="lv-off">capture turned off — no request or response text is stored for this client, key or backend. Its timeline, sizes and message roles are still recorded.</div>';
+
+/** What a turn re-sent that an earlier request already delivered, as one line:
+ *  how many, where they first appeared, and what they were (roles, size). The
+ *  conversation is one view, so by default they show only on the turn that first
+ *  sent them and every later turn names them instead of repeating them. */
+function lvCarry(i) {
+  const turns = lvTurns();
+  const hidden = lvHidden(i);
+  if (!hidden) return null;
+  const held = ((turns[i] || {}).msgs || []).slice(0, hidden);
+  const counts = {};
+  let chars = 0;
+  for (const m of held) { counts[m.role] = (counts[m.role] || 0) + 1; chars += m.chars || 0; }
+  const roles = ['system', 'user', 'assistant', 'tool'].concat(Object.keys(counts))
+    .filter((r, k, all) => counts[r] && all.indexOf(r) === k).map(r => `${r} ${counts[r]}`).join(' · ');
+  // The request that first carried them: the first one whose body reached that
+  // many messages.
+  let from = i;
+  for (let k = 0; k <= i; k++) if (lvMsgCount(turns[k]) >= hidden) { from = k; break; }
+  return { hidden, from, roles, bytes: chars ? `≈${fmtBytes(chars)}` : null };
+}
+
+const lvCarryText = (c, open, short = false) =>
+  short ? `${c.hidden} from #${c.from + 1}${c.roles ? ` · ${c.roles}` : ''}${c.bytes ? ` · ${c.bytes}` : ''}`
+    : `${c.hidden} ${c.hidden === 1 ? 'message' : 'messages'} held from request ${c.from + 1}`
+      + [c.roles, c.bytes].filter(Boolean).map(x => ` · ${x}`).join('')
+      + ` — ${open ? 'hide' : 'show'} them here too`;
+
+function lvMsgsHtml(obj, i, rid) {
+  const msgs = (obj && obj.messages) || [];
+  const toolNames = new Map();
+  for (const m of msgs) for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
+  // A turn carrying exactly as many messages as the previous one added nothing
+  // comparable — show them all rather than hide the whole block.
+  const carry = lvCarry(i);
+  const open = !!carry && LV.hist.has(rid);
+  const from = carry && !open ? carry.hidden : 0;
+  const mid = (k) => (rid != null ? `lv-m-${rid}-${k}` : undefined);
+  const body = msgs.slice(from).map((m, k) => msgBlock(m, toolNames, mid(from + k))).join('');
+  const line = carry ? `<div class="lv-carry" data-action="lv-carry" data-rid="${rid}" role="button" tabindex="0"
+      aria-expanded="${open}" title="these arrived with this request, but an earlier request already sent them">${open ? '▾' : '▸'} ${esc(lvCarryText(carry, open))}</div>` : '';
+  return line + (body || (from ? '' : '<div class="empty">No messages in this request.</div>'));
+}
+
+function lvReqHtml(t, c) {
+  const i = lvIdxOf(t.rid);
+  const prevCount = i > 0 ? lvMsgCount(lvTurns()[i - 1]) : 0;
+  if (c.req == null) return (t.redacted ? lvOff() : '<div class="lv-note">No request text was stored for this request.</div>') + lvMsgChips(t);
   if (S.lv.fmt === 'raw')
-    return (text.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(text);
-  if (kind === 'req' && S.lv.scope === 'new' && lvScopeUsable()) return lvNewOnly(text);
-  return formatContent(text);
+    return (c.req.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(c.req);
+  if (!c.reqObj) return rawView(c.req);
+  const msgs = (c.reqObj.messages || []).length;
+  // The count stays on the line so the omitted prefix is visible as a number,
+  // without a fold line repeating what the turns above already show.
+  const sent = prevCount > 0 && prevCount < msgs ? ` · ${msgs - prevCount} new this turn` : '';
+  return `<div class="lv-meta">${esc(reqMeta(c.reqObj) + sent)}</div>` + lvMsgsHtml(c.reqObj, i, t.rid);
 }
 
-// --- outline rail + round navigation ---
-
-const lvRoundIdx = () => LV.rounds.findIndex(
-  r => (r.solo ? `s${r.solo.seq}` : `r${(r.in || r.out).rid}`) === LV.roundKey);
-
-function lvStep(delta) {
-  const r = LV.rounds[lvRoundIdx() + delta];
-  if (!r) return;
-  if (r.in?.rid || r.out?.rid) openRound({ rid: (r.in || r.out).rid });
-  else openRound({ seq: r.solo.seq });
+function lvRespHtml(t, c) {
+  if (c.resp == null)
+    return (t.redacted ? lvOff() : `<div class="lv-note">${t.tl?.end != null ? 'No response text was stored for this request.' : 'No response recorded yet — still queued, running, or disconnected.'}</div>`)
+      + lvRespChips(t);
+  return S.lv.fmt === 'raw' ? rawView(c.resp) : formatContent(c.resp);
 }
 
-/** dmesg -H stamps: absolute when the clock anchors (or drifted ≥ 60 s), `+Ns`
- *  while the item sits close to the anchor — messages share their section's
- *  event time, the only real clock a round has. */
-const railStamp = (ms, anchor) =>
-  anchor == null || ms - anchor >= 60_000 ? fmtTime(ms) : `+${Math.floor((ms - anchor) / 1000)}s`;
+/** Without text the turn still lists what it held: one chip per message. */
+function lvMsgChips(t) {
+  const chips = (t.msgs || []).map(m =>
+    `<div class="msg-slot ${ROLE_CLS[m.role] || 'user'}"><span class="role">${ROLE_LABEL[m.role] || 'MSG'}</span>`
+    + `<span>${esc(m.name || (m.calls || []).join(', ') || '—')}</span><span>${fmtBytes(m.chars)}</span></div>`).join('');
+  return chips;
+}
 
-const lvSecMs = (sec) => !sec ? null
-  : sec.querySelector('.lv-sec-h.req') ? LV.inEv?.at_ms ?? null
-  : sec.querySelector('.lv-sec-h.out') ? LV.outEv?.at_ms ?? null : null;
+function lvRespChips(t) {
+  const bits = [];
+  if (t.completion_tokens != null) bits.push(`${fmtTok(t.completion_tokens)} tok`);
+  if (t.tl?.first_token != null && t.tl?.end != null)
+    bits.push(`${fmtSec1((t.tl.end - t.tl.first_token) / 1000)} of generation`);
+  // The header already carries the status; repeat it only where the chip is
+  // the whole trace that remains.
+  if (t.status != null && !t.redacted) bits.push(`HTTP ${t.status}`);
+  if (!bits.length) return '';
+  // "ASSIST" would be a guess on a request that never carried a chat body.
+  if (!/\/chat\//.test(t.path || '')) return `<div class="lv-note">${esc(bits.join(' · '))}</div>`;
+  return `<div class="msg-slot asst"><span class="role">${ROLE_LABEL.assistant}</span><span>${esc(bits.join(' · '))}</span></div>`;
+}
 
-/** Rebuild the Jump rail from what just rendered: sections + message blocks,
- *  in document order — it mirrors the view instead of re-deriving it. */
-function renderRail() {
+async function lvTurnInner(t) {
+  const c = await lvLoad(t.rid);
+  const reqSize = t.req?.bytes != null ? fmtBytes(t.req.bytes) : null;
+  const respSize = t.resp?.bytes != null ? fmtBytes(t.resp.bytes) : null;
+  return lvSec('req', 'Request', [t.method, t.path, reqSize].filter(Boolean).join(' '), lvReqHtml(t, c))
+    + lvSec('out', 'Response', [t.status ?? '—', respSize].filter(Boolean).join(' '), lvRespHtml(t, c));
+}
+
+/** Render the whole conversation. `scroll` lands on the focused request. */
+async function lvDraw({ scroll = false } = {}) {
+  const tk = ++lvToken;
+  const turns = lvTurns();
+  const parts = [];
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    parts.push(lvGap(t, turns[i - 1]));
+    const sp = lvSpan(t, i === 0 ? null : turns[0].at_ms);
+    parts.push(`<section class="turn${t.rid === LV.rid ? ' active' : ''}" id="lv-t-${t.rid}" data-rid="${t.rid}">
+      <h3 class="turn-h" data-action="lv-toggle" data-rid="${t.rid}" title="expand or collapse this request">
+        <span class="chev">${LV.open.has(t.rid) ? '▾' : '▸'}</span>
+        <span class="n">Request ${i + 1} of ${turns.length}</span>
+        <span class="ts"${sp.tip ? ` title="${esc(sp.tip)}"` : ''}>${sp.txt}</span>
+        <span>${lvStages(t)}</span>
+        <span class="tail">${t.status != null ? `<span class="${t.status >= 400 ? 'st-bad' : 'st-ok'}">${t.status}</span>` : '<span class="dim">running</span>'}</span>
+        ${t.redacted ? '<span class="badge warn" title="no body text is stored for this client, key or backend">no text</span>' : ''}
+      </h3>${LV.open.has(t.rid) ? await lvTurnInner(t) : ''}</section>`);
+  }
+  if (!turns.length) parts.push('<div class="empty">This conversation has no requests.</div>');
+  const html = parts.join('');
+  if (tk !== lvToken) return; // a newer click beat us
+  setHTML($('#dlg-log [data-content]'), html);
+  lvDrawRail();
+  $('#lv-jump').classList.toggle('active', S.lv.rail);
+  const i = lvIdxOf(LV.rid);
+  $('#lv-first').disabled = $('#lv-prev').disabled = i <= 0;
+  $('#lv-last').disabled = $('#lv-next').disabled = i < 0 || i >= turns.length - 1;
+  if (scroll) lvScroll();
+}
+
+function lvScroll() {
+  const el = document.getElementById('lv-t-' + LV.rid);
+  if (el) el.scrollIntoView({ block: 'start' });
+}
+
+/** Focus one request: expand it (leaving the others as they were), scroll to it. */
+async function lvFocus(rid) {
+  if (rid == null || lvIdxOf(rid) < 0) return;
+  LV.rid = rid;
+  LV.focusMsg = null;
+  LV.open.add(rid);
+  await lvDraw({ scroll: true });
+}
+
+/** A tree message node (the `USER` / `ASSIST` / `TOOL` line under a request):
+ *  focus that message, not just its request — open the turn, unfold the history
+ *  block if the message lives in it, scroll it into view and flash it. */
+async function lvFocusMsg(rid, idx) {
+  const turns = lvTurns();
+  const i = turns.findIndex(t => t.rid === rid);
+  if (i < 0) return;
+  // A message this request only resent is drawn in the turn that first sent it,
+  // so that is the one to open and flash — unless this turn has its re-sent
+  // history unfolded, in which case the copy on screen is the one to land on.
+  let k = i, tgt = { rid: turns[i].rid, idx };
+  while (k > 0 && !LV.hist.has(turns[i].rid)) {
+    const hid = lvHidden(k);
+    if (!(hid && tgt.idx < hid)) break;
+    k--;
+    tgt = { rid: turns[k].rid, idx: Math.min(tgt.idx, Math.max(lvMsgCount(turns[k]) - 1, 0)) };
+  }
+  const needed = !LV.open.has(tgt.rid) || !LV.content.has(tgt.rid);
+  LV.rid = tgt.rid;
+  LV.open.add(tgt.rid);
+  LV.focusMsg = [tgt.rid, tgt.idx];
+  if (needed) await lvDraw({ scroll: false });
+  const el = document.getElementById(`lv-m-${tgt.rid}-${tgt.idx}`);
+  if (!el) { lvScroll(); lvDrawRail(); return; }
+  for (const d of [el.closest('details'), ...el.querySelectorAll('details')]) if (d) d.open = true;
+  el.scrollIntoView({ block: 'center' });
+  el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 1300);
+  lvDrawRail();
+}
+
+async function lvStep(delta) {
+  const i = lvIdxOf(LV.rid) + delta;
+  if (i >= 0 && i < lvTurns().length) await lvFocus(lvTurns()[i].rid);
+}
+
+async function lvToggle(rid) {
+  // Each request opens and closes on its own: opening one never folds the others.
+  // One set drives both views, so folding from the tree folds the block and
+  // folding the block folds the tree.
+  if (LV.open.has(rid)) LV.open.delete(rid);
+  else LV.open.add(rid);
+  LV.rid = rid;
+  LV.focusMsg = null;
+  await lvDraw({ scroll: false });
+}
+
+async function lvReload() {
+  if (!LV.conv) return;
+  const key = LV.conv.key;
+  let conv;
+  try { conv = await api('GET', 'conv?key=' + encodeURIComponent(key)); }
+  catch (e) { return toast(e.message, false); }
+  // Turn text is refetched too: a finished response may have arrived since.
+  const keep = r => conv.turns.some(t => t.rid === r);
+  const open = [...LV.open], hist = [...LV.hist];
+  LV.conv = conv;
+  LV.content = new Map();
+  LV.open = new Set(open.filter(keep));
+  LV.hist = new Set(hist.filter(keep));
+  $('#dlg-log [data-sub]').textContent =
+    `${conv.turns.length} requests · ${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`;
+  await lvDraw({ scroll: true });
+  toast('reloaded', true);
+}
+
+/** Refetch everything and hand the browser a file: raw is the log line as the
+ *  file holds it, formatted is the conversation as a transcript. */
+async function lvDownload() {
+  if (!LV.conv) return;
+  toast(`preparing ${S.lv.fmt === 'raw' ? 'raw log' : 'transcript'}…`, true);
+  const turns = lvTurns();
+  for (const t of turns) await lvLoad(t.rid);
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '').slice(0, 11);
+  const base = `ollamamq-${(LV.conv.user || 'client').replace(/[^\w.-]/g, '_')}-${(LV.conv.session || 'one-shot')}-${stamp}`;
+  if (S.lv.fmt === 'raw') {
+    const line = JSON.stringify({ ...LV.conv, turns: turns.map(t => ({ ...t, content: { req: LV.content.get(t.rid)?.req ?? null, resp: LV.content.get(t.rid)?.resp ?? null } })) });
+    lvSave(line + '\n', base + '.jsonl', 'application/x-ndjson');
+    return;
+  }
+  lvSave(lvMarkdown(LV.conv, LV.content, turns), base + '.md', 'text/markdown');
+}
+
+/**
+ * The conversation as a transcript: what the viewer shows, in a file. One
+ * section per request with its measured timeline, the messages the request
+ * actually added (the history it resent is named, not repeated), and the
+ * response reconstructed to text — thinking, answer, tool calls, usage.
+ */
+function lvMarkdown(conv, content, turns) {
+  const out = [`# ${conv.user}${conv.session ? ` · #${sessName(conv)}` : ''}`, ''];
+  if (conv.session_label) out.push(conv.session_label, '');
+  if (conv.redacted) out.push('_Body capture was switched off for part of this conversation; the timeline, sizes and roles below are complete._', '');
+  out.push(`_${turns.length} ${turns.length === 1 ? 'request' : 'requests'} · ${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}${conv.model ? ` · ${conv.model}` : ''}${conv.backend ? ` → ${conv.backend}` : ''}_`, '');
+  turns.forEach((t, i) => {
+    const c = content.get(t.rid) || {};
+    out.push(`## Request ${i + 1} — ${fmtTime(t.at_ms)}${t.tl?.end != null ? ` → ${fmtTime(t.tl.end)}` : ' (running)'}`, '',
+      `> ${lvStages(t).replace(/<[^>]*>/g, '')}${t.status != null ? ` · HTTP ${t.status}` : ''}${t.outcome && t.outcome !== 'ok' ? ` · ${t.outcome}` : ''}`, '');
+    const prev = i > 0 ? lvMsgCount(turns[i - 1]) : 0;
+    const msgs = c.reqObj?.messages || [];
+    // What an earlier turn already sent is not repeated here; the count says so.
+    const cut = prev > 0 && prev < msgs.length ? prev : 0;
+    out.push(`**Request** ${[t.method, t.path, t.req?.bytes != null ? fmtBytes(t.req.bytes) : null,
+      msgs.length ? `${msgs.length} messages${cut ? `, ${msgs.length - cut} new` : ''}` : null]
+      .filter(Boolean).join(' ')}`, '');
+    if (c.req == null) out.push(t.redacted ? '_capture turned off — no text is stored for this client, key or backend_' : '_no request text stored_', '');
+    else if (msgs.length) for (const m of msgs.slice(cut)) out.push(...lvMsgMd(m));
+    else out.push('```', c.req, '```', '');
+    out.push(`**Response**${t.resp?.bytes != null ? ` · ${fmtBytes(t.resp.bytes)}` : ''}`, '');
+    if (c.resp == null) out.push(t.redacted ? '_capture turned off_' : '_no response text stored_', '');
+    else {
+      const st = streamState(c.resp) || lvPlainResp(c.resp);
+      if (!st) out.push('```', c.resp, '```', '');
+      else {
+        if (st.think) out.push('_thinking_', '', `> ${st.think.replace(/\n/g, '\n> ')}`, '');
+        if (st.text) out.push(st.text.trimEnd(), '');
+        for (const tc of st.tools || [])
+          out.push(`_tool call_ **${tc.name || '?'}**`, '', '```json', lvArgsText(tc.args), '```', '');
+        if (st.usage?.c != null)
+          out.push(`_${fmtNum(st.usage.c)} tokens generated${st.finish ? `, finished \`${st.finish}\`` : ''}${st.cutTail ? ', capture truncated' : ''}_`, '');
+      }
+    }
+  });
+  return out.join('\n');
+}
+
+/** One request message as markdown: role, text, then the calls it issues. */
+function lvMsgMd(m) {
+  const role = String(m.role || 'message').toLowerCase();
+  const label = ROLE_LABEL[role] || role.toUpperCase();
+  const who = role === 'tool' ? (m.name || m.tool_name || m.tool_call_id || '') : '';
+  const think = m.reasoning_content || m.reasoning || '';
+  const text = msgText(m.content, m.images);
+  const out = [`**${label}${who ? ` · ${who}` : ''}**`, ''];
+  if (think) out.push('_thinking_', `> ${String(think).replace(/\n/g, '\n> ')}`, '');
+  if (text) out.push(String(text).trimEnd(), '');
+  for (const tc of m.tool_calls || [])
+    out.push(`_tool call_ **${tc.function?.name ?? tc.name ?? '?'}**`, '', '```json', lvArgsText(tc.function?.arguments), '```', '');
+  return out;
+}
+
+/** A non-stream response has no SSE to rebuild, but reads out the same way. */
+function lvPlainResp(text) {
+  const o = tryJson(text);
+  const m = o?.choices?.[0]?.message || (o?.choices?.[0]?.text != null ? { content: o.choices[0].text } : null);
+  if (!m) return null;
+  return {
+    text: m.content || '', think: m.reasoning_content || m.reasoning || '',
+    tools: (m.tool_calls || []).map(tc => ({ name: tc.function?.name ?? tc.name, args: tc.function?.arguments })),
+    usage: o.usage ? { p: o.usage.prompt_tokens, c: o.usage.completion_tokens } : null,
+    finish: o.choices?.[0]?.finish_reason,
+  };
+}
+
+/** Tool-call arguments arrive as a JSON string (sometimes mid-stream, so
+ *  sometimes not yet valid); pretty-print what parses, pass through the rest. */
+function lvArgsText(args) {
+  if (args == null) return '';
+  if (typeof args === 'string') {
+    const o = tryJson(args);
+    return o === undefined ? args : JSON.stringify(o, null, 2);
+  }
+  return JSON.stringify(args, null, 2);
+}
+
+function lvSave(text, name, type) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  toast(`saved ${name}`, true);
+}
+
+// --- Jump tree ---
+//
+// The rail mirrors the conversation as a tree: request → request/response →
+// message → tool call. Each node is expandable on its own and every node
+// carries the timestamp it was measured at, so the outline reads as the
+// timeline it is.
+
+function lvNode({ level, rid, idx, when, tip, tag, snip, caret, cls = '', action = 'lv-jump', on = false }) {
+  return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}
+    ${tip ? `title="${esc(tip)}"` : ''}>
+    <span class="car"${caret ? ' data-action="lv-tree"' : ''} data-rid="${rid}">${caret ?? ''}</span>
+    <span class="when">${when ?? ''}</span><span class="tag">${esc(tag)}</span>
+    <span class="snip">${esc(snip)}</span></div>`;
+}
+
+/** A message has no clock instant of its own: it arrives inside one request, and
+ *  the capture never timed it separately. What IS measured is the window that
+ *  produced it — a tool result is the stretch since the previous answer ended,
+ *  an assistant message is that answer's own generation. The tree names those
+ *  windows the way dmesg -H names a delta, and leaves the rows that truly have
+ *  no time of their own (system, user) blank, with the reason in the tooltip.
+ *  A message an earlier request already sent resolves back to the turn that
+ *  first carried it, so one message never claims two different windows. */
+function lvMsgWhen(i, idx) {
+  const turns = lvTurns();
+  let k = i;
+  while (k > 0) {
+    const hid = lvHidden(k);
+    if (!(hid && idx < hid)) break;
+    k--;
+  }
+  if (idx < lvHidden(k)) return null;          // older than the log: no window to name
+  const t = turns[k], before = turns[k - 1];
+  const role = (t.msgs?.[idx] || {}).role;
+  if (before && role === 'tool' && before.tl?.end != null)
+    return { when: fmtDur((t.at_ms - before.tl.end) / 1000),
+      tip: `tool result sent with request ${k + 1} — produced between ${fmtTime(before.tl.end)} and ${fmtTime(t.at_ms)}` };
+  // A streamed answer is timed from its first token; a single-shot one has no
+  // first token, so its whole model-side window (dispatch to end) is what the
+  // message took to be produced.
+  if (before && role === 'assistant' && (before.tl?.first_token ?? before.tl?.dispatch) != null && before.tl?.end != null) {
+    const from = before.tl.first_token ?? before.tl.dispatch;
+    return { when: fmtDur((before.tl.end - from) / 1000),
+      tip: `the answer to request ${k} — generated ${fmtTime(from)} → ${fmtTime(before.tl.end)}` };
+  }
+  return { when: '', tip: `sent inside request ${k + 1} at ${fmtTime(t.at_ms)} — a message has no instant of its own` };
+}
+
+const lvFinish = t => `${t.status ?? '…'}${t.outcome && t.outcome !== 'ok' ? ` ${t.outcome}` : ''}`;
+
+function lvDrawRail() {
   const rail = $('#lv-rail');
   $('#dlg-log .lv-shell').classList.toggle('railed', S.lv.rail);
   rail.hidden = !S.lv.rail;
+  lvApplyRail();
   if (!S.lv.rail) return;
-  const items = [];
-  let n = 0, anchor = null;
-  for (const el of $('#dlg-log [data-content]').querySelectorAll('.lv-sec, .msg')) {
-    let cls = 'sec', tag = '', snip = '';
-    if (el.classList.contains('lv-sec')) {
-      const txt = (el.querySelector('.lv-sec-h')?.textContent || 'Section').trim();
-      tag = txt.startsWith('→') ? 'req' : txt.startsWith('←') ? 'resp' : 'sec';
-      snip = txt.replace(/^[→←]\s*/, '');
-    } else {
-      cls = el.classList.contains('sys') ? 'sys' : el.classList.contains('user') ? 'user'
-        : el.classList.contains('tool') ? 'tool' : 'asst';
-      tag = (el.querySelector(':scope > .role')?.textContent || 'msg').split('·')[0].trim();
-      snip = (el.querySelector(':scope > .mtext')?.textContent || '').split('\n')[0].trim() || tag;
+  const turns = lvTurns();
+  const items = [`<div class="lv-rail-h"><h4>Jump to request</h4>
+    <button class="btn sm" data-action="lv-expand">Expand all</button>
+    <button class="btn sm" data-action="lv-collapse">Collapse all</button></div>`];
+  turns.forEach((t, i) => {
+    const prev = turns[i - 1];
+    if (prev && prev.tl?.end != null && t.at_ms - prev.tl.end >= LV_IDLE_MS)
+      items.push(lvNode({ level: 1, rid: t.rid, when: fmtDur((t.at_ms - prev.tl.end) / 1000), tag: 'idle',
+        tip: `how long it sat quiet: ${fmtDur((t.at_ms - prev.tl.end) / 1000)} (${fmtTime(prev.tl.end)} → ${fmtTime(t.at_ms)})`,
+        snip: ((t.msgs || []).filter(m => m.name).map(m => m.name).join(', ') || 'agent side'), cls: 'gapnode', caret: '' }));
+    items.push(lvNode({
+      level: 1, rid: t.rid, tag: `Request ${i + 1}`,
+      when: i === 0 ? fmtTime(t.at_ms) : `+${fmtDur((t.at_ms - turns[0].at_ms) / 1000)}`,
+      snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ← ${lvFinish(t)}`,
+      cls: 'turn', caret: LV.open.has(t.rid) ? '▾' : '▸',
+      tip: `arrived ${fmtTime(t.at_ms)}${i ? ` · a moment: ${fmtDur((t.at_ms - turns[0].at_ms) / 1000)} after the conversation began` : ''}`
+        + `${prev ? ` · ${fmtDur((t.at_ms - prev.at_ms) / 1000)} after request ${i}` : ''}`,
+      on: t.rid === LV.rid && !LV.focusMsg }));
+    if (!LV.open.has(t.rid)) return;
+    const carry = lvCarry(i);
+    const c = LV.content.get(t.rid);
+    const msgs = lvMsgCount(t) || (c?.reqObj?.messages || []).length;
+    // The request row owns the arrival time and the response row its duration:
+    // one turn reads as a moment and a length, never two clock times.
+    items.push(lvNode({ level: 2, rid: t.rid, cls: 'req', when: '', tag: 'req',
+      tip: `arrived ${fmtTime(t.at_ms)} with the request — the body carries no time of its own`,
+      snip: msgs ? (carry ? `${msgs - carry.hidden} new · ${carry.hidden} held` : `${msgs} messages`)
+        : t.req?.bytes != null ? `${fmtBytes(t.req.bytes)}${t.redacted ? ' \u00b7 no text' : ''}` : 'no body',
+      caret: '' }));
+    // The messages this request re-sent are not the tree's business: they are
+    // already drawn under their own request. The request row says `3 new · 7
+    // held`, and unfolding the body adds them here too.
+    const showHist = LV.hist.has(t.rid);
+    for (const [mi, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
+      if (carry && !showHist && mi < carry.hidden) continue;
+      const w = lvMsgWhen(lvIdxOf(t.rid), mi)
+        || { when: '', tip: 'older than this log \u2014 the request that produced it was never captured' };
+      items.push(lvNode({ level: 3, rid: t.rid, idx: mi, when: w.when, tip: w.tip,
+        tag: ROLE_LABEL[m.role] || 'MSG', snip: lvSnip(m), cls: ROLE_CLS[m.role] || 'user',
+        action: 'lv-msg', on: !!LV.focusMsg && LV.focusMsg[0] === t.rid && LV.focusMsg[1] === mi }));
     }
-    const ms = el.classList.contains('lv-sec') ? lvSecMs(el) : lvSecMs(el.closest('.lv-sec'));
-    const when = ms == null ? '' : `<span class="when">${railStamp(ms, anchor)}</span>`;
-    if (ms != null && (anchor == null || ms - anchor >= 60_000)) anchor = ms;
-    el.dataset.jmp = String(++n);
-    items.push(`<button class="lv-item ${cls}" data-jmp="${n}">${when}<span class="tag">${esc(tag)}</span><span class="snip">${esc(snip.slice(0, 48))}</span></button>`);
-  }
-  setHTML(rail, `<h4>Jump to message</h4>${items.join('') || '<div class="lv-foot">Nothing to jump to in this view.</div>'}`);
+    // A response is a length: how long it took, not when it ended.
+    const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
+    items.push(lvNode({ level: 2, rid: t.rid, cls: 'resp', tag: 'resp',
+      when: dur == null ? '' : fmtDur(dur / 1000),
+      tip: t.tl?.end != null
+        ? `how long this response took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)})`
+        : 'no response recorded yet',
+      snip: lvFinish(t) + (c?.resp ? '' : ' · no text'), caret: '' }));
+  });
+  if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');
+  setHTML(rail, items.join(''));
 }
+
+const lvSnip = m => {
+  const first = String(typeof m.content === 'string' ? m.content
+    : Array.isArray(m.content) ? (m.content.find(p => p.text)?.text || '') : '')
+    .split('\n')[0].trim();
+  const calls = (m.tool_calls || []).map(tc => tc.function?.name ?? tc.name).filter(Boolean).join(', ');
+  return (first || calls || m.name || '').slice(0, 48);
+};
 
 // --- formatters: every one returns the raw view if it cannot parse ---
 
@@ -1969,6 +2426,9 @@ function formatContent(text) {
 }
 
 const ROLE_CLS = { system: 'sys', developer: 'sys', user: 'user', assistant: 'asst', tool: 'tool' };
+// The role chip locates a message in a long transcript; it is not a sentence.
+// Six characters is the longest of them, so the column stays narrow.
+const ROLE_LABEL = { system: 'SYS', developer: 'DEV', user: 'USER', assistant: 'ASSIST', tool: 'TOOL' };
 
 /** A message `content`: string, or parts array (images as placeholders). */
 function msgText(c, images) {
@@ -1989,12 +2449,12 @@ function toolCallBlock(name, args) {
   return `<div class="tc"><div class="tc-h"><span class="fn">${esc(name || 'tool call')}</span></div><pre>${esc(body)}</pre></div>`;
 }
 
-function msgBlock(m, toolNames) {
+function msgBlock(m, toolNames, id) {
   const role = String(m.role || 'message');
   const label = role === 'tool'
-    ? `tool · ${esc(m.tool_name || m.name || (toolNames && toolNames.get(m.tool_call_id)) || m.tool_call_id || '?')}`
-    : esc(role);
-  let html = `<div class="msg ${ROLE_CLS[role] || 'user'}"><span class="role">${label}</span>`;
+    ? `TOOL · ${esc(m.tool_name || m.name || (toolNames && toolNames.get(m.tool_call_id)) || m.tool_call_id || '?')}`
+    : (ROLE_LABEL[role] || esc(role));
+  let html = `<div class="msg ${ROLE_CLS[role] || 'user'}"${id ? ` id="${id}"` : ''}><span class="role">${label}</span>`;
   html += thinkBlock(m.reasoning_content || m.reasoning || '');
   const t = msgText(m.content, m.images);
   if (t) html += `<div class="mtext">${esc(t)}</div>`;
@@ -2024,13 +2484,19 @@ function transcriptView(body) {
     + (body.messages || []).map(m => msgBlock(m, toolNames)).join('');
 }
 
-/** Reconstruct one assistant message from a streamed response: OpenAI SSE
- *  (`data: {…}` lines + `[DONE]`) or Ollama-native line-delimited JSON. */
-function groupStream(text) {
+/** Parse a streamed capture into its parts — reconstructed text, thinking,
+ *  tool calls, finish reason, usage — or null when it is not a stream. OpenAI
+ *  SSE (`data: {…}` lines + `[DONE]`) or Ollama-native line-delimited JSON.
+ *  The viewer renders this to HTML; the markdown download writes it as text. */
+function streamState(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   if (!lines.length) return null;
-  const sse = /^data:/.test(lines[0]);
-  if (!sse && !/^\{/.test(lines[0])) return null;
+  // A stream may open with an SSE comment (`: keepalive`) or an `event:` line —
+  // llama.cpp does exactly that — so the first line that carries payload is
+  // what decides the shape, not line 0.
+  const head = lines.find(l => /^data:/.test(l) || /^\{/.test(l));
+  if (!head) return null;
+  const sse = /^data:/.test(head);
   const trunc = text.includes('[truncated:');
   const st = { text: '', think: '', tools: [], finish: null, usage: null, chunks: 0, errs: 0, cutTail: false };
   for (const line of lines) {
@@ -2042,6 +2508,10 @@ function groupStream(text) {
     // parsed instead of dropping the whole view.
     if (!o || typeof o !== 'object') { if (trunc) { st.cutTail = true; continue; } return null; }
     st.chunks++;
+    // A single whole response object (`chat.completion`, not a chunk) is not a
+    // stream: let the caller fall back to the plain-response reader.
+    if (!sse && st.chunks === 1 && o.object !== 'chat.completion.chunk'
+        && !o.choices?.[0]?.delta && typeof o.response !== 'string') return null;
     if (o.error) { st.errs++; st.text += `\n[error: ${o.error.message ?? JSON.stringify(o.error)}]`; continue; }
     if (o.choices?.[0]?.finish_reason) st.finish = o.choices[0].finish_reason;
     if (o.done_reason) st.finish = o.done_reason;
@@ -2063,13 +2533,20 @@ function groupStream(text) {
     }
   }
   if (!st.chunks) return null;
-  const tools = st.tools.filter(Boolean);
+  st.tools = st.tools.filter(Boolean);
+  return st;
+}
+
+/** Render that reconstruction as one assistant message. */
+function groupStream(text) {
+  const st = streamState(text);
+  if (!st) return null;
   const foot = [`finish: ${st.finish || '?'}`];
   if (st.usage) foot.push(`prompt ${fmtTok(st.usage.p || 0)} → completion ${fmtTok(st.usage.c || 0)} tok`);
   foot.push(`${fmtNum(st.chunks)} chunks grouped${st.errs ? ` · ${st.errs} error payload(s)` : ''}${st.cutTail ? ' · tail truncated' : ''}`);
   return `<div class="msg asst"><span class="role">assistant</span>${thinkBlock(st.think)}`
     + (st.text ? `<div class="mtext">${esc(st.text)}</div>` : '')
-    + tools.map(t => toolCallBlock(t.name, t.args)).join('')
+    + st.tools.map(t => toolCallBlock(t.name, t.args)).join('')
     + `</div><div class="lv-foot">${esc(foot.join(' · '))}</div>`;
 }
 
@@ -2098,39 +2575,6 @@ function jsonTree(v, key, depth) {
   if (!es.length) return `<div class="jl" style="margin-left:${depth * 14}px">${label}${isArr ? '[]' : '{}'}</div>`;
   const inner = es.map(([k, v2]) => jsonTree(v2, k, depth + 1)).join('');
   return `<details${depth < 1 ? ' open' : ''}><summary style="margin-left:${depth * 14}px">${label}${isArr ? `[${es.length}]` : `{${es.length}}`}</summary>${inner}</details>`;
-}
-
-/** New only: the current request minus the previous round's message prefix. */
-async function lvNewOnly(curText) {
-  const note = msg => `<div class="lv-note">${esc(msg)} — showing the whole request instead.</div>`;
-  const cur = tryJson(curText) || salvageChat(curText);
-  if (!cur || !Array.isArray(cur.messages)) return note('Only chat requests carry a message history') + formatContent(curText);
-  if (!LV.prevEv) return note('No earlier round of this conversation is in the log ring') + formatContent(curText);
-  if (LV.prevText === undefined) {
-    LV.prevText = await evContent(LV.prevEv) ?? '';
-  }
-  const prev = tryJson(LV.prevText) || salvageChat(LV.prevText);
-  if (!prev || !Array.isArray(prev.messages)) return note('The previous round’s captured content is no longer available') + formatContent(curText);
-  const a = prev.messages, b = cur.messages;
-  let k = 0;
-  while (k < Math.min(a.length, b.length) && JSON.stringify(a[k]) === JSON.stringify(b[k])) k++;
-  // The fresh suffix usually leads with the previous round's reply — first
-  // resent here, already shown in that round's Response section. New input
-  // starts at the next user message.
-  let kShown = k;
-  while (kShown < b.length && b[kShown].role === 'assistant') kShown++;
-  if (kShown >= b.length) kShown = k; // whole tail is replies — show it
-  const repliesHidden = kShown > k;
-  const inside = k < a.length && k < b.length;
-  const changed = Object.keys(cur).filter(x => x !== 'messages' && JSON.stringify(cur[x]) !== JSON.stringify(prev[x]));
-  const noteTxt = inside
-    ? `History changed at message #${k + 1} (context compacted?) — previous round had ${a.length} messages, this one ${b.length}`
-    : `History identical to the previous round up to message #${k} — ${b.length - kShown} new message(s)${repliesHidden ? ' (the previous reply is hidden; see that round’s Response)' : ''}`;
-  const toolNames = new Map();
-  for (const m of b.slice(0, k)) for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
-  return `<div class="lv-note">${esc(noteTxt)}${changed.length ? ` · also changed: ${esc(changed.join(', '))}` : ''}</div>`
-    + b.slice(kShown).map(m => msgBlock(m, toolNames)).join('')
-    + `<div class="lv-foot">messages #1–${kShown} hidden · identical JSON per message${repliesHidden ? ' · previous replies live in that round’s Response' : ''}</div>`;
 }
 
 // --- Settings
@@ -2678,16 +3122,40 @@ const actions = {
   'fold-all': () => { S.collapsed.clear(); saveCollapsed(); render(); },
   'fold-none': () => { for (const b of $$('#ov-now .det-h')) S.collapsed.add(b.dataset.key); saveCollapsed(); render(); },
 
-  'log-detail': el => openRound({ seq: +el.dataset.seq }),
-  'log-round': el => openRound({ rid: +el.dataset.rid }),
+  'log-detail': el => openSeq(+el.dataset.seq),
+  'log-round': el => openConv({ rid: +el.dataset.rid }),
   'log-close': () => $('#dlg-log').close(),
-  // Overview row -> the request's log round (rid maps it to the ring).
-  'log-jump': el => { const rid = +el.dataset.rid; if (rid) openRound({ rid }).catch(e => toast(e.message, false)); },
-  // Conversation header -> the Logs page filtered to that session tag.
-  'logs-for': el => {
-    location.hash = '#logs';
-    $('#log-filter').value = el.dataset.session || '';
-    renderLogs();
+  // A log row -> the conversation that request belongs to, opened on it.
+  'log-jump': el => { const rid = +el.dataset.rid; if (rid) openConv({ rid }).catch(e => toast(e.message, false)); },
+  // A conversation row in the grouped list, or an Overview header chip: open the
+  // whole conversation, focused on the newest request when the row names one.
+  'conv-open': el => openConv({ rid: +el.dataset.rid || null, session: el.dataset.session, user: el.dataset.user })
+    .catch(e => toast(e.message, false)),
+  // A turn header or a tree request row: focus that request.
+  'lv-toggle': el => lvToggle(+el.dataset.rid),
+  'lv-jump': el => lvFocus(+el.dataset.rid),
+  // The tree's caret is the turn header's caret: one fold, and it moves the
+  // same way whichever side you click it on.
+  'lv-tree': el => lvToggle(+el.dataset.rid),
+  // The line standing in for re-sent history: show those messages here too, in
+  // the body and in the tree at once.
+  'lv-carry': async el => {
+    const rid = +el.dataset.rid;
+    if (LV.hist.has(rid)) LV.hist.delete(rid);
+    else LV.hist.add(rid);
+    await lvDraw({ scroll: false });
+  },
+  // A message row inside a request: jump to that message in the body.
+  'lv-msg': el => lvFocusMsg(+el.dataset.rid, +el.dataset.idx),
+  'lv-expand': async () => {
+    const rids = lvTurns().map(t => t.rid);
+    LV.open = new Set(rids); LV.hist = new Set(rids);
+    await lvDraw();
+  },
+  'lv-collapse': async () => {
+    const keep = LV.rid != null ? [LV.rid] : [];
+    LV.open = new Set(keep); LV.hist = new Set(keep);
+    await lvDraw({ scroll: true });
   },
 };
 
@@ -2710,39 +3178,69 @@ document.addEventListener('keydown', e => {
 $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close('cancel'); }));
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
+// Grouped or per-request: which view of the same ring, remembered like the
+// other view choices.
+S.logGroup = storedLogGroup();
+$$('#log-group input[name="log-group"]').forEach(r => {
+  r.checked = S.logGroup === r.value;
+  r.addEventListener('change', () => {
+    S.logGroup = r.value;
+    try { localStorage.setItem('omq.logGroup', r.value); } catch { /* storage blocked */ }
+    renderLogs();
+  });
+});
 // Round-viewer controls: choices persist like the other view preferences.
-$$('input[name="lv-scope"]').forEach(r => r.addEventListener('change', () => { S.lv.scope = r.value; saveLv(); drawLv(); }));
-$('#lv-jump').addEventListener('click', () => { S.lv.rail = !S.lv.rail; saveLv(); renderRail(); $('#lv-jump').classList.toggle('active', S.lv.rail); });
+$('#lv-jump').addEventListener('click', () => { S.lv.rail = !S.lv.rail; saveLv(); lvDrawRail(); $('#lv-jump').classList.toggle('active', S.lv.rail); });
+// Drag the tree wider or narrower; the width is remembered, double-click (or
+// Home) puts it back, arrow keys nudge it for anyone not using a mouse.
+(() => {
+  const grip = $('#lv-grip');
+  const edge = () => $('#dlg-log .lv-shell').getBoundingClientRect().right;
+  let dragging = false;
+  grip.addEventListener('pointerdown', e => {
+    dragging = true;
+    document.body.classList.add('lv-resizing');
+    try { grip.setPointerCapture(e.pointerId); } catch { /* synthetic events */ }
+    e.preventDefault();
+  });
+  grip.addEventListener('pointermove', e => { if (dragging) lvSetRail(edge() - e.clientX); });
+  const end = () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('lv-resizing');
+    saveLv();
+  };
+  grip.addEventListener('pointerup', end);
+  grip.addEventListener('pointercancel', end);
+  grip.addEventListener('dblclick', () => { lvSetRail(LV_RAIL_DEF); saveLv(); });
+  grip.addEventListener('keydown', e => {
+    const step = e.shiftKey ? 64 : 24;
+    if (e.key === 'ArrowLeft') lvSetRail(lvRailW() + step);
+    else if (e.key === 'ArrowRight') lvSetRail(lvRailW() - step);
+    else if (e.key === 'Home') lvSetRail(LV_RAIL_DEF);
+    else return;
+    e.preventDefault();
+    saveLv();
+  });
+})();
+$('#lv-first').addEventListener('click', () => lvFocus(lvTurns()[0]?.rid));
 $('#lv-prev').addEventListener('click', () => lvStep(-1));
 $('#lv-next').addEventListener('click', () => lvStep(1));
-$('#lv-rail').addEventListener('click', e => {
-  const b = e.target.closest('.lv-item');
-  if (!b) return;
-  const t = $('#dlg-log [data-content]').querySelector(`[data-jmp="${b.dataset.jmp}"]`);
-  if (!t) return;
-  t.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  t.classList.add('flash');
-  setTimeout(() => t.classList.remove('flash'), 1200);
-  for (const x of $('#lv-rail').querySelectorAll('.lv-item')) x.classList.toggle('on', x === b);
-});
-$$('input[name="lv-fmt"]').forEach(r => r.addEventListener('change', () => { S.lv.fmt = r.value; saveLv(); drawLv(); }));
+$('#lv-last').addEventListener('click', () => lvFocus(lvTurns().at(-1)?.rid));
+$('#lv-reload').addEventListener('click', () => lvReload().catch(e => toast(e.message, false)));
+$('#lv-dl').addEventListener('click', () => lvDownload().catch(e => toast(e.message, false)));
+$$('input[name="lv-fmt"]').forEach(r => r.addEventListener('change', () => { S.lv.fmt = r.value; saveLv(); lvDraw({ scroll: true }); }));
 $('#client-filter').addEventListener('change', e => { S.clientFilter = e.target.value; render(); });
 $('#model-search').addEventListener('input', e => { S.modelQuery = e.target.value.trim().toLowerCase(); render(); });
 $('#model-show').addEventListener('change', e => { S.modelShow = e.target.value; render(); });
 $('#model-mode').addEventListener('change', e => setModelMode(e.target.value));
 $(`#ov-req-show input[value="${S.reqShow}"]`).checked = true;
-$(`#ov-req-view input[value="${S.reqView}"]`).checked = true;
 ['input', 'change'].forEach(t => $('#set-form').addEventListener(t, onSettingsInput));
 // Leaving with unsaved settings: the browser asks first.
 window.addEventListener('beforeunload', e => { if (S.draft.size) e.preventDefault(); });
 $('#ov-req-show').addEventListener('change', e => {
   S.reqShow = e.target.value;
   try { localStorage.setItem('omq.reqShow', S.reqShow); } catch { /* storage blocked */ }
-  render();
-});
-$('#ov-req-view').addEventListener('change', e => {
-  S.reqView = e.target.value;
-  try { localStorage.setItem('omq.reqView', S.reqView); } catch { /* storage blocked */ }
   render();
 });
 // The Filters modal writes the scope on Apply (Esc/Cancel discard the edits).

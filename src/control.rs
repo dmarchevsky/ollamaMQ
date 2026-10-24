@@ -2502,7 +2502,7 @@ mod tests {
             1,
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         );
@@ -2558,7 +2558,7 @@ mod tests {
             1,
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         );
@@ -2670,7 +2670,7 @@ mod tests {
                 max_concurrent_requests: 1,
                 backends: vec![],
             }],
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         );
@@ -2709,7 +2709,7 @@ mod tests {
             1,
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         );
@@ -2929,7 +2929,7 @@ mod tests {
             1, // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         ));
@@ -2979,7 +2979,7 @@ mod tests {
             1, // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         ));
@@ -3048,7 +3048,7 @@ mod tests {
             1,
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         );
@@ -3144,7 +3144,7 @@ mod tests {
             1, // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         ));
@@ -3208,7 +3208,7 @@ mod tests {
             1, // max concurrent per backend
             "appconf.yaml".into(),
             Vec::new(),
-            crate::reqlog::RequestLogger::disabled(),
+            crate::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         ));

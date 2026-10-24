@@ -3,10 +3,114 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
-## Unreleased
+## v0.17.0 — 2026-10-23
 
 ### Changed
 
+- **A streamed response is finally readable in Formatted.** The viewer rebuilds the stream into the
+  answer it produced (text, thinking, tool calls, finish reason, usage) instead of printing the wire, but
+  it only recognised a stream whose very first line was `data: {…}`. llama.cpp opens with a
+  `: keepalive` comment and keeps the socket warm with empty deltas, so real streams fell through to a
+  raw dump — a 156 KB wall of `data: {"id":…}` for one answer. Detection now looks at the first line
+  that carries payload, and the keep-alives, empty deltas and `[DONE]` are dropped from the view (`Raw`
+  still shows everything as captured).
+- **`+` now means one thing in the timeline: a moment.** Response and idle rows are durations, but they
+  wore the same `+` as the request stamps, so a column mixing `19:03:59`, `+52.5s`, `+45.2s` and `44.6s`
+  asked you to guess which were times and which were lengths. Request rows are moments (`+52.5s` after
+  the conversation began), response/idle/message rows are lengths (`45.2s`), and each tooltip says which
+  of the two it is.
+- **The `≣ View` chips are one column now.** The stage rows had no right inset, so their chips sat 9 px
+  outside the header chips; they share the inset now and the pills line up edge to edge.
+- **Conversation timestamps count from its start, not from the turn before.** Each request used to be
+  stamped with the gap since the previous one, so three turns spaced a steady 7 s apart read
+  `+7.0s | +7.0s` — a number that says nothing and repeats itself. Now the first request keeps the
+  absolute clock and every stamp after it counts continuously from the conversation's start
+  (`+7.0s`, `+14.0s`, `+21.0s`), in the log and the jump tree alike. Things that are lengths rather than
+  moments keep their length: a response's duration, an idle gap, the window that produced a message.
+- **The jump tree is resizable.** Drag its left edge — it widens to show tool names and message text, or
+  narrows to a glance beside the log — with `←`/`→` for the keyboard and double-click (or `Home`) to
+  reset to 292 px. The width is remembered, and on a phone, where the tree is a sheet across the top,
+  there is nothing to drag.
+- **The timeline reads like `dmesg -H` all the way down.** A conversation's first request keeps the
+  absolute clock (`17:30:14`); every request and node after it is a delta — `+18s` between two requests,
+  `+6.2s` for an idle gap, `+18.4s` for how long a response took — with the absolute time on hover. Idle
+  gaps are named from 5 s (was 30 s), so the seconds an agent spends running a tool show up in both the
+  log and the jump tree instead of looking like an instant.
+- **No `Held` row in the jump tree.** The tree lists only what each request added and says
+  `3 new · 7 held` on the request row; opening the held history stays a body action, where the messages
+  actually appear.
+- **Fonts on the Overview are consistent.** The `≣ View` chip inherited monospace from the stage row it
+  sits in, so the header's chip and the row's chip looked different; the chip now names the interface face
+  itself and is identical in both. The `By conversation / By request` switch on the Logs page also sits
+  on the toolbar line with the filter, the select and Pause instead of riding 7 px above them.
+- **A request in the viewer shows what it added, not the whole conversation again.** Every turn after the
+  first re-sends the entire history, so the viewer used to repeat it: turn 4 reprinted the messages turns
+  1–3 had already drawn. Each turn now collapses what it merely re-sent into one line —
+  `▸ 7 messages held from request 1 · system 1 · user 2 · assistant 2 · tool 2 · ≈799 B — show them here
+  too` — and clicking it (in the body or in the jump tree, which share the fold) puts those messages inside
+  that request too. The request line keeps both halves: `10 messages · 3 new this turn`.
+- **The jump tree and the log body are now one fold.** The caret on a request row in the tree and the caret
+  on the request's header in the body are the same control: folding either folds both, so the tree no
+  longer claims a request is open while the body has it shut. The tree's request row also says
+  `3 new · 7 held` now instead of a bare message count.
+- **Conversation headers and stage lines carry one and the same `≣ View` chip** (it said
+  `≣ view conversation` on the header), at the same right edge of the row.
+- **The Overview has one list now — Details — and it says how fast you are being served.**
+  The **List / Details** switch is gone (with it the phone's card layout and the wide twelve-column
+  table): the Activity panel always threads conversations, one line per stage event. A conversation
+  header now carries the rates an active session is getting instead of just the word `decode` or
+  `prefill`: `decode 88.7 t/s` from the live stream and `prefill 349 tok/s` measured on the last
+  finished request in that conversation — a request cannot time its own prefill, so while its first
+  token is still out the header shows `prefill 4.2s` and puts the last measured rate in its tooltip.
+  The `≣ view conversation` chip moved to the right edge of the header, where the stage lines below
+  already keep their `≣ View` chips, and both are now `cursor: pointer` (they used to show a text
+  cursor over their own label).
+- **The conversation viewer stops repeating itself, and the jump tree grew real timings.**
+  A turn no longer shows the messages the previous request already sent — those are on screen in
+  the turns above — so the `7 earlier messages, already sent in the previous request — expand`
+  fold is gone and the request line says `7 messages · 3 new this turn` instead; the downloaded
+  transcript does the same. In the `≡ Jump` tree each request carries one absolute clock (when it
+  arrived) and everything after it is a delta from that, dmesg `-H` style: the response row is
+  `+18.4s`, and a message row carries the measured window that produced it — a `TOOL` result is the
+  stretch between the previous answer ending and this request arriving, an `ASSIST` row the answer
+  that wrote it. System and user rows stay blank, because a message that arrives inside a request has
+  no instant of its own, and the tooltip says so instead of inventing a time. The tree is also
+  indented far tighter (34 px → 18 px per level), leaving the snippet the room it needs.
+  Along the way: three `//` comments in `app.css` — not CSS comments — were swallowing the rules for
+  `.capnote`, `.logs .sess` and `.lv-node` whole, so the capture banner, the session chip and the
+  tree layout were silently unstyled.
+- **The Logs page is one row per conversation by default.** A chat session makes twenty calls, and
+  twenty rows that each repeat part of the previous one hid what the session was doing. The table now
+  switches between **By conversation** — one row per client and session, naming the session as its
+  client labelled it and summing what it sent and got (`→ 4 req · 1.3 MB ← 200 · 92 KB`, with `waiting`
+  or `2 failed` when either is true) — and **By request**, the old one row per round, which is what a
+  single call that misbehaved needs. Control actions and traffic that sent no session token stand alone
+  in either view, and the choice is remembered across sessions. `GET /ui/api/logs` gained
+  `session_label`, so a row reads `#cache-warmup` instead of the six-hex tag. Clicking a grouped row
+  opens that conversation on its newest request, so the turns are walked without going back to the list.
+- **The request log is now one line per conversation (`v: 2`), and the log viewer follows it.**
+  A chat client resends its whole history every turn, so one line per request stored the same
+  messages over and over: `src/reqlog.rs` became `src/convlog.rs`, a conversation is one JSON
+  object that grows and is appended again once it has been quiet for `request_log_flush_secs`
+  (default 60 s) — the last line per `key` is the complete one, and startup re-seeds from the file's
+  tail. Every stage (queue, dispatch, first token, end) is now stamped with the unix time it happened,
+  so the Overview prints measured times instead of back-computing them from durations, and the idle
+  stretch between two turns can name the tools that ran in it. The viewer opens a **conversation**
+  (from a Logs row, or from any `≣ View` chip in Details), shows every turn as a block on one
+  timeline, folds the messages a turn resent from the previous one, walks request by request with
+  `⏮ ‹ › ⏭`, reloads, and downloads the conversation as a markdown transcript or as the log line;
+  `≡ Jump` is an expandable request tree. The `Whole / New only` switch is gone — the resent history
+  is folded per turn instead. Conversations whose capture was switched off render their full structure
+  and timeline with *capture turned off* where the text would be. The TUI's Requests panel and the
+  in-memory event ring are unchanged. **Breaking for log readers:** the JSONL format is `v: 2`, one
+  line per conversation; `v: 1` files are still rotated and never rewritten.
+- **Capture failure is now loud instead of silent.** Missing directories inside `request_log_path`
+  are created at startup, and a path that still cannot be opened (a container path like `/data/…` on
+  a host without one) falls back to `ollamamq-requests.jsonl` next to `appconf.yaml` with a warning
+  naming both paths. Before, that config booted with the log disabled and every Logs row failed to
+  open with the same message an aged-out conversation gives. `GET /ui/api/capture` reports whether
+  capture runs and where it writes; the Logs page shows the path, badges rows `not captured` and
+  explains when nothing is captured.
 - **Developer playbook only, no product change.** Three stale lines of the dev-flow playbook were
   replaced with what actually works. Dark-mode screenshots were lying: the recipe rewrote
   `prefers-color-scheme: dark` to `all`, which is not a valid media query, so the dark block never
@@ -17,6 +121,27 @@ since upstream `v0.5.0`.
   a round that stored text. And the test gate now runs `node --check` over the three embedded web
   bundles before `cargo test`, so a syntax error in `src/web/*.js` can no longer pass while the UI is
   broken.
+
+### Fixed
+
+- **A downloaded transcript wrote every request twice.** Each request section opened with two
+  `**Request**` lines — the plain one and the one carrying the message count — so the file a reviewer
+  got held a duplicated heading per request. The viewer never showed it (the duplicate lived only in
+  the markdown writer), and nothing looked at that file; the transcript is checked heading by heading
+  now.
+- **The jump tree folded everything else whenever you opened one request.** Body blocks and tree
+  nodes shared one open-set, and focusing a request replaced it (`LV.open = new Set([rid])`), so
+  expanding a node collapsed the rest — and because every node of the focused request was marked as
+  current, an expanded request painted a solid wall of highlight. Tree nodes now have their own
+  state, each request opens and closes independently, and only the row in view is marked. Clicking a
+  message row (`USER` / `ASSIST` / `TOOL`) now focuses *that message* — opening the turn, unfolding
+  the resent-history block if the message lives in it, scrolling it into view and flashing it —
+  instead of only scrolling to the request header. Only the request row and the response row carry a
+  clock time now (arrival and finish); the `req` row and the message rows dropped the request's
+  second repeated on every line, which read as a measurement that was never taken.
+- **`≡ View conversation` in Overview → Details failed for keyed traffic.** The chip sent the display
+  name (which becomes `client:key` when the identity filter is by key) where the store matches on the
+  client, so the viewer answered *no such conversation in the log*. It sends the client identity now.
 
 ## v0.16.0 — 2026-10-22
 

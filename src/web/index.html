@@ -52,14 +52,10 @@
             <label><input type="radio" name="req-show" value="active" checked><span>Active</span></label>
             <label><input type="radio" name="req-show" value="all"><span>All</span></label>
           </div>
-          <span class="btn-group" id="ov-fold" hidden>
+          <span class="btn-group" id="ov-fold">
             <button class="btn sm" data-action="fold-all" title="Expand all conversations" aria-label="Expand all conversations">⊞</button>
             <button class="btn sm" data-action="fold-none" title="Collapse all conversations" aria-label="Collapse all conversations">⊟</button>
           </span>
-          <div class="seg" id="ov-req-view" role="radiogroup" aria-label="List under the graph">
-            <label><input type="radio" name="req-view" value="list" checked><span>List</span></label>
-            <label><input type="radio" name="req-view" value="details"><span>Details</span></label>
-          </div>
         </div>
         <div id="ov-now"></div></div>
       <div class="panel"><div class="panel-h"><h2>Backends</h2><a href="#backends" class="more">Manage →</a></div><div class="tscroll" id="ov-backends"></div></div>
@@ -138,6 +134,10 @@
         <h1>Logs</h1>
         <div class="toolbar">
           <input type="search" id="log-filter" placeholder="Filter by user, model, backend, info…" autocomplete="off">
+          <div class="seg" id="log-group" role="radiogroup" aria-label="One row per conversation or per request">
+            <label><input type="radio" name="log-group" value="session" checked><span>By conversation</span></label>
+            <label><input type="radio" name="log-group" value="request"><span>By request</span></label>
+          </div>
           <select id="log-dir">
             <option value="">All</option><option value="awaiting">Awaiting response</option><option value="CTL">Control</option>
           </select>
@@ -270,27 +270,29 @@
 
 <dialog id="dlg-log" class="logview">
   <div class="lv-head">
-    <div class="lv-title"><b data-title>Log</b><span class="lv-sub" data-sub></span></div>
+    <div class="lv-title"><b data-title>Conversation</b><span class="lv-sub" data-sub></span></div>
     <div class="lv-tools">
-      <div class="seg" id="lv-scope" role="radiogroup" aria-label="Request scope" title="Request only: everything the client sent, or only what is new since its previous round">
-        <label><input type="radio" name="lv-scope" value="whole"><span>Whole</span></label>
-        <label><input type="radio" name="lv-scope" value="new"><span>New only</span></label>
-      </div>
-      <div class="seg" id="lv-fmt" role="radiogroup" aria-label="Format">
+      <div class="seg" id="lv-fmt" role="radiogroup" aria-label="Format" title="Raw stores as captured, Formatted as a transcript">
         <label><input type="radio" name="lv-fmt" value="raw"><span>Raw</span></label>
         <label><input type="radio" name="lv-fmt" value="fmt"><span>Formatted</span></label>
       </div>
-      <button class="btn sm" id="lv-jump" title="show the message outline">≣ Jump</button>
+      <button class="btn sm" id="lv-dl" title="download this conversation (the format above decides which)">⤓ Download</button>
+      <button class="btn sm" id="lv-jump" title="show the request tree">≣ Jump</button>
+      <button class="btn sm" id="lv-reload" title="reload — pull in the newest turns">⟳</button>
       <div class="lv-nav">
-        <button class="btn sm" id="lv-prev" title="newer round" aria-label="newer round">↑</button>
-        <button class="btn sm" id="lv-next" title="older round" aria-label="older round">↓</button>
+        <button class="btn sm" id="lv-first" title="first request" aria-label="first request">⏮</button>
+        <button class="btn sm" id="lv-prev" title="previous request" aria-label="previous request">‹</button>
+        <button class="btn sm" id="lv-next" title="next request" aria-label="next request">›</button>
+        <button class="btn sm" id="lv-last" title="last request" aria-label="last request">⏭</button>
       </div>
     </div>
     <button class="btn sm lv-close" data-action="log-close" aria-label="Close">X</button>
   </div>
   <div class="lv-shell">
     <div class="lv-body"><div class="lv-wrap" data-content></div></div>
-    <aside class="lv-rail" id="lv-rail" aria-label="Jump to message" hidden></aside>
+    <div class="lv-grip" id="lv-grip" role="separator" aria-orientation="vertical" tabindex="0"
+      aria-label="Resize the request tree" title="Drag to resize the tree · double-click or Home to reset" hidden></div>
+    <aside class="lv-rail" id="lv-rail" aria-label="Jump to request" hidden></aside>
   </div>
 </dialog>
 
