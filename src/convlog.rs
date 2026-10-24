@@ -598,7 +598,7 @@ impl ConvStore {
             .map(|(k, e)| (e.last_ms, e.dirty, k.clone()))
             .collect();
         // Clean before dirty, quietest first.
-        quiet_first.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+        quiet_first.sort_by_key(|a| (a.1, a.0));
         for (_, dirty, key) in quiet_first {
             if self.content_bytes <= MAX_CONTENT_BYTES && self.entries.len() <= MAX_CONVS {
                 break;
@@ -685,7 +685,7 @@ impl ConvStore {
 
     fn summaries(&self, limit: usize) -> Vec<ConvSummary> {
         let mut rows: Vec<&Conv> = self.entries.values().map(|e| &e.conv).collect();
-        rows.sort_by(|a, b| b.end_ms.cmp(&a.end_ms));
+        rows.sort_by_key(|c| std::cmp::Reverse(c.end_ms));
         rows.into_iter()
             .take(limit)
             .map(|c| ConvSummary {
@@ -743,18 +743,18 @@ impl ConvLogger {
         max_files: usize,
         flush_idle: Duration,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), std::io::Error> {
-        if let Some(dir) = std::path::Path::new(&path).parent() {
-            if !dir.as_os_str().is_empty() {
-                // A directory in the way is as fatal as an unwritable parent:
-                // better to report the open failure than to log next to it.
-                if dir.exists() && !dir.is_dir() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotADirectory,
-                        format!("{} is not a directory", dir.display()),
-                    ));
-                }
-                std::fs::create_dir_all(dir)?;
+        if let Some(dir) = std::path::Path::new(&path).parent()
+            && !dir.as_os_str().is_empty()
+        {
+            // A directory in the way is as fatal as an unwritable parent:
+            // better to report the open failure than to log next to it.
+            if dir.exists() && !dir.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!("{} is not a directory", dir.display()),
+                ));
             }
+            std::fs::create_dir_all(dir)?;
         }
         std::fs::OpenOptions::new()
             .create(true)
@@ -1054,16 +1054,22 @@ fn seed_from_tail(path: &str) -> Vec<Conv> {
 }
 
 /// Writer task: every `SWEEP`, append the conversations that have gone quiet.
-async fn writer_loop(
-    file: Arc<FileTarget>,
-    store: Arc<Mutex<ConvStore>>,
-    flush_idle: Duration,
-) {
+async fn writer_loop(file: Arc<FileTarget>, store: Arc<Mutex<ConvStore>>, flush_idle: Duration) {
     // Continue sizing from the existing file so restarts keep rotation honest.
     let mut current_size = tokio::fs::metadata(&file.path)
         .await
         .map(|m| m.len())
         .unwrap_or(0);
+    // One handle, kept open across sweeps: a flush is one line per changed
+    // conversation, and opening and closing the file for each of them was pure
+    // overhead. It is dropped before a rotation and reopened afterwards.
+    let mut handle: Option<tokio::fs::File> = open_append(&file.path).await.ok();
+    if handle.is_none() {
+        warn!(
+            "conversation log: cannot open {} for writing yet; will retry on the next flush",
+            file.path
+        );
+    }
     // Wake at least as often as the flush target, so a short
     // `request_log_flush_secs` is honoured instead of rounded up to the sweep.
     let mut ticker = tokio::time::interval(SWEEP.min(flush_idle.max(Duration::from_millis(10))));
@@ -1073,10 +1079,28 @@ async fn writer_loop(
         let pending = take_pending(&store, flush_idle);
         for (line, key, rev) in pending {
             if current_size + line.len() as u64 > file.max_bytes {
-                rotate(&file.path, file.max_files).await;
-                current_size = 0;
+                // Nothing may hold the old file while it is renamed, or the
+                // writer would keep appending to the rotated copy.
+                drop(handle.take());
+                match rotate(&file.path, file.max_files).await {
+                    Ok(()) => current_size = 0,
+                    Err(e) => {
+                        // Resetting the size to 0 here would disable rotation
+                        // for good: every later check would start from zero and
+                        // the file would grow past its ceiling in silence.
+                        current_size = tokio::fs::metadata(&file.path)
+                            .await
+                            .map(|m| m.len())
+                            .unwrap_or(current_size);
+                        warn!(
+                            "conversation log: rotation of {} failed ({e}); appending to it and \
+                             keeping its real size ({} B) so the {} B ceiling still bites",
+                            file.path, current_size, file.max_bytes
+                        );
+                    }
+                }
             }
-            match append(&file.path, &line).await {
+            match append(&mut handle, &file.path, &line).await {
                 Ok(n) => current_size += n,
                 Err(e) => {
                     warn!("conversation log: failed to append to {}: {}", file.path, e);
@@ -1106,33 +1130,77 @@ async fn open_append(path: &str) -> Result<tokio::fs::File, std::io::Error> {
         .await
 }
 
-/// Append one flushed line, so a tailing reader never sees half a conversation.
-/// Returns the bytes written.
-async fn append(path: &str, line: &str) -> Result<u64, std::io::Error> {
-    let mut f = open_append(path).await?;
+/// Append one flushed line through the shared handle (reopened when it is not
+/// open), so a tailing reader never sees half a conversation. A failed write
+/// drops the handle, so the next call starts from a fresh one. Returns the bytes
+/// written.
+async fn append(
+    handle: &mut Option<tokio::fs::File>,
+    path: &str,
+    line: &str,
+) -> Result<u64, std::io::Error> {
+    if handle.is_none() {
+        *handle = Some(open_append(path).await?);
+    }
     let mut buf = String::with_capacity(line.len() + 1);
     buf.push_str(line);
     buf.push('\n');
-    f.write_all(buf.as_bytes()).await?;
-    f.flush().await?;
-    Ok(buf.len() as u64)
+    let f = handle
+        .as_mut()
+        .expect("the handle is open on this path through the function");
+    match f.write_all(buf.as_bytes()).await {
+        Ok(()) => match f.flush().await {
+            Ok(()) => Ok(buf.len() as u64),
+            Err(e) => {
+                *handle = None;
+                Err(e)
+            }
+        },
+        Err(e) => {
+            *handle = None;
+            Err(e)
+        }
+    }
 }
 
 /// Shift the rotation chain: `{path}.{max_files-1}` is deleted, each existing
 /// `{path}.{i}` moves up one slot (missing files skipped), and the current file
-/// becomes `{path}.0`.
-async fn rotate(path: &str, max_files: usize) {
+/// becomes `{path}.0`. Reports the first failure instead of swallowing it: the
+/// caller has to keep the file's true size when the chain did not move.
+async fn rotate(path: &str, max_files: usize) -> Result<(), String> {
+    // Nothing on disk to move (deleted out of band, or a first write that has
+    // not happened yet): the caller's next append recreates the file, so this
+    // is not a failure.
+    if tokio::fs::metadata(path).await.is_err() {
+        return Ok(());
+    }
+    let mut failed: Option<String> = None;
+    let note = |what: &str, e: std::io::Error, failed: &mut Option<String>| {
+        if failed.is_none() {
+            *failed = Some(format!("{what}: {e}"));
+        }
+    };
     let oldest = format!("{}.{}", path, max_files - 1);
-    let _ = tokio::fs::remove_file(&oldest).await;
+    if let Err(e) = tokio::fs::remove_file(&oldest).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        note("cannot drop the oldest file", e, &mut failed);
+    }
     for i in (0..max_files.saturating_sub(1)).rev() {
         let from = format!("{}.{}", path, i);
         if tokio::fs::metadata(&from).await.is_ok() {
             let to = format!("{}.{}", path, i + 1);
-            let _ = tokio::fs::rename(&from, &to).await;
+            if let Err(e) = tokio::fs::rename(&from, &to).await {
+                note("cannot shift", e, &mut failed);
+            }
         }
     }
-    if tokio::fs::metadata(path).await.is_ok() {
-        let _ = tokio::fs::rename(path, format!("{}.0", path)).await;
+    if let Err(e) = tokio::fs::rename(path, format!("{}.0", path)).await {
+        note("cannot rotate the current file", e, &mut failed);
+    }
+    match failed {
+        None => Ok(()),
+        Some(e) => Err(e),
     }
 }
 
@@ -1294,6 +1362,39 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A rotation that cannot move the chain has to say so: the caller keeps
+    /// the file's real size only when it learns the chain did not move, and a
+    /// silent success would disable rotation for the rest of the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rotate_reports_a_chain_it_cannot_move() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ollamamq_rotate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("log.jsonl");
+        std::fs::write(&path, "{\"v\":2}\n").expect("write log");
+        // No rename may happen in the log's directory (a read-only mount, the
+        // case this exists for).
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let outcome = rotate(path.to_str().expect("utf-8 path"), 2).await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+        let err = outcome.expect_err("renaming into a read-only directory must fail");
+        assert!(!err.is_empty(), "the failure names what went wrong");
+        assert!(
+            std::fs::metadata(&path).is_ok(),
+            "a failed rotation leaves the current file alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rotating_a_log_that_is_not_there_is_not_a_failure() {
+        let path = tmp("never-written.jsonl");
+        let _ = std::fs::remove_file(&path);
+        rotate(&path, 3).await.expect("nothing to move");
+    }
+
     #[tokio::test]
     async fn resume_rewrites_the_newest_line_for_a_key() {
         let path = tmp("resume.jsonl");
@@ -1303,14 +1404,14 @@ mod tests {
             log.note(begin("carol#c1", 1, 1000));
             log.note(resp("carol#c1", 1, 2000));
             let (line, key, rev) = take_pending(&log.store, Duration::ZERO).remove(0);
-            append(&path, &line).await.unwrap();
+            append(&mut None, &path, &line).await.unwrap();
             log.store.lock_or_recover().entries.get_mut(&key).unwrap().dirty = false;
             let _ = rev;
             // The conversation resumes: one longer line, same key.
             log.note(begin("carol#c1", 2, 9000));
             log.note(resp("carol#c1", 2, 9500));
             let (line2, _, _) = take_pending(&log.store, Duration::ZERO).remove(0);
-            append(&path, &line2).await.unwrap();
+            append(&mut None, &path, &line2).await.unwrap();
             handle.abort();
         }
         let lines = read_lines(&path);
@@ -1337,7 +1438,7 @@ mod tests {
             log.note(begin("dave#d1", 1, 1000));
             log.note(resp("dave#d1", 1, 2000));
             let (line, _, _) = take_pending(&log.store, Duration::ZERO).remove(0);
-            append(&path, &line).await.unwrap();
+            append(&mut None, &path, &line).await.unwrap();
             // Shorter/older view of the same key must not overwrite the newer one.
             let (log2, h2) =
                 ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();

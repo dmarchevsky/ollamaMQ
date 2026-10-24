@@ -354,6 +354,68 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// Bytes this process may grow to, as its control group says. Both cgroup
+/// layouts are checked, because a container gets whichever the host runs:
+/// v2 `memory.max` holds `max` when unlimited, v1
+/// `memory/memory.limit_in_bytes` holds an enormous sentinel instead. `None`
+/// means "nothing bounds us here" — a bare host, or an unreadable cgroup.
+pub fn memory_limit() -> Option<u64> {
+    let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max");
+    if let Ok(text) = v2 {
+        return parse_limit(&text);
+    }
+    let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    match v1 {
+        Ok(text) => parse_limit(&text),
+        Err(_) => None,
+    }
+}
+
+fn parse_limit(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text == "max" {
+        return None;
+    }
+    // v1 writes something near u64::MAX for "no limit"; anything that big is
+    // not a limit anyone set on purpose.
+    let bytes = text.parse::<u128>().ok()?;
+    if bytes >= 1 << 62 {
+        return None;
+    }
+    Some(bytes as u64)
+}
+
+/// What the request queue is actually allowed to hold. A queue may never be
+/// sized so that filling it is itself the out-of-memory event: the whole point
+/// of `max_queued_bytes` is to shed load instead of absorbing it, and a limit
+/// above half the container's memory does the opposite — the bodies it keeps
+/// resident are what gets killed. So the ceiling is halved when it would
+/// otherwise eat more than half of what the box has, and the operator hears
+/// about it rather than finding out from a restart loop.
+pub fn queue_budget(asked: u64) -> u64 {
+    let limit = memory_limit();
+    let budget = clamp_queue_budget(asked, limit);
+    if budget != asked {
+        tracing::warn!(
+            "settings.max_queued_bytes is {} B but this process may only grow to {} B; \
+             the queue ceiling is {} B (half of it) so a flood is shed, not absorbed",
+            asked,
+            limit.unwrap_or(0),
+            budget
+        );
+    }
+    budget
+}
+
+/// The pure half of [`queue_budget`], so the rule can be tested without a
+/// cgroup to argue with.
+pub fn clamp_queue_budget(asked: u64, limit: Option<u64>) -> u64 {
+    match limit {
+        Some(limit) if asked > limit / 2 => limit / 2,
+        _ => asked,
+    }
+}
+
 impl Settings {
     /// `self` with every value `top` sets replacing this one's.
     pub fn overlay(&self, top: &Settings) -> Settings {
@@ -641,6 +703,34 @@ models:
             .err()
             .unwrap()
             .contains("-5"));
+    }
+
+    /// The queue may not be sized so that filling it is the out-of-memory event.
+    #[test]
+    fn a_queue_bigger_than_the_box_is_halved() {
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        // The shipped pair: 512 MiB of queue inside a 1 GiB container — exactly
+        // half, so nothing is lowered.
+        assert_eq!(clamp_queue_budget(512 * mib, Some(gib)), 512 * mib);
+        // Anything above half gives way to half.
+        assert_eq!(clamp_queue_budget(gib, Some(gib)), gib / 2);
+        assert_eq!(clamp_queue_budget(2 * gib, Some(3 * gib / 4)), 3 * gib / 8);
+        // A small ask in a small box is left alone (it is already under half).
+        assert_eq!(clamp_queue_budget(64 * mib, Some(gib)), 64 * mib);
+        // No limit: the setting stands, since nothing bounds the process.
+        assert_eq!(clamp_queue_budget(4 * gib, None), 4 * gib);
+    }
+
+    /// `max` in v2 and a sentinel near `u64::MAX` in v1 both mean unlimited.
+    #[test]
+    fn an_unlimited_cgroup_is_not_a_memory_limit() {
+        assert_eq!(parse_limit("max\n"), None);
+        assert_eq!(parse_limit("9223372036854771712\n"), None);
+        assert_eq!(parse_limit("1073741824\n"), Some(1073741824));
+        assert_eq!(parse_limit("  268435456 "), Some(268435456));
+        assert_eq!(parse_limit("not a number"), None);
+        assert_eq!(parse_limit(""), None);
     }
 
     #[test]

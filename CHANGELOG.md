@@ -3,15 +3,70 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
-## Unreleased
+## v0.18.0 — 2026-10-24
 
-- **Developer playbook only, no product changes.** The live-walk recipe now runs the worktree
-  binary against the repo's own `config/appconf.yaml` by absolute path — the v0.17.0 log-path
-  fallback (capture lands next to appconf.yaml when `request_log_path` is unwritable) makes the
-  old `live/` config-copy workaround obsolete, and a copy risked a login the operator could not
-  use. Two checks the dev-flow gates now enforce explicitly: the test instance on :8081 is killed
-  before `flow finish`, and the worktree is free of uncommitted paths before `flow release`
-  (v0.17.0 shipped with a review fix to `app.css` left uncommitted).
+### Breaking
+
+- **`/admin/*` fails closed.** Model control (`GET /admin/models`, `POST /admin/models/load`,
+  `POST /admin/models/unload`) used to follow the proxy's *optional* key: with `OLLAMA_MQ_API_KEY`
+  unset — the usual single-machine setup, and the one the dashboard is built for — anyone who could
+  reach the port could read the fleet and load or unload models on it. Those routes now answer to
+  the operator: the proxy key when one is set, else the dashboard's own credential (a session
+  cookie or `curl -u user:pass`), and only when neither exists, an enabled client key from
+  `keys.toml`. Anything else gets `403` naming what to configure, and the startup log now says
+  which door is open. A script that called `/admin/*` with no credential needs one now.
+
+### Fixed
+
+- **The queue ceiling no longer outgrows its container.** `docker-compose.yml` shipped `mem_limit: 256m`
+  against a default `max_queued_bytes` of 512 MiB: the flood defence was an OOM restart instead of a
+  `503`. The limit is now 1 GiB, and the proxy reads its own cgroup limit (`memory.max`, or
+  `memory/memory.limit_in_bytes` under v1) and halves a queue ceiling above half of it, logging that
+  it did — in the shipped container and in any other. The clamp also applies when the setting is
+  changed live, so raising it in the UI cannot reopen the hole.
+- **A failed log rotation stopped rotating, forever.** `rotate()` swallowed every error and the writer
+  zeroed its running size regardless, so when a rename failed (a read-only mount) the conversation log
+  kept appending past `request_log_max_bytes` and the accounting said zero from then on. The writer now
+  logs the failure once per attempt and re-reads the file's real size, so the ceiling keeps biting.
+- **A crash cost a minute of conversations, not five seconds.** `request_log_flush_secs` defaulted to
+  60: an open conversation was written out only after a minute of quiet, which is exactly the
+  conversation that was in flight. The default is 5 s.
+- **The model list stopped re-probing the fleet on every poll.** `GET /v1/models` asked every online
+  backend for its models on each call, so a dashboard left open on the Models page kept hitting all of
+  them several times a second. Results are cached for 2 s (and dropped when the backend set changes),
+  and the probes go out 8 at a time instead of all at once.
+- **Idle cost, twice over.** The per-second snapshot cloned the whole 20 k-request history to sum
+  prefill/waste seconds per backend, and the 10 fps change-detection diff compared every captured
+  request and response body (up to 1 MiB each) even though the view shows a 30-character preview. The
+  waste totals are now counters accumulated as requests finish, and the snapshot carries a preview and
+  a "has text" flag instead of the text; opening a row fetches that row's text by `rid`. A proxy with
+  nothing happening stopped copying megabytes per second to prove nothing had changed.
+- **A forged `X-User-ID` could squat in the identity column.** The header arrived verbatim and was
+  displayed and labelled as-is, so a client could send an id that looked like a key holder's namespace
+  or a 5 KB blob. It is now clipped to 64 printable ASCII characters, control characters and
+  whitespace collapse to `-`, `:` is dropped, and the header still reaches backends unchanged.
+- A deprecated `fetch_update` call site moved to `try_update`.
+
+### Added
+
+- **CI.** `.github/workflows/test.yml` runs on every push and PR: clippy with `-D warnings`,
+  `cargo test`, `node --check` on the three dashboard scripts, and the end-to-end suite against the
+  mock backends. Until now the only workflow ran on a release tag, so the first person to
+  see a broken build or a failing test was whoever tagged it.
+- **The tree is clippy-clean**, so that gate means something: 23 findings went away — let-chains over
+  nested `if`s, `sort_by_key`, two long tuples given names, a derived `Default`, and a test that held a
+  client-store lock across an `await`. Two `too_many_arguments` stay, allowed where they are, because
+  those argument lists *are* the rows the functions draw.
+- **`.gitignore` covers what the tooling drops in the tree**: config and log archives.
+
+### Removed
+
+- `test_dispatcher.sh`, its `demo-test.gif` and the README section pointing at them: a 149-line
+  script that hammered a running proxy with 50 fake users, was not a test anyone could run unattended,
+  and had already drifted from the API it exercised. The README's Development section now names the two
+  suites that do run.
+- A dead design note (`docs/plan-system-one-backends.md`, the decisions it describes shipped long ago)
+  and a test helper nothing called.
 
 ## v0.17.0 — 2026-10-23
 

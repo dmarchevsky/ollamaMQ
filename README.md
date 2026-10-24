@@ -169,7 +169,13 @@ Models can be loaded and unloaded on connected backends without touching the bac
 - Plain OpenAI backends (vLLM, etc.) have no control API and are rejected with a clear error.
 - **System One decision-model servers (CLM, Laya, Kev)** have no model-control API either — no load/unload, no `keep_alive`, not even `/api/ps`. Residency is configured on the server itself (e.g. `LAYA_PRELOAD`, `LAYA_MAX_LOADED`), so a `models:` entry for these backends only makes the name routable and pins it; it never starts a load.
 
-All three endpoints are served by the proxy itself (they are never proxied to a backend) and are protected by the same optional `OLLAMA_MQ_API_KEY` auth as the proxy routes.
+All three endpoints are served by the proxy itself (they are never proxied to a backend). They are **not** open by default: an admin call is accepted from
+
+1. the proxy key, when `OLLAMA_MQ_API_KEY` is set (`Authorization: Bearer <key>` or `X-API-Key`),
+2. otherwise the dashboard's own credential — a live session cookie, or the same user and password as HTTP basic auth (`curl -u admin:…`). The cookie is set with `Path=/ui`, so a browser will not offer it to `/admin/*` on its own; pass it yourself (`curl -b omq_session=…`). This works whether or not the dashboard is listening on this interface: the credential is what counts, so an operator can keep `settings.web_ui.listen` on `127.0.0.1` and still administer over the network,
+3. otherwise — and only when neither of the above exists — any **enabled** client key from `keys.toml`.
+
+Anything else gets `403` with a body naming what to configure, and the startup log says which door is open (or that the control is closed). A client key is the last resort rather than the rule: a box full of client keys is not a box whose clients may reconfigure it. The dashboard's own model controls go through `/ui/api/*` and follow the dashboard's login.
 
 #### `GET /admin/models`
 
@@ -211,23 +217,25 @@ Responses:
 | `409`  | Conflict — another control operation is already in flight on that backend, or the backend is busy with active requests. |
 
 ```bash
-# Load (llama3 resolves to llama3:latest)
+# Load (llama3 resolves to llama3:latest). ADMIN stands for the credential the
+# box accepts — the proxy key, or `-u admin:<password>` for the dashboard's.
+ADMIN='Authorization: Bearer supersecret'
 curl -s -X POST http://localhost:11435/admin/models/load \
-  -H "Content-Type: application/json" \
+  -H "$ADMIN" -H "Content-Type: application/json" \
   -d '{"backend": 0, "model": "llama3"}'
 
 # Unload by URL (frees GPU memory on Ollama)
 curl -s -X POST http://localhost:11435/admin/models/unload \
-  -H "Content-Type: application/json" \
+  -H "$ADMIN" -H "Content-Type: application/json" \
   -d '{"backend": "http://10.0.0.2:11434", "model": "qwen2.5:7b"}'
 
 # Let the proxy pick a backend
 curl -s -X POST http://localhost:11435/admin/models/load \
-  -H "Content-Type: application/json" \
+  -H "$ADMIN" -H "Content-Type: application/json" \
   -d '{"backend": "any", "model": "llama3:latest"}'
 
-# With API-key auth enabled
-curl -s http://localhost:11435/admin/models -H "Authorization: Bearer supersecret"
+# The inventory, with the dashboard's credential instead
+curl -s -u admin:change-me http://localhost:11435/admin/models | python3 -m json.tool
 ```
 
 **Note:** Ollama keeps a model loaded for `keep_alive` seconds only (its own default is 5 minutes). A control "load" sends the `--load-keep-alive` value (default 24 h) so the model actually stays resident; an "unload" sends `keep_alive: 0`.
@@ -345,7 +353,7 @@ settings:
   request_log_path: ollamamq-requests.jsonl   # conversation JSONL log file (default shown)
   request_log_max_bytes: 10485760             # rotate when the file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
-  request_log_flush_secs: 60                  # quiet time after which a conversation is written out (default 60)
+  request_log_flush_secs: 5                   # quiet time after which a conversation is written out (default 5)
   log_content_limit: 1048576                  # max body bytes captured per request, min 1024 (default 1 MiB)
   clients_file: clients.yaml   # clients and their API keys, managed from the web UI (default shown)
   models_file: models.yaml     # model filter rules, managed from the web UI (default shown)
@@ -412,7 +420,7 @@ Each turn is one proxied request and its response:
 | `redacted` | body capture was switched off for this turn |
 | `content` | `req`/`resp` captured text, cut to `log_content_limit` with a `...[truncated: N bytes total]` marker; absent when nothing was stored |
 
-**When a line is written.** A conversation is appended once it has been quiet for `request_log_flush_secs` (default 60 s), and a longer line follows if it resumes, so **the last line for a `key` is the complete one** — readers take that and ignore earlier lines of the same key. Earlier lines of the same key are therefore *superseded snapshots*, not separate conversations: each one contains what the conversation had up to that point, which is why consecutive lines overlap (the newer response of line 1 appears again inside line 2, because the client resent it). Appending is kept instead of rewriting in place so a crash mid-flush costs at most the last line. Folding the file by `key` and keeping the longest line per key yields exactly **one record per conversation**. At startup the log re-seeds from the file's tail, so open conversations survive a restart without reading the whole file. The in-memory log keeps the 200 most recent conversations and at most 64 MiB of captured text.
+**When a line is written.** A conversation is appended once it has been quiet for `request_log_flush_secs` (default 5 s — a crash should cost the last few seconds of a conversation, not the last minute; nothing is `fsync`-ed, so a hard power loss can still take what the operating system had not written), and a longer line follows if it resumes, so **the last line for a `key` is the complete one** — readers take that and ignore earlier lines of the same key. Earlier lines of the same key are therefore *superseded snapshots*, not separate conversations: each one contains what the conversation had up to that point, which is why consecutive lines overlap (the newer response of line 1 appears again inside line 2, because the client resent it). Appending is kept instead of rewriting in place so a crash mid-flush costs at most the last line. Folding the file by `key` and keeping the longest line per key yields exactly **one record per conversation**. At startup the log re-seeds from the file's tail, so open conversations survive a restart without reading the whole file. The in-memory log keeps the 200 most recent conversations and at most 64 MiB of captured text.
 
 **Where the file goes, and what happens if it cannot be opened.** Missing directories inside `request_log_path` are created at startup. A path that still cannot be opened — a container path such as `/data/…` on a host without one — falls back to `ollamamq-requests.jsonl` next to `appconf.yaml`, the store folder the other state files live in, and the log says so (`conversation log: <configured> is unusable here, writing to <actual> instead`) instead of starting with capture off and leaving every log row unopenable. Capture applies from boot: changing the path in Settings takes effect on restart. The Logs page shows the path being written to, and when nothing could be opened it says so above the table and badges the rows `not captured`.
 
@@ -422,7 +430,7 @@ Each turn is one proxied request and its response:
 - A **key** rule covers that key's requests in both directions. Redaction is an opt-out: a key whose client is marked stays covered whatever the key says.
 - A **backend** rule covers the **response** text of requests it served. A request's own text is logged before a backend is chosen, so that half is the client/key's job.
 
-**Rotation:** when the file exceeds `request_log_max_bytes` it is renamed to `.0` (existing `.0` → `.1`, etc.), at most `request_log_max_files` rotated files are kept and the oldest is deleted. The current file size is re-read at startup, so sizing/rotation survives restarts.
+**Rotation:** when the file exceeds `request_log_max_bytes` it is renamed to `.0` (existing `.0` → `.1`, etc.), at most `request_log_max_files` rotated files are kept and the oldest is deleted. The current file size is re-read at startup, so sizing/rotation survives restarts. When a rotation cannot happen at all (a read-only mount), the writer says so and keeps appending to the current file, tracking its real size so the ceiling stays honest rather than silently resetting to zero.
 
 **TUI:** the bottom "Requests" panel shows the newest live log events (one line per request and per response, from the in-memory ring) with a one-line content preview; press **Enter** on a row for the full-content detail view (`j`/`k` or `PgUp`/`PgDn` scroll, `q`/`Esc`/`Enter` close). It is independent of the file format above.
 
@@ -497,6 +505,8 @@ When a key is set, every request **except `/health`** must present it via one of
 - `X-API-Key: <key>`
 
 The key of any enabled client (see *Web UI, Clients & API Keys* below) is accepted too. Requests with a missing or wrong key get `401 Unauthorized` (`{"error":"unauthorized"}`). The `/health` endpoint always stays unauthenticated so health checks and Docker healthchecks keep working.
+
+`/admin/*` keeps its own rule and does **not** inherit this one — see [Model Control](#model-control-admin-api). It fails closed: with no proxy key and no dashboard password it answers `403` to everyone, client keys included, until you create a credential. `/health` and `/metrics` are outside both rules.
 
 ```bash
 # Enable auth
@@ -588,7 +598,7 @@ The **Settings** page edits `appconf.yaml` itself while the proxy runs.
 It also manages **clients and their API keys**. The Clients page is one list with two levels (filter with *All / Registered / Unregistered*): a row per id, and — while that row is open — the client's keys beneath it. *Expand all / Collapse all* works over the whole list.
 
 - **Registered clients** are created in the UI and saved in `clients.yaml`. They authenticate with their API keys and are listed even when idle.
-- **Unregistered ids** are what requests without a key are queued under: their `X-User-ID`, or the IP a front proxy fills in, else `anonymous`. They live in memory and drop off the list after an hour idle. **Register** turns one into a client of the same name and opens the add-key dialog.
+- **Unregistered ids** are what requests without a key are queued under: their `X-User-ID`, or the IP a front proxy fills in, else `anonymous`. The value is sanitised before it is used — clipped to 64 characters, control characters and runs of whitespace collapsed to `-`, and anything outside printable ASCII dropped — because it arrives from the client and is shown in the dashboard and in metrics labels verbatim otherwise. `:` is stripped so no caller can forge the namespace the proxy reserves for its own identities. The header itself still reaches the backend unchanged. They live in memory and drop off the list after an hour idle. **Register** turns one into a client of the same name and opens the add-key dialog.
 
 - Create a client (its name becomes its queue id), then add keys — **generated** (`omq-…`) or **any string you choose** (8–256 printable characters, unique across clients). A key is opened from its row to **edit** (label, log capture) or **delete**; a client can be renamed, disabled (its keys get `403`) or deleted. A key always belongs to the client it was created for — moving one means deleting it and handing out a new one.
 - Each client row carries **VIP**, **boost**, **Block IP**, **+ Key** and **Disable**/**Enable**; each key row carries **Edit** and **Delete**.
@@ -832,15 +842,10 @@ docker run -d \
 
 ## 🧪 Development
 
-### Stress Testing
-
-You can use the provided `test_dispatcher.sh` script to simulate multiple users and verify the dispatcher's behavior under load:
-
 ```bash
-./test_dispatcher.sh
+cargo test                    # unit tests: routing, sessions, queueing, the log
+bash tests/e2e/run.sh         # model load/unload and the admin gate, against mock backends
 ```
-
-![ollamaMQ Stress Test](demo-test.gif)
 
 ## 📝 License
 

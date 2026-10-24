@@ -283,7 +283,7 @@ async fn main() {
     let request_log_max_bytes = eff.request_log_max_bytes.unwrap_or(10 * 1024 * 1024);
     let request_log_max_files = eff.request_log_max_files.unwrap_or(5);
     let request_log_flush =
-        std::time::Duration::from_secs(eff.request_log_flush_secs.unwrap_or(60));
+        std::time::Duration::from_secs(eff.request_log_flush_secs.unwrap_or(5));
     let log_content_limit = eff
         .log_content_limit
         .map(|v| v.max(1024))
@@ -292,7 +292,9 @@ async fn main() {
     // backend takes it), so the body limit is a per-request memory commitment.
     // It used to be a flat 1 GiB on every route.
     let max_body_bytes = eff.max_body_bytes.unwrap_or(64 * 1024 * 1024);
-    let max_queued_bytes = eff.max_queued_bytes.unwrap_or(512 * 1024 * 1024);
+    // Clamped to the container's own memory: a queue that can outgrow the box
+    // holding it is not a limit (see `config::queue_budget`).
+    let max_queued_bytes = config::queue_budget(eff.max_queued_bytes.unwrap_or(512 * 1024 * 1024));
     let clients_file = store_file("clients_file", eff.clients_file.clone(), clients::DEFAULT_CLIENTS_FILE);
     let models_file = store_file("models_file", eff.models_file.clone(), model_policy::DEFAULT_MODELS_FILE);
     layers.resolved = resolved;
@@ -530,6 +532,17 @@ async fn main() {
     let api_key = std::env::var("OLLAMA_MQ_API_KEY")
         .ok()
         .filter(|k| !k.is_empty());
+    // The dashboard's credentials and sessions, as a handle shared with the
+    // admin gate: a password changed in the UI is a new credential for both.
+    let web_state = web_auth.clone().map(web::auth_state);
+    let admin_gate = Arc::new(admin::AdminGate::new(api_key.clone(), web_state.clone()));
+    // Say up front who may drive the admin API: when nothing can identify a
+    // caller, `/admin/*` answers 403, and the operator needs to be told that is
+    // why rather than find it out from a failing curl.
+    info!(
+        "Admin API (/admin/*): {}",
+        admin_gate.describe(state.clients.lock_or_recover().len())
+    );
 
     let mut app = Router::new()
         // Ollama API Endpoints (Explicitly listed)
@@ -568,12 +581,7 @@ async fn main() {
         .route("/v1/systemone", any(proxy_handler))
         // Olla-style prefixes (`proxy_handler` strips them).
         .route("/olla/openai/{*rest}", any(proxy_handler))
-        .route("/olla/proxy/{*rest}", any(proxy_handler))
-        // Local admin API (model load/unload control) — never proxied to
-        // backends, protected by the same optional API-key auth.
-        .route("/admin/models", get(admin_models_state))
-        .route("/admin/models/load", post(admin_model_load))
-        .route("/admin/models/unload", post(admin_model_unload));
+        .route("/olla/proxy/{*rest}", any(proxy_handler));
 
     // Unknown routes: proxied while `allow_all_routes` is on (live setting).
     app = app.fallback(fallback_handler);
@@ -605,11 +613,29 @@ async fn main() {
             ),
         )
         .merge(app);
+    // The admin API (model load/unload control) — never proxied to backends,
+    // and deliberately outside the proxy's own key rule: it answers to the
+    // admin gate instead (see `admin.rs`), which knows the dashboard login and
+    // treats a client key as a last resort rather than as the norm.
+    app = app.merge(
+        Router::new()
+            .route("/admin/models", get(admin_models_state))
+            .route("/admin/models/load", post(admin_model_load))
+            .route("/admin/models/unload", post(admin_model_unload))
+            .layer(middleware::from_fn_with_state(
+                (state.clone(), admin_gate),
+                admin::guard,
+            )),
+    );
     // The web UI has its own (basic) auth, so it sits outside the API-key layer.
-    match web_auth {
+    match web_state {
         Some(auth) => {
-            info!("Web UI enabled at /ui (user '{}', password from {})", auth.username, auth.source);
-            app = app.merge(web::router(auth));
+            let creds = web_auth.clone().expect("credentials come from the same decision");
+            info!(
+                "Web UI enabled at /ui (user '{}', password from {})",
+                creds.username, creds.source
+            );
+            app = app.merge(web::router_with_state(auth));
         }
         None => info!("Web UI disabled (set OLLAMA_MQ_UI_PASSWORD or settings.web_ui.password)"),
     }

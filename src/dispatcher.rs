@@ -398,6 +398,24 @@ async fn aggregate_model_list(
         .first()
         .expect("a listing endpoint declares at least one shape");
     let route = families_for_route(&Method::GET, endpoint);
+    // Hidden models are dropped per backend, before de-duplication, so one
+    // hidden on one backend still lists when another serves it. Taken before
+    // the cache lookup: a cached listing is only valid under the policy it was
+    // merged with.
+    let policy = state.model_policy();
+
+    // Client apps poll these routes on a timer, and one poll used to fan out to
+    // every online backend again — polling clients times backends, forever, for
+    // a list that changes when a model is added. The merged answer is therefore
+    // kept briefly; anything the scheduler learns in between (a health round
+    // that changed a backend, a policy edit) clears or invalidates it.
+    if let Some(hit) = state.listing_cache.lock_or_recover().get(endpoint)
+        && hit.at.elapsed() < LISTING_CACHE_TTL
+        && Arc::ptr_eq(&hit.policy, &policy)
+    {
+        debug!("{endpoint} answered from the listing cache");
+        return Some((StatusCode::OK, axum::Json(hit.body.clone())).into_response());
+    }
 
     /// The model names we know a backend serves even if it cannot list them,
     /// sorted because `available_models` is a `HashSet` whose iteration order
@@ -412,9 +430,6 @@ async fn aggregate_model_list(
     // that must not be asked but have models to advertise anyway (below).
     let mut probed: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
     let mut state_only: Vec<(String, Vec<String>)> = Vec::new();
-    // Hidden models are dropped per backend, before de-duplication, so one
-    // hidden on one backend still lists when another serves it.
-    let policy = state.model_policy();
     {
         let backends = state.backends.lock_or_recover();
         for b in backends.iter() {
@@ -442,28 +457,37 @@ async fn aggregate_model_list(
         return None;
     }
 
-    let bodies = futures_util::future::join_all(probed.into_iter().map(|(base, token, names)| {
-        let client = state.client.clone();
-        let url = format!("{}{}", base, endpoint);
-        async move {
-            let body = async {
-                let mut req = client.get(&url).timeout(crate::control::PROBE_TIMEOUT);
-                if let Some(t) = &token {
-                    req = req.header("Authorization", format!("Bearer {}", t));
+    // Bounded fan-out: the listing routes take no backend slot, so without a
+    // limit a few slow backends and a room full of polling clients would leave
+    // an unbounded number of these requests in flight at once. `buffered`
+    // rather than `buffer_unordered`: the merged list's order (and which
+    // backend's envelope wins) is backend order on purpose, and a completion-
+    // ordered fan-out would reshuffle it between two polls.
+    let bodies: Vec<(Option<serde_json::Value>, Vec<String>, String)> =
+        futures_util::stream::iter(probed.into_iter().map(|(base, token, names)| {
+            let client = state.client.clone();
+            let url = format!("{}{}", base, endpoint);
+            async move {
+                let body = async {
+                    let mut req = client.get(&url).timeout(crate::control::PROBE_TIMEOUT);
+                    if let Some(t) = &token {
+                        req = req.header("Authorization", format!("Bearer {}", t));
+                    }
+                    let res = req.send().await.ok()?;
+                    if !res.status().is_success() {
+                        return None;
+                    }
+                    res.json::<serde_json::Value>().await.ok()
                 }
-                let res = req.send().await.ok()?;
-                if !res.status().is_success() {
-                    return None;
-                }
-                res.json::<serde_json::Value>().await.ok()
+                .await;
+                // The names travel with the answer so a backend that says
+                // nothing still gets to contribute its own models.
+                (body, names, base)
             }
-            .await;
-            // The names travel with the answer so a backend that says
-            // nothing still gets to contribute its own models.
-            (body, names, base)
-        }
-    }))
-    .await;
+        }))
+        .buffered(LISTING_FANOUT)
+        .collect()
+        .await;
 
     // The first answering body, with the array key *it* reported its listing
     // under — on a route shared by two families that is not the key the merged
@@ -566,7 +590,36 @@ async fn aggregate_model_list(
         map.remove(consumed_key);
     }
     envelope[out_key] = serde_json::Value::Array(merged);
+    state.listing_cache.lock_or_recover().insert(
+        endpoint.to_string(),
+        ListingEntry {
+            at: std::time::Instant::now(),
+            policy,
+            body: envelope.clone(),
+        },
+    );
     Some((StatusCode::OK, axum::Json(envelope)).into_response())
+}
+
+/// One merged model listing, kept for [`LISTING_CACHE_TTL`] under its route.
+pub struct ListingEntry {
+    at: std::time::Instant,
+    /// The policy this listing was merged with. Hiding a model must be visible
+    /// on the next request, so an entry built under a different policy is
+    /// never served — compared by pointer, because the store swaps the `Arc`
+    /// instead of mutating the policy in place.
+    policy: Arc<crate::model_policy::Policy>,
+    body: serde_json::Value,
+}
+
+/// How long a merged model listing is reused.
+const LISTING_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Concurrent listing probes across all backends in one merged listing.
+const LISTING_FANOUT: usize = 8;
+
+/// Forget every cached model listing (backend state changed underneath it).
+pub fn clear_listing_cache(state: &AppState) {
+    state.listing_cache.lock_or_recover().clear();
 }
 
 /// Insert the backend's configured auth token into `headers` unless the
@@ -814,6 +867,9 @@ pub struct AppState {
     pub model_config_path: String,
     /// Ring buffer of recent request/control events for the TUI Logs panel.
     pub logs: Mutex<VecDeque<LogEvent>>,
+    /// Merged model listings, per listing route, for [`LISTING_CACHE_TTL`]
+    /// (see `aggregate_model_list`). A leaf lock.
+    pub listing_cache: Mutex<HashMap<String, ListingEntry>>,
     /// Conversation log: one line per conversation, written when it goes quiet
     /// (no-op when disabled).
     pub convlog: crate::convlog::ConvLogger,
@@ -1024,6 +1080,45 @@ pub fn sanitize_label(raw: Option<&str>) -> Option<String> {
     }
     let trimmed = out.trim_matches('-');
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// How many characters a client may claim as its identity.
+const MAX_IDENTITY_LEN: usize = 64;
+
+/// The queue/stats/blocking identity a keyless request claims with `X-User-ID`.
+///
+/// The header is unauthenticated, so it is treated as hostile input rather than
+/// as a name: it is the key of every per-user map and the string written into
+/// the request log and the TUI, so an unbounded or control-character-laden value
+/// is an unbounded, terminal-poisoning one. Whitespace and control characters
+/// collapse to `-` (as session labels do), non-printing and symbolic characters
+/// outside ASCII (emoji, combining marks) are dropped, `:` is dropped — client
+/// names cannot contain one, so this is also what keeps the reserved
+/// `unverified:<name>` namespace unforgable from a header — and an empty result
+/// is `anonymous`. Case is preserved: identity equality is what it always was.
+pub fn sanitize_identity(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if out.chars().count() >= MAX_IDENTITY_LEN {
+            break;
+        }
+        if ch.is_control() || ch.is_whitespace() {
+            if !out.ends_with('-') && !out.is_empty() {
+                out.push('-');
+            }
+            continue;
+        }
+        if ch == ':' || (!ch.is_ascii_graphic() && !ch.is_alphabetic() && !ch.is_numeric()) {
+            continue;
+        }
+        out.push(ch);
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "anonymous".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 
@@ -1900,6 +1995,7 @@ impl AppState {
 
         Self {
             queues: Mutex::new(HashMap::new()),
+            listing_cache: Mutex::new(HashMap::new()),
             processing_counts: Mutex::new(HashMap::new()),
             processed_counts: Mutex::new(HashMap::new()),
             dropped_counts: Mutex::new(HashMap::new()),
@@ -2283,10 +2379,11 @@ impl AppState {
     /// priority or stats (client names cannot contain ':', so this never
     /// collides with a real client).
     pub fn unkeyed_identity(&self, claimed: &str) -> String {
-        if self.clients.lock_or_recover().is_registered(claimed) {
+        let claimed = sanitize_identity(claimed);
+        if self.clients.lock_or_recover().is_registered(&claimed) {
             format!("unverified:{claimed}")
         } else {
-            claimed.to_string()
+            claimed
         }
     }
 
@@ -2833,7 +2930,7 @@ fn apply_family_learning(state: &AppState, backend_idx: usize, route: ApiSet, re
 /// Saturating, so a task queued outside the normal enqueue path can never wrap
 /// the counter and lock out every later request.
 fn release_queued_bytes(state: &AppState, bytes: u64) {
-    let _ = state.queued_bytes.fetch_update(
+    let _ = state.queued_bytes.try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |held| Some(held.saturating_sub(bytes)),
@@ -3029,9 +3126,27 @@ async fn health_check_round(
     // finished loading, backend came online, etc.) so queued requests are
     // re-evaluated immediately.
     if any_changed {
+        // A backend that came and went or changed its model list makes every
+        // cached merged listing wrong; say so instead of serving it for another
+        // couple of seconds.
+        clear_listing_cache(state);
         state.notify.notify_one();
     }
 }
+
+/// One dispatch decision: user id, the task, the index it was taken from in
+/// that user's queue, the backend that will serve it and its token, whether
+/// that backend's traffic is kept out of the log, and the session metadata
+/// collected on the way.
+type Selection = (
+    String,
+    Task,
+    usize,
+    String,
+    Option<String>,
+    bool,
+    bool,
+);
 
 pub async fn run_worker(state: Arc<AppState>) {
     let client = state.client.clone();
@@ -3155,13 +3270,13 @@ pub async fn run_worker(state: Arc<AppState>) {
                 }) {
                     order.push(ui);
                 }
-                if let Some(i) = vip.as_ref().and_then(&position_of)
+                if let Some(i) = vip.as_ref().and_then(position_of)
                     && !order.contains(&i)
                 {
                     order.push(i);
                 }
                 if counter.is_multiple_of(2)
-                    && let Some(i) = boost.as_ref().and_then(&position_of)
+                    && let Some(i) = boost.as_ref().and_then(position_of)
                     && !order.contains(&i)
                 {
                     order.push(i);
@@ -3246,9 +3361,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                 // the FIRST routable task (not just the front) so an
                 // unroutable request — e.g. an Ollama-family call with every
                 // Ollama backend offline — can't starve everything behind it.
-                let mut selection: Option<
-                    (String, Task, usize, String, Option<String>, bool, bool),
-                > = None;
+                let mut selection: Option<Selection> = None;
                 'users: for &ui in &order {
                     let user_id = &active_users[ui];
                     let queue_len = queues.get(user_id).map(|q| q.len()).unwrap_or(0);
@@ -3257,10 +3370,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                     // stable). `pos` stays the queue index, so the pin lookup
                     // above and the removal below still line up with it.
                     let mut positions: Vec<usize> = (0..queue_len).collect();
-                    if queue_len > 1 {
-                        if let Some(q) = queues.get(user_id) {
-                            positions.sort_by_key(|&p| std::cmp::Reverse(q[p].priority));
-                        }
+                    if queue_len > 1
+                        && let Some(q) = queues.get(user_id)
+                    {
+                        positions.sort_by_key(|&p| std::cmp::Reverse(q[p].priority));
                     }
                     for pos in positions {
                         let task_ref = match queues.get(user_id).and_then(|q| q.get(pos)) {
@@ -3639,10 +3752,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                         // being held back stays bounded (see `cold_hold`).
                         if !cold_users.is_empty() && !cold_users.contains(user_id) {
                             for cu in &cold_users {
-                                if let Some(q) = queues.get_mut(cu) {
-                                    if let Some(p) = next_pos(q) {
-                                        q[p].cache_passes = q[p].cache_passes.saturating_add(1);
-                                    }
+                                if let Some(q) = queues.get_mut(cu)
+                                    && let Some(p) = next_pos(q)
+                                {
+                                    q[p].cache_passes = q[p].cache_passes.saturating_add(1);
                                 }
                             }
                         }
@@ -4080,7 +4193,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     // entry below overwrites it.
                                     let served = status.is_success() && !client_disconnected;
                                     let prior = served
-                                        .then(|| task.session_key.as_ref())
+                                        .then_some(task.session_key.as_ref())
                                         .flatten()
                                         .and_then(|k| conv_cache_prior(&state_clone, k, &backend_url));
                                     let waste_secs = served
@@ -6164,6 +6277,41 @@ mod tests {
         assert!(text.contains(r#"ollamamq_backend_free_slots{backend="127.0.0.1:9"} 0"#));
     }
 
+    /// The TUI's Waste column reads the snapshot's per-backend pairs, in backend
+    /// order, straight from the accumulated counters — no history walk.
+    #[test]
+    fn capture_reports_waste_per_backend_in_backend_order() {
+        let state = new_test_state(vec![
+            "http://127.0.0.1:9".into(),
+            "http://127.0.0.1:10".into(),
+        ]);
+        let timing = crate::stats::Timing {
+            prefill: Some((20.0, 500)),
+            waste_secs: Some(5.0),
+            ..Default::default()
+        };
+        state.stats.record(crate::stats::Finished {
+            at_ms: crate::stats::now_ms(),
+            client: "tester".into(),
+            key: "none".into(),
+            model: "llama3".into(),
+            backend: Some("127.0.0.1:10".into()),
+            outcome: "ok",
+            session: None,
+            session_label: None,
+            priority: "normal",
+            rid: None,
+            tools: vec![],
+            queue_wait: Some(0.1),
+            stage: Default::default(),
+            timing,
+        });
+        let snap = crate::snapshot::capture(&state, 0);
+        assert_eq!(snap.backend_waste.len(), 2);
+        assert_eq!(snap.backend_waste[0], (0.0, 0.0));
+        assert_eq!(snap.backend_waste[1], (20.0, 5.0));
+    }
+
     /// A backend that reports 2 slots runs two requests for the same
     /// (unlisted) model at once; with detection off it runs one at a time.
     #[tokio::test]
@@ -7622,24 +7770,48 @@ mod tests {
         );
     }
 
-    /// True once the conversation is remembered on `url` — polled, because the
-    /// mapping is rewritten when the response finishes, not at dispatch.
-    async fn affinity_is(state: &Arc<AppState>, k: &SessionKey, url: &str) -> bool {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let hit = state
-                    .affinity
-                    .lock_or_recover()
-                    .get(k)
-                    .is_some_and(|a| a.backend_url == url);
-                if hit {
-                    return true;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap_or(false)
+    #[test]
+    fn identity_from_the_user_header_is_bounded_and_clean() {
+        assert_eq!(sanitize_identity("alice"), "alice");
+        assert_eq!(sanitize_identity(" Alice Chen "), "Alice-Chen");
+        // ANSI escapes and other control characters never reach the log or the
+        // TUI verbatim (the sequence's introducer is gone, so what is left is
+        // inert text).
+        assert_eq!(
+            sanitize_identity("al\u{1b}[31mice\u{7}"),
+            "al-[31mice",
+            "the escape bytes go and the split collapses to one dash"
+        );
+        assert_eq!(sanitize_identity("\u{1b}\u{7}"), "anonymous");
+        // A `:` would let a keyless client spell itself into the reserved
+        // `unverified:<name>` namespace.
+        assert_eq!(sanitize_identity("unverified:alice"), "unverifiedalice");
+        assert_eq!(sanitize_identity("a".repeat(300).as_str()).chars().count(), 64);
+        // Letters outside ASCII survive — this is a name, not a header value.
+        assert_eq!(sanitize_identity("josé"), "josé");
+        for empty in ["", "   ", "\n\t", "---", ":::", "\u{7}"] {
+            assert_eq!(sanitize_identity(empty), "anonymous", "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn a_forged_unverified_claim_cannot_reach_the_namespace() {
+        // Whatever the client sends, the reserved prefix is only ever produced
+        // by the proxy itself.
+        assert_eq!(sanitize_identity("unverified:alice"), "unverifiedalice");
+        assert_eq!(sanitize_identity("unverified: alice"), "unverified-alice");
+    }
+
+    /// The identity a keyless request is queued under, through the same entry
+    /// point `proxy_handler` uses.
+    #[test]
+    fn the_claimed_identity_is_the_sanitized_one() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        add_test_client(&state, "alice", "alice-key-123");
+        assert_eq!(state.unkeyed_identity("alice"), "unverified:alice");
+        assert_eq!(state.unkeyed_identity("unverified:alice"), "unverifiedalice");
+        assert_eq!(state.unkeyed_identity("\u{1b}\u{7}"), "anonymous");
+        assert_eq!(state.unkeyed_identity(""), "anonymous");
     }
 
     /// The conversation id used by the routing tests below, as the scheduler
@@ -8182,6 +8354,67 @@ mod tests {
         mock_b.abort();
     }
 
+    /// A listing route is answered once per TTL rather than once per client
+    /// poll: apps poll `/v1/models` on a timer, and every poll used to mean one
+    /// fresh request to every online backend.
+    #[tokio::test]
+    async fn model_listing_is_cached_until_something_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Relaxed);
+                    axum::Json(serde_json::json!({"data": [{"id": "cached-model"}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listing mock");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let state = new_test_state(vec![url]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            for b in backends.iter_mut() {
+                b.is_online = true;
+                b.api_type = BackendApiType::OpenAi;
+            }
+        }
+
+        for _ in 0..3 {
+            let v = response_json(
+                aggregate_model_list(&state, "/v1/models")
+                    .await
+                    .expect("backend answers"),
+            )
+            .await;
+            assert_eq!(v["data"][0]["id"], "cached-model");
+        }
+        assert_eq!(hits.load(Relaxed), 1, "three polls, one fan-out");
+
+        // Hiding a model must show on the next request, not after the TTL.
+        hide_models(&state, "cached-model", vec![]);
+        let v = response_json(
+            aggregate_model_list(&state, "/v1/models")
+                .await
+                .expect("still answered"),
+        )
+        .await;
+        assert!(
+            v["data"].as_array().expect("data array").is_empty(),
+            "the cached listing survived the policy change: {v}"
+        );
+        assert_eq!(hits.load(Relaxed), 2, "the policy change forced a fresh probe");
+    }
+
     /// How CLM / Kev answer `GET /v1/models` — the System One envelope, not
     /// OpenAI's `{"data":[{"id":…}]}`.
     const SYSTEMONE_V1_MODELS: &str =
@@ -8307,11 +8540,15 @@ mod tests {
         assert_eq!(ids, vec!["qwen3.8-27b"]);
 
         // With no compatible backend online there is nothing to merge, and the
-        // caller falls back to the normal queued proxy path.
+        // caller falls back to the normal queued proxy path. Going offline is
+        // what a health round reports, and a round that changes anything clears
+        // the cached listing — simulated here because the test flips the flag
+        // directly.
         {
             let mut backends = state.backends.lock_or_recover();
             backends[0].is_online = false;
         }
+        clear_listing_cache(&state);
         assert!(aggregate_model_list(&state, "/v1/models").await.is_none());
 
         mock_a.abort();

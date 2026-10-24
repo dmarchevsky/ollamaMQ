@@ -189,10 +189,7 @@ impl ModelPolicyStore {
     /// model the operator meant to hide.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
-        let mut policy = match read_store_or_migrate::<Policy>(&path)? {
-            Some(p) => p,
-            None => Policy::default(),
-        };
+        let mut policy = read_store_or_migrate::<Policy>(&path)?.unwrap_or_default();
         for r in &mut policy.rules {
             if r.id.is_empty() {
                 r.id = format!("m{}", random_hex(6));

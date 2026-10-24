@@ -1,0 +1,45 @@
+# The checks the dev-flow playbook runs locally, now on every push and PR: clippy
+# (so a warning cannot reach the default branch), the Rust suite, the dashboard's
+# scripts, and the end-to-end run against the mock backends. `docker-release.yml`
+# still builds the image on a tag; this is what has to be green before a tag.
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust, clippy and Node all come with the runner image; only the component
+      # has to be added. No third-party action to trust or to break.
+      - name: Add clippy
+        run: rustup component add clippy
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      # The dashboard ships as plain scripts; a syntax error is invisible until
+      # the page is opened, so say it here instead.
+      - name: Check the dashboard scripts
+        run: |
+          node --check src/web/app.js
+          node --check src/web/demo.js
+          node --check src/web/login.js
+
+      # Model load/unload against the mock backends, including the admin gate:
+      # it needs the release-less binary the steps above already built.
+      - name: End-to-end
+        run: bash tests/e2e/run.sh

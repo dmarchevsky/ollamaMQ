@@ -388,6 +388,9 @@ fn stack_buckets(from_ms: u64, w_ms: u64, n: usize, occ: &[Occ]) -> (Vec<Vec<Lan
 
 /// Finish one lane: `None` when the backend did nothing in the window.
 /// `from_ms` is the aligned start of the first bucket; buckets are `w_ms` wide.
+/// The wide argument list is the lane's own shape — backend identity, capacity,
+/// activity and the window it is drawn over — so it is allowed to stay flat.
+#[allow(clippy::too_many_arguments)]
 fn build_lane(
     idx: usize,
     label: &str,
@@ -420,6 +423,22 @@ fn build_lane(
     })
 }
 
+/// One waiting request as the overview shows it: client, the model it asked for
+/// and the one it will get, how long it has waited, its position and the queue
+/// length, its session, and its priority with the moment it was queued.
+type WaitingRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    f64,
+    usize,
+    usize,
+    Option<String>,
+    Option<String>,
+    &'static str,
+    u64,
+);
+
 pub async fn get_overview(
     State(state): State<Arc<AppState>>,
     Query(q): Query<OverviewQuery>,
@@ -427,10 +446,10 @@ pub async fn get_overview(
     let window = window_secs(q.window.as_deref());
     let key_mode = q.mode.as_deref() == Some("key");
     let mut clients = csv(q.clients.as_deref());
-    if clients.is_none() {
-        if let Some(c) = q.client.as_deref().filter(|c| !c.is_empty()) {
-            clients = Some(HashSet::from([c.to_string()]));
-        }
+    if clients.is_none()
+        && let Some(c) = q.client.as_deref().filter(|c| !c.is_empty())
+    {
+        clients = Some(HashSet::from([c.to_string()]));
     }
     let scope = Scope { clients, backends: csv(q.backends.as_deref()), models: csv(q.models.as_deref()) };
     // Display identity: in key mode a client is shown as `client:keylabel`.
@@ -466,7 +485,7 @@ pub async fn get_overview(
 
     // Waiting requests, copied out under the queues lock and labelled
     // afterwards (that takes the backends lock).
-    let waiting: Vec<(String, Option<String>, Option<String>, f64, usize, usize, Option<String>, Option<String>, &'static str, u64)> = state
+    let waiting: Vec<WaitingRow> = state
         .queues
         .lock_or_recover()
         .iter()
@@ -554,7 +573,7 @@ pub async fn get_overview(
                     .filter(|f| f.backend.as_deref() == Some(label.as_str()))
                     .map(|f| (f.at_ms, f.timing.completion_tokens)),
             )
-            .into_iter()
+            .iter()
             .map(|v| Some(v.iter().sum::<u64>() as f64 / bucket_secs))
             .collect();
             BackendStats {
@@ -580,7 +599,6 @@ pub async fn get_overview(
         })
         // The backend filter hides whole backends (their lanes and capacity
         // rows go too); indices stay the originals.
-        .into_iter()
         .filter(|b| scope.backend_ok(&b.label))
         .collect();
 

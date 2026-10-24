@@ -70,7 +70,7 @@ pub fn defaults() -> Settings {
         request_log_path: Some("ollamamq-requests.jsonl".into()),
         request_log_max_bytes: Some(10 * 1024 * 1024),
         request_log_max_files: Some(5),
-        request_log_flush_secs: Some(60),
+        request_log_flush_secs: Some(5),
         log_content_limit: Some(1024 * 1024),
         max_body_bytes: Some(64 * 1024 * 1024),
         max_queued_bytes: Some(512 * 1024 * 1024),
@@ -83,6 +83,7 @@ pub fn defaults() -> Settings {
 
 /// Every source of settings, kept so the UI can show where a value comes
 /// from.
+#[derive(Default)]
 pub struct Layers {
     /// `appconf.yaml` as last read or saved.
     pub file: AppConfig,
@@ -100,20 +101,6 @@ pub struct Layers {
     pub startup: Settings,
     /// Where each store file was found (setting name -> path), for display.
     pub resolved: BTreeMap<&'static str, String>,
-}
-
-impl Default for Layers {
-    fn default() -> Self {
-        Self {
-            file: AppConfig::default(),
-            pinned: Settings::default(),
-            pinned_by: BTreeMap::new(),
-            backends_from_cli: false,
-            fallback_backends: Vec::new(),
-            startup: Settings::default(),
-            resolved: BTreeMap::new(),
-        }
-    }
 }
 
 impl Layers {
@@ -229,9 +216,11 @@ pub fn apply(state: &AppState, eff: &Settings) {
         .allow_all_routes
         .store(eff.allow_all_routes.unwrap_or(false), Relaxed);
     state.max_queued_bytes.store(
-        eff.max_queued_bytes
-            .or(d.max_queued_bytes)
-            .unwrap_or(512 * 1024 * 1024),
+        crate::config::queue_budget(
+            eff.max_queued_bytes
+                .or(d.max_queued_bytes)
+                .unwrap_or(512 * 1024 * 1024),
+        ),
         Relaxed,
     );
     state.log_content_limit.store(
@@ -425,6 +414,7 @@ pub fn apply_backends(state: &Arc<AppState>, list: &[Backend]) {
     }
     drop(backends);
     crate::dispatcher::clear_affinity(state);
+    crate::dispatcher::clear_listing_cache(state);
     state.notify.notify_one();
 }
 
@@ -441,6 +431,14 @@ fn set_disabled(b: &mut BackendStatus, disabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A crash should cost the last few seconds of a conversation, not the last
+    /// minute — and the default has to stay inside `validate()`'s floor.
+    #[test]
+    fn the_conversation_log_flushes_after_five_seconds_by_default() {
+        assert_eq!(defaults().request_log_flush_secs, Some(5));
+        defaults().validate().expect("the defaults validate");
+    }
 
     /// A backend's capture switch follows the file, in both directions.
     #[test]

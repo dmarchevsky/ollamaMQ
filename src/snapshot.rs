@@ -55,6 +55,69 @@ impl UserRow {
     }
 }
 
+/// One row of the TUI's log table: every field the row and its detail header
+/// show, plus a display-sized preview of the captured text.
+///
+/// The full text is deliberately not carried here. `capture()` runs ten times a
+/// second and a captured body runs to `log_content_limit` (1 MiB by default), so
+/// handing the newest 50 records over whole meant copying — and then deep-
+/// comparing, since that is how the dashboard decides whether to redraw — tens of
+/// megabytes per second inside the process that holds every queue. The detail
+/// view fetches the full text from the conversation log by `rid` when it is
+/// opened, which is the same store the web log viewer reads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogRow {
+    pub at: std::time::SystemTime,
+    /// `"IN"` | `"OUT"` | `"CTL"`.
+    pub dir: &'static str,
+    pub user: String,
+    pub model: Option<String>,
+    /// Metrics label of the backend, never a URL.
+    pub backend: Option<String>,
+    /// Status code or short note ("queued", "dropped", …).
+    pub info: String,
+    /// First line of the captured text, shortened for the table.
+    pub preview: Option<String>,
+    /// True when text was captured for this event — the preview can be shorter
+    /// than it, or empty when the body itself was.
+    pub has_content: bool,
+    /// Correlation id: what the detail view looks the full text up by.
+    pub rid: Option<u64>,
+    pub session: Option<String>,
+    pub redacted: bool,
+}
+
+impl LogRow {
+    fn new(ev: &LogEvent) -> Self {
+        let has_content = ev.content.as_deref().is_some_and(|c| !c.is_empty());
+        let preview = has_content.then(|| {
+            ev.content
+                .as_deref()
+                .map(String::as_str)
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(30)
+                .collect::<String>()
+        });
+        Self {
+            at: ev.at,
+            dir: ev.dir,
+            user: ev.user.clone(),
+            model: ev.model.clone(),
+            backend: ev.backend.clone(),
+            info: ev.info.clone(),
+            preview,
+            has_content,
+            rid: ev.rid,
+            session: ev.session.clone(),
+            redacted: ev.redacted,
+        }
+    }
+}
+
 #[derive(PartialEq)]
 pub struct StateSnapshot {
     /// Users in display order.
@@ -75,11 +138,13 @@ pub struct StateSnapshot {
     pub live_priority: Vec<(String, &'static str)>,
     pub backends: Vec<BackendStatus>,
     /// Per backend (same order as `backends`): `(prefill secs, waste secs)`
-    /// of the retained request history; `(0.0, 0.0)` where nothing was
-    /// measurable — the TUI's Waste column renders `—` for those.
+    /// accumulated over every request that had measurable cache waste;
+    /// `(0.0, 0.0)` where nothing was measurable — the TUI's Waste column
+    /// renders `—` for those.
     pub backend_waste: Vec<(f64, f64)>,
-    /// Recent request/control events (newest first) for the Logs panel.
-    pub logs: Vec<LogEvent>,
+    /// Recent request/control events (newest first) for the Logs panel. See
+    /// [`LogRow`] for why these are display rows and not the log records.
+    pub logs: Vec<LogRow>,
     pub active_ops: Vec<ActiveOpView>,
     pub recent_results: Vec<RecentResultView>,
     /// Which models are served (to mark hidden ones).
@@ -157,30 +222,24 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
             .collect()
     };
     let backends = state.backends.lock_or_recover().clone();
-    // Waste totals per backend from the retained finish history (the same
-    // data the Web overview windows over; the TUI shows the whole history).
-    let backend_waste: Vec<(f64, f64)> = {
-        let mut acc: Vec<(f64, f64)> = vec![(0.0, 0.0); backends.len()];
-        let labels: Vec<String> = backends.iter().map(|b| crate::metrics::backend_label(&b.url)).collect();
-        for f in state.stats.finished_since(0) {
-            let Some(w) = f.timing.waste_secs else { continue };
-            let Some(idx) = f.backend.as_deref().and_then(|l| labels.iter().position(|x| x == l)) else {
-                continue;
-            };
-            if let Some((ps, _)) = f.timing.prefill {
-                acc[idx].0 += ps;
-            }
-            acc[idx].1 += w;
-        }
-        acc
-    };
-    let logs: Vec<LogEvent> = state
+    // Waste totals per backend, accumulated as requests finish (see
+    // `Stats::backend_waste`): lifetime totals, so the TUI's Waste column no
+    // longer resets when a turn ages out of the retained history window.
+    let backend_waste: Vec<(f64, f64)> = backends
+        .iter()
+        .map(|b| {
+            state
+                .stats
+                .backend_waste(&crate::metrics::backend_label(&b.url))
+        })
+        .collect();
+    let logs: Vec<LogRow> = state
         .logs
         .lock_or_recover()
         .iter()
         .rev()
         .take(log_limit)
-        .cloned()
+        .map(LogRow::new)
         .collect();
     let active_ops: Vec<ActiveOpView> = state
         .control_ops
@@ -232,5 +291,47 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
         active_ops,
         recent_results,
         model_policy: state.model_policy(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(content: Option<&str>) -> LogEvent {
+        LogEvent {
+            at: std::time::SystemTime::now(),
+            dir: "IN",
+            user: "alice".into(),
+            model: Some("llama3".into()),
+            backend: None,
+            info: "POST /api/chat body=123B".into(),
+            content: content.map(|c| Arc::new(c.to_string())),
+            rid: Some(7),
+            session: Some("a3f19c".into()),
+            redacted: false,
+        }
+    }
+
+    #[test]
+    fn a_log_row_carries_a_preview_never_the_whole_body() {
+        let body = format!("first line\n{}", "x".repeat(200_000));
+        let row = LogRow::new(&event(Some(&body)));
+        assert!(row.has_content);
+        assert_eq!(
+            row.preview.as_deref().expect("preview"),
+            "first line",
+            "the table shows one short line and nothing more"
+        );
+        assert_eq!(row.rid, Some(7), "the detail view looks the text up by rid");
+
+        // A long single-line body is clipped to the table's width.
+        let long = LogRow::new(&event(Some(&"y".repeat(5_000))));
+        assert_eq!(long.preview.expect("preview").chars().count(), 30);
+
+        assert!(!LogRow::new(&event(None)).has_content);
+        assert!(LogRow::new(&event(None)).preview.is_none());
+        let empty = LogRow::new(&event(Some("")));
+        assert!(!empty.has_content, "an empty body is not captured content");
     }
 }

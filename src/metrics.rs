@@ -966,6 +966,12 @@ pub struct Runs {
 impl Runs {
     /// Register a run; it is removed when the returned guard drops, so every
     /// exit path (finished, client gone, backend error, panic) clears it.
+    ///
+    /// Eleven arguments is a lot, and they are all one thing: the labels the run
+    /// is published under. Bundling them would mean the caller building a struct
+    /// at the same distance from the same eleven fields, so they stay as they
+    /// are and the count is stated rather than hidden.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
         client: &str,

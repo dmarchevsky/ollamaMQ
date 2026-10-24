@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::control::{self, ControlAction, LoadOptions};
-use crate::dispatcher::{AppState, BackendApiType, LogEvent, Priority};
-use crate::snapshot::{self, StateSnapshot};
+use crate::dispatcher::{AppState, BackendApiType, Priority};
+use crate::snapshot::{self, LogRow, StateSnapshot};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Panel {
@@ -71,10 +71,15 @@ struct FlashMsg {
     at: Instant,
 }
 
-/// Full-content detail overlay for one log event. The event is a clone, so
-/// events arriving while the view is open don't shift what's displayed.
+/// Full-content detail overlay for one log row. The row is a clone, so events
+/// arriving while the view is open don't shift what's displayed; the text is
+/// fetched from the conversation log when the row is opened, because the
+/// snapshot only ever carries a display-sized preview (see
+/// [`crate::snapshot::LogRow`]).
 struct LogDetail {
-    event: LogEvent,
+    row: LogRow,
+    /// The full captured text, when the log still holds it.
+    text: Option<String>,
     /// Scroll offset in wrapped (visual) lines.
     offset: usize,
 }
@@ -285,20 +290,35 @@ impl TuiDashboard {
                             {
                                 // Enter on a logs row opens the full-content
                                 // detail view; rows without captured content
-                                // just flash a note.
+                                // just flash a note. The text itself is read
+                                // from the conversation log here, not from the
+                                // snapshot.
                                 if let Some(i) = self
                                     .log_table_state
                                     .selected()
                                     .filter(|&i| i < snapshot.logs.len())
                                 {
-                                    let ev = &snapshot.logs[i];
-                                    if ev
-                                        .content
-                                        .as_deref()
-                                        .is_some_and(|c| !c.is_empty())
-                                    {
+                                    let row = snapshot.logs[i].clone();
+                                    if row.has_content {
+                                        let text = row.rid.and_then(|rid| {
+                                            let dir = if row.dir == "OUT" {
+                                                crate::convlog::Dir::Resp
+                                            } else {
+                                                crate::convlog::Dir::Req
+                                            };
+                                            state.convlog.content(
+                                                &crate::convlog::Find {
+                                                    key: None,
+                                                    session: None,
+                                                    user: None,
+                                                    rid: Some(rid),
+                                                },
+                                                dir,
+                                            )
+                                        });
                                         self.log_detail = Some(LogDetail {
-                                            event: ev.clone(),
+                                            row,
+                                            text,
                                             offset: 0,
                                         });
                                     } else {
@@ -765,7 +785,7 @@ impl TuiDashboard {
             height,
         );
         let block = Block::default()
-            .title(format!(" Log detail — {} ", detail.event.dir))
+            .title(format!(" Log detail — {} ", detail.row.dir))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow));
         let inner = block.inner(block_area);
@@ -774,13 +794,13 @@ impl TuiDashboard {
         // Manually pre-wrap the content: split it into lines, then split each
         // line into chunks of `inner.width` chars, collecting the visual
         // lines. (No ratatui `Wrap`: it can't be scrolled by visual line.)
+        // Captured when the row went by, but the conversation log may since
+        // have dropped it (or capture may be off).
         let raw = detail
-            .event
-            .content
+            .text
             .as_deref()
-            .map(String::as_str)
             .filter(|c| !c.is_empty())
-            .unwrap_or("(no content captured)");
+            .unwrap_or("(no captured text available for this event)");
         let mut visual: Vec<String> = Vec::new();
         if inner.width > 0 {
             for line in raw.lines() {
@@ -811,18 +831,18 @@ impl TuiDashboard {
         detail.offset = detail.offset.min(total_visual.saturating_sub(visible));
 
         let header = Paragraph::new(Text::from(vec![
-            Line::from(format!("Time: {}", Self::fmt_event_time(detail.event.at))),
-            Line::from(format!("Direction: {}", detail.event.dir)),
-            Line::from(format!("User: {}", detail.event.user)),
+            Line::from(format!("Time: {}", Self::fmt_event_time(detail.row.at))),
+            Line::from(format!("Direction: {}", detail.row.dir)),
+            Line::from(format!("User: {}", detail.row.user)),
             Line::from(format!(
                 "Model: {}",
-                detail.event.model.as_deref().unwrap_or("-")
+                detail.row.model.as_deref().unwrap_or("-")
             )),
             Line::from(format!(
                 "Backend: {}",
-                detail.event.backend.as_deref().unwrap_or("-")
+                detail.row.backend.as_deref().unwrap_or("-")
             )),
-            Line::from(format!("Info: {}", detail.event.info)),
+            Line::from(format!("Info: {}", detail.row.info)),
         ]));
 
         let chunks = Layout::default()
@@ -1110,7 +1130,7 @@ impl TuiDashboard {
                 let height = name_lines.len() as u16;
 
                 // Share of this backend's prefill time lost to cache eviction
-                // over the retained history; `—` where nothing is measurable.
+                // over everything served so far; `—` where nothing is measurable.
                 let (prefill_secs, waste_secs) =
                     snapshot.backend_waste.get(idx).copied().unwrap_or((0.0, 0.0));
                 let (waste_str, waste_style) = if prefill_secs > 0.0 {
@@ -1444,17 +1464,8 @@ impl TuiDashboard {
                     Style::default().fg(Color::Gray)
                 };
                 // Append a short single-line content preview when present.
-                let info_text = match ev.content.as_deref().filter(|c| !c.is_empty()) {
-                    Some(c) => format!(
-                        "{} [{}]",
-                        ev.info,
-                        c.lines()
-                            .next()
-                            .unwrap_or("")
-                            .chars()
-                            .take(30)
-                            .collect::<String>()
-                    ),
+                let info_text = match ev.preview.as_deref().filter(|c| !c.is_empty()) {
+                    Some(c) => format!("{} [{}]", ev.info, c),
                     None => ev.info.clone(),
                 };
                 Row::new(vec![
