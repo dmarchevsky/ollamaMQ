@@ -40,7 +40,13 @@ services:
     volumes:
       - ./config:/config
       - ./logs:/data
-    mem_limit: 256m
+    # Memory, sized for the queue rather than guessed at: the default
+    # max_queued_bytes is 512 MiB, and a limit below what the queues may hold
+    # turns a flood into an OOM restart instead of a 503. 1 GiB covers the
+    # queues plus the proxy's own working set; the proxy also reads this limit at
+    # startup and halves its queue ceiling (with a log line) if the setting
+    # would exceed half of it. Raise both together for very long prompts.
+    mem_limit: 1g
     restart: unless-stopped
     logging:                    # `docker logs` keeps at most 2 x 10 MB
       driver: json-file

@@ -94,6 +94,9 @@ settings:
   max_queued_bytes: 536870912  # total bytes of request bodies waiting in all queues; 503 beyond it
                                # (default 512 MiB). A request is always admitted when the queues are
                                # empty, so one oversized body can never stall the proxy.
+                               # Inside a memory-limited container the ceiling is halved when it
+                               # would exceed half of that limit (docker-compose.yml ships 1 GiB),
+                               # so a flood is shed rather than absorbed; the log says when it did.
   request_log_path: ollamamq-requests.jsonl   # request/response JSONL log file (default shown)
   request_log_max_bytes: 10485760             # rotate when file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)

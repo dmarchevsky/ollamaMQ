@@ -292,7 +292,9 @@ async fn main() {
     // backend takes it), so the body limit is a per-request memory commitment.
     // It used to be a flat 1 GiB on every route.
     let max_body_bytes = eff.max_body_bytes.unwrap_or(64 * 1024 * 1024);
-    let max_queued_bytes = eff.max_queued_bytes.unwrap_or(512 * 1024 * 1024);
+    // Clamped to the container's own memory: a queue that can outgrow the box
+    // holding it is not a limit (see `config::queue_budget`).
+    let max_queued_bytes = config::queue_budget(eff.max_queued_bytes.unwrap_or(512 * 1024 * 1024));
     let clients_file = store_file("clients_file", eff.clients_file.clone(), clients::DEFAULT_CLIENTS_FILE);
     let models_file = store_file("models_file", eff.models_file.clone(), model_policy::DEFAULT_MODELS_FILE);
     layers.resolved = resolved;

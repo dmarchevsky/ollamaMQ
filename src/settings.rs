@@ -229,9 +229,11 @@ pub fn apply(state: &AppState, eff: &Settings) {
         .allow_all_routes
         .store(eff.allow_all_routes.unwrap_or(false), Relaxed);
     state.max_queued_bytes.store(
-        eff.max_queued_bytes
-            .or(d.max_queued_bytes)
-            .unwrap_or(512 * 1024 * 1024),
+        crate::config::queue_budget(
+            eff.max_queued_bytes
+                .or(d.max_queued_bytes)
+                .unwrap_or(512 * 1024 * 1024),
+        ),
         Relaxed,
     );
     state.log_content_limit.store(
