@@ -2323,15 +2323,15 @@ function lvDrawRail() {
   turns.forEach((t, i) => {
     const prev = turns[i - 1];
     if (prev && prev.tl?.end != null && t.at_ms - prev.tl.end >= LV_IDLE_MS)
-      items.push(lvNode({ level: 1, rid: t.rid, when: `+${fmtDur((t.at_ms - prev.tl.end) / 1000)}`, tag: 'idle',
-        tip: `the proxy waited ${fmtTime(prev.tl.end)} → ${fmtTime(t.at_ms)}`,
+      items.push(lvNode({ level: 1, rid: t.rid, when: fmtDur((t.at_ms - prev.tl.end) / 1000), tag: 'idle',
+        tip: `how long it sat quiet: ${fmtDur((t.at_ms - prev.tl.end) / 1000)} (${fmtTime(prev.tl.end)} → ${fmtTime(t.at_ms)})`,
         snip: ((t.msgs || []).filter(m => m.name).map(m => m.name).join(', ') || 'agent side'), cls: 'gapnode', caret: '' }));
     items.push(lvNode({
       level: 1, rid: t.rid, tag: `Request ${i + 1}`,
       when: i === 0 ? fmtTime(t.at_ms) : `+${fmtDur((t.at_ms - turns[0].at_ms) / 1000)}`,
       snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ← ${lvFinish(t)}`,
       cls: 'turn', caret: LV.open.has(t.rid) ? '▾' : '▸',
-      tip: `arrived ${fmtTime(t.at_ms)}${i ? ` · ${fmtDur((t.at_ms - turns[0].at_ms) / 1000)} into this conversation` : ''}`
+      tip: `arrived ${fmtTime(t.at_ms)}${i ? ` · a moment: ${fmtDur((t.at_ms - turns[0].at_ms) / 1000)} after the conversation began` : ''}`
         + `${prev ? ` · ${fmtDur((t.at_ms - prev.at_ms) / 1000)} after request ${i}` : ''}`,
       on: t.rid === LV.rid && !LV.focusMsg }));
     if (!LV.open.has(t.rid)) return;
@@ -2361,8 +2361,10 @@ function lvDrawRail() {
     // from it while the turn is short enough for the delta to be the point.
     const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
     items.push(lvNode({ level: 2, rid: t.rid, cls: 'resp', tag: 'resp',
-      when: dur == null ? '' : `+${fmtDur(dur / 1000)}`,
-      tip: t.tl?.end != null ? `arrived ${fmtTime(t.at_ms)} · finished ${fmtTime(t.tl.end)}` : 'no response recorded yet',
+      when: dur == null ? '' : fmtDur(dur / 1000),
+      tip: t.tl?.end != null
+        ? `how long this response took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)})`
+        : 'no response recorded yet',
       snip: lvFinish(t) + (c?.resp ? '' : ' · no text'), caret: '' }));
   });
   if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');

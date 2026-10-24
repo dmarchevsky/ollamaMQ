@@ -136,9 +136,17 @@ addEventListener('load', () => {
           A('tree-unmeasured-explained', rows.filter(n => !n.querySelector('.when').textContent.trim())
             .every(n => /no instant of its own|never was captured/.test(n.title)),
             `${rows.length - stamped.length} row(s) with no window, all explained`);
-          A('tree-response-delta', [...document.querySelectorAll('#lv-rail .lv-node.resp')]
-            .every(n => /^\+\d+(\.\d)?s$|^$|^\d{2}:\d{2}:\d{2}$/.test(n.querySelector('.when').textContent)),
-            [...document.querySelectorAll('#lv-rail .lv-node.resp')].map(n => n.querySelector('.when').textContent).join(' '));
+          // A `+` marks a moment on the conversation's timeline; a plain
+          // duration is a length. Response and idle rows are lengths, so they
+          // must never wear the `+` a request row carries.
+          const LEN = /^\d+(\.\d)?s$|^\d+m \d{2}s$/;
+          const long = [...document.querySelectorAll('#lv-rail .lv-node.resp, #lv-rail .lv-node.gapnode')];
+          A('resp-idle-are-lengths', long.length > 0 && long.every(n => {
+            const w = n.querySelector('.when').textContent.trim();
+            return w === '' || LEN.test(w);
+          }), long.map(n => `${n.querySelector('.tag').textContent} ${n.querySelector('.when').textContent.trim()}`).join(' ') || 'no response rows');
+          A('length-say-what-they-measure', long.filter(n => n.querySelector('.when').textContent.trim())
+            .every(n => /how long/.test(n.title)), 'every duration row says how long of what');
           A('tree-single-highlight', document.querySelectorAll('#lv-rail .lv-node.on').length <= 1,
             `${document.querySelectorAll('#lv-rail .lv-node.on').length} row(s) highlighted`);
           const msg = document.querySelector('#lv-rail .lv-node.l3:not(.carry)');

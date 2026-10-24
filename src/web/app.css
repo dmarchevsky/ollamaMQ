@@ -786,7 +786,9 @@ tr.is-off td { color: var(--muted); }
    own timestamp, threaded down the left by the session colour. */
 .det-body { border-left: 2px dotted color-mix(in srgb, var(--c, var(--accent)) 45%, var(--border));
   margin: 2px 0 6px 7px; padding-left: 10px; }
-.det-row { display: flex; align-items: baseline; gap: 9px; padding: 3px 0;
+/* 9px of right padding, the header's own inset: the View chips at the end of a
+   header and of a stage line then fall on one edge instead of a ragged one. */
+.det-row { display: flex; align-items: baseline; gap: 9px; padding: 3px 9px 3px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
   font: 12px var(--mono); }
 .det-row:last-child { border-bottom: none; }

@@ -14,6 +14,13 @@ since upstream `v0.5.0`.
   raw dump — a 156 KB wall of `data: {"id":…}` for one answer. Detection now looks at the first line
   that carries payload, and the keep-alives, empty deltas and `[DONE]` are dropped from the view (`Raw`
   still shows everything as captured).
+- **`+` now means one thing in the timeline: a moment.** Response and idle rows are durations, but they
+  wore the same `+` as the request stamps, so a column mixing `19:03:59`, `+52.5s`, `+45.2s` and `44.6s`
+  asked you to guess which were times and which were lengths. Request rows are moments (`+52.5s` after
+  the conversation began), response/idle/message rows are lengths (`45.2s`), and each tooltip says which
+  of the two it is.
+- **The `≣ View` chips are one column now.** The stage rows had no right inset, so their chips sat 9 px
+  outside the header chips; they share the inset now and the pills line up edge to edge.
 - **Conversation timestamps count from its start, not from the turn before.** Each request used to be
   stamped with the gap since the previous one, so three turns spaced a steady 7 s apart read
   `+7.0s | +7.0s` — a number that says nothing and repeats itself. Now the first request keeps the
