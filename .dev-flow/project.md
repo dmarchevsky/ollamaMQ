@@ -26,6 +26,7 @@ kill $pid; exit $rc
 
 - [ ] (ui) visual pass in light **and** dark at 390px and 1280px: no overflows, no stray scrollbars, legible contrast
 - [ ] app runs locally against real backends (not `?demo`); primary views walked with live data
+- [ ] test instance on :8081 killed before `flow finish` — `pgrep -a ollamaMQ` is empty
 
 Visual-pass recipe (headless shell): screenshotting the *served* app crashes the shell
 (zygote socket errors) — render the static bundle instead: `file://<worktree>/src/web/index.html?demo`.
@@ -66,17 +67,25 @@ production container and a dev walk contend for the same port: before starting, 
 `ss -ltnp | grep :8081` / `pgrep -a ollamaMQ`, and re-check if the UI shows stale behaviour —
 a proxy left running pins the port after its worktree is rebuilt or deleted
 (`exe -> …/ollamaMQ (deleted)`) and silently serves the wrong build. Start it only after
-implementation completes, kill it before `flow finish`. Run it from a config copy outside
-`worktree/` (`.dev-flow/<slug>/live/config/appconf.yaml`) whose `request_log_path` points into
-that `live/` dir — the repo `config/appconf.yaml` points at `/data/…`, which does not exist on
-this host, so the proxy starts with "request log disabled" and writes no JSONL. `live/`
-survives `finish`; prune it with the feature.
+implementation completes, kill it before `flow finish`. Run the worktree binary against the
+repo's own config by absolute path: `-c /home/dima/work/ollamaMQ/config/appconf.yaml` — real
+backends, real credentials, sign-in-able with the operator's saved login; no config copy, no
+test password, no `.dev-flow/<slug>/live/` dir (retired). `config/` is untracked, so worktrees
+carry no config of their own — the `flow-check health` probe resolves it the same way. Its
+`request_log_path: /data/…` is the container's log mount and does not exist on this host, but
+since v0.17.0 capture falls back to `config/ollamamq-requests.jsonl` next to appconf.yaml and
+warns (`conversation log: … writing to … instead`); confirm with `GET /ui/api/capture` that
+capture runs and where it writes.
 
 Persist as you go: draft findings, calibration constants and mid-stage decisions into
 `plan/plan.md` (or a scratch file under the feature dir) as they happen, not only at stage
 boundaries — long implement stages otherwise lose them to context compaction.
 
 ## release
+
+Before `flow release`, `git status --porcelain` in the worktree must be empty: `flow check` and
+`flow release` do not report uncommitted paths (only `flow verify` prints them), and the squash
+ships without them — v0.17.0 released with a review fix to `app.css` left uncommitted.
 
 Semver: minor for user-facing features, patch for chores/fixes. The version-bump commit must
 include the refreshed `Cargo.lock` — a release commit that leaves the lock stale is incomplete.
