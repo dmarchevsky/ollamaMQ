@@ -1026,6 +1026,43 @@ pub fn sanitize_label(raw: Option<&str>) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// How many characters a client may claim as its identity.
+const MAX_IDENTITY_LEN: usize = 64;
+
+/// The queue/stats/blocking identity a keyless request claims with `X-User-ID`.
+///
+/// The header is unauthenticated, so it is treated as hostile input rather than
+/// as a name: it is the key of every per-user map and the string written into
+/// the request log and the TUI, so an unbounded or control-character-laden value
+/// is an unbounded, terminal-poisoning one. Whitespace and control characters
+/// collapse to `-` (as session labels do), non-printing and symbolic characters
+/// outside ASCII (emoji, combining marks) are dropped, `:` is dropped — client
+/// names cannot contain one, so this is also what keeps the reserved
+/// `unverified:<name>` namespace unforgable from a header — and an empty result
+/// is `anonymous`. Case is preserved: identity equality is what it always was.
+pub fn sanitize_identity(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if out.chars().count() >= MAX_IDENTITY_LEN {
+            break;
+        }
+        if ch.is_control() || ch.is_whitespace() {
+            if !out.ends_with('-') && !out.is_empty() {
+                out.push('-');
+            }
+            continue;
+        }
+        if ch == ':' || (!ch.is_ascii_graphic() && !ch.is_alphabetic() && !ch.is_numeric()) {
+            continue;
+        }
+        out.push(ch);
+    }
+    let trimmed = out.trim_matches('-');
+    (!trimmed.is_empty())
+        .then(|| trimmed.to_string())
+        .unwrap_or_else(|| "anonymous".to_string())
+}
+
 
 /// The backend a conversation was last served by.
 #[derive(Clone, Debug)]
@@ -2283,10 +2320,11 @@ impl AppState {
     /// priority or stats (client names cannot contain ':', so this never
     /// collides with a real client).
     pub fn unkeyed_identity(&self, claimed: &str) -> String {
-        if self.clients.lock_or_recover().is_registered(claimed) {
+        let claimed = sanitize_identity(claimed);
+        if self.clients.lock_or_recover().is_registered(&claimed) {
             format!("unverified:{claimed}")
         } else {
-            claimed.to_string()
+            claimed
         }
     }
 
@@ -7620,6 +7658,50 @@ mod tests {
             sanitize_label(Some("Refaktor äuth")),
             Some("refaktor-äuth".into())
         );
+    }
+
+    #[test]
+    fn identity_from_the_user_header_is_bounded_and_clean() {
+        assert_eq!(sanitize_identity("alice"), "alice");
+        assert_eq!(sanitize_identity(" Alice Chen "), "Alice-Chen");
+        // ANSI escapes and other control characters never reach the log or the
+        // TUI verbatim (the sequence's introducer is gone, so what is left is
+        // inert text).
+        assert_eq!(
+            sanitize_identity("al\u{1b}[31mice\u{7}"),
+            "al-[31mice",
+            "the escape bytes go and the split collapses to one dash"
+        );
+        assert_eq!(sanitize_identity("\u{1b}\u{7}"), "anonymous");
+        // A `:` would let a keyless client spell itself into the reserved
+        // `unverified:<name>` namespace.
+        assert_eq!(sanitize_identity("unverified:alice"), "unverifiedalice");
+        assert_eq!(sanitize_identity("a".repeat(300).as_str()).chars().count(), 64);
+        // Letters outside ASCII survive — this is a name, not a header value.
+        assert_eq!(sanitize_identity("josé"), "josé");
+        for empty in ["", "   ", "\n\t", "---", ":::", "\u{7}"] {
+            assert_eq!(sanitize_identity(empty), "anonymous", "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn a_forged_unverified_claim_cannot_reach_the_namespace() {
+        // Whatever the client sends, the reserved prefix is only ever produced
+        // by the proxy itself.
+        assert_eq!(sanitize_identity("unverified:alice"), "unverifiedalice");
+        assert_eq!(sanitize_identity("unverified: alice"), "unverified-alice");
+    }
+
+    /// The identity a keyless request is queued under, through the same entry
+    /// point `proxy_handler` uses.
+    #[test]
+    fn the_claimed_identity_is_the_sanitized_one() {
+        let state = new_test_state(vec!["http://127.0.0.1:9".into()]);
+        add_test_client(&state, "alice", "alice-key-123");
+        assert_eq!(state.unkeyed_identity("alice"), "unverified:alice");
+        assert_eq!(state.unkeyed_identity("unverified:alice"), "unverifiedalice");
+        assert_eq!(state.unkeyed_identity("\u{1b}\u{7}"), "anonymous");
+        assert_eq!(state.unkeyed_identity(""), "anonymous");
     }
 
     /// The conversation id used by the routing tests below, as the scheduler
