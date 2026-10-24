@@ -398,6 +398,24 @@ async fn aggregate_model_list(
         .first()
         .expect("a listing endpoint declares at least one shape");
     let route = families_for_route(&Method::GET, endpoint);
+    // Hidden models are dropped per backend, before de-duplication, so one
+    // hidden on one backend still lists when another serves it. Taken before
+    // the cache lookup: a cached listing is only valid under the policy it was
+    // merged with.
+    let policy = state.model_policy();
+
+    // Client apps poll these routes on a timer, and one poll used to fan out to
+    // every online backend again — polling clients times backends, forever, for
+    // a list that changes when a model is added. The merged answer is therefore
+    // kept briefly; anything the scheduler learns in between (a health round
+    // that changed a backend, a policy edit) clears or invalidates it.
+    if let Some(hit) = state.listing_cache.lock_or_recover().get(endpoint)
+        && hit.at.elapsed() < LISTING_CACHE_TTL
+        && Arc::ptr_eq(&hit.policy, &policy)
+    {
+        debug!("{endpoint} answered from the listing cache");
+        return Some((StatusCode::OK, axum::Json(hit.body.clone())).into_response());
+    }
 
     /// The model names we know a backend serves even if it cannot list them,
     /// sorted because `available_models` is a `HashSet` whose iteration order
@@ -412,9 +430,6 @@ async fn aggregate_model_list(
     // that must not be asked but have models to advertise anyway (below).
     let mut probed: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
     let mut state_only: Vec<(String, Vec<String>)> = Vec::new();
-    // Hidden models are dropped per backend, before de-duplication, so one
-    // hidden on one backend still lists when another serves it.
-    let policy = state.model_policy();
     {
         let backends = state.backends.lock_or_recover();
         for b in backends.iter() {
@@ -442,28 +457,37 @@ async fn aggregate_model_list(
         return None;
     }
 
-    let bodies = futures_util::future::join_all(probed.into_iter().map(|(base, token, names)| {
-        let client = state.client.clone();
-        let url = format!("{}{}", base, endpoint);
-        async move {
-            let body = async {
-                let mut req = client.get(&url).timeout(crate::control::PROBE_TIMEOUT);
-                if let Some(t) = &token {
-                    req = req.header("Authorization", format!("Bearer {}", t));
+    // Bounded fan-out: the listing routes take no backend slot, so without a
+    // limit a few slow backends and a room full of polling clients would leave
+    // an unbounded number of these requests in flight at once. `buffered`
+    // rather than `buffer_unordered`: the merged list's order (and which
+    // backend's envelope wins) is backend order on purpose, and a completion-
+    // ordered fan-out would reshuffle it between two polls.
+    let bodies: Vec<(Option<serde_json::Value>, Vec<String>, String)> =
+        futures_util::stream::iter(probed.into_iter().map(|(base, token, names)| {
+            let client = state.client.clone();
+            let url = format!("{}{}", base, endpoint);
+            async move {
+                let body = async {
+                    let mut req = client.get(&url).timeout(crate::control::PROBE_TIMEOUT);
+                    if let Some(t) = &token {
+                        req = req.header("Authorization", format!("Bearer {}", t));
+                    }
+                    let res = req.send().await.ok()?;
+                    if !res.status().is_success() {
+                        return None;
+                    }
+                    res.json::<serde_json::Value>().await.ok()
                 }
-                let res = req.send().await.ok()?;
-                if !res.status().is_success() {
-                    return None;
-                }
-                res.json::<serde_json::Value>().await.ok()
+                .await;
+                // The names travel with the answer so a backend that says
+                // nothing still gets to contribute its own models.
+                (body, names, base)
             }
-            .await;
-            // The names travel with the answer so a backend that says
-            // nothing still gets to contribute its own models.
-            (body, names, base)
-        }
-    }))
-    .await;
+        }))
+        .buffered(LISTING_FANOUT)
+        .collect()
+        .await;
 
     // The first answering body, with the array key *it* reported its listing
     // under — on a route shared by two families that is not the key the merged
@@ -566,7 +590,36 @@ async fn aggregate_model_list(
         map.remove(consumed_key);
     }
     envelope[out_key] = serde_json::Value::Array(merged);
+    state.listing_cache.lock_or_recover().insert(
+        endpoint.to_string(),
+        ListingEntry {
+            at: std::time::Instant::now(),
+            policy,
+            body: envelope.clone(),
+        },
+    );
     Some((StatusCode::OK, axum::Json(envelope)).into_response())
+}
+
+/// One merged model listing, kept for [`LISTING_CACHE_TTL`] under its route.
+pub struct ListingEntry {
+    at: std::time::Instant,
+    /// The policy this listing was merged with. Hiding a model must be visible
+    /// on the next request, so an entry built under a different policy is
+    /// never served — compared by pointer, because the store swaps the `Arc`
+    /// instead of mutating the policy in place.
+    policy: Arc<crate::model_policy::Policy>,
+    body: serde_json::Value,
+}
+
+/// How long a merged model listing is reused.
+const LISTING_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Concurrent listing probes across all backends in one merged listing.
+const LISTING_FANOUT: usize = 8;
+
+/// Forget every cached model listing (backend state changed underneath it).
+pub fn clear_listing_cache(state: &AppState) {
+    state.listing_cache.lock_or_recover().clear();
 }
 
 /// Insert the backend's configured auth token into `headers` unless the
@@ -814,6 +867,9 @@ pub struct AppState {
     pub model_config_path: String,
     /// Ring buffer of recent request/control events for the TUI Logs panel.
     pub logs: Mutex<VecDeque<LogEvent>>,
+    /// Merged model listings, per listing route, for [`LISTING_CACHE_TTL`]
+    /// (see `aggregate_model_list`). A leaf lock.
+    pub listing_cache: Mutex<HashMap<String, ListingEntry>>,
     /// Conversation log: one line per conversation, written when it goes quiet
     /// (no-op when disabled).
     pub convlog: crate::convlog::ConvLogger,
@@ -1937,6 +1993,7 @@ impl AppState {
 
         Self {
             queues: Mutex::new(HashMap::new()),
+            listing_cache: Mutex::new(HashMap::new()),
             processing_counts: Mutex::new(HashMap::new()),
             processed_counts: Mutex::new(HashMap::new()),
             dropped_counts: Mutex::new(HashMap::new()),
@@ -3067,6 +3124,10 @@ async fn health_check_round(
     // finished loading, backend came online, etc.) so queued requests are
     // re-evaluated immediately.
     if any_changed {
+        // A backend that came and went or changed its model list makes every
+        // cached merged listing wrong; say so instead of serving it for another
+        // couple of seconds.
+        clear_listing_cache(state);
         state.notify.notify_one();
     }
 }
@@ -8277,6 +8338,67 @@ mod tests {
         mock_b.abort();
     }
 
+    /// A listing route is answered once per TTL rather than once per client
+    /// poll: apps poll `/v1/models` on a timer, and every poll used to mean one
+    /// fresh request to every online backend.
+    #[tokio::test]
+    async fn model_listing_is_cached_until_something_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Relaxed);
+                    axum::Json(serde_json::json!({"data": [{"id": "cached-model"}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listing mock");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let state = new_test_state(vec![url]);
+        {
+            let mut backends = state.backends.lock_or_recover();
+            for b in backends.iter_mut() {
+                b.is_online = true;
+                b.api_type = BackendApiType::OpenAi;
+            }
+        }
+
+        for _ in 0..3 {
+            let v = response_json(
+                aggregate_model_list(&state, "/v1/models")
+                    .await
+                    .expect("backend answers"),
+            )
+            .await;
+            assert_eq!(v["data"][0]["id"], "cached-model");
+        }
+        assert_eq!(hits.load(Relaxed), 1, "three polls, one fan-out");
+
+        // Hiding a model must show on the next request, not after the TTL.
+        hide_models(&state, "cached-model", vec![]);
+        let v = response_json(
+            aggregate_model_list(&state, "/v1/models")
+                .await
+                .expect("still answered"),
+        )
+        .await;
+        assert!(
+            v["data"].as_array().expect("data array").is_empty(),
+            "the cached listing survived the policy change: {v}"
+        );
+        assert_eq!(hits.load(Relaxed), 2, "the policy change forced a fresh probe");
+    }
+
     /// How CLM / Kev answer `GET /v1/models` — the System One envelope, not
     /// OpenAI's `{"data":[{"id":…}]}`.
     const SYSTEMONE_V1_MODELS: &str =
@@ -8402,11 +8524,15 @@ mod tests {
         assert_eq!(ids, vec!["qwen3.8-27b"]);
 
         // With no compatible backend online there is nothing to merge, and the
-        // caller falls back to the normal queued proxy path.
+        // caller falls back to the normal queued proxy path. Going offline is
+        // what a health round reports, and a round that changes anything clears
+        // the cached listing — simulated here because the test flips the flag
+        // directly.
         {
             let mut backends = state.backends.lock_or_recover();
             backends[0].is_online = false;
         }
+        clear_listing_cache(&state);
         assert!(aggregate_model_list(&state, "/v1/models").await.is_none());
 
         mock_a.abort();

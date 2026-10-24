@@ -907,6 +907,11 @@ pub fn apply_declared_models(state: &AppState) {
         }
         b.declared_models = names;
     }
+    // Declared names are routable now, so a listing merged before this moment
+    // is already missing them. Dropped first: the cache lock is a leaf and does
+    // not belong under `backends`.
+    drop(backends);
+    crate::dispatcher::clear_listing_cache(state);
 }
 
 /// Wait until backend `idx` can accept a control op: no control op already in

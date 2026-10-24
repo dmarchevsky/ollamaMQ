@@ -425,6 +425,7 @@ pub fn apply_backends(state: &Arc<AppState>, list: &[Backend]) {
     }
     drop(backends);
     crate::dispatcher::clear_affinity(state);
+    crate::dispatcher::clear_listing_cache(state);
     state.notify.notify_one();
 }
 
