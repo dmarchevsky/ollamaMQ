@@ -1,4 +1,4 @@
-//! Point-in-time view of the proxy state shared by the TUI and the web UI.
+//! Point-in-time view of the proxy state — the payload the web UI renders.
 //!
 //! Built in one pass under short-lived locks; every field is an owned copy,
 //! so callers can render from it without holding any `AppState` lock.
@@ -55,7 +55,7 @@ impl UserRow {
     }
 }
 
-/// One row of the TUI's log table: every field the row and its detail header
+/// One row of the log table: every field the row and its detail header
 /// show, plus a display-sized preview of the captured text.
 ///
 /// The full text is deliberately not carried here. `capture()` runs ten times a
@@ -133,13 +133,13 @@ pub struct StateSnapshot {
     pub vip_user: Option<String>,
     pub boost_user: Option<String>,
     /// Per client, the highest priority level anything of theirs sits at right
-    /// now (`"high"` / `"top"`). What the TUI marks, so the marker says what the
+    /// now (`"high"` / `"top"`). What the dashboard marks, so the marker says what the
     /// board is doing rather than what was pinned once and has since drained.
     pub live_priority: Vec<(String, &'static str)>,
     pub backends: Vec<BackendStatus>,
     /// Per backend (same order as `backends`): `(prefill secs, waste secs)`
     /// accumulated over every request that had measurable cache waste;
-    /// `(0.0, 0.0)` where nothing was measurable — the TUI's Waste column
+    /// `(0.0, 0.0)` where nothing was measurable — the dashboard's Waste column
     /// renders `—` for those.
     pub backend_waste: Vec<(f64, f64)>,
     /// Recent request/control events (newest first) for the Logs panel. See
@@ -223,7 +223,7 @@ pub fn capture(state: &Arc<AppState>, log_limit: usize) -> StateSnapshot {
     };
     let backends = state.backends.lock_or_recover().clone();
     // Waste totals per backend, accumulated as requests finish (see
-    // `Stats::backend_waste`): lifetime totals, so the TUI's Waste column no
+    // `Stats::backend_waste`): lifetime totals, so the dashboard's Waste column no
     // longer resets when a turn ages out of the retained history window.
     let backend_waste: Vec<(f64, f64)> = backends
         .iter()

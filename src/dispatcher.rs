@@ -683,7 +683,7 @@ pub struct BackendStatus {
     pub is_online: bool,
     pub api_type: BackendApiType,
     /// Reference-counted: replaced wholesale by each probe, but cloned by
-    /// the TUI on every frame (a backend can list hundreds of models).
+    /// the dashboard on every refresh (a backend can list hundreds of models).
     pub available_models: Arc<HashSet<String>>,
     pub loaded_models: Arc<HashSet<String>>,
     /// True when the backend reported loaded-model data in its latest probe
@@ -841,7 +841,7 @@ pub struct AppState {
     /// (at most one per backend). Backends with an entry are treated as busy
     /// by the scheduler.
     pub control_ops: Mutex<HashMap<usize, crate::control::ControlOp>>,
-    /// Recent finished control operations (bounded), for TUI feedback.
+    /// Recent finished control operations (bounded), for dashboard feedback.
     pub control_history: Mutex<VecDeque<crate::control::ControlResult>>,
     /// `keep_alive` (seconds) sent with control "load" requests so explicitly
     /// loaded models stay resident (Ollama's own default is only 5 minutes).
@@ -861,11 +861,11 @@ pub struct AppState {
     /// whenever the model config changes. Unlisted models default to 1.
     pub model_limits: Mutex<HashMap<String, u32>>,
     /// Model configuration from `appconf.yaml` (models to load on backends,
-    /// with load settings). Re-read with the TUI 'r' key.
+    /// with load settings). Re-read with **Reload config** in the web UI.
     pub model_config: Mutex<Vec<crate::config::ModelConfig>>,
     /// Path of the model config file.
     pub model_config_path: String,
-    /// Ring buffer of recent request/control events for the TUI Logs panel.
+    /// Ring buffer of recent request/control events for the Logs panel.
     pub logs: Mutex<VecDeque<LogEvent>>,
     /// Merged model listings, per listing route, for [`LISTING_CACHE_TTL`]
     /// (see `aggregate_model_list`). A leaf lock.
@@ -910,7 +910,7 @@ pub struct AppState {
     pub rid_seq: std::sync::atomic::AtomicU64,
 }
 
-/// One line of the TUI Logs panel: a request entering ("IN") or leaving
+/// One line of the Logs panel: a request entering ("IN") or leaving
 /// ("OUT") the proxy, or a model-control action ("CTL").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogEvent {
@@ -924,8 +924,8 @@ pub struct LogEvent {
     pub info: String,
     /// Optional body/response content preview (truncated to the configured
     /// limit) for IN/OUT events; None for drops and control actions.
-    /// Reference-counted: the TUI snapshots the newest events on every frame,
-    /// and these strings run to `log_content_limit` (1 MiB by default).
+    /// Reference-counted: the dashboard snapshots the newest events on every
+    /// refresh, and these strings run to `log_content_limit` (1 MiB by default).
     pub content: Option<Arc<String>>,
     /// Correlation id of the proxied request this event belongs to: the IN and
     /// OUT events of one request share it, which is how the web UI pairs them
@@ -1089,7 +1089,7 @@ const MAX_IDENTITY_LEN: usize = 64;
 ///
 /// The header is unauthenticated, so it is treated as hostile input rather than
 /// as a name: it is the key of every per-user map and the string written into
-/// the request log and the TUI, so an unbounded or control-character-laden value
+/// the request log and the dashboard, so an unbounded or control-character-laden value
 /// is an unbounded, terminal-poisoning one. Whitespace and control characters
 /// collapse to `-` (as session labels do), non-printing and symbolic characters
 /// outside ASCII (emoji, combining marks) are dropped, `:` is dropped — client
@@ -2193,30 +2193,6 @@ impl AppState {
             .iter()
             .map(|(tag, p)| (tag.clone(), p.level.as_str()))
             .collect()
-    }
-
-    /// The TUI's one keystroke for a client: set the level of every request of
-    /// that client waiting right now, and pin the conversations behind them so
-    /// the next turn of the same conversation keeps it. A request already
-    /// running keeps the level it was queued with — the order is decided before
-    /// a slot is spent, and nothing is taken away mid-flight. Returns how many
-    /// waiting requests moved.
-    pub fn pin_user_sessions(&self, user: &str, level: Priority) -> usize {
-        let now = std::time::Instant::now();
-        let mut queues = self.queues.lock_or_recover();
-        let Some(queue) = queues.get_mut(user) else {
-            return 0;
-        };
-        let mut pins = self.session_pins.lock_or_recover();
-        let mut moved = 0;
-        for task in queue.iter_mut() {
-            task.priority = level;
-            moved += 1;
-            if let Some(k) = task.session_key.as_ref() {
-                pins.insert(k.tag(), SessionPin { level, since: now });
-            }
-        }
-        moved
     }
 
     /// Toggle `user_id` as the VIP user. A user is never VIP and boost at
@@ -3990,7 +3966,7 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                     // Set only when a response was delivered to the client in
                     // full; `processed_count` used to be bumped on every exit
-                    // path, so the TUI counted blocked, abandoned and errored
+                    // path, so the dashboard counted blocked, abandoned and errored
                     // requests as throughput.
                     let mut delivered = false;
 
@@ -6277,7 +6253,7 @@ mod tests {
         assert!(text.contains(r#"ollamamq_backend_free_slots{backend="127.0.0.1:9"} 0"#));
     }
 
-    /// The TUI's Waste column reads the snapshot's per-backend pairs, in backend
+    /// The dashboard's Waste column reads the snapshot's per-backend pairs, in backend
     /// order, straight from the accumulated counters — no history walk.
     #[test]
     fn capture_reports_waste_per_backend_in_backend_order() {
@@ -7671,30 +7647,6 @@ mod tests {
     }
 
     #[test]
-    fn one_key_sets_every_waiting_request_of_a_client() {
-        let state = new_test_state(vec!["http://127.0.0.1:11434".into()]);
-        let k = key("thread", "m");
-        let _a = enqueue_chat_with_key(&state, "m", "{}".into(), Some(k.clone()));
-        let _b = enqueue_chat_with_key(&state, "m", "{\"x\":1}".into(), None);
-        assert_eq!(state.pin_user_sessions("tester", Priority::Top), 2);
-        let q = state.queues.lock_or_recover();
-        assert!(
-            q["tester"].iter().all(|t| t.priority == Priority::Top),
-            "every waiting request moved"
-        );
-        drop(q);
-        // The conversation behind a queued request is pinned as well, so its
-        // next turn keeps the level; a request without a session key has
-        // nothing to pin, which is why one pin and not two.
-        assert_eq!(state.session_pins.lock_or_recover().len(), 1);
-        assert_eq!(
-            resolve_priority(&state, &HeaderMap::new(), false, Some(&k)),
-            Priority::Top
-        );
-        assert_eq!(state.pin_user_sessions("nobody", Priority::High), 0);
-    }
-
-    #[test]
     fn a_clients_own_queue_runs_priority_first_then_arrival_order() {
         let q: std::collections::VecDeque<Task> = [
             Priority::Normal,
@@ -7775,7 +7727,7 @@ mod tests {
         assert_eq!(sanitize_identity("alice"), "alice");
         assert_eq!(sanitize_identity(" Alice Chen "), "Alice-Chen");
         // ANSI escapes and other control characters never reach the log or the
-        // TUI verbatim (the sequence's introducer is gone, so what is left is
+        // dashboard verbatim (the sequence's introducer is gone, so what is left is
         // inert text).
         assert_eq!(
             sanitize_identity("al\u{1b}[31mice\u{7}"),

@@ -121,7 +121,7 @@ impl Stats {
         if let Some(waste_secs) = f.timing.waste_secs
             && let Some(backend) = f.backend.as_deref()
         {
-            // Same rule the TUI's Waste column always used: a turn only
+            // Same rule the dashboard's Waste column always used: a turn only
             // counts when its waste was measurable, and its prefill time
             // joins the denominator at that moment.
             let prefill = f.timing.prefill.map(|(secs, _)| secs).unwrap_or(0.0);

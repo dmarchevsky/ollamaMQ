@@ -31,10 +31,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// How many finished control ops to remember for TUI feedback.
+/// How many finished control ops to remember for dashboard feedback.
 const MAX_HISTORY: usize = 20;
 
-/// How long a finished op stays visible in the TUI.
+/// How long a finished op stays visible in the dashboard.
 pub const RESULT_VISIBLE: Duration = Duration::from_secs(10);
 
 /// How long applying the model config waits for a backend to go idle before
@@ -42,7 +42,7 @@ pub const RESULT_VISIBLE: Duration = Duration::from_secs(10);
 ///
 /// `start_model_control` refuses to load while a backend has requests in
 /// flight — loading can evict the model those requests are using. Config apply
-/// runs at startup and on TUI 'r', so on a proxy restarted under live traffic
+/// runs at startup and on a config reload, so on a proxy restarted under live traffic
 /// every entry used to be rejected on the spot and never retried: the
 /// configured models, and in particular their `max_ctx`, were silently never
 /// applied. Waiting for the in-flight requests to drain fixes that; the bound
@@ -101,7 +101,7 @@ pub struct ControlOp {
     pub started: Instant,
 }
 
-/// Terminal record of a finished control op (kept for TUI feedback).
+/// Terminal record of a finished control op (kept for dashboard feedback).
 #[derive(Clone, Debug)]
 pub struct ControlResult {
     pub backend_idx: usize,
@@ -1020,7 +1020,7 @@ pub fn apply_model_config(state: &Arc<AppState>) -> usize {
 
                 // A resident model is only "done" when it also runs with the
                 // configured max_ctx. Models loaded by an earlier ollamaMQ
-                // run, the backend's own UI, a JIT auto-load or a TUI load
+                // run, the backend's own UI, a JIT auto-load or a model-control load
                 // (which sends no context) may have the wrong context window;
                 // in that case unload and reload with the configured value
                 // instead of skipping.
