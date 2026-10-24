@@ -115,8 +115,9 @@
     tools: ['read', 'edit', 'bash', 'write', 'grep'].map(n => ({ function: { name: n } })),
     messages: [...chatMsgs, ...extra],
   });
-  const sse = (deltas, usage, finish) => deltas
-    .map(d => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: d }] }) + '\n\n').join('')
+  const sse = (deltas, usage, finish) => ': keepalive\n\n'
+    + 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] }) + '\n\n'
+    + deltas.map(d => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: d }] }) + '\n\n').join('')
     + 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: finish }], usage }) + '\n\n'
     + 'data: [DONE]\n\n';
   const streamOut = sse(

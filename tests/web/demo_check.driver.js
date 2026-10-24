@@ -48,8 +48,11 @@ addEventListener('load', () => {
     const turns = nodes.filter(n => n.classList.contains('turn'));
     A('tree-has-all-turns', turns.length === LV.conv.turns.length,
       `${turns.length} nodes of ${LV.conv.turns.length} turns`);
-    const whens = turns.map(n => n.querySelector('.when').textContent);
-    A('stamps-shaped', whens.length > 0 && whens.every(w => /^(\d{2}:\d{2}:\d{2}|\+\d+s)$/.test(w)), JSON.stringify(whens));
+    const whens = turns.map(n => n.querySelector('.when').textContent.trim());
+    // One absolute clock (the conversation's first request); everything after it
+    // is a delta from the request before it.
+    A('stamps-shaped', whens.length > 0 && /^\d{2}:\d{2}:\d{2}$/.test(whens[0])
+      && whens.slice(1).every(w => /^\+\d+(\.\d)?s$|^\+\d+m \d{2}s$/.test(w)), JSON.stringify(whens));
     A('first-stamp-absolute', whens[0] === fmtTime(LV.conv.turns[0].at_ms),
       `${whens[0]} want ${fmtTime(LV.conv.turns[0].at_ms)}`);
     // The whole conversation is on the page, not the one round it was opened on:
@@ -148,36 +151,55 @@ addEventListener('load', () => {
             fl ? `focused ${fl.id}` : `nothing focused, wanted ${want}`);
           A('tree-child-marked', document.querySelector('#lv-rail .lv-node.on')?.dataset.idx
             === msg.dataset.idx, 'the tree row shows which message is in view');
-          // The re-sent prefix is one line in the tree and one in the body, and
-          // the two are the same fold: opening it grows both.
-          const cnode = document.querySelector(`#lv-rail .lv-node.carry[data-rid="${LV.conv.turns[1].rid}"]`);
-          if (!cnode) { A('carry-line-folds-both', false, 'request 2 shows no carried-history line'); return; }
-          const rid2 = +cnode.dataset.rid;
-          const hid = lvHidden(1);
-          const car = s2 => document.querySelector(`#lv-rail .lv-node.carry[data-rid="${rid2}"] .car`).textContent.trim();
-          const count = () => document.querySelectorAll(`#lv-t-${rid2} .msg`).length;
-          const wasOpen = LV.hist.has(rid2);       // Expand all may have opened it already
-          const before2 = count();
-          cnode.click();
+          // The jump tree lists only what each request added — no Held row, and
+          // no re-sent rows under a later request. The body keeps the fold line.
+          const rid2 = LV.conv.turns[1].rid, hid = lvHidden(1);
+          const cl = () => document.querySelector(`#lv-t-${rid2} .lv-carry`);
+          if (LV.hist.has(rid2)) { cl().click(); await wait(700); }   // Expand all opens folds too
+          const rows2 = [...document.querySelectorAll(`#lv-rail .lv-node.l3[data-rid="${rid2}"]`)];
+          A('tree-rows-are-new-only', rows2.length > 0 && rows2.every(n => +n.dataset.idx >= hid)
+            && !document.querySelector('#lv-rail .lv-node.carry'),
+            `${rows2.length} rows for request 2, every idx >= ${hid}, no Held row`);
+          if (!cl()) { A('carry-line-folds-body', false, 'request 2 shows no carried-history line'); return; }
+          const n0 = document.querySelectorAll(`#lv-t-${rid2} .msg`).length;
+          cl().click();
           await wait(700);
-          const after2 = count();
-          A('carry-line-folds-both', LV.hist.has(rid2) === !wasOpen
-            && after2 === before2 + (wasOpen ? -hid : hid)
-            && car() === (wasOpen ? '▸' : '▾') && !!document.querySelector(`#lv-t-${rid2} .lv-carry`),
-            `request 2 ${before2} → ${after2} body messages (${wasOpen ? 'folded' : 'unfolded'} ${hid} held), tree caret ${car()}`);
-          // (re-query: the redraw replaced the rail, so `cnode` is detached now)
-          if (!LV.hist.has(rid2)) { document.querySelector(`#lv-rail .lv-node.carry[data-rid="${rid2}"]`).click(); await wait(700); }
-          // With its history unfolded, a message that this request re-sent is on
-          // screen here, so clicking it stays here instead of jumping away.
-          const resent = [...document.querySelectorAll('#lv-rail .lv-node.l3:not(.carry)')]
-            .find(n => +n.dataset.rid === rid2 && +n.dataset.idx < hid);
-          if (!resent) { A('tree-resent-click-lands', false, `no unfolded row in request 2 (hidden ${hid})`); return; }
-          resent.click();
+          const n1 = document.querySelectorAll(`#lv-t-${rid2} .msg`).length;
+          A('carry-line-folds-body', LV.hist.has(rid2) && n1 === n0 + hid
+            && cl().textContent.trim().startsWith('\u25be'),
+            `request 2 body ${n0} \u2192 ${n1} messages (+${hid} held)`);
+          // With its held history open on screen, that request's own copy of a
+          // re-sent message is what a jump lands on \u2014 not the earlier turn.
+          await lvFocusMsg(rid2, 0);
+          await wait(500);
+          A('unfolded-resent-stays', LV.focusMsg?.[0] === rid2 && LV.focusMsg?.[1] === 0
+            && !!document.getElementById(`lv-m-${rid2}-0`), 'idx 0 of request 2 stays in request 2');
+          // One absolute clock per conversation; every later request and node is
+          // a delta from the one before it.
+          const tw = [...document.querySelectorAll('#lv-rail .lv-node.turn .when')].map(n => n.textContent.trim());
+          const DELTA = /^\+\d+(\.\d)?s$|^\+\d+m \d{2}s$/;
+          A('tree-first-clock-rest-delta', /^\d{2}:\d{2}:\d{2}$/.test(tw[0])
+            && tw.slice(1).every(w => DELTA.test(w)), tw.join(' '));
+          const bw = [...document.querySelectorAll('#dlg-log .turn-h .ts')].map(n => n.textContent.trim());
+          A('body-first-clock-rest-delta', /^\d{2}:\d{2}:\d{2} \u2192 \d{2}:\d{2}:\d{2}$/.test(bw[0])
+            && bw.slice(1).every(w => DELTA.test(w.split(' \u2192 ')[0])), bw.join(' | '));
+          A('idle-gap-named', !!document.querySelector('#dlg-log .lv-gap')
+            && !!document.querySelector('#lv-rail .lv-node.gapnode'),
+            document.querySelector('#dlg-log .lv-gap')?.textContent.trim().slice(0, 64));
+          // Formatted view reads the stream back as the answer, not as the wire:
+          // keep-alive comments and empty deltas are gone, the text is whole.
+          // (the Response section is the last one in the turn; its class sits on
+          // the heading, not the section)
+          const out = () => [...document.querySelectorAll(`#lv-t-${rid2} .lv-sec`)].pop().textContent;
+          const fmt = out();
+          A('formatted-stream-is-text', !/data: ?\{|keepalive/.test(fmt)
+            && /rotate\(\) loop shifts files/.test(fmt), fmt.replace(/\s+/g, ' ').trim().slice(0, 96));
+          document.querySelector('#lv-fmt label:has(input[value="raw"])').click();
           await wait(700);
-          const want2 = `lv-m-${rid2}-${resent.dataset.idx}`;
-          A('tree-resent-click-lands', LV.focusMsg?.[0] === rid2
-            && String(LV.focusMsg[1]) === resent.dataset.idx && !!document.getElementById(want2),
-            `${resent.querySelector('.tag').textContent} of request 2 -> ${want2} (unfolded here, so it stays here)`);
+          const raw = out();
+          A('raw-keeps-the-wire', /data: ?\{/.test(raw) && raw.includes('[DONE]'), `${raw.length} chars of captured bytes`);
+          document.querySelector('#lv-fmt label:has(input[value="fmt"])').click();
+          await wait(500);
         })();
       }, 600);
     }, 600);

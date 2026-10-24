@@ -1876,12 +1876,32 @@ const nowish = () => (S.overview && S.overview.now_ms) || Date.now();
 
 /** The quiet stretch before a turn, named by what ran in it: the turn's own
  *  tool results are exactly what the agent did while the proxy was idle. */
+/** A gap this long between one answer ending and the next request arriving is
+ *  worth a line of its own: that is a tool (or a human) working, not network
+ *  turnaround. The request row already carries the gap as a `+Xs` stamp. */
+const LV_IDLE_MS = 5_000;
+
 function lvGap(t, prev) {
   const end = prev && prev.tl && prev.tl.end;
-  if (!end || t.at_ms - end < 30_000) return '';
+  if (!end || t.at_ms - end < LV_IDLE_MS) return '';
   const tools = (t.msgs || []).filter(m => m.name).map(m => m.name);
   const what = tools.length ? `tool ${tools.join(', ')}` : 'agent side';
   return `<div class="lv-gap"><span class="dot">◌</span>idle ${fmtDur((t.at_ms - end) / 1000)} · ${esc(what)} (${fmtTime(end)} → ${fmtTime(t.at_ms)})</div>`;
+}
+
+/** The first request of a conversation owns the clock; every later one is written
+ *  as the delta from the request before it, the way `dmesg -H` stamps a log —
+ *  the spacing is the point, and the absolute pair stays one hover away. */
+function lvSpan(t, prev) {
+  const end = t.tl?.end;
+  if (!prev)
+    return { txt: `${fmtTime(t.at_ms)}${end != null ? ` → ${fmtTime(end)}` : ''}`, tip: '' };
+  const from = prev.at_ms;
+  return {
+    txt: `+${fmtDur((t.at_ms - from) / 1000)}${end != null ? ` → +${fmtDur((end - from) / 1000)}` : ''}`,
+    tip: `arrived ${fmtTime(t.at_ms)}${end != null ? ` · finished ${fmtTime(end)}` : ''}`
+      + ` · ${fmtDur((t.at_ms - from) / 1000)} after the request before it`,
+  };
 }
 
 const lvSec = (cls, title, info, html) =>
@@ -1992,11 +2012,12 @@ async function lvDraw({ scroll = false } = {}) {
   for (let i = 0; i < turns.length; i++) {
     const t = turns[i];
     parts.push(lvGap(t, turns[i - 1]));
+    const sp = lvSpan(t, turns[i - 1]);
     parts.push(`<section class="turn${t.rid === LV.rid ? ' active' : ''}" id="lv-t-${t.rid}" data-rid="${t.rid}">
       <h3 class="turn-h" data-action="lv-toggle" data-rid="${t.rid}" title="expand or collapse this request">
         <span class="chev">${LV.open.has(t.rid) ? '▾' : '▸'}</span>
         <span class="n">Request ${i + 1} of ${turns.length}</span>
-        <span>${fmtTime(t.at_ms)}${t.tl?.end != null ? ` → ${fmtTime(t.tl.end)}` : ''}</span>
+        <span class="ts"${sp.tip ? ` title="${esc(sp.tip)}"` : ''}>${sp.txt}</span>
         <span>${lvStages(t)}</span>
         <span class="tail">${t.status != null ? `<span class="${t.status >= 400 ? 'st-bad' : 'st-ok'}">${t.status}</span>` : '<span class="dim">running</span>'}</span>
         ${t.redacted ? '<span class="badge warn" title="no body text is stored for this client, key or backend">no text</span>' : ''}
@@ -2210,10 +2231,10 @@ function lvSave(text, name, type) {
 // carries the timestamp it was measured at, so the outline reads as the
 // timeline it is.
 
-function lvNode({ level, rid, idx, when, tip, tag, snip, caret, caretAction = 'lv-tree', cls = '', action = 'lv-jump', on = false }) {
+function lvNode({ level, rid, idx, when, tip, tag, snip, caret, cls = '', action = 'lv-jump', on = false }) {
   return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}
     ${tip ? `title="${esc(tip)}"` : ''}>
-    <span class="car"${caret ? ` data-action="${caretAction}" data-rid="${rid}"` : ''}>${caret ?? ''}</span>
+    <span class="car"${caret ? ' data-action="lv-tree"' : ''} data-rid="${rid}">${caret ?? ''}</span>
     <span class="when">${when ?? ''}</span><span class="tag">${esc(tag)}</span>
     <span class="snip">${esc(snip)}</span></div>`;
 }
@@ -2264,14 +2285,16 @@ function lvDrawRail() {
     <button class="btn sm" data-action="lv-collapse">Collapse all</button></div>`];
   turns.forEach((t, i) => {
     const prev = turns[i - 1];
-    if (prev && prev.tl?.end != null && t.at_ms - prev.tl.end >= 30_000)
+    if (prev && prev.tl?.end != null && t.at_ms - prev.tl.end >= LV_IDLE_MS)
       items.push(lvNode({ level: 1, rid: t.rid, when: `+${fmtDur((t.at_ms - prev.tl.end) / 1000)}`, tag: 'idle',
         tip: `the proxy waited ${fmtTime(prev.tl.end)} → ${fmtTime(t.at_ms)}`,
         snip: ((t.msgs || []).filter(m => m.name).map(m => m.name).join(', ') || 'agent side'), cls: 'gapnode', caret: '' }));
     items.push(lvNode({
-      level: 1, rid: t.rid, when: fmtTime(t.at_ms), tag: `Request ${i + 1}`,
+      level: 1, rid: t.rid, tag: `Request ${i + 1}`,
+      when: prev ? `+${fmtDur((t.at_ms - prev.at_ms) / 1000)}` : fmtTime(t.at_ms),
       snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ← ${lvFinish(t)}`,
-      cls: 'turn', caret: LV.open.has(t.rid) ? '▾' : '▸', tip: `arrived ${fmtTime(t.at_ms)}`,
+      cls: 'turn', caret: LV.open.has(t.rid) ? '▾' : '▸',
+      tip: `arrived ${fmtTime(t.at_ms)}${prev ? ` · ${fmtDur((t.at_ms - prev.at_ms) / 1000)} after request ${i}` : ''}`,
       on: t.rid === LV.rid && !LV.focusMsg }));
     if (!LV.open.has(t.rid)) return;
     const carry = lvCarry(i);
@@ -2284,13 +2307,10 @@ function lvDrawRail() {
       snip: msgs ? (carry ? `${msgs - carry.hidden} new · ${carry.hidden} held` : `${msgs} messages`)
         : t.req?.bytes != null ? `${fmtBytes(t.req.bytes)}${t.redacted ? ' \u00b7 no text' : ''}` : 'no body',
       caret: '' }));
-    // The messages this request re-sent fold into one line — the same line the
-    // body shows, and clicking either one opens both.
+    // The messages this request re-sent are not the tree's business: they are
+    // already drawn under their own request. The request row says `3 new · 7
+    // held`, and unfolding the body adds them here too.
     const showHist = LV.hist.has(t.rid);
-    if (carry && (c?.reqObj?.messages || []).length)
-      items.push(lvNode({ level: 3, rid: t.rid, when: '', tag: 'held', cls: 'carry', action: 'lv-carry',
-        caret: showHist ? '▾' : '▸', caretAction: 'lv-carry',
-        tip: lvCarryText(carry, showHist), snip: lvCarryText(carry, showHist, true) }));
     for (const [i, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
       if (carry && !showHist && i < carry.hidden) continue;
       const w = lvMsgWhen(lvIdxOf(t.rid), i)
@@ -2303,7 +2323,7 @@ function lvDrawRail() {
     // from it while the turn is short enough for the delta to be the point.
     const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
     items.push(lvNode({ level: 2, rid: t.rid, cls: 'resp', tag: 'resp',
-      when: dur == null ? '' : dur < 60_000 ? `+${fmtDur(dur / 1000)}` : fmtTime(t.tl.end),
+      when: dur == null ? '' : `+${fmtDur(dur / 1000)}`,
       tip: t.tl?.end != null ? `arrived ${fmtTime(t.at_ms)} · finished ${fmtTime(t.tl.end)}` : 'no response recorded yet',
       snip: lvFinish(t) + (c?.resp ? '' : ' · no text'), caret: '' }));
   });
@@ -2442,8 +2462,12 @@ function transcriptView(body) {
 function streamState(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   if (!lines.length) return null;
-  const sse = /^data:/.test(lines[0]);
-  if (!sse && !/^\{/.test(lines[0])) return null;
+  // A stream may open with an SSE comment (`: keepalive`) or an `event:` line —
+  // llama.cpp does exactly that — so the first line that carries payload is
+  // what decides the shape, not line 0.
+  const head = lines.find(l => /^data:/.test(l) || /^\{/.test(l));
+  if (!head) return null;
+  const sse = /^data:/.test(head);
   const trunc = text.includes('[truncated:');
   const st = { text: '', think: '', tools: [], finish: null, usage: null, chunks: 0, errs: 0, cutTail: false };
   for (const line of lines) {

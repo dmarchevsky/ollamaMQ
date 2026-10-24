@@ -285,6 +285,11 @@ input, select {
 }
 input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 #log-filter { width: 300px; }
+/* The group switch shares the toolbar row with the filter box, the select and
+   Pause, so it drops the margin that spaces a standalone switch and matches
+   their height instead of riding above the row. */
+.toolbar .seg { margin-bottom: 0; }
+.toolbar .seg span { padding: 4px 12px; }
 .check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
 /* Shown on the Logs page when the conversation log could not be opened at boot:
    the rows are real requests, but there is nothing behind them to open. */
@@ -852,9 +857,11 @@ table.logs td.round { padding-right: 16px; }
 .det-row .jump { margin-left: auto; }
 .det-row[data-action], .jump-chip { cursor: pointer; }
 .det-h .logs-link { flex: none; }
+/* Same widget in the header and in the stage lines: the stage row is monospace,
+   so the chip names its own face instead of inheriting two looks. */
 .jump-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 9px;
   border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2);
-  color: var(--muted); font-size: 11px; white-space: nowrap; }
+  color: var(--muted); font: 11px var(--sans); white-space: nowrap; }
 .jump-chip:hover { color: var(--accent); border-color: var(--accent); }
 
 /* ------------------------------------------------------------ round view */

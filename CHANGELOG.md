@@ -7,6 +7,25 @@ since upstream `v0.5.0`.
 
 ### Changed
 
+- **A streamed response is finally readable in Formatted.** The viewer rebuilds the stream into the
+  answer it produced (text, thinking, tool calls, finish reason, usage) instead of printing the wire, but
+  it only recognised a stream whose very first line was `data: {…}`. llama.cpp opens with a
+  `: keepalive` comment and keeps the socket warm with empty deltas, so real streams fell through to a
+  raw dump — a 156 KB wall of `data: {"id":…}` for one answer. Detection now looks at the first line
+  that carries payload, and the keep-alives, empty deltas and `[DONE]` are dropped from the view (`Raw`
+  still shows everything as captured).
+- **The timeline reads like `dmesg -H` all the way down.** A conversation's first request keeps the
+  absolute clock (`17:30:14`); every request and node after it is a delta — `+18s` between two requests,
+  `+6.2s` for an idle gap, `+18.4s` for how long a response took — with the absolute time on hover. Idle
+  gaps are named from 5 s (was 30 s), so the seconds an agent spends running a tool show up in both the
+  log and the jump tree instead of looking like an instant.
+- **No `Held` row in the jump tree.** The tree lists only what each request added and says
+  `3 new · 7 held` on the request row; opening the held history stays a body action, where the messages
+  actually appear.
+- **Fonts on the Overview are consistent.** The `≣ View` chip inherited monospace from the stage row it
+  sits in, so the header's chip and the row's chip looked different; the chip now names the interface face
+  itself and is identical in both. The `By conversation / By request` switch on the Logs page also sits
+  on the toolbar line with the filter, the select and Pause instead of riding 7 px above them.
 - **A request in the viewer shows what it added, not the whole conversation again.** Every turn after the
   first re-sends the entire history, so the viewer used to repeat it: turn 4 reprinted the messages turns
   1–3 had already drawn. Each turn now collapses what it merely re-sent into one line —
