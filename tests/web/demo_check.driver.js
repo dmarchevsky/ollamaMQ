@@ -104,16 +104,29 @@ addEventListener('load', () => {
         A('turn-line-numbered', nTxt.length === LV.conv.turns.length
           && nTxt.every((x, k) => x === `#${k + 1}`), nTxt.join(' '));
         A('turn-line-sizes-quiet', [...document.querySelectorAll('#dlg-log .turn-h .tail.sz')].every(n => /→/.test(n.textContent)));
-        A('turn-line-preview', [...document.querySelectorAll('#dlg-log .turn-h .pv .u')].length > 0
+        A('turn-line-preview', [...document.querySelectorAll('#dlg-log .turn-h .pv')].some(n => n.innerHTML !== '')
+          && [...document.querySelectorAll('#dlg-log .turn-h .pv .u')].length >= 0
           && [...document.querySelectorAll('#dlg-log .turn-h .pv .t')].length >= 0,
-          'user previews render blue (thinking previews when the text lands)');
+          'folded lines tease their words (user blue, thinking green)');
         A('problem-row-tinted', !!document.querySelector('#dlg-log .turn.prob'));
+        A('preview-teases-only-when-folded', document.querySelector(`#lv-t-${rid2} .turn-h .pv`)?.innerHTML === ''
+          && !document.querySelector(`#lv-rail .lv-node.turn[data-rid="${rid2}"] .pv`)
+          && document.querySelector(`#lv-t-${LV.conv.turns.at(-3).rid} .turn-h .pv`)?.innerHTML !== '',
+          'open requests say their words once; folded ones tease them');
         // A run groups the requests between two final answers; folding one
         // folds its requests to the run line, and the rail mirrors it.
         const runHeads = [...document.querySelectorAll('#dlg-log .run-h')];
-        A('runs-group-the-session', runHeads.length >= 2
-          && document.querySelectorAll('#lv-rail .lv-node.run').length === runHeads.length,
-          `${runHeads.length} runs, mirrored in the rail`);
+        A('runs-group-the-session', runHeads.length >= 1
+          && document.querySelectorAll('#lv-rail .lv-node.run').length === runHeads.length
+          && !runHeads.some(h => /#(\d+)–#\1/.test(h.textContent)),
+          `${runHeads.length} runs, mirrored in the rail, every run names a range`);
+        // A request between two final answers alone groups nothing — it stands
+        // on its own, with no chrome and no second numbering system.
+        A('single-requests-stand-alone', !document.getElementById(`lv-t-${LV.conv.turns[0].rid}`).closest('.run'),
+          'request #1 renders with no run wrapper');
+        // The preview belongs to the fold: an open request spells its words
+        // out in the message lines below, so the header stays quiet there —
+        // a header echoing the first line under it reads as a duplicate.
         const rh0 = runHeads[0].dataset.run;
         const turnsInRun0 = () => document.querySelectorAll(`.run[data-run="${rh0}"] section.turn`).length;
         const r0 = turnsInRun0();

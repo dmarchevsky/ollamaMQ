@@ -2014,7 +2014,11 @@ function lvRuns() {
   for (let i = 0; i < turns.length; i++)
     if (lvFacts(i).finish === 'stop') { runs.push({ a: s, b: i }); s = i + 1; }
   if (s < turns.length) runs.push({ a: s, b: turns.length - 1 });
-  return runs.length >= 2 && runs.some(r => r.b > r.a) ? runs : [];
+  // A run of one request groups nothing and reads as a second numbering
+  // system competing with #N — those requests stand on their own, and only
+  // spans of two or more get a group line.
+  const kept = runs.filter(r => r.b > r.a);
+  return kept.length ? kept : [];
 }
 const lvRunOf = (runs, i) => runs.findIndex(r => i >= r.a && i <= r.b);
 
@@ -2141,14 +2145,15 @@ async function lvDraw({ scroll = false } = {}) {
   const runs = lvRuns();
   for (const k of [...LV.closedRuns]) if (k >= runs.length) LV.closedRuns.delete(k);
   const parts = [];
-  let prevRun = -1;
+  let prevRun = null, openRun = false;
   for (let i = 0; i < turns.length; i++) {
     const t = turns[i];
-    const rk = lvRunOf(runs, i);
+    const rk = lvRunOf(runs, i); // -1: a request that belongs to no group
     const gap = lvGap(t, turns[i - 1]);
-    if (runs.length && rk !== prevRun) {
-      if (prevRun !== -1) { parts.push(gap, '</div>'); }
-      parts.push(lvRunHead(runs, rk), `<div class="run" data-run="${rk}">`);
+    if (rk !== prevRun) { // a group starts or ends here
+      parts.push(openRun ? gap + '</div>' : gap);
+      openRun = rk !== -1;
+      if (openRun) parts.push(lvRunHead(runs, rk), `<div class="run" data-run="${rk}">`);
       prevRun = rk;
     } else parts.push(gap);
     if (rk !== -1 && LV.closedRuns.has(rk)) continue; // folded run: its header says it all
@@ -2156,7 +2161,7 @@ async function lvDraw({ scroll = false } = {}) {
     if (LV.open.has(t.rid)) sec += await lvTurnInner(t);
     parts.push(sec + '</section>');
   }
-  if (runs.length) parts.push('</div>');
+  if (openRun) parts.push('</div>');
   if (!turns.length) parts.push('<div class="empty">This conversation has no requests.</div>');
   const html = parts.join('');
   if (tk !== lvToken) return; // a newer click beat us
@@ -2174,16 +2179,16 @@ async function lvDraw({ scroll = false } = {}) {
 const lvProb = t => (t.status != null && t.status >= 400)
   || t.outcome === 'timeout' || t.outcome === 'backend_error';
 
-/** One collapsed run: what it covers, how long it ran, its first words, and
- *  how many tools it fired. Clicking folds the whole run; folding one request
- *  inside it is untouched. */
+/** One collapsed run: the range it covers, how long it ran, its first words,
+ *  and how many tools it fired. A run is named by that range — `#1–#3`, the
+ *  requests between two final answers — never by a second counter. */
 function lvRunHead(runs, k) {
   const ri = lvRunInfo(runs, k);
   const shut = LV.closedRuns.has(k);
   return `<h3 class="run-h" data-action="lv-run" data-run="${k}" role="button" tabindex="0"
-    title="requests ${ri.a}–${ri.b}${ri.dur ? ` · ${ri.dur}` : ''} — click to ${shut ? 'open' : 'fold'} this run">
-    <span class="chev">${shut ? '▸' : '▾'}</span><span>RUN ${k + 1} · #${ri.a}–#${ri.b}${ri.dur ? ` · ${ri.dur}` : ''}</span>
-    <span class="pv">${ri.pv ? `<span class="${ri.pv.cls}">${esc(ri.pv.txt)}</span>` : ''}</span>
+    title="a run: the requests between two final answers — #${ri.a}–#${ri.b}${ri.dur ? ` · ${ri.dur}` : ''}; click to ${shut ? 'open' : 'fold'} it">
+    <span class="chev">${shut ? '▸' : '▾'}</span><span>#${ri.a}–#${ri.b}${ri.dur ? ` · ${ri.dur}` : ''}</span>
+    <span class="pv">${shut && ri.pv ? `<span class="${ri.pv.cls}">${esc(ri.pv.txt)}</span>` : ''}</span>
     ${ri.calls ? `<span class="tb" title="${ri.calls} tool calls across this run">×${ri.calls}</span>` : ''}</h3>`;
 }
 
@@ -2194,7 +2199,10 @@ function lvRunHead(runs, k) {
 function lvTurnHead(t, i) {
   const f = lvFacts(i);
   const sp = lvSpan(t, i === 0 ? null : lvTurns()[0].at_ms);
-  const pv = f.pvU || f.pvT
+  // The preview is the tease for a line you cannot see: once the request is
+  // open, its own message lines spell out the same words right below, and a
+  // header repeating the first of them just reads as a duplicate entry.
+  const pv = !LV.open.has(t.rid) && (f.pvU || f.pvT)
     ? `<span class="pv"><span class="${f.pvU ? 'u' : 't'}">${esc(f.pvU || f.pvT)}</span></span>`
     : '<span class="pv"></span>';
   const tb = f.tCalls
@@ -2543,31 +2551,35 @@ function lvDrawRail() {
   turns.forEach((t, i) => {
     const prev = turns[i - 1];
     const rk = lvRunOf(runs, i);
-    const subLevel = runs.length ? 3 : 2;
-    const turnLevel = runs.length ? 2 : 1;
+    // Indent by membership: a request inside a group sits one level under its
+    // range line; a lone request sits at the top, with its messages under it.
+    const subLevel = rk !== -1 ? 3 : 2;
+    const turnLevel = rk !== -1 ? 2 : 1;
     const gapNode = prev && prev.tl?.end != null && t.at_ms - prev.tl.end >= LV_IDLE_MS
       ? lvNode({ level: turnLevel, rid: t.rid, when: fmtDur((t.at_ms - prev.tl.end) / 1000), tag: 'idle',
         tip: `how long it sat quiet: ${fmtDur((t.at_ms - prev.tl.end) / 1000)} (${fmtTime(prev.tl.end)} → ${fmtTime(t.at_ms)})`,
         snip: ((t.msgs || []).filter(m => m.name).map(m => m.name).join(', ') || 'agent side'), cls: 'gapnode', caret: '' })
       : '';
+    items.push(gapNode);
     if (runs.length && rk !== prevRun) {
-      if (prevRun !== -1) items.push(gapNode);
-      const ri = lvRunInfo(runs, rk);
-      const shut = LV.closedRuns.has(rk);
-      items.push(lvNode({ level: 1, rid: '', run: rk, tag: `Run ${rk + 1}`,
-        when: rk === 0 ? fmtTime(turns[0].at_ms) : `+${fmtDur((turns[ri.a - 1].at_ms - turns[0].at_ms) / 1000)}`,
-        pv: `${esc(`#${ri.a}–#${ri.b}${ri.dur ? ' · ' + ri.dur : ''}`)}${ri.pv ? ` · <span class="${ri.pv.cls}">${esc(ri.pv.txt)}</span>` : ''}`,
-        tb: ri.calls ? `<span class="tb" title="${ri.calls} tool calls across this run">×${ri.calls}</span>` : '',
-        tip: `requests ${ri.a}–${ri.b}${ri.dur ? ` · ${ri.dur}` : ''} — click to ${shut ? 'open' : 'fold'} this run`,
-        caret: shut ? '▸' : '▾', cls: 'run', action: 'lv-run' }));
+      if (rk !== -1) {
+        const ri = lvRunInfo(runs, rk);
+        const shut = LV.closedRuns.has(rk);
+        items.push(lvNode({ level: 1, rid: '', run: rk, tag: `#${ri.a}–#${ri.b}`,
+          when: rk === 0 ? fmtTime(turns[0].at_ms) : `+${fmtDur((turns[ri.a - 1].at_ms - turns[0].at_ms) / 1000)}`,
+          pv: `${esc(`#${ri.a}–#${ri.b}${ri.dur ? ' · ' + ri.dur : ''}`)}${shut && ri.pv ? ` · <span class="${ri.pv.cls}">${esc(ri.pv.txt)}</span>` : ''}`,
+          tb: ri.calls ? `<span class="tb" title="${ri.calls} tool calls across this run">×${ri.calls}</span>` : '',
+          tip: `a run: the requests between two final answers — ${ri.a}–${ri.b}${ri.dur ? ` · ${ri.dur}` : ''}; click to ${shut ? 'open' : 'fold'} it`,
+          caret: shut ? '▸' : '▾', cls: 'run', action: 'lv-run' }));
+      }
       prevRun = rk;
-    } else items.push(gapNode);
+    }
     if (rk !== -1 && LV.closedRuns.has(rk)) return; // folded run: the row above is all of it
     const f = lvFacts(i);
     items.push(lvNode({
       level: turnLevel, rid: t.rid, tag: `#${i + 1}`,
       when: i === 0 ? fmtTime(t.at_ms) : `+${fmtDur((t.at_ms - turns[0].at_ms) / 1000)}`,
-      pv: f.pvU || f.pvT ? `<span class="${f.pvU ? 'u' : 't'}">${esc(f.pvU || f.pvT)}</span>` : '',
+      pv: !LV.open.has(t.rid) && (f.pvU || f.pvT) ? `<span class="${f.pvU ? 'u' : 't'}">${esc(f.pvU || f.pvT)}</span>` : '',
       snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ← ${lvFinish(t)}`,
       tb: f.tCalls ? `<span class="tb${f.tBad ? ' bad' : ''}" title="${f.tCalls} ${f.tCalls === 1 ? 'tool call' : 'tool calls'} in this request${f.tBad ? ' — a result reported a non-zero exit code' : ''}">×${f.tCalls}</span>` : '',
       cls: 'turn', caret: LV.open.has(t.rid) ? '▾' : '▸',
