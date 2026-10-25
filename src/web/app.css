@@ -929,16 +929,20 @@ body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-selec
 .lv-node.req .tag, .lv-node.resp .tag { color: var(--muted); }
 .lv-node.turn .tag { color: var(--text); }
 .lv-node.gapnode { color: var(--faint); } .lv-node.gapnode .tag { color: var(--faint); }
-.lv-node .snip { font: 12px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lv-node .snip { font: 12px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  flex: 1 1 auto; min-width: 0; }
 .lv-node.l2 { padding-left: 10px; } .lv-node.l3 { padding-left: 18px; }
 .lv-node.l3 .tag { width: 40px; }
-/* One row (and one body line) stands in for the messages this request re-sent
-   and an earlier one already delivered. Clicking either opens both. */
-.lv-node.carry, .lv-node.carry .tag { color: var(--faint); }
-.lv-carry { display: inline-flex; align-items: center; gap: 6px; margin: 2px 0 10px; padding: 4px 11px;
-  border: 1px dashed var(--border); border-radius: 999px; background: var(--surface-2); color: var(--muted);
-  font: 11.5px var(--mono); cursor: pointer; }
-.lv-carry:hover { color: var(--text); border-color: var(--accent); }
+/* Message and RESP rows share one column geometry at whatever level they sit,
+   so a RESP label never stands out from the messages beside it. */
+.lv-node.sub .tag { width: 40px; }
+.lv-node.run .tag { color: var(--text); }
+.lv-node .tb { flex: none; margin-left: 6px; }
+.lv-node .snip .u { color: var(--accent); } .lv-node .snip .t { color: var(--ok); }
+/* The rail header is the Show-incremental switch beside the fold buttons. */
+.lv-rail-h label.inc { display: inline-flex; gap: 5px; align-items: center; margin-right: auto;
+  font: 600 11.5px var(--sans); color: var(--text); cursor: pointer; white-space: nowrap; }
+
 #dlg-log .flash { outline: 2px solid var(--accent); outline-offset: 1px; animation: lv-flash 1.3s ease-out; }
 @keyframes lv-flash { from { outline-color: var(--accent); } to { outline-color: transparent; } }
 .lv-body::-webkit-scrollbar { width: 12px; }
@@ -970,8 +974,33 @@ body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-selec
 .turn-h .n { color: var(--text); font-weight: 700; }
 .turn.active .turn-h .n { color: var(--accent); }
 .turn-h .tail { margin-left: auto; }
+/* A problem row reads as one from across the room: the whole header tints red,
+   and no per-request status text competes with a healthy conversation. */
+.turn.prob > .turn-h { background: var(--bad-soft); border-radius: 9px; }
+/* The identity of a collapsed request: a word from its increment (blue user,
+   green thinking), a tool badge, and the sizes kept quiet on the right. */
+.turn-h .pv { flex: 1 1 160px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv .u { color: var(--accent); } .pv .t { color: var(--ok); }
+.tb { display: inline-block; font: 700 10px var(--mono); color: var(--warn);
+  background: var(--warn-soft); border: 1px solid color-mix(in srgb, var(--warn) 38%, transparent);
+  padding: 1px 7px; border-radius: 9px; vertical-align: 1px; }
+.tb.bad { color: var(--bad); background: var(--bad-soft);
+  border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+.turn-h .sz { color: var(--faint); font-weight: 400; white-space: nowrap; }
 .turn .lv-sec { padding: 0 14px 14px; }
 .turn .lv-sec + .lv-sec { border-top: 1px solid var(--border); margin-top: 0; padding-top: 14px; }
+/* A run is the agent's work between two final answers: the requests from the
+   last `stop` to the next one fold as one unit; per-request folding inside
+   is untouched. */
+.run { border: 1px dashed var(--border); border-radius: 12px; padding: 4px 8px 6px; margin-bottom: 12px; }
+.run > .turn { margin-top: 6px; }
+.run-h { display: flex; gap: 10px; align-items: baseline; cursor: pointer; padding: 7px 8px;
+  font: 700 11px var(--mono); letter-spacing: .05em; color: var(--muted); }
+.run-h:hover { background: var(--surface-2); border-radius: 8px; }
+.run-h .chev { color: var(--faint); }
+.run-h .pv { flex: 1 1 140px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  letter-spacing: 0; font-weight: 500; font-size: 12px; }
+.run-h .tail { margin-left: auto; }
 /* The quiet stretch between two turns, named by what ran inside it. */
 .lv-gap { display: flex; gap: 8px; align-items: baseline; color: var(--faint);
   font: 12px var(--mono); margin: 0 0 8px; padding: 6px 10px 6px 12px;
@@ -999,6 +1028,12 @@ body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-selec
 .msg.asst > .role { color: var(--ok); }
 .msg.tool > .role { color: var(--warn); }
 .msg .mtext { padding: 10px 12px; font: 12.5px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; margin: 0; }
+/* What a request newly brought reads bright; what it only re-sent (visible when
+   Show incremental is off) recedes. No counting needed to spot the increment. */
+.msg.m-new { border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
+.msg.m-held { opacity: .55; background: var(--surface-2); border-left: 3px solid var(--border); }
+.msg-slot.m-held { opacity: .55; }
 .msg .msg { margin: 0 12px 10px; }
 .msg details > summary { cursor: pointer; margin: 8px 12px; padding: 4px 10px; font-size: 12px;
   color: var(--muted); border: 1px dashed var(--border); border-radius: 6px; }
