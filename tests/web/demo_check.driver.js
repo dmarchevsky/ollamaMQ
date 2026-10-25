@@ -161,6 +161,28 @@ addEventListener('load', () => {
         A('show-incremental-remembered', inc() === n0
           && JSON.parse(localStorage.getItem('omq.lv') || '{}').inc === true,
           `back to ${n0} messages, choice stored`);
+        // Scrolling the log is navigation too: the rail row of whichever block
+        // sits at the top lights up and stays in view as the wheel turns.
+        const mTarget = document.getElementById(`lv-m-${rid2}-7`);
+        const bTop2 = body.getBoundingClientRect().top;
+        body.scrollTop = mTarget.getBoundingClientRect().top - bTop2 + body.scrollTop + 6;
+        await wait(400);   // a set scrollTop fires the real scroll event
+        const lit = document.querySelector('#lv-rail .lv-node.on');
+        const railEl = document.querySelector('#lv-rail');
+        const rr = lit?.getBoundingClientRect(), rp = railEl.getBoundingClientRect();
+        A('rail-follows-scroll', lit?.classList.contains('msg') && lit?.dataset.rid === String(rid2)
+          && lit?.dataset.idx === '7' && rr && rr.top >= rp.top - 2 && rr.bottom <= rp.bottom + 2,
+          `${lit ? lit.className.replace('lv-node ', '') : 'nothing'} lit, kept in the rail view`);
+        // And the rail's RUN row folds the run in the body, not just the
+        // body's own run header.
+        const railRun = document.querySelector('#lv-rail .lv-node.run');
+        const runK = railRun.dataset.run;
+        railRun.click();
+        await wait(500);
+        A('rail-run-folds-body', document.querySelectorAll(`#dlg-log .run[data-run="${runK}"] section.turn`).length === 0,
+          `rail run ${runK} folded its requests in the body`);
+        document.querySelector('#lv-rail .lv-node.run').click();
+        await wait(500);
 
         // --- The jump tree: nodes fold independently, and a message row jumps
         // to that message instead of merely to its request.

@@ -2225,6 +2225,7 @@ function lvScroll() {
 /** Focus one request: expand it (leaving the others as they were), scroll to it. */
 async function lvFocus(rid) {
   if (rid == null || lvIdxOf(rid) < 0) return;
+  lvTrackLock = Date.now() + 700; // its own scroll lands the highlight it drew
   LV.rid = rid;
   LV.focusMsg = null;
   LV.open.add(rid);
@@ -2237,6 +2238,7 @@ async function lvFocus(rid) {
  *  which for a tall turn reads as "the top of the page". */
 async function lvFocusSec(rid, side) {
   if (rid == null || lvIdxOf(rid) < 0) return;
+  lvTrackLock = Date.now() + 700;
   LV.rid = rid;
   LV.focusMsg = null;
   LV.open.add(rid);
@@ -2250,6 +2252,44 @@ async function lvFocusSec(rid, side) {
   lvDrawRail();
 }
 
+/** The rail is where you are, not just what you click: whatever block sits at
+ *  the top of the log lights its row, and the rail scrolls it into view — so a
+ *  hand on the wheel never loses its place in a long session. Jump handlers
+ *  light the target themselves, so their own scroll settles under a short
+ *  lock instead of fighting the highlight it just placed. */
+let lvTrackLock = 0;
+function lvTrackRail() {
+  if (!S.lv.rail || !LV || Date.now() < lvTrackLock) return;
+  const body = document.querySelector('#dlg-log .lv-body');
+  const rail = $('#lv-rail');
+  if (!body || !rail || rail.hidden) return;
+  const top = body.getBoundingClientRect().top;
+  let hit = null, node = null;
+  // Document order is visual order; the last block whose top has crossed the
+  // container's top edge is the one being read.
+  for (const el of document.querySelectorAll('#dlg-log .run-h, #dlg-log section.turn, #dlg-log .msg[id], #dlg-log .lv-sec.out')) {
+    if (el.getBoundingClientRect().top - top > 8) break;
+    let sel = null;
+    if (el.classList.contains('run-h')) sel = `.lv-node.run[data-run="${el.dataset.run}"]`;
+    else if (el.matches('section.turn')) sel = `.lv-node.turn[data-rid="${el.dataset.rid}"]`;
+    else if (el.classList.contains('msg')) {
+      const m = /^lv-m-(\d+)-(\d+)$/.exec(el.id);
+      if (m) sel = `.lv-node.msg.sub[data-rid="${m[1]}"][data-idx="${m[2]}"]`;
+    } else sel = `.lv-node.resp.sub[data-rid="${el.id.slice(5)}"]`;
+    const found = sel && rail.querySelector(sel);
+    if (found) { hit = el; node = found; }
+  }
+  const nodes = rail.querySelectorAll('.lv-node.on');
+  if (!node && !hit) { nodes.forEach(n => n.classList.remove('on')); return; }
+  nodes.forEach(n => { if (n !== node) n.classList.remove('on'); });
+  if (node && !node.classList.contains('on')) {
+    node.classList.add('on');
+    const rr = node.getBoundingClientRect(), pr = rail.getBoundingClientRect();
+    if (rr.top < pr.top) rail.scrollTop += rr.top - pr.top - 4;
+    else if (rr.bottom > pr.bottom) rail.scrollTop += rr.bottom - pr.bottom + 4;
+  }
+}
+
 /** A tree message node (the `USER` / `ASSIST` / `TOOL` line under a request):
  *  focus that message, not just its request — open the turn, unfold the history
  *  block if the message lives in it, scroll it into view and flash it. */
@@ -2257,6 +2297,7 @@ async function lvFocusMsg(rid, idx) {
   const turns = lvTurns();
   const i = turns.findIndex(t => t.rid === rid);
   if (i < 0) return;
+  lvTrackLock = Date.now() + 700;
   // A message this request only resent is drawn in the turn that first sent it,
   // so that is the one to open and flash — unless this turn has its re-sent
   // history unfolded, in which case the copy on screen is the one to land on.
@@ -2436,8 +2477,8 @@ function lvSave(text, name, type) {
 // carries the timestamp it was measured at, so the outline reads as the
 // timeline it is.
 
-function lvNode({ level, rid, idx, when, tip, tag, snip, pv, tb, caret, cls = '', action = 'lv-jump', on = false }) {
-  return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}
+function lvNode({ level, rid, idx, when, tip, tag, snip, pv, tb, caret, cls = '', action = 'lv-jump', on = false, run }) {
+  return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}${run != null ? ` data-run="${run}"` : ''}
     ${tip ? `title="${esc(tip)}"` : ''}>
     <span class="car"${caret ? ` data-action="${action === 'lv-run' ? 'lv-run' : 'lv-tree'}"` : ''} data-rid="${rid}">${caret ?? ''}</span>
     <span class="when">${when ?? ''}</span><span class="tag">${esc(tag)}</span>
@@ -2506,7 +2547,7 @@ function lvDrawRail() {
       if (prevRun !== -1) items.push(gapNode);
       const ri = lvRunInfo(runs, rk);
       const shut = LV.closedRuns.has(rk);
-      items.push(lvNode({ level: 1, rid: '', tag: `Run ${rk + 1}`,
+      items.push(lvNode({ level: 1, rid: '', run: rk, tag: `Run ${rk + 1}`,
         when: rk === 0 ? fmtTime(turns[0].at_ms) : `+${fmtDur((turns[ri.a - 1].at_ms - turns[0].at_ms) / 1000)}`,
         pv: `${esc(`#${ri.a}–#${ri.b}${ri.dur ? ' · ' + ri.dur : ''}`)}${ri.pv ? ` · <span class="${ri.pv.cls}">${esc(ri.pv.txt)}</span>` : ''}`,
         tb: ri.calls ? `<span class="tb" title="${ri.calls} tool calls across this run">×${ri.calls}</span>` : '',
@@ -3397,6 +3438,17 @@ $$('#log-group input[name="log-group"]').forEach(r => {
 });
 // Round-viewer controls: choices persist like the other view preferences.
 $('#lv-jump').addEventListener('click', () => { S.lv.rail = !S.lv.rail; saveLv(); lvDrawRail(); $('#lv-jump').classList.toggle('active', S.lv.rail); });
+/* One reading position: as the log is scrolled, the rail row of the block at
+   its top lights up and the rail scrolls it into view, so the hand on the
+   wheel always sees where it is. Scroll does not bubble, but a capture-phase
+   listener on the dialog sees it and re-checks which element it came from. */
+let lvTrackPending = false;
+$('#dlg-log').addEventListener('scroll', e => {
+  if (!e.target.classList?.contains('lv-body')) return;
+  if (lvTrackPending) return;
+  lvTrackPending = true;
+  setTimeout(() => { lvTrackPending = false; lvTrackRail(); }, 50);
+}, true);
 // Drag the tree wider or narrower; the width is remembered, double-click (or
 // Home) puts it back, arrow keys nudge it for anyone not using a mouse.
 (() => {
