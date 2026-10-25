@@ -145,6 +145,13 @@ addEventListener('load', () => {
         await wait(600);
         A('resp-jump-lands-on-section', document.querySelector('#dlg-log .lv-sec.flash')?.id === `lv-a-${rid2}`
           && body.scrollTop > 0, `flashed lv-a-${rid2}, scrolled ${body.scrollTop}px`);
+        // The response row previews the reply itself: a one-request
+        // conversation has no re-sent assistant history, so this row is the
+        // only place the rail can show what the model answered.
+        const respRow = document.querySelector(`#lv-rail .lv-node.resp[data-rid="${rid2}"] .snip`);
+        A('resp-row-says-what-it-said', /·/.test(respRow?.textContent || '')
+          && (respRow?.textContent || '').length > 'stop ·'.length + 3,
+          `rail response row: "${(respRow?.textContent || '').slice(0, 40)}"`);
         // The rail rows for a turn are the messages it ADDED — no REQ count
         // row, and no re-sent rows under a later request while incremental.
         const rows2 = [...document.querySelectorAll(`#lv-rail .lv-node.msg[data-rid="${rid2}"]`)];

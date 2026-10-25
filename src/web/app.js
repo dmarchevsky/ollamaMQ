@@ -1979,11 +1979,11 @@ const lvWords = (s, n = 7) => {
 
 function lvFacts(i) {
   const t = lvTurns()[i];
-  if (!t) return { finish: null, pvU: '', pvT: '', tCalls: 0, tBad: false };
+  if (!t) return { finish: null, words: '', pvU: '', pvT: '', tCalls: 0, tBad: false };
   const c = LV.content.get(t.rid);
   if (c && c.facts) return c.facts;
   const hid = lvHidden(i);
-  const f = { finish: null, pvU: '', pvT: '', tCalls: 0, tBad: false };
+  const f = { finish: null, words: '', pvU: '', pvT: '', tCalls: 0, tBad: false };
   // A turn that did not grow the message list has no measurable increment
   // (a retry, a no-growth step): guessing from the whole body would invent a
   // preview and a badge. Only the first turn's increment is all of it.
@@ -1992,7 +1992,14 @@ function lvFacts(i) {
     if (grew) f.tCalls = (t.msgs || []).slice(hid).reduce((n, m) => n + (m.calls ? m.calls.length : 0), 0);
   };
   if (!c) { fromMeta(); return f; }
-  if (c.resp != null) { const st = streamState(c.resp) || lvPlainResp(c.resp); f.finish = (st && st.finish) || null; }
+  if (c.resp != null) {
+    const st = streamState(c.resp) || lvPlainResp(c.resp);
+    f.finish = (st && st.finish) || null;
+    // The response's own opening words: a one-request conversation has no
+    // re-sent assistant history, so without this the rail never shows what
+    // the model actually answered — only how the stream ended.
+    f.words = lvWords((st && st.text) || '');
+  }
   const msgs = c.reqObj && c.reqObj.messages;
   if (msgs && grew) {
     for (const m of msgs.slice(hid)) {
@@ -2610,7 +2617,7 @@ function lvDrawRail() {
       tip: t.tl?.end != null
         ? `how long this response took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)}) — click to jump to it`
         : 'no response recorded yet',
-      snip: (fin || lvFinish(t)) + (c && c.resp == null ? ' · no text' : ''), caret: '' }));
+      snip: `${fin || lvFinish(t)}${f.words ? ' · ' + f.words : (c && c.resp == null ? ' · no text' : '')}`, caret: '' }));
   });
   if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');
   setHTML(rail, items.join(''));
