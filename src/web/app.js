@@ -1984,18 +1984,24 @@ function lvFacts(i) {
   if (c && c.facts) return c.facts;
   const hid = lvHidden(i);
   const f = { finish: null, pvU: '', pvT: '', tCalls: 0, tBad: false };
-  const fromMeta = () => { f.tCalls = (t.msgs || []).slice(hid).reduce((n, m) => n + (m.calls ? m.calls.length : 0), 0); };
+  // A turn that did not grow the message list has no measurable increment
+  // (a retry, a no-growth step): guessing from the whole body would invent a
+  // preview and a badge. Only the first turn's increment is all of it.
+  const grew = i === 0 || hid > 0;
+  const fromMeta = () => {
+    if (grew) f.tCalls = (t.msgs || []).slice(hid).reduce((n, m) => n + (m.calls ? m.calls.length : 0), 0);
+  };
   if (!c) { fromMeta(); return f; }
   if (c.resp != null) { const st = streamState(c.resp) || lvPlainResp(c.resp); f.finish = (st && st.finish) || null; }
   const msgs = c.reqObj && c.reqObj.messages;
-  if (msgs) {
+  if (msgs && grew) {
     for (const m of msgs.slice(hid)) {
       if (m.role === 'user' && !f.pvU) f.pvU = lvWords(msgText(m.content, m.images));
       if (m.role === 'assistant' && !f.pvT) f.pvT = lvWords(m.reasoning_content || m.reasoning || msgText(m.content));
       f.tCalls += (m.tool_calls || []).length;
       if (m.role === 'tool' && /exit code: -?[1-9]\d*/i.test(msgText(m.content))) f.tBad = true;
     }
-  } else fromMeta();
+  } else if (!msgs) fromMeta();
   return (c.facts = f);
 }
 
@@ -2174,7 +2180,7 @@ const lvProb = t => (t.status != null && t.status >= 400)
 function lvRunHead(runs, k) {
   const ri = lvRunInfo(runs, k);
   const shut = LV.closedRuns.has(k);
-  return `<h3 class="run-h" data-action="lv-run" data-run="${rk}" role="button" tabindex="0"
+  return `<h3 class="run-h" data-action="lv-run" data-run="${k}" role="button" tabindex="0"
     title="requests ${ri.a}–${ri.b}${ri.dur ? ` · ${ri.dur}` : ''} — click to ${shut ? 'open' : 'fold'} this run">
     <span class="chev">${shut ? '▸' : '▾'}</span><span>RUN ${k + 1} · #${ri.a}–#${ri.b}${ri.dur ? ` · ${ri.dur}` : ''}</span>
     <span class="pv">${ri.pv ? `<span class="${ri.pv.cls}">${esc(ri.pv.txt)}</span>` : ''}</span>
@@ -3335,7 +3341,7 @@ const actions = {
     return lvDraw({ scroll: false });
   },
   // The tree's RESP row: land on the Response section, not the turn top.
-  'lv-resp': el => lvFocusSec(+el.dataset.rid, 'out'),
+  'lv-resp': el => lvFocusSec(+el.dataset.rid, 'a'),
   // One switch decides increment-vs-full-prompt for every request at once.
   'lv-inc': async el => {
     S.lv.inc = el.checked;

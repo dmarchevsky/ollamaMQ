@@ -107,6 +107,7 @@
   for (let i = 1; i <= 11; i++) {
     chatMsgs.push({ role: 'user', content: `Turn ${i}: look at src/file${i}.rs and summarise it.` });
     chatMsgs.push({ role: 'assistant', content: `Reading file${i}.`,
+      reasoning_content: `Opening src/file${i}.rs to see what it holds before summarising it.`,
       tool_calls: [{ id: `c${i}`, function: { name: 'read', arguments: JSON.stringify({ path: `src/file${i}.rs` }) } }] });
     chatMsgs.push({ role: 'tool', tool_call_id: `c${i}`, content: `// file${i}: ${'summary text '.repeat(24)}` });
   }
@@ -184,13 +185,46 @@
   const T = now - 300_000;
   const convA = chatMsgs.slice(0, 7);
   const convB = chatMsgs.slice(0, 10);
-  const CONV_TEXT = { 900: { in: bodyOf(convA), out: prevOut }, 901: { in: bodyOf(convB), out: streamOut } };
+  // The story the second run continues: a test run that comes back red and the
+  // fix of the test itself — the increment of two requests, one of them with a
+  // non-zero exit, ending in the answer that closes the run.
+  const moreMsgs = [
+    { role: 'assistant', content: 'Running the suite to verify the rotation fix.',
+      reasoning_content: 'The edit landed; the right move now is a focused test run before anything else.',
+      tool_calls: [{ id: 'c20', function: { name: 'bash', arguments: JSON.stringify({ command: 'cargo test rotate' }) } }] },
+    { role: 'tool', tool_call_id: 'c20',
+      content: 'running `cargo test rotate`\ntest rotate_keeps_latest ... FAILED\n\nassertion failed: slots[0] == "notes.1"\n\nExit code: 1' },
+    { role: 'assistant', content: 'The rotation test still expects the old ordering — updating its expectation to match the new chain.',
+      reasoning_content: 'The failure is the test itself: it asserts the oldest-slot order, but the fix deliberately walks the other way.',
+      tool_calls: [{ id: 'c21', function: { name: 'edit', arguments: JSON.stringify({ path: 'src/reqlog.rs' }) } }] },
+    { role: 'tool', tool_call_id: 'c21', content: 'Successfully edited src/reqlog.rs\n\nExit code: 0' },
+    { role: 'assistant', content: 'All green: 142 tests pass. The rotation chain now walks from the newest slot and the test says so.',
+      reasoning_content: 'The suite is green with the corrected expectation — this answers the original request; no tools are left to run.' },
+  ];
+  const convC = convB.concat(moreMsgs.slice(0, 2));
+  const convD = convB.concat(moreMsgs.slice(0, 5));
+  const out904 = sse(
+    [{ role: 'assistant', content: '' },
+     { reasoning: 'The edit landed; the right move now is a focused test run before anything else.' },
+     ...'Running the suite to verify the rotation fix.'
+       .match(/.{1,14}/g).map(s => ({ content: s })),
+     { tool_calls: [{ index: 0, id: 'c20', function: { name: 'bash', arguments: '{"command":' } }] },
+     { tool_calls: [{ index: 0, function: { arguments: '"cargo test rotate"}' } }] }],
+    { prompt_tokens: 1310, completion_tokens: 210 }, 'tool_calls');
+  const out905 = sse(
+    [{ role: 'assistant', content: '' },
+     { reasoning: 'The suite is green with the corrected expectation — this answers the original request.' },
+     ...'All green: 142 tests pass. The rotation chain walks from the newest slot.'
+       .match(/.{1,14}/g).map(s => ({ content: s }))],
+    { prompt_tokens: 1480, completion_tokens: 168 }, 'stop');
+  const CONV_TEXT = { 900: { in: bodyOf(convA), out: prevOut }, 901: { in: bodyOf(convB), out: streamOut },
+    904: { in: bodyOf(convC), out: out904 }, 905: { in: bodyOf(convD), out: out905 } };
   const convs = [
     {
       v: 2, key: 'codex-laptop#a3f19c', user: 'codex-laptop', session: 'a3f19c',
       session_label: 'dispatcher refactor', model: 'Qwen3.8-Flash-Next',
       backend: 'http://192.168.6.11:8731', priority: 'normal', redacted: false,
-      start_ms: T, end_ms: T + 80_000,
+      start_ms: T, end_ms: T + 134_000,
       turns: [
         { rid: 900, at_ms: T, tl: { queue: T, dispatch: T + 800, first_token: T + 6_400, end: T + 7_000 },
           method: 'POST', path: '/v1/chat/completions', model: 'Qwen3.8-Flash-Next',
@@ -202,6 +236,26 @@
           backend: 'http://192.168.6.11:8731', status: 200, outcome: 'ok', priority: 'normal',
           req: { bytes: 676_918, chars: bodyOf(convB).length }, resp: { bytes: 41_832, chars: streamOut.length },
           prompt_tokens: 1204, completion_tokens: 345, msgs: msgMeta(convB) },
+        // The run 901 closed is not the story's end: the agent keeps working —
+        // a test run that comes back red (its exit code badges the request red),
+        // the fix of the test itself, and the answer that closes the next run.
+        { rid: 904, at_ms: T + 90_000, tl: { queue: T + 90_000, dispatch: T + 90_600, first_token: T + 95_000, end: T + 101_000 },
+          method: 'POST', path: '/v1/chat/completions', model: 'Qwen3.8-Flash-Next',
+          backend: 'http://192.168.6.11:8731', status: 200, outcome: 'ok', priority: 'normal',
+          req: { bytes: 688_120, chars: bodyOf(convC).length }, resp: { bytes: 12_904, chars: out904.length },
+          prompt_tokens: 1310, completion_tokens: 210, msgs: msgMeta(convC) },
+        { rid: 905, at_ms: T + 108_000, tl: { queue: T + 108_000, dispatch: T + 108_600, first_token: T + 113_000, end: T + 120_000 },
+          method: 'POST', path: '/v1/chat/completions', model: 'Qwen3.8-Flash-Next',
+          backend: 'http://192.168.6.11:8731', status: 200, outcome: 'ok', priority: 'normal',
+          req: { bytes: 701_455, chars: bodyOf(convD).length }, resp: { bytes: 14_208, chars: out905.length },
+          prompt_tokens: 1480, completion_tokens: 168, msgs: msgMeta(convD) },
+        // And a backend that died after the story: a problem row whose text
+        // capture was switched off, so its line can only say what it measured.
+        { rid: 906, at_ms: T + 128_000, tl: { queue: T + 128_000, dispatch: T + 128_600, first_token: T + 130_000, end: T + 134_000 },
+          method: 'POST', path: '/v1/chat/completions', model: 'Qwen3.8-Flash-Next',
+          backend: 'http://192.168.6.11:8731', status: 500, outcome: 'backend_error', priority: 'normal',
+          req: { bytes: 705_004 }, resp: { bytes: 618 }, redacted: true,
+          prompt_tokens: null, completion_tokens: null, msgs: msgMeta(convD) },
       ],
     },
     {
