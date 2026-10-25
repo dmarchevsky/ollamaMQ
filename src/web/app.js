@@ -2567,7 +2567,7 @@ function lvDrawRail() {
         const shut = LV.closedRuns.has(rk);
         items.push(lvNode({ level: 1, rid: '', run: rk, tag: `#${ri.a}–#${ri.b}`,
           when: rk === 0 ? fmtTime(turns[0].at_ms) : `+${fmtDur((turns[ri.a - 1].at_ms - turns[0].at_ms) / 1000)}`,
-          pv: `${esc(`#${ri.a}–#${ri.b}${ri.dur ? ' · ' + ri.dur : ''}`)}${shut && ri.pv ? ` · <span class="${ri.pv.cls}">${esc(ri.pv.txt)}</span>` : ''}`,
+          pv: `${ri.dur ? esc(ri.dur) : ''}${shut && ri.pv ? ` · <span class="${ri.pv.cls}">${esc(ri.pv.txt)}</span>` : ''}`,
           tb: ri.calls ? `<span class="tb" title="${ri.calls} tool calls across this run">×${ri.calls}</span>` : '',
           tip: `a run: the requests between two final answers — ${ri.a}–${ri.b}${ri.dur ? ` · ${ri.dur}` : ''}; click to ${shut ? 'open' : 'fold'} it`,
           caret: shut ? '▸' : '▾', cls: 'run', action: 'lv-run' }));
