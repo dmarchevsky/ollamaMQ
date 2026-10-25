@@ -897,7 +897,7 @@ dialog.logview[open] { display: flex; }
    never drift apart; the grip on its left edge lets you set it (remembered). */
 .lv-shell { position: relative; flex: 1; display: flex; min-height: 0; --lv-w: 292px; }
 .lv-rail { position: absolute; top: 0; right: 0; bottom: 0; width: var(--lv-w); background: var(--surface);
-  border-left: 1px solid var(--border); overflow: auto; padding: 14px 10px; }
+  border-left: 1px solid var(--border); overflow-y: auto; overflow-x: hidden; padding: 14px 10px; }
 .lv-rail[hidden] { display: none; }
 .lv-shell.railed .lv-body { margin-right: var(--lv-w); }
 .lv-grip { position: absolute; top: 0; bottom: 0; right: calc(var(--lv-w) - 3px); width: 7px;
@@ -909,7 +909,10 @@ dialog.logview[open] { display: flex; }
 body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-select: none; }
 .lv-rail h4 { margin: 0 4px 8px; font: 700 10.5px var(--mono); letter-spacing: .06em;
   text-transform: uppercase; color: var(--muted); }
-.lv-rail-h { display: flex; align-items: center; gap: 6px; margin: 0 2px 8px; }
+/* The header carries the one switch and the two fold buttons; at the default
+   rail width they do not share a line, so they wrap instead of pushing the
+   rail into a horizontal scrollbar. */
+.lv-rail-h { display: flex; flex-wrap: wrap; align-items: center; column-gap: 6px; row-gap: 4px; margin: 0 2px 8px; }
 .lv-rail-h h4 { margin: 0 auto 0 0; }
 .lv-rail-h .btn { height: 24px; padding: 2px 7px; font-size: 11px; }
 /* The jump tree: request -> request/response -> message -> tool call. Every

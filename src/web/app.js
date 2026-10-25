@@ -968,8 +968,8 @@ function renderDetails(rows) {
     out.push(`<button class="det-h" style="--c:var(--${c})" data-key="${esc(head.key)}" aria-expanded="${!shut}"
       title="${shut ? 'expand' : 'collapse'} this conversation">
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(fmtWho(head.o))}</span>
-      ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}${chip}
-      <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
+      ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}
+      <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>${chip}
       ${sum}
       ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(head.o.client)}" title="open this conversation in the viewer">\u2263 View</span>` : ''}</button>`);
     if (shut) continue;
@@ -2264,11 +2264,15 @@ function lvTrackRail() {
   const rail = $('#lv-rail');
   if (!body || !rail || rail.hidden) return;
   const top = body.getBoundingClientRect().top;
-  let hit = null, node = null;
-  // Document order is visual order; the last block whose top has crossed the
-  // container's top edge is the one being read.
+  // Scrolled to the end means reading the last block — the tail rows are
+  // short and can never reach the top edge, so the crossed rule alone would
+  // strand the mark one (or several) messages before the end.
+  const atEnd = body.scrollHeight - (body.scrollTop + body.clientHeight) <= 24;
+  let node = null, last = null;
+  // Document order is visual order; the lit row is the last block whose top
+  // has crossed the container's top edge — at the end, the last block there
+  // is at all.
   for (const el of document.querySelectorAll('#dlg-log .run-h, #dlg-log section.turn, #dlg-log .msg[id], #dlg-log .lv-sec.out')) {
-    if (el.getBoundingClientRect().top - top > 8) break;
     let sel = null;
     if (el.classList.contains('run-h')) sel = `.lv-node.run[data-run="${el.dataset.run}"]`;
     else if (el.matches('section.turn')) sel = `.lv-node.turn[data-rid="${el.dataset.rid}"]`;
@@ -2277,10 +2281,13 @@ function lvTrackRail() {
       if (m) sel = `.lv-node.msg.sub[data-rid="${m[1]}"][data-idx="${m[2]}"]`;
     } else sel = `.lv-node.resp.sub[data-rid="${el.id.slice(5)}"]`;
     const found = sel && rail.querySelector(sel);
-    if (found) { hit = el; node = found; }
+    if (!found) continue;
+    last = found;
+    if (el.getBoundingClientRect().top - top <= 8) node = found;
   }
+  if (atEnd && last) node = last;
   const nodes = rail.querySelectorAll('.lv-node.on');
-  if (!node && !hit) { nodes.forEach(n => n.classList.remove('on')); return; }
+  if (!node) { nodes.forEach(n => n.classList.remove('on')); return; }
   nodes.forEach(n => { if (n !== node) n.classList.remove('on'); });
   if (node && !node.classList.contains('on')) {
     node.classList.add('on');

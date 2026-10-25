@@ -166,13 +166,29 @@ addEventListener('load', () => {
         const mTarget = document.getElementById(`lv-m-${rid2}-7`);
         const bTop2 = body.getBoundingClientRect().top;
         body.scrollTop = mTarget.getBoundingClientRect().top - bTop2 + body.scrollTop + 6;
-        await wait(400);   // a set scrollTop fires the real scroll event
+        // A scroll event is dispatched at the next render — under virtual
+        // time that is late; a real wheel always has frames, so fire it now.
+        body.dispatchEvent(new Event('scroll', { bubbles: true }));
+        await wait(400);
         const lit = document.querySelector('#lv-rail .lv-node.on');
         const railEl = document.querySelector('#lv-rail');
         const rr = lit?.getBoundingClientRect(), rp = railEl.getBoundingClientRect();
         A('rail-follows-scroll', lit?.classList.contains('msg') && lit?.dataset.rid === String(rid2)
           && lit?.dataset.idx === '7' && rr && rr.top >= rp.top - 2 && rr.bottom <= rp.bottom + 2,
           `${lit ? lit.className.replace('lv-node ', '') : 'nothing'} lit, kept in the rail view`);
+        // Scrolling all the way to the end marks the last row: the tail rows
+        // are short and can never reach the top edge — the mark used to stop
+        // a message or two before the end for exactly that reason.
+        body.scrollTop = body.scrollHeight;
+        body.dispatchEvent(new Event('scroll', { bubbles: true }));
+        await wait(400);
+        const litEnd = document.querySelector('#lv-rail .lv-node.on');
+        A('rail-follows-to-end', litEnd && (litEnd.classList.contains('resp') || litEnd.classList.contains('turn'))
+          && litEnd.dataset.rid === String(LV.conv.turns.at(-1).rid),
+          litEnd ? `${litEnd.className.replace('lv-node ', '')} lit at the very bottom` : 'nothing lit at the end');
+        // The rail never wears a horizontal scrollbar — its header wraps.
+        A('rail-no-hscroll', railEl.scrollWidth <= railEl.clientWidth + 1,
+          `rail content ${railEl.scrollWidth}px in ${railEl.clientWidth}px`);
         // And the rail's RUN row folds the run in the body, not just the
         // body's own run header.
         const railRun = document.querySelector('#lv-rail .lv-node.run');
@@ -362,5 +378,13 @@ addEventListener('load', () => setTimeout(() => {
     A3('header-shows-decode-rate', dec.some(t => /^decode [\d.]+ t\/s$/.test(t)), dec.slice(0, 3).join(' | ') || 'none');
     A3('header-shows-prefill-rate', pre.some(t => /^prefill [\d≈.]+ ?(tok\/s|s|m ..s)$/.test(t)),
       pre.slice(0, 3).join(' | ') || 'none');
+    // The rate labels read as a property of the serving model: they follow
+    // the `model → backend` span, not the client name.
+    A3('rate-labels-after-model', heads.every(h => {
+      const sub = h.querySelector('.sub'), t = h.textContent;
+      if (!sub) return true;
+      const i = t.indexOf(sub.textContent);
+      return [...h.querySelectorAll('.badge')].every(b => t.indexOf(b.textContent) > i);
+    }), 'prefill/decode follow the model → backend name');
   }, 900);
 }, 16500));
