@@ -2613,16 +2613,18 @@ function lvDrawRail() {
         cls: `msg sub ${ROLE_CLS[m.role] || 'user'}`,
         action: 'lv-msg', on: !!LV.focusMsg && LV.focusMsg[0] === t.rid && LV.focusMsg[1] === mi }));
     }
-    // A response is a length: how long it took, not when it ended. Clicking it
-    // lands on the Response section in the body, not on the turn header.
+    // The assistant's own answer row. It carries the reply's opening words
+    // (the operator reads the rail as SYS / USER / ASST messages — a meta
+    // "resp" row did not read as the assistant), and clicking it lands on the
+    // Response section in the body. The duration is a length, not a moment.
     const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
     const fin = f.finish;
-    items.push(lvNode({ level: subLevel, rid: t.rid, cls: 'resp sub', tag: 'resp', action: 'lv-resp',
+    items.push(lvNode({ level: subLevel, rid: t.rid, cls: 'resp sub asst', tag: 'ASST', action: 'lv-resp',
       when: dur == null ? '' : fmtDur(dur / 1000),
       tip: t.tl?.end != null
-        ? `how long this response took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)}) — click to jump to it`
+        ? `the assistant's answer — how long it took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)})${fin ? ` — ${fin}` : ''} — click to jump to it`
         : 'no response recorded yet',
-      snip: `${fin || lvFinish(t)}${f.words ? ' · ' + f.words : (c && c.resp == null ? ' · no text' : '')}`, caret: '' }));
+      snip: (f.words || fin || lvFinish(t)) + (c && c.resp == null ? ' · no text' : ''), caret: '' }));
   });
   if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');
   setHTML(rail, items.join(''));

@@ -929,7 +929,7 @@ body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-selec
 .lv-node .tag { flex: none; width: 58px; white-space: nowrap; font: 700 9.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
 .lv-node.user .tag { color: var(--accent); } .lv-node.asst .tag { color: var(--ok); }
 .lv-node.tool .tag { color: var(--warn); } .lv-node.sys .tag { color: var(--vip); }
-.lv-node.req .tag, .lv-node.resp .tag { color: var(--muted); }
+.lv-node.req .tag { color: var(--muted); }
 .lv-node.turn .tag { color: var(--text); }
 .lv-node.gapnode { color: var(--faint); } .lv-node.gapnode .tag { color: var(--faint); }
 .lv-node .snip { font: 12px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

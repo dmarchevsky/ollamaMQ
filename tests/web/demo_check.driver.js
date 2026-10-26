@@ -179,13 +179,15 @@ addEventListener('load', () => {
         await wait(600);
         A('resp-jump-lands-on-section', document.querySelector('#dlg-log .lv-sec.flash')?.id === `lv-a-${rid2}`
           && body.scrollTop > 0, `flashed lv-a-${rid2}, scrolled ${body.scrollTop}px`);
-        // The response row previews the reply itself: a one-request
-        // conversation has no re-sent assistant history, so this row is the
-        // only place the rail can show what the model answered.
-        const respRow = document.querySelector(`#lv-rail .lv-node.resp[data-rid="${rid2}"] .snip`);
-        A('resp-row-says-what-it-said', /·/.test(respRow?.textContent || '')
-          && (respRow?.textContent || '').length > 'stop ·'.length + 3,
-          `rail response row: "${(respRow?.textContent || '').slice(0, 40)}"`);
+        // The rail carries the assistant's answer under the assistant label
+        // with the reply's own words — a one-request conversation has no
+        // re-sent history, so this row is where the answer is.
+        const respRow = document.querySelector(`#lv-rail .lv-node.resp[data-rid="${rid2}"]`);
+        const respTag = respRow?.querySelector('.tag')?.textContent || '';
+        const respSnip = respRow?.querySelector('.snip')?.textContent || '';
+        A('resp-row-says-what-it-said', respTag === 'ASST' && /rotate/i.test(respSnip)
+          && respSnip.length > 'stop'.length + 3,
+          `rail answer row: ${respTag} "${respSnip.slice(0, 40)}"`);
         // The formatted view reads the stream back as the answer, not as the
         // wire: keep-alive comments and empty deltas are gone, the text is whole.
         const out = () => [...document.querySelectorAll(`#lv-t-${rid2} .lv-sec`)].pop().textContent;
