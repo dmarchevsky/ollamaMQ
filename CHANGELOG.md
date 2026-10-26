@@ -3,6 +3,37 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.21.0 — 2026-10-26
+
+### Changed
+
+- **The conversation viewer reads like a log now, not like a dump.** Pure frontend — nothing about
+  capture, storage or the wire format changes.
+  - **Runs.** The requests between two final answers — one job's tool loop — wrap as a single run,
+    named only by the range it covers (`#1–#3 · 2m 30s · ×6`); folding is per run as well as per
+    request, and `Expand all` / `Collapse all` move both trees together.
+  - **Problem tint.** A request that failed (HTTP ≥ 400, timeout, backend error) tints its turn row,
+    its run row and its tree rows red — `client gone` does not, because a walkaway is not a failure.
+  - **Foldable message blocks.** Every block (SYS/USER/ASST/TOOL, and the reconstructed reply itself)
+    folds on its label click; system prompts start folded to one line with a preview, so the
+    transcript opens on what the conversation said, not on the harness prompt every request repeats.
+  - **Thinking renders as an appendix box** — a summary lid with its own caret and a ruled-off body —
+    instead of a text blob under a floating summary.
+  - **The jump tree got the vocabulary of the transcript.** Each answer stands as a green `ASST` row
+    (opening words + duration, finish reason on hover) instead of a mute `RESP` line; an answer a
+    later request re-sent is not repeated as a message row; clicking any row lands on its block's
+    first line, and the tree follows the wheel — the block at the top of the log lights its row.
+  - **Header switches.** `Incremental` (was a rail button, label remembered) and a new `Auto-refresh`
+    checkbox — a quiet 5 s poll that keeps scroll place, open turns and folds; `⟳` now keeps the
+    scroll place too. Message labels fold; checkbox clicks no longer fight the global click handler.
+  - The tree never grows its own horizontal scrollbar (content clips), and the focused conversation
+    shows its name beside its hex id in the viewer header.
+
+### Fixed
+
+- A `[data-action]` checkbox click no longer has its toggle cancelled by the global click handler —
+  static header checkboxes (remembered state) now actually toggle on the first click.
+
 ## v0.20.0 — 2026-10-26
 
 ### Added
