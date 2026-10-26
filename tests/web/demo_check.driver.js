@@ -151,6 +151,28 @@ addEventListener('load', () => {
         });
         A('answer-echoes-nowhere', echoes.length === 0,
           echoes.join(',') || 'no reply repeats as a message row');
+        // The header switch carries a short label and never splits across lines.
+        const incLab = document.querySelector('#lv-inc').closest('label');
+        A('inc-label-short-one-line', /^Incremental$/.test(incLab.textContent.trim())
+          && incLab.getBoundingClientRect().height < 28,
+          `"${incLab.textContent.trim()}" on one line (${Math.round(incLab.getBoundingClientRect().height)}px)`);
+        // Message blocks fold on their label — the system prompt starts as one
+        // line so the transcript opens on what the conversation said.
+        const rid1 = LV.conv.turns[0].rid;
+        const sysSel = `#lv-t-${rid1} .msg.sys`;
+        A('sys-block-folded-by-default', !!document.querySelector(`${sysSel}.fold`)
+          && !!document.querySelector(`${sysSel} .mf-pv`),
+          document.querySelector(sysSel)?.textContent.trim().replace(/\s+/g, ' ').slice(0, 46));
+        document.querySelector(`${sysSel} .role`).click();
+        await wait(600);
+        const sysOpen = !!document.querySelector(sysSel)
+          && !document.querySelector(sysSel).classList.contains('fold')
+          && !!document.querySelector(`${sysSel} .mtext`);
+        document.querySelector(`${sysSel} .role`).click();
+        await wait(600);
+        A('msg-block-folds-and-opens', sysOpen
+          && document.querySelector(sysSel)?.classList.contains('fold'),
+          'a click opens the system block, a click folds it back');
         // The incremental view is about one request's moment: the run
         // grouping is the session's story and waits for the whole-prompt
         // view. The answer stays visible — with it hidden a single-request
@@ -251,6 +273,21 @@ addEventListener('load', () => {
           && JSON.parse(localStorage.getItem('omq.lv') || '{}').inc === true
           && !document.querySelector('#dlg-log .run-h'),
           `back to ${inc()} of ${n0} messages, stored=${JSON.parse(localStorage.getItem('omq.lv') || '{}').inc}, run-h=${!!document.querySelector('#dlg-log .run-h')}`);
+        // Auto-refresh polls quietly and keeps the view: your scroll place and
+        // your open turns survive every poll.
+        const auto = document.querySelector('#lv-auto');
+        body.scrollTop = 420;
+        await wait(200);
+        const reloads0 = LV.reloads || 0;
+        auto.click();
+        await wait(6400);
+        A('auto-refresh-refreshes', (LV.reloads || 0) > reloads0
+          && JSON.parse(localStorage.getItem('omq.lv') || '{}').auto === true,
+          `${(LV.reloads || 0) - reloads0} quiet refreshes`);
+        A('auto-refresh-keeps-view', Math.abs(body.scrollTop - 420) <= 2 && LV.open.size > 0,
+          `scroll kept at ${body.scrollTop}, ${LV.open.size} turns open`);
+        document.querySelector('#lv-auto').click();   // stop polling
+        await wait(200);
         // Scrolling the log is navigation too: the rail row of whichever block
         // sits at the top lights up and stays in view as the wheel turns.
         const mTarget = document.getElementById(`lv-m-${rid2}-7`);

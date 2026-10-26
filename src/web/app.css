@@ -949,8 +949,9 @@ body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-selec
 .lv-node .snip .u { color: var(--accent); } .lv-node .snip .t { color: var(--ok); }
 /* The viewer header carries the Show-incremental switch beside Raw/Formatted;
    the rail's own header is only the two fold buttons. */
-label.inc { display: inline-flex; gap: 5px; align-items: center;
-  font: 600 11.5px var(--sans); color: var(--text); cursor: pointer; white-space: nowrap; }
+dialog label.inc, label.inc { display: inline-flex; gap: 5px; align-items: center; flex: none;
+  font: 600 11.5px var(--sans); color: var(--text); cursor: pointer; white-space: nowrap; margin: 0; }
+dialog label.inc input, label.inc input { display: inline-block; width: auto; margin: 0; }
 
 #dlg-log .flash { outline: 2px solid var(--accent); outline-offset: 1px; animation: lv-flash 1.3s ease-out; }
 @keyframes lv-flash { from { outline-color: var(--accent); } to { outline-color: transparent; } }
@@ -1029,6 +1030,13 @@ label.inc { display: inline-flex; gap: 5px; align-items: center;
 /* Transcript blocks (chat request, reconstructed response). */
 .msg { border: 1px solid var(--border); background: var(--surface); border-radius: 8px;
   margin-bottom: 10px; overflow: hidden; }
+/* Message labels fold their block: a click on SYS/USER/TOOL shuts it to one
+   line, with the fold preview wearing the muted voice of a tease. */
+.msg > .role[data-action] { cursor: pointer; user-select: none; }
+.msg.fold { margin-bottom: 6px; }
+.msg .mf-pv { font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--faint);
+  margin-left: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: min(64ch, 60vw); vertical-align: bottom; }
 .msg > .role { display: block; padding: 4px 12px; font-size: 11px; font-weight: 700;
   letter-spacing: .05em; text-transform: uppercase; color: var(--muted);
   background: var(--surface-2); border-bottom: 1px solid var(--border); }

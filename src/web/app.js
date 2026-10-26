@@ -1747,9 +1747,9 @@ const storedLv = () => {
   try {
     const v = JSON.parse(localStorage.getItem('omq.lv') || '{}');
     return { fmt: v.fmt === 'raw' ? 'raw' : 'fmt', rail: !!v.rail,
-      inc: v.inc !== false, railW: lvRailClamp(v.railW) };
+      inc: v.inc !== false, railW: lvRailClamp(v.railW), auto: !!v.auto };
   } catch { /* storage blocked */ }
-  return { fmt: 'fmt', rail: false, inc: true, railW: LV_RAIL_DEF };
+  return { fmt: 'fmt', rail: false, inc: true, railW: LV_RAIL_DEF, auto: false };
 };
 const saveLv = () => { try { localStorage.setItem('omq.lv', JSON.stringify(S.lv)); } catch { /* storage blocked */ } };
 /* The jump tree is a side column you may want wide (tool names, message text) or
@@ -1787,7 +1787,8 @@ S.lv = storedLv();
  *  turn header fold the same block, in either direction. `closedRuns` holds the
  *  run ordinals folded shut; whether a request shows only its increment or the
  *  whole re-sent prompt is the one global `S.lv.inc` switch, not per-request. */
-const LV = { conv: null, rid: null, open: new Set(), closedRuns: new Set(), focusMsg: null, content: new Map() };
+const LV = { conv: null, rid: null, open: new Set(), closedRuns: new Set(), focusMsg: null, content: new Map(),
+  msgFold: new Map() };
 let lvToken = 0;
 
 const tryJson = s => { try { return JSON.parse(s); } catch { return undefined; } };
@@ -1825,20 +1826,30 @@ async function openConv({ rid, session, user } = {}) {
   LV.closedRuns = new Set();
   LV.focusMsg = null;
   LV.content = new Map();
+  LV.msgFold = new Map();
   $('#dlg-log [data-title]').textContent =
     `${conv.model || 'traffic'} · ${conv.user}${conv.backend ? ` → ${bkName(conv.backend)}` : ''}`;
+  $('#dlg-log [data-sub]').textContent = lvSubline(conv);
+  $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
+  $('#lv-inc').checked = S.lv.inc;
+  $('#lv-auto').checked = S.lv.auto;
+  const dlg = $('#dlg-log');
+  if (!dlg.open) dlg.showModal();
+  await lvDraw({ scroll: true });
+  lvPrefetch();
+  lvAutoStart();
+}
+
+/** The viewer header's second line: conversation id, its name when it has
+ *  one, request count and span — rebuilt on refresh so a growing conversation
+ *  says so without a reload. */
+function lvSubline(conv) {
   const sub = [`#${conv.session || conv.key}`];
   if (conv.session_label) sub.push(`#${conv.session_label}`);
   sub.push(`${conv.turns.length} ${conv.turns.length === 1 ? 'request' : 'requests'}`);
   if (conv.turns.length) sub.push(`${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`);
   if (conv.redacted) sub.push('no text');
-  $('#dlg-log [data-sub]').textContent = sub.join(' · ');
-  $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
-  $('#lv-inc').checked = S.lv.inc;
-  const dlg = $('#dlg-log');
-  if (!dlg.open) dlg.showModal();
-  await lvDraw({ scroll: true });
-  lvPrefetch();
+  return sub.join(' · ');
 }
 
 /** The collapsed lines want a word from every turn's text (and the run lines
@@ -2348,6 +2359,8 @@ async function lvFocusMsg(rid, idx) {
     tgt = { rid: turns[k].rid, idx: Math.min(tgt.idx, Math.max(lvMsgCount(turns[k]) - 1, 0)) };
   }
   const needed = !LV.open.has(tgt.rid) || !LV.content.has(tgt.rid);
+  // a jump to a message opens a folded block — the row was clicked for its text
+  LV.msgFold.set(`lv-m-${tgt.rid}-${tgt.idx}`, false);
   LV.rid = tgt.rid;
   LV.open.add(tgt.rid);
   LV.focusMsg = [tgt.rid, tgt.idx];
@@ -2381,24 +2394,42 @@ async function lvToggle(rid) {
   await lvDraw({ scroll: false });
 }
 
-async function lvReload() {
+async function lvReload({ quiet = false } = {}) {
   if (!LV.conv) return;
   const key = LV.conv.key;
   let conv;
   try { conv = await api('GET', 'conv?key=' + encodeURIComponent(key)); }
-  catch (e) { return toast(e.message, false); }
+  catch (e) { if (!quiet) toast(e.message, false); return; }
   // Turn text is refetched too: a finished response may have arrived since.
   const keep = r => conv.turns.some(t => t.rid === r);
   const open = [...LV.open], shut = [...LV.closedRuns];
+  // A refresh keeps the view: same open turns, same block folds, same scroll
+  // position — a poll that yanks you to the focused request is a poll off.
+  const b = document.querySelector('#dlg-log .lv-body');
+  const top = b ? b.scrollTop : 0;
   LV.conv = conv;
   LV.content = new Map();
   LV.open = new Set(open.filter(keep));
   LV.closedRuns = new Set(shut);
-  $('#dlg-log [data-sub]').textContent =
-    `${conv.turns.length} requests · ${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`;
-  await lvDraw({ scroll: true });
+  $('#dlg-log [data-sub]').textContent = lvSubline(conv);
+  await lvDraw({ scroll: false });
+  if (b) b.scrollTop = top;
   lvPrefetch();
-  toast('reloaded', true);
+  LV.reloads = (LV.reloads || 0) + 1;
+  if (!quiet) toast('reloaded', true);
+}
+
+// Auto-refresh: a quiet lvReload on a timer, stopped the moment the viewer
+// closes so nothing polls behind a shut dialog.
+const LV_AUTO_MS = 5000;
+let lvAutoTimer = null;
+function lvAutoStart() {
+  lvAutoStop();
+  if (!S.lv.auto) return;
+  lvAutoTimer = setInterval(() => lvReload({ quiet: true }), LV_AUTO_MS);
+}
+function lvAutoStop() {
+  if (lvAutoTimer) { clearInterval(lvAutoTimer); lvAutoTimer = null; }
 }
 
 /** Refetch everything and hand the browser a file: raw is the log line as the
@@ -2741,7 +2772,13 @@ function msgBlock(m, toolNames, id, cls = '') {
   const label = role === 'tool'
     ? `TOOL · ${esc(m.tool_name || m.name || (toolNames && toolNames.get(m.tool_call_id)) || m.tool_call_id || '?')}`
     : (ROLE_LABEL[role] || esc(role));
-  let html = `<div class="msg ${ROLE_CLS[role] || 'user'}${cls}"${id ? ` id="${id}"` : ''}><span class="role">${label}</span>`;
+  // Fold state: an explicit click wins; system/developer blocks default to one
+  // line so the transcript opens on what the conversation said, not on the
+  // harness prompt every request repeats.
+  const shut = id ? (LV.msgFold.has(id) ? LV.msgFold.get(id) : role === 'system' || role === 'developer') : false;
+  let html = `<div class="msg ${ROLE_CLS[role] || 'user'}${cls}${shut ? ' fold' : ''}"${id ? ` id="${id}"` : ''}><span class="role"${id ? ` data-action="msg-fold" data-key="${id}" title="click to ${shut ? 'open' : 'fold'} this message"` : ''}>${shut ? '▸' : '▾'} ${label}`;
+  if (shut) return html + `<span class="mf-pv">${esc(lvSnip(m))}</span></span></div>`;
+  html += '</span>';
   html += thinkBlock(m.reasoning_content || m.reasoning || '');
   const t = msgText(m.content, m.images);
   if (t) html += `<div class="mtext">${esc(t)}</div>`;
@@ -3439,6 +3476,18 @@ const actions = {
     saveLv();
     await lvDraw({ scroll: false });
   },
+  'lv-auto': el => {
+    S.lv.auto = el.checked;
+    saveLv();
+    if (el.checked) lvAutoStart(); else lvAutoStop();
+  },
+  // A message block folds on its label — the system prompt defaults to one
+  // line, every block is the user's to open or shut.
+  'msg-fold': el => {
+    const shutNow = el.closest('.msg').classList.contains('fold');
+    LV.msgFold.set(el.dataset.key, !shutNow);
+    lvDraw();
+  },
   // A message row inside a request: jump to that message in the body.
   'lv-msg': el => lvFocusMsg(+el.dataset.rid, +el.dataset.idx),
   'lv-expand': async () => {
@@ -3477,6 +3526,8 @@ document.addEventListener('keydown', e => {
 
 // Click on a dialog's backdrop closes it.
 $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close('cancel'); }));
+// A closed viewer must leave no poller behind.
+$('#dlg-log').addEventListener('close', lvAutoStop);
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
 // Grouped or per-request: which view of the same ring, remembered like the
