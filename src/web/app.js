@@ -1375,8 +1375,8 @@ function clientRow(r, st) {
 }
 
 /** Says why a record has no body text: switched off, not missing. */
-const redactBadge = title => `<span class="badge warn" title="${title}">no text</span>`;
-const REDACT_BADGE = redactBadge('No request/response text is stored — the log entry keeps user, model, backend, status, size, session and timing');
+const redactBadge = title => `<span class="badge warn" title="${title}">redacted</span>`;
+const REDACT_BADGE = redactBadge("Text not stored — the client's X-Redact-Log header or its client, key or backend setting; the log entry keeps user, model, backend, status, size, session and timing");
 
 /** Level 2: the client's keys, while its own row is open. */
 function keyRows(r) {
@@ -1829,7 +1829,7 @@ async function openConv({ rid, session, user } = {}) {
   const sub = [`#${sessName(conv) || conv.key}`];
   sub.push(`${conv.turns.length} ${conv.turns.length === 1 ? 'request' : 'requests'}`);
   if (conv.turns.length) sub.push(`${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`);
-  if (conv.redacted) sub.push('no text');
+  if (conv.redacted) sub.push('redacted');
   $('#dlg-log [data-sub]').textContent = sub.join(' · ');
   $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
   const dlg = $('#dlg-log');
@@ -1935,7 +1935,7 @@ const lvSec = (cls, title, info, html) =>
   `<section class="lv-sec"><h3 class="lv-sec-h ${cls}"><span class="ar">${cls === 'req' ? '→' : '←'}</span>${esc(title)}${info ? ` · ${esc(info)}` : ''}</h3>${html}</section>`;
 
 /** Capture switched off is a decision, not a gap: say so and show what was kept. */
-const lvOff = () => '<div class="lv-off">capture turned off — no request or response text is stored for this client, key or backend. Its timeline, sizes and message roles are still recorded.</div>';
+const lvOff = () => '<div class="lv-off">text redacted — the client\'s <code>X-Redact-Log</code> header or its client, key or backend setting kept this text out of the log. Its timeline, sizes and message roles are still recorded.</div>';
 
 /** What a turn re-sent that an earlier request already delivered, as one line:
  *  how many, where they first appeared, and what they were (roles, size). The
@@ -2047,7 +2047,7 @@ async function lvDraw({ scroll = false } = {}) {
         <span class="ts"${sp.tip ? ` title="${esc(sp.tip)}"` : ''}>${sp.txt}</span>
         <span>${lvStages(t)}</span>
         <span class="tail">${t.status != null ? `<span class="${t.status >= 400 ? 'st-bad' : 'st-ok'}">${t.status}</span>` : '<span class="dim">running</span>'}</span>
-        ${t.redacted ? '<span class="badge warn" title="no body text is stored for this client, key or backend">no text</span>' : ''}
+        ${t.redacted ? '<span class="badge warn" title="text not stored for this request — the client\'s X-Redact-Log header or its client, key or backend setting">redacted</span>' : ''}
       </h3>${LV.open.has(t.rid) ? await lvTurnInner(t) : ''}</section>`);
   }
   if (!turns.length) parts.push('<div class="empty">This conversation has no requests.</div>');
@@ -2181,11 +2181,11 @@ function lvMarkdown(conv, content, turns) {
     out.push(`**Request** ${[t.method, t.path, t.req?.bytes != null ? fmtBytes(t.req.bytes) : null,
       msgs.length ? `${msgs.length} messages${cut ? `, ${msgs.length - cut} new` : ''}` : null]
       .filter(Boolean).join(' ')}`, '');
-    if (c.req == null) out.push(t.redacted ? '_capture turned off — no text is stored for this client, key or backend_' : '_no request text stored_', '');
+    if (c.req == null) out.push(t.redacted ? '_text redacted — X-Redact-Log header or client/key/backend setting_' : '_no request text stored_', '');
     else if (msgs.length) for (const m of msgs.slice(cut)) out.push(...lvMsgMd(m));
     else out.push('```', c.req, '```', '');
     out.push(`**Response**${t.resp?.bytes != null ? ` · ${fmtBytes(t.resp.bytes)}` : ''}`, '');
-    if (c.resp == null) out.push(t.redacted ? '_capture turned off_' : '_no response text stored_', '');
+    if (c.resp == null) out.push(t.redacted ? '_text redacted_' : '_no response text stored_', '');
     else {
       const st = streamState(c.resp) || lvPlainResp(c.resp);
       if (!st) out.push('```', c.resp, '```', '');
@@ -2333,7 +2333,7 @@ function lvDrawRail() {
     items.push(lvNode({ level: 2, rid: t.rid, cls: 'req', when: '', tag: 'req',
       tip: `arrived ${fmtTime(t.at_ms)} with the request — the body carries no time of its own`,
       snip: msgs ? (carry ? `${msgs - carry.hidden} new · ${carry.hidden} held` : `${msgs} messages`)
-        : t.req?.bytes != null ? `${fmtBytes(t.req.bytes)}${t.redacted ? ' \u00b7 no text' : ''}` : 'no body',
+        : t.req?.bytes != null ? `${fmtBytes(t.req.bytes)}${t.redacted ? ' \u00b7 redacted' : ''}` : 'no body',
       caret: '' }));
     // The messages this request re-sent are not the tree's business: they are
     // already drawn under their own request. The request row says `3 new · 7
@@ -2354,7 +2354,7 @@ function lvDrawRail() {
       tip: t.tl?.end != null
         ? `how long this response took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)})`
         : 'no response recorded yet',
-      snip: lvFinish(t) + (c?.resp ? '' : ' · no text'), caret: '' }));
+      snip: lvFinish(t) + (c?.resp ? '' : ' · redacted'), caret: '' }));
   });
   if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');
   setHTML(rail, items.join(''));

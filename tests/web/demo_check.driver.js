@@ -33,7 +33,7 @@ addEventListener('load', () => {
       convRows.map(r => r.querySelector('.rline')?.textContent.trim().slice(0, 28)).join(' | '));
     A('logs-row-names-session', convRows.some(r => /#dispatcher refactor/.test(r.textContent)),
       convRows.map(r => r.querySelector('.sess')?.textContent).join(' '));
-    const tr = convRows.find(r => !/no text/.test(r.textContent));
+    const tr = convRows.find(r => !/redacted/.test(r.textContent));
     if (tr) tr.click();
   }, 1500);
   setTimeout(() => {
