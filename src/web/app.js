@@ -968,8 +968,8 @@ function renderDetails(rows) {
     out.push(`<button class="det-h" style="--c:var(--${c})" data-key="${esc(head.key)}" aria-expanded="${!shut}"
       title="${shut ? 'expand' : 'collapse'} this conversation">
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(fmtWho(head.o))}</span>
-      ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}${chip}
-      <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>
+      ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}
+      <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>${chip}
       ${sum}
       ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(head.o.client)}" title="open this conversation in the viewer">\u2263 View</span>` : ''}</button>`);
     if (shut) continue;
@@ -1747,9 +1747,9 @@ const storedLv = () => {
   try {
     const v = JSON.parse(localStorage.getItem('omq.lv') || '{}');
     return { fmt: v.fmt === 'raw' ? 'raw' : 'fmt', rail: !!v.rail,
-      railW: lvRailClamp(v.railW) };
+      inc: v.inc !== false, railW: lvRailClamp(v.railW), auto: !!v.auto };
   } catch { /* storage blocked */ }
-  return { fmt: 'fmt', rail: false, railW: LV_RAIL_DEF };
+  return { fmt: 'fmt', rail: false, inc: true, railW: LV_RAIL_DEF, auto: false };
 };
 const saveLv = () => { try { localStorage.setItem('omq.lv', JSON.stringify(S.lv)); } catch { /* storage blocked */ } };
 /* The jump tree is a side column you may want wide (tool names, message text) or
@@ -1784,9 +1784,11 @@ function lvSetRail(w) {
 S.lv = storedLv();
 
 /** Viewer state. `open` is the one fold for a request: the tree caret and the
- *  turn header fold the same block, in either direction. `hist` remembers which
- *  requests also show the messages an earlier request already delivered. */
-const LV = { conv: null, rid: null, open: new Set(), hist: new Set(), focusMsg: null, content: new Map() };
+ *  turn header fold the same block, in either direction. `closedRuns` holds the
+ *  run ordinals folded shut; whether a request shows only its increment or the
+ *  whole re-sent prompt is the one global `S.lv.inc` switch, not per-request. */
+const LV = { conv: null, rid: null, open: new Set(), closedRuns: new Set(), focusMsg: null, content: new Map(),
+  msgFold: new Map() };
 let lvToken = 0;
 
 const tryJson = s => { try { return JSON.parse(s); } catch { return undefined; } };
@@ -1821,20 +1823,60 @@ async function openConv({ rid, session, user } = {}) {
   LV.conv = conv;
   LV.rid = rid || (resuming && LV.rid) || conv.turns.at(-1)?.rid || null;
   LV.open = new Set(LV.rid != null ? [LV.rid] : []);
-  LV.hist = new Set();
+  LV.closedRuns = new Set();
   LV.focusMsg = null;
   LV.content = new Map();
+  LV.msgFold = new Map();
   $('#dlg-log [data-title]').textContent =
     `${conv.model || 'traffic'} · ${conv.user}${conv.backend ? ` → ${bkName(conv.backend)}` : ''}`;
-  const sub = [`#${sessName(conv) || conv.key}`];
-  sub.push(`${conv.turns.length} ${conv.turns.length === 1 ? 'request' : 'requests'}`);
-  if (conv.turns.length) sub.push(`${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`);
-  if (conv.redacted) sub.push('redacted');
-  $('#dlg-log [data-sub]').textContent = sub.join(' · ');
+  $('#dlg-log [data-sub]').textContent = lvSubline(conv);
   $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
+  $('#lv-inc').checked = S.lv.inc;
+  $('#lv-auto').checked = S.lv.auto;
   const dlg = $('#dlg-log');
   if (!dlg.open) dlg.showModal();
   await lvDraw({ scroll: true });
+  lvPrefetch();
+  lvAutoStart();
+}
+
+/** The viewer header's second line: conversation id, its name when it has
+ *  one, request count and span — rebuilt on refresh so a growing conversation
+ *  says so without a reload. */
+function lvSubline(conv) {
+  const sub = [`#${conv.session || conv.key}`];
+  if (conv.session_label) sub.push(`#${conv.session_label}`);
+  sub.push(`${conv.turns.length} ${conv.turns.length === 1 ? 'request' : 'requests'}`);
+  if (conv.turns.length) sub.push(`${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`);
+  if (conv.redacted) sub.push('redacted');
+  return sub.join(' · ');
+}
+
+/** The collapsed lines want a word from every turn's text (and the run lines
+ *  want every finish), so all turn texts are fetched in the background after
+ *  the first paint — newest first, a few in flight, repaints throttled. A
+ *  redacted turn has no text to fetch. */
+let lvPrefetchKey = null;
+async function lvPrefetch() {
+  if (!LV.conv) return;
+  const key = lvPrefetchKey = LV.conv.key;
+  const todo = lvTurns().filter(t => !t.redacted && !LV.content.has(t.rid)).reverse();
+  if (!todo.length) return;
+  let timer = 0;
+  const paint = () => {
+    if (lvPrefetchKey !== key) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => { if (lvPrefetchKey === key) lvDraw({ scroll: false }); }, 250);
+  };
+  const worker = async list => {
+    for (const t of list) {
+      if (lvPrefetchKey !== key) return;
+      await lvLoad(t.rid);
+      paint();
+    }
+  };
+  const N = Math.min(6, todo.length);
+  await Promise.all(Array.from({ length: N }, (_, w) => worker(todo.filter((_, i) => i % N === w))));
 }
 
 /** A log event with no proxied request behind it (a control action): the same
@@ -1849,7 +1891,7 @@ async function openSeq(seq) {
   };
   LV.rid = seq;
   LV.open = new Set([seq]);
-  LV.hist = new Set();
+  LV.closedRuns = new Set();
   LV.focusMsg = null;
   LV.content = new Map([[seq, { req: null, resp: ev.content ?? null, reqObj: null }]]);
   $('#dlg-log [data-title]').textContent = `control \u00b7 ${ev.user}`;
@@ -1931,8 +1973,105 @@ function lvSpan(t, first) {
   };
 }
 
-const lvSec = (cls, title, info, html) =>
-  `<section class="lv-sec"><h3 class="lv-sec-h ${cls}"><span class="ar">${cls === 'req' ? '→' : '←'}</span>${esc(title)}${info ? ` · ${esc(info)}` : ''}</h3>${html}</section>`;
+const lvSec = ({ cls, title, info, tip, id }, html) =>
+  `<section class="lv-sec"${id ? ` id="${id}"` : ''}><h3 class="lv-sec-h ${cls}"${tip ? ` title="${esc(tip)}"` : ''}><span class="ar">${cls === 'req' ? '→' : '←'}</span>${esc(title)}${info ? ` · ${esc(info)}` : ''}</h3>${html}</section>`;
+
+// --- Derived turn facts and runs ------------------------------------------
+//
+// The collapsed line and the run boundaries need what the turn index does not
+// carry: what the response finished with, a word of the increment, and whether
+// its tool calls came back bad. All of it lives in the captured bodies, so it
+// is derived once per turn as its text arrives (prefetched after the first
+// paint) and cached on the content entry; without text the tool count still
+// comes from the message metadata.
+
+const lvWords = (s, n = 7) => {
+  const words = String(s || '').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+  return words.length ? words.slice(0, n).join(' ') + (words.length > n ? '…' : '') : '';
+};
+
+function lvFacts(i) {
+  const t = lvTurns()[i];
+  if (!t) return { finish: null, words: '', pvU: '', pvT: '', tCalls: 0, tBad: false };
+  const c = LV.content.get(t.rid);
+  if (c && c.facts) return c.facts;
+  const hid = lvHidden(i);
+  const f = { finish: null, words: '', pvU: '', pvT: '', tCalls: 0, tBad: false };
+  // A turn that did not grow the message list has no measurable increment
+  // (a retry, a no-growth step): guessing from the whole body would invent a
+  // preview and a badge. Only the first turn's increment is all of it.
+  const grew = i === 0 || hid > 0;
+  const fromMeta = () => {
+    if (grew) f.tCalls = (t.msgs || []).slice(hid).reduce((n, m) => n + (m.calls ? m.calls.length : 0), 0);
+  };
+  if (!c) { fromMeta(); return f; }
+  if (c.resp != null) {
+    const st = streamState(c.resp) || lvPlainResp(c.resp);
+    f.finish = (st && st.finish) || null;
+    // The response's own opening words: a one-request conversation has no
+    // re-sent assistant history, so without this the rail never shows what
+    // the model actually answered — only how the stream ended.
+    f.words = lvWords((st && st.text) || '');
+  }
+  const msgs = c.reqObj && c.reqObj.messages;
+  if (msgs && grew) {
+    for (const m of msgs.slice(hid)) {
+      if (m.role === 'user' && !f.pvU) f.pvU = lvWords(msgText(m.content, m.images));
+      if (m.role === 'assistant' && !f.pvT) f.pvT = lvWords(m.reasoning_content || m.reasoning || msgText(m.content));
+      f.tCalls += (m.tool_calls || []).length;
+      if (m.role === 'tool' && /exit code: -?[1-9]\d*/i.test(msgText(m.content))) f.tBad = true;
+    }
+  } else if (!msgs) fromMeta();
+  return (c.facts = f);
+}
+
+/** The opening signature of a turn's answer text — enough to recognize the
+ *  very same reply when the next request re-sends it as a message. */
+function lvAnswerSig(t) {
+  const c = t && LV.content.get(t.rid);
+  if (!c || c.resp == null) return '';
+  if (c.ansSig != null) return c.ansSig;
+  const st = streamState(c.resp) || lvPlainResp(c.resp);
+  return (c.ansSig = lvWords((st && st.text) || ''));
+}
+
+/** Runs in index ranges: the requests from the previous final answer up to the
+ *  next `finish: stop`. A turn whose finish is unknown cannot close a run — it
+ *  merges forward — and a conversation with nothing to split renders flat,
+ *  exactly as before runs existed. */
+function lvRuns() {
+  // The incremental view is about one request's moment: the run grouping is
+  // the whole session's story and waits for the whole-prompt view. The answer
+  // to the request stays visible — hide it and a single-request conversation
+  // shows no assistant words anywhere.
+  if (S.lv.inc) return [];
+  const turns = lvTurns(); const runs = []; let s = 0;
+  for (let i = 0; i < turns.length; i++)
+    if (lvFacts(i).finish === 'stop') { runs.push({ a: s, b: i }); s = i + 1; }
+  if (s < turns.length) runs.push({ a: s, b: turns.length - 1 });
+  // A run of one request groups nothing and reads as a second numbering
+  // system competing with #N — those requests stand on their own, and only
+  // spans of two or more get a group line.
+  const kept = runs.filter(r => r.b > r.a);
+  return kept.length ? kept : [];
+}
+const lvRunOf = (runs, i) => runs.findIndex(r => i >= r.a && i <= r.b);
+
+function lvRunInfo(runs, k) {
+  const turns = lvTurns(); const { a, b } = runs[k];
+  const first = turns[a], last = turns[b];
+  const end = last.tl?.end ?? LV.conv?.end_ms ?? last.at_ms;
+  const info = { a: a + 1, b: b + 1, n: b - a + 1,
+    dur: end > first.at_ms ? fmtDur((end - first.at_ms) / 1000) : null, pv: null, calls: 0 };
+  let think = null;
+  for (let i = a; i <= b; i++) {
+    const f = lvFacts(i); info.calls += f.tCalls;
+    if (!info.pv && f.pvU) info.pv = { cls: 'u', txt: f.pvU };
+    if (!think && f.pvT) think = { cls: 't', txt: f.pvT };
+  }
+  if (!info.pv) info.pv = think;
+  return info;
+}
 
 /** Capture switched off is a decision, not a gap: say so and show what was kept. */
 const lvOff = () => '<div class="lv-off">text redacted — the client\'s <code>X-Redact-Log</code> header or its client, key or backend setting kept this text out of the log. Its timeline, sizes and message roles are still recorded.</div>';
@@ -1940,7 +2079,8 @@ const lvOff = () => '<div class="lv-off">text redacted — the client\'s <code>X
 /** What a turn re-sent that an earlier request already delivered, as one line:
  *  how many, where they first appeared, and what they were (roles, size). The
  *  conversation is one view, so by default they show only on the turn that first
- *  sent them and every later turn names them instead of repeating them. */
+ *  sent them; the Show-incremental switch decides everywhere whether a later
+ *  turn names them (bright strip only on the increment) or shows them dimmed. */
 function lvCarry(i) {
   const turns = lvTurns();
   const hidden = lvHidden(i);
@@ -1958,11 +2098,10 @@ function lvCarry(i) {
   return { hidden, from, roles, bytes: chars ? `≈${fmtBytes(chars)}` : null };
 }
 
-const lvCarryText = (c, open, short = false) =>
-  short ? `${c.hidden} from #${c.from + 1}${c.roles ? ` · ${c.roles}` : ''}${c.bytes ? ` · ${c.bytes}` : ''}`
-    : `${c.hidden} ${c.hidden === 1 ? 'message' : 'messages'} held from request ${c.from + 1}`
-      + [c.roles, c.bytes].filter(Boolean).map(x => ` · ${x}`).join('')
-      + ` — ${open ? 'hide' : 'show'} them here too`;
+const lvCarryTip = c => c
+  ? `${c.hidden} ${c.hidden === 1 ? 'message' : 'messages'} held from request ${c.from + 1}`
+    + [c.roles, c.bytes].filter(Boolean).map(x => ` · ${x}`).join('')
+  : '';
 
 function lvMsgsHtml(obj, i, rid) {
   const msgs = (obj && obj.messages) || [];
@@ -1971,34 +2110,30 @@ function lvMsgsHtml(obj, i, rid) {
   // A turn carrying exactly as many messages as the previous one added nothing
   // comparable — show them all rather than hide the whole block.
   const carry = lvCarry(i);
-  const open = !!carry && LV.hist.has(rid);
-  const from = carry && !open ? carry.hidden : 0;
+  // Incremental mode renders the re-sent prefix not at all; full mode renders
+  // it dimmed. The strip says which rows the request actually added.
+  const from = carry && S.lv.inc ? carry.hidden : 0;
   const mid = (k) => (rid != null ? `lv-m-${rid}-${k}` : undefined);
-  const body = msgs.slice(from).map((m, k) => msgBlock(m, toolNames, mid(from + k))).join('');
-  const line = carry ? `<div class="lv-carry" data-action="lv-carry" data-rid="${rid}" role="button" tabindex="0"
-      aria-expanded="${open}" title="these arrived with this request, but an earlier request already sent them">${open ? '▾' : '▸'} ${esc(lvCarryText(carry, open))}</div>` : '';
-  return line + (body || (from ? '' : '<div class="empty">No messages in this request.</div>'));
+  const cls = k => !carry ? '' : (from + k < carry.hidden ? ' m-held' : ' m-new');
+  const body = msgs.slice(from).map((m, k) => msgBlock(m, toolNames, mid(from + k), cls(k))).join('');
+  return body || (from ? '' : '<div class="empty">No messages in this request.</div>');
 }
 
-function lvReqHtml(t, c) {
-  const i = lvIdxOf(t.rid);
-  const prevCount = i > 0 ? lvMsgCount(lvTurns()[i - 1]) : 0;
+function lvReqHtml(t, c, i) {
   if (c.req == null) return (t.redacted ? lvOff() : '<div class="lv-note">No request text was stored for this request.</div>') + lvMsgChips(t);
   if (S.lv.fmt === 'raw')
     return (c.req.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(c.req);
   if (!c.reqObj) return rawView(c.req);
-  const msgs = (c.reqObj.messages || []).length;
-  // The count stays on the line so the omitted prefix is visible as a number,
-  // without a fold line repeating what the turns above already show.
-  const sent = prevCount > 0 && prevCount < msgs ? ` · ${msgs - prevCount} new this turn` : '';
-  return `<div class="lv-meta">${esc(reqMeta(c.reqObj) + sent)}</div>` + lvMsgsHtml(c.reqObj, i, t.rid);
+  // No meta line: the section header carries method, path and size, and its
+  // tooltip carries the parameters and the new/held split.
+  return lvMsgsHtml(c.reqObj, i, t.rid);
 }
 
 function lvRespHtml(t, c) {
   if (c.resp == null)
     return (t.redacted ? lvOff() : `<div class="lv-note">${t.tl?.end != null ? 'No response text was stored for this request.' : 'No response recorded yet — still queued, running, or disconnected.'}</div>`)
       + lvRespChips(t);
-  return S.lv.fmt === 'raw' ? rawView(c.resp) : formatContent(c.resp);
+  return S.lv.fmt === 'raw' ? rawView(c.resp) : formatContent(c.resp, t.rid);
 }
 
 /** Without text the turn still lists what it held: one chip per message. */
@@ -2018,38 +2153,50 @@ function lvRespChips(t) {
   // the whole trace that remains.
   if (t.status != null && !t.redacted) bits.push(`HTTP ${t.status}`);
   if (!bits.length) return '';
-  // "ASSIST" would be a guess on a request that never carried a chat body.
+  // "ASST" would be a guess on a request that never carried a chat body.
   if (!/\/chat\//.test(t.path || '')) return `<div class="lv-note">${esc(bits.join(' · '))}</div>`;
   return `<div class="msg-slot asst"><span class="role">${ROLE_LABEL.assistant}</span><span>${esc(bits.join(' · '))}</span></div>`;
 }
 
 async function lvTurnInner(t) {
+  const i = lvIdxOf(t.rid);
   const c = await lvLoad(t.rid);
   const reqSize = t.req?.bytes != null ? fmtBytes(t.req.bytes) : null;
   const respSize = t.resp?.bytes != null ? fmtBytes(t.resp.bytes) : null;
-  return lvSec('req', 'Request', [t.method, t.path, reqSize].filter(Boolean).join(' '), lvReqHtml(t, c))
-    + lvSec('out', 'Response', [t.status ?? '—', respSize].filter(Boolean).join(' '), lvRespHtml(t, c));
+  const carry = lvCarry(i);
+  const reqTip = [c.reqObj ? reqMeta(c.reqObj) : null,
+    carry ? `${(c.reqObj?.messages || []).length - carry.hidden} new · ${lvCarryTip(carry)}` : null
+  ].filter(Boolean).join(' · ');
+  return lvSec({ cls: 'req', title: 'Request', info: [t.method, t.path, reqSize].filter(Boolean).join(' '),
+    tip: reqTip || null, id: `lv-q-${t.rid}` }, lvReqHtml(t, c, i))
+    + lvSec({ cls: 'out', title: 'Response', info: [t.status ?? '—', respSize].filter(Boolean).join(' '),
+      id: `lv-a-${t.rid}` }, lvRespHtml(t, c));
 }
 
 /** Render the whole conversation. `scroll` lands on the focused request. */
 async function lvDraw({ scroll = false } = {}) {
   const tk = ++lvToken;
   const turns = lvTurns();
+  const runs = lvRuns();
+  for (const k of [...LV.closedRuns]) if (k >= runs.length) LV.closedRuns.delete(k);
   const parts = [];
+  let prevRun = null, openRun = false;
   for (let i = 0; i < turns.length; i++) {
     const t = turns[i];
-    parts.push(lvGap(t, turns[i - 1]));
-    const sp = lvSpan(t, i === 0 ? null : turns[0].at_ms);
-    parts.push(`<section class="turn${t.rid === LV.rid ? ' active' : ''}" id="lv-t-${t.rid}" data-rid="${t.rid}">
-      <h3 class="turn-h" data-action="lv-toggle" data-rid="${t.rid}" title="expand or collapse this request">
-        <span class="chev">${LV.open.has(t.rid) ? '▾' : '▸'}</span>
-        <span class="n">Request ${i + 1} of ${turns.length}</span>
-        <span class="ts"${sp.tip ? ` title="${esc(sp.tip)}"` : ''}>${sp.txt}</span>
-        <span>${lvStages(t)}</span>
-        <span class="tail">${t.status != null ? `<span class="${t.status >= 400 ? 'st-bad' : 'st-ok'}">${t.status}</span>` : '<span class="dim">running</span>'}</span>
-        ${t.redacted ? '<span class="badge warn" title="text not stored for this request — the client\'s X-Redact-Log header or its client, key or backend setting">redacted</span>' : ''}
-      </h3>${LV.open.has(t.rid) ? await lvTurnInner(t) : ''}</section>`);
+    const rk = lvRunOf(runs, i); // -1: a request that belongs to no group
+    const gap = lvGap(t, turns[i - 1]);
+    if (rk !== prevRun) { // a group starts or ends here
+      parts.push(openRun ? gap + '</div>' : gap);
+      openRun = rk !== -1;
+      if (openRun) parts.push(lvRunHead(runs, rk), `<div class="run" data-run="${rk}">`);
+      prevRun = rk;
+    } else parts.push(gap);
+    if (rk !== -1 && LV.closedRuns.has(rk)) continue; // folded run: its header says it all
+    let sec = lvTurnHead(t, i);
+    if (LV.open.has(t.rid)) sec += await lvTurnInner(t);
+    parts.push(sec + '</section>');
   }
+  if (openRun) parts.push('</div>');
   if (!turns.length) parts.push('<div class="empty">This conversation has no requests.</div>');
   const html = parts.join('');
   if (tk !== lvToken) return; // a newer click beat us
@@ -2062,6 +2209,57 @@ async function lvDraw({ scroll = false } = {}) {
   if (scroll) lvScroll();
 }
 
+/** A problem worth the red tint: a failure the operator should notice. A
+ *  client that walked away is not one — that row just carries no status. */
+const lvProb = t => (t.status != null && t.status >= 400)
+  || t.outcome === 'timeout' || t.outcome === 'backend_error';
+
+/** One collapsed run: the range it covers, how long it ran, its first words,
+ *  and how many tools it fired. A run is named by that range — `#1–#3`, the
+ *  requests between two final answers — never by a second counter. */
+function lvRunHead(runs, k) {
+  const ri = lvRunInfo(runs, k);
+  const shut = LV.closedRuns.has(k);
+  return `<h3 class="run-h" data-action="lv-run" data-run="${k}" role="button" tabindex="0"
+    title="a run: the requests between two final answers — #${ri.a}–#${ri.b}${ri.dur ? ` · ${ri.dur}` : ''}; click to ${shut ? 'open' : 'fold'} it">
+    <span class="chev">${shut ? '▸' : '▾'}</span><span>#${ri.a}–#${ri.b}${ri.dur ? ` · ${ri.dur}` : ''}</span>
+    <span class="pv">${shut && ri.pv ? `<span class="${ri.pv.cls}">${esc(ri.pv.txt)}</span>` : ''}</span>
+    ${ri.calls ? `<span class="tb" title="${ri.calls} tool calls across this run">×${ri.calls}</span>` : ''}</h3>`;
+}
+
+/** The request line: `#N`, its measured moments, a word of its increment
+ *  (blue user, green thinking), a tool badge (red when a call came back on a
+ *  non-zero exit), and the sizes kept quiet on the right. A healthy status
+ *  shows nothing; a problem tints the whole line through `.prob`. */
+function lvTurnHead(t, i) {
+  const f = lvFacts(i);
+  const sp = lvSpan(t, i === 0 ? null : lvTurns()[0].at_ms);
+  // The preview is the tease for a line you cannot see: once the request is
+  // open, its own message lines spell out the same words right below, and a
+  // header repeating the first of them just reads as a duplicate entry.
+  const pv = !LV.open.has(t.rid) && (f.pvU || f.pvT)
+    ? `<span class="pv"><span class="${f.pvU ? 'u' : 't'}">${esc(f.pvU || f.pvT)}</span></span>`
+    : '<span class="pv"></span>';
+  const tb = f.tCalls
+    ? `<span class="tb${f.tBad ? ' bad' : ''}" title="${f.tCalls} ${f.tCalls === 1 ? 'tool call' : 'tool calls'} in this request${f.tBad ? ' — a result reported a non-zero exit code' : ''}">×${f.tCalls}</span>`
+    : '';
+  const szBits = [t.req?.bytes != null ? [`→ ${fmtBytes(t.req.bytes)}`, `request ${fmtBytes(t.req.bytes)}`] : null,
+    t.resp?.bytes != null ? [`← ${fmtBytes(t.resp.bytes)}`, `response ${fmtBytes(t.resp.bytes)}`] : null].filter(Boolean);
+  const szTxt = szBits.map(b => b[0]).join(' ');
+  const tail = t.status == null ? '<span class="tail"><span class="dim">running</span></span>'
+    : szTxt ? `<span class="tail sz" title="${szBits.map(b => b[1]).join(' · ')}">${szTxt}</span>`
+      : '<span class="tail"></span>';
+  return `<section class="turn${t.rid === LV.rid ? ' active' : ''}${lvProb(t) ? ' prob' : ''}" id="lv-t-${t.rid}" data-rid="${t.rid}">
+    <h3 class="turn-h" data-action="lv-toggle" data-rid="${t.rid}" title="expand or collapse this request${t.status != null ? ` · ${t.status}${t.outcome && t.outcome !== 'ok' ? ` ${t.outcome}` : ''}` : ''}">
+      <span class="chev">${LV.open.has(t.rid) ? '▾' : '▸'}</span>
+      <span class="n">#${i + 1}</span>
+      <span class="ts"${sp.tip ? ` title="${esc(sp.tip)}"` : ''}>${sp.txt}</span>
+      <span>${lvStages(t)}</span>
+      ${pv}${tb}
+      ${t.redacted ? '<span class="badge warn" title="text not stored for this request — the client\'s X-Redact-Log header or its client, key or backend setting">redacted</span>' : ''}
+      ${tail}</h3>`;
+}
+
 function lvScroll() {
   const el = document.getElementById('lv-t-' + LV.rid);
   if (el) el.scrollIntoView({ block: 'start' });
@@ -2070,10 +2268,76 @@ function lvScroll() {
 /** Focus one request: expand it (leaving the others as they were), scroll to it. */
 async function lvFocus(rid) {
   if (rid == null || lvIdxOf(rid) < 0) return;
+  lvTrackLock = Date.now() + 700; // its own scroll lands the highlight it drew
   LV.rid = rid;
   LV.focusMsg = null;
   LV.open.add(rid);
+  LV.closedRuns.delete(lvRunOf(lvRuns(), lvIdxOf(rid)));
   await lvDraw({ scroll: true });
+}
+
+/** A deep target inside a turn (the rail's RESP row): focus the turn, then
+ *  land on that section and flash it — a plain jump lands on the turn header,
+ *  which for a tall turn reads as "the top of the page". */
+async function lvFocusSec(rid, side) {
+  if (rid == null || lvIdxOf(rid) < 0) return;
+  lvTrackLock = Date.now() + 700;
+  LV.rid = rid;
+  LV.focusMsg = null;
+  LV.open.add(rid);
+  LV.closedRuns.delete(lvRunOf(lvRuns(), lvIdxOf(rid)));
+  await lvDraw({ scroll: false });
+  const el = document.getElementById(`lv-${side}-${rid}`);
+  if (!el) { lvScroll(); lvDrawRail(); return; }
+  el.scrollIntoView({ block: 'start' });
+  el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 1300);
+  lvDrawRail();
+}
+
+/** The rail is where you are, not just what you click: whatever block sits at
+ *  the top of the log lights its row, and the rail scrolls it into view — so a
+ *  hand on the wheel never loses its place in a long session. Jump handlers
+ *  light the target themselves, so their own scroll settles under a short
+ *  lock instead of fighting the highlight it just placed. */
+let lvTrackLock = 0;
+function lvTrackRail() {
+  if (!S.lv.rail || !LV || Date.now() < lvTrackLock) return;
+  const body = document.querySelector('#dlg-log .lv-body');
+  const rail = $('#lv-rail');
+  if (!body || !rail || rail.hidden) return;
+  const top = body.getBoundingClientRect().top;
+  // Scrolled to the end means reading the last block — the tail rows are
+  // short and can never reach the top edge, so the crossed rule alone would
+  // strand the mark one (or several) messages before the end.
+  const atEnd = body.scrollHeight - (body.scrollTop + body.clientHeight) <= 24;
+  let node = null, last = null;
+  // Document order is visual order; the lit row is the last block whose top
+  // has crossed the container's top edge — at the end, the last block there
+  // is at all.
+  for (const el of document.querySelectorAll('#dlg-log .run-h, #dlg-log section.turn, #dlg-log .msg[id], #dlg-log .lv-sec[id^="lv-a-"]')) {
+    let sel = null;
+    if (el.classList.contains('run-h')) sel = `.lv-node.run[data-run="${el.dataset.run}"]`;
+    else if (el.matches('section.turn')) sel = `.lv-node.turn[data-rid="${el.dataset.rid}"]`;
+    else if (el.classList.contains('msg')) {
+      const m = /^lv-m-(\d+)-(\d+)$/.exec(el.id);
+      if (m) sel = `.lv-node.msg.sub[data-rid="${m[1]}"][data-idx="${m[2]}"]`;
+    } else sel = `.lv-node.resp.sub[data-rid="${el.id.slice(5)}"]`;
+    const found = sel && rail.querySelector(sel);
+    if (!found) continue;
+    last = found;
+    if (el.getBoundingClientRect().top - top <= 8) node = found;
+  }
+  if (atEnd && last) node = last;
+  const nodes = rail.querySelectorAll('.lv-node.on');
+  if (!node) { nodes.forEach(n => n.classList.remove('on')); return; }
+  nodes.forEach(n => { if (n !== node) n.classList.remove('on'); });
+  if (node && !node.classList.contains('on')) {
+    node.classList.add('on');
+    const rr = node.getBoundingClientRect(), pr = rail.getBoundingClientRect();
+    if (rr.top < pr.top) rail.scrollTop += rr.top - pr.top - 4;
+    else if (rr.bottom > pr.bottom) rail.scrollTop += rr.bottom - pr.bottom + 4;
+  }
 }
 
 /** A tree message node (the `USER` / `ASSIST` / `TOOL` line under a request):
@@ -2083,17 +2347,20 @@ async function lvFocusMsg(rid, idx) {
   const turns = lvTurns();
   const i = turns.findIndex(t => t.rid === rid);
   if (i < 0) return;
+  lvTrackLock = Date.now() + 700;
   // A message this request only resent is drawn in the turn that first sent it,
   // so that is the one to open and flash — unless this turn has its re-sent
   // history unfolded, in which case the copy on screen is the one to land on.
   let k = i, tgt = { rid: turns[i].rid, idx };
-  while (k > 0 && !LV.hist.has(turns[i].rid)) {
+  while (k > 0 && S.lv.inc) {
     const hid = lvHidden(k);
     if (!(hid && tgt.idx < hid)) break;
     k--;
     tgt = { rid: turns[k].rid, idx: Math.min(tgt.idx, Math.max(lvMsgCount(turns[k]) - 1, 0)) };
   }
   const needed = !LV.open.has(tgt.rid) || !LV.content.has(tgt.rid);
+  // a jump to a message opens a folded block — the row was clicked for its text
+  LV.msgFold.set(`lv-m-${tgt.rid}-${tgt.idx}`, false);
   LV.rid = tgt.rid;
   LV.open.add(tgt.rid);
   LV.focusMsg = [tgt.rid, tgt.idx];
@@ -2101,7 +2368,7 @@ async function lvFocusMsg(rid, idx) {
   const el = document.getElementById(`lv-m-${tgt.rid}-${tgt.idx}`);
   if (!el) { lvScroll(); lvDrawRail(); return; }
   for (const d of [el.closest('details'), ...el.querySelectorAll('details')]) if (d) d.open = true;
-  el.scrollIntoView({ block: 'center' });
+  el.scrollIntoView({ block: 'start' });
   el.classList.add('flash');
   setTimeout(() => el.classList.remove('flash'), 1300);
   lvDrawRail();
@@ -2115,31 +2382,54 @@ async function lvStep(delta) {
 async function lvToggle(rid) {
   // Each request opens and closes on its own: opening one never folds the others.
   // One set drives both views, so folding from the tree folds the block and
-  // folding the block folds the tree.
+  // folding the block folds the tree. Opening also opens its run.
+  if (lvIdxOf(rid) < 0) return;
   if (LV.open.has(rid)) LV.open.delete(rid);
-  else LV.open.add(rid);
+  else {
+    LV.open.add(rid);
+    LV.closedRuns.delete(lvRunOf(lvRuns(), lvIdxOf(rid)));
+  }
   LV.rid = rid;
   LV.focusMsg = null;
   await lvDraw({ scroll: false });
 }
 
-async function lvReload() {
+async function lvReload({ quiet = false } = {}) {
   if (!LV.conv) return;
   const key = LV.conv.key;
   let conv;
   try { conv = await api('GET', 'conv?key=' + encodeURIComponent(key)); }
-  catch (e) { return toast(e.message, false); }
+  catch (e) { if (!quiet) toast(e.message, false); return; }
   // Turn text is refetched too: a finished response may have arrived since.
   const keep = r => conv.turns.some(t => t.rid === r);
-  const open = [...LV.open], hist = [...LV.hist];
+  const open = [...LV.open], shut = [...LV.closedRuns];
+  // A refresh keeps the view: same open turns, same block folds, same scroll
+  // position — a poll that yanks you to the focused request is a poll off.
+  const b = document.querySelector('#dlg-log .lv-body');
+  const top = b ? b.scrollTop : 0;
   LV.conv = conv;
   LV.content = new Map();
   LV.open = new Set(open.filter(keep));
-  LV.hist = new Set(hist.filter(keep));
-  $('#dlg-log [data-sub]').textContent =
-    `${conv.turns.length} requests · ${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`;
-  await lvDraw({ scroll: true });
-  toast('reloaded', true);
+  LV.closedRuns = new Set(shut);
+  $('#dlg-log [data-sub]').textContent = lvSubline(conv);
+  await lvDraw({ scroll: false });
+  if (b) b.scrollTop = top;
+  lvPrefetch();
+  LV.reloads = (LV.reloads || 0) + 1;
+  if (!quiet) toast('reloaded', true);
+}
+
+// Auto-refresh: a quiet lvReload on a timer, stopped the moment the viewer
+// closes so nothing polls behind a shut dialog.
+const LV_AUTO_MS = 5000;
+let lvAutoTimer = null;
+function lvAutoStart() {
+  lvAutoStop();
+  if (!S.lv.auto) return;
+  lvAutoTimer = setInterval(() => lvReload({ quiet: true }), LV_AUTO_MS);
+}
+function lvAutoStop() {
+  if (lvAutoTimer) { clearInterval(lvAutoTimer); lvAutoTimer = null; }
 }
 
 /** Refetch everything and hand the browser a file: raw is the log line as the
@@ -2257,12 +2547,12 @@ function lvSave(text, name, type) {
 // carries the timestamp it was measured at, so the outline reads as the
 // timeline it is.
 
-function lvNode({ level, rid, idx, when, tip, tag, snip, caret, cls = '', action = 'lv-jump', on = false }) {
-  return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}
+function lvNode({ level, rid, idx, when, tip, tag, snip, pv, tb, caret, cls = '', action = 'lv-jump', on = false, run }) {
+  return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}${run != null ? ` data-run="${run}"` : ''}
     ${tip ? `title="${esc(tip)}"` : ''}>
-    <span class="car"${caret ? ' data-action="lv-tree"' : ''} data-rid="${rid}">${caret ?? ''}</span>
+    <span class="car"${caret ? ` data-action="${action === 'lv-run' ? 'lv-run' : 'lv-tree'}"` : ''} data-rid="${rid}">${caret ?? ''}</span>
     <span class="when">${when ?? ''}</span><span class="tag">${esc(tag)}</span>
-    <span class="snip">${esc(snip)}</span></div>`;
+    <span class="snip">${pv || esc(snip ?? '')}</span>${tb ?? ''}</div>`;
 }
 
 /** A message has no clock instant of its own: it arrives inside one request, and
@@ -2307,54 +2597,82 @@ function lvDrawRail() {
   lvApplyRail();
   if (!S.lv.rail) return;
   const turns = lvTurns();
-  const items = [`<div class="lv-rail-h"><h4>Jump to request</h4>
+  const runs = lvRuns();
+  const items = [`<div class="lv-rail-h">
     <button class="btn sm" data-action="lv-expand">Expand all</button>
     <button class="btn sm" data-action="lv-collapse">Collapse all</button></div>`];
+  let prevRun = -1;
   turns.forEach((t, i) => {
     const prev = turns[i - 1];
-    if (prev && prev.tl?.end != null && t.at_ms - prev.tl.end >= LV_IDLE_MS)
-      items.push(lvNode({ level: 1, rid: t.rid, when: fmtDur((t.at_ms - prev.tl.end) / 1000), tag: 'idle',
+    const rk = lvRunOf(runs, i);
+    // Indent by membership: a request inside a group sits one level under its
+    // range line; a lone request sits at the top, with its messages under it.
+    const subLevel = rk !== -1 ? 3 : 2;
+    const turnLevel = rk !== -1 ? 2 : 1;
+    const gapNode = prev && prev.tl?.end != null && t.at_ms - prev.tl.end >= LV_IDLE_MS
+      ? lvNode({ level: turnLevel, rid: t.rid, when: fmtDur((t.at_ms - prev.tl.end) / 1000), tag: 'idle',
         tip: `how long it sat quiet: ${fmtDur((t.at_ms - prev.tl.end) / 1000)} (${fmtTime(prev.tl.end)} → ${fmtTime(t.at_ms)})`,
-        snip: ((t.msgs || []).filter(m => m.name).map(m => m.name).join(', ') || 'agent side'), cls: 'gapnode', caret: '' }));
+        snip: ((t.msgs || []).filter(m => m.name).map(m => m.name).join(', ') || 'agent side'), cls: 'gapnode', caret: '' })
+      : '';
+    items.push(gapNode);
+    if (runs.length && rk !== prevRun) {
+      if (rk !== -1) {
+        const ri = lvRunInfo(runs, rk);
+        const shut = LV.closedRuns.has(rk);
+        items.push(lvNode({ level: 1, rid: '', run: rk, tag: `#${ri.a}–#${ri.b}`,
+          when: rk === 0 ? fmtTime(turns[0].at_ms) : `+${fmtDur((turns[ri.a - 1].at_ms - turns[0].at_ms) / 1000)}`,
+          pv: `${ri.dur ? esc(ri.dur) : ''}${shut && ri.pv ? ` · <span class="${ri.pv.cls}">${esc(ri.pv.txt)}</span>` : ''}`,
+          tb: ri.calls ? `<span class="tb" title="${ri.calls} tool calls across this run">×${ri.calls}</span>` : '',
+          tip: `a run: the requests between two final answers — ${ri.a}–${ri.b}${ri.dur ? ` · ${ri.dur}` : ''}; click to ${shut ? 'open' : 'fold'} it`,
+          caret: shut ? '▸' : '▾', cls: 'run', action: 'lv-run' }));
+      }
+      prevRun = rk;
+    }
+    if (rk !== -1 && LV.closedRuns.has(rk)) return; // folded run: the row above is all of it
+    const f = lvFacts(i);
     items.push(lvNode({
-      level: 1, rid: t.rid, tag: `Request ${i + 1}`,
+      level: turnLevel, rid: t.rid, tag: `#${i + 1}`,
       when: i === 0 ? fmtTime(t.at_ms) : `+${fmtDur((t.at_ms - turns[0].at_ms) / 1000)}`,
+      pv: !LV.open.has(t.rid) && (f.pvU || f.pvT) ? `<span class="${f.pvU ? 'u' : 't'}">${esc(f.pvU || f.pvT)}</span>` : '',
       snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ← ${lvFinish(t)}`,
+      tb: f.tCalls ? `<span class="tb${f.tBad ? ' bad' : ''}" title="${f.tCalls} ${f.tCalls === 1 ? 'tool call' : 'tool calls'} in this request${f.tBad ? ' — a result reported a non-zero exit code' : ''}">×${f.tCalls}</span>` : '',
       cls: 'turn', caret: LV.open.has(t.rid) ? '▾' : '▸',
       tip: `arrived ${fmtTime(t.at_ms)}${i ? ` · a moment: ${fmtDur((t.at_ms - turns[0].at_ms) / 1000)} after the conversation began` : ''}`
-        + `${prev ? ` · ${fmtDur((t.at_ms - prev.at_ms) / 1000)} after request ${i}` : ''}`,
+        + `${prev ? ` · ${fmtDur((t.at_ms - prev.at_ms) / 1000)} after request ${i}` : ''}`
+        + `${t.status != null ? ` · ${t.status}${t.outcome && t.outcome !== 'ok' ? ` ${t.outcome}` : ''}` : ''}`,
       on: t.rid === LV.rid && !LV.focusMsg }));
     if (!LV.open.has(t.rid)) return;
-    const carry = lvCarry(i);
     const c = LV.content.get(t.rid);
-    const msgs = lvMsgCount(t) || (c?.reqObj?.messages || []).length;
-    // The request row owns the arrival time and the response row its duration:
-    // one turn reads as a moment and a length, never two clock times.
-    items.push(lvNode({ level: 2, rid: t.rid, cls: 'req', when: '', tag: 'req',
-      tip: `arrived ${fmtTime(t.at_ms)} with the request — the body carries no time of its own`,
-      snip: msgs ? (carry ? `${msgs - carry.hidden} new · ${carry.hidden} held` : `${msgs} messages`)
-        : t.req?.bytes != null ? `${fmtBytes(t.req.bytes)}${t.redacted ? ' \u00b7 redacted' : ''}` : 'no body',
-      caret: '' }));
-    // The messages this request re-sent are not the tree's business: they are
-    // already drawn under their own request. The request row says `3 new · 7
-    // held`, and unfolding the body adds them here too.
-    const showHist = LV.hist.has(t.rid);
+    // The messages this request re-sent stay out of the tree while incremental
+    // mode is on — they are drawn under the request that first sent them.
+    const hid = lvHidden(i);
+    // The answer this turn gave re-enters the next request as a message —
+    // the answer row under its own turn already speaks it, so the increment
+    // below does not repeat it (it read as a duplicated assistant).
+    const prevAns = i ? lvAnswerSig(turns[i - 1]) : '';
     for (const [mi, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
-      if (carry && !showHist && mi < carry.hidden) continue;
+      if (S.lv.inc && mi < hid) continue;
+      if (S.lv.inc && m.role === 'assistant' && prevAns
+        && lvWords(msgText(m.content, m.images)) === prevAns) continue;
       const w = lvMsgWhen(lvIdxOf(t.rid), mi)
         || { when: '', tip: 'older than this log \u2014 the request that produced it was never captured' };
-      items.push(lvNode({ level: 3, rid: t.rid, idx: mi, when: w.when, tip: w.tip,
-        tag: ROLE_LABEL[m.role] || 'MSG', snip: lvSnip(m), cls: ROLE_CLS[m.role] || 'user',
+      items.push(lvNode({ level: subLevel, rid: t.rid, idx: mi, when: w.when, tip: w.tip,
+        tag: ROLE_LABEL[m.role] || 'MSG', snip: lvSnip(m),
+        cls: `msg sub ${ROLE_CLS[m.role] || 'user'}`,
         action: 'lv-msg', on: !!LV.focusMsg && LV.focusMsg[0] === t.rid && LV.focusMsg[1] === mi }));
     }
-    // A response is a length: how long it took, not when it ended.
+    // The assistant's own answer row. It carries the reply's opening words
+    // (the operator reads the rail as SYS / USER / ASST messages — a meta
+    // "resp" row did not read as the assistant), and clicking it lands on the
+    // Response section in the body. The duration is a length, not a moment.
     const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
-    items.push(lvNode({ level: 2, rid: t.rid, cls: 'resp', tag: 'resp',
+    const fin = f.finish;
+    items.push(lvNode({ level: subLevel, rid: t.rid, cls: 'resp sub asst', tag: 'ASST', action: 'lv-resp',
       when: dur == null ? '' : fmtDur(dur / 1000),
       tip: t.tl?.end != null
-        ? `how long this response took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)})`
+        ? `the assistant's answer — how long it took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)})${fin ? ` — ${fin}` : ''} — click to jump to it`
         : 'no response recorded yet',
-      snip: lvFinish(t) + (c?.resp ? '' : ' · redacted'), caret: '' }));
+      snip: (f.words || fin || lvFinish(t)) + (c && c.resp == null ? (t.redacted ? ' · redacted' : ' · no text') : ''), caret: '' }));
   });
   if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');
   setHTML(rail, items.join(''));
@@ -2409,26 +2727,26 @@ function salvageChat(text) {
 
 /** Chat request body → meta line + transcript blocks; chat response →
  *  reconstructed message + footer; any other JSON → collapsible tree. */
-function formatContent(text) {
+function formatContent(text, rid) {
   const trunc = text.includes('[truncated:')
     ? '<div class="lv-note">Body was truncated by the content limit — showing everything the capture kept.</div>' : '';
   const o = tryJson(text);
   if (o && typeof o === 'object' && !Array.isArray(o)) {
-    if (Array.isArray(o.messages)) return transcriptView(o);
-    if (o.choices || o.message) return responseView(o) ?? jsonView(o, text);
+    if (Array.isArray(o.messages)) return transcriptView(o, rid);
+    if (o.choices || o.message) return responseView(o, rid) ?? jsonView(o, text);
     return jsonView(o, text);
   }
   const salv = salvageChat(text);
-  if (salv) return trunc + transcriptView(salv);
-  const gs = groupStream(text);
+  if (salv) return trunc + transcriptView(salv, rid);
+  const gs = groupStream(text, rid);
   if (gs) return gs + trunc;
   return rawView(text);
 }
 
 const ROLE_CLS = { system: 'sys', developer: 'sys', user: 'user', assistant: 'asst', tool: 'tool' };
 // The role chip locates a message in a long transcript; it is not a sentence.
-// Six characters is the longest of them, so the column stays narrow.
-const ROLE_LABEL = { system: 'SYS', developer: 'DEV', user: 'USER', assistant: 'ASSIST', tool: 'TOOL' };
+// Four letters, like every other role chip, so the column stays narrow.
+const ROLE_LABEL = { system: 'SYS', developer: 'DEV', user: 'USER', assistant: 'ASST', tool: 'TOOL' };
 
 /** A message `content`: string, or parts array (images as placeholders). */
 function msgText(c, images) {
@@ -2449,12 +2767,18 @@ function toolCallBlock(name, args) {
   return `<div class="tc"><div class="tc-h"><span class="fn">${esc(name || 'tool call')}</span></div><pre>${esc(body)}</pre></div>`;
 }
 
-function msgBlock(m, toolNames, id) {
+function msgBlock(m, toolNames, id, cls = '') {
   const role = String(m.role || 'message');
   const label = role === 'tool'
     ? `TOOL · ${esc(m.tool_name || m.name || (toolNames && toolNames.get(m.tool_call_id)) || m.tool_call_id || '?')}`
     : (ROLE_LABEL[role] || esc(role));
-  let html = `<div class="msg ${ROLE_CLS[role] || 'user'}"${id ? ` id="${id}"` : ''}><span class="role">${label}</span>`;
+  // Fold state: an explicit click wins; system/developer blocks default to one
+  // line so the transcript opens on what the conversation said, not on the
+  // harness prompt every request repeats.
+  const shut = id ? (LV.msgFold.has(id) ? LV.msgFold.get(id) : role === 'system' || role === 'developer') : false;
+  let html = `<div class="msg ${ROLE_CLS[role] || 'user'}${cls}${shut ? ' fold' : ''}"${id ? ` id="${id}"` : ''}><span class="role"${id ? ` data-action="msg-fold" data-key="${id}" title="click to ${shut ? 'open' : 'fold'} this message"` : ''}>${shut ? '▸' : '▾'} ${label}`;
+  if (shut) return html + `<span class="mf-pv">${esc(lvSnip(m))}</span></span></div>`;
+  html += '</span>';
   html += thinkBlock(m.reasoning_content || m.reasoning || '');
   const t = msgText(m.content, m.images);
   if (t) html += `<div class="mtext">${esc(t)}</div>`;
@@ -2476,12 +2800,13 @@ function reqMeta(body) {
   return bits.join(' · ');
 }
 
-function transcriptView(body) {
+function transcriptView(body, rid) {
   const toolNames = new Map();
   for (const m of body.messages || [])
     for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
   return `<div class="lv-meta">${esc(reqMeta(body))}</div>`
-    + (body.messages || []).map(m => msgBlock(m, toolNames)).join('');
+    + (body.messages || []).map((m, k) =>
+        msgBlock(m, toolNames, rid != null ? `lv-x-${rid}-${k}` : undefined)).join('');
 }
 
 /** Parse a streamed capture into its parts — reconstructed text, thinking,
@@ -2538,26 +2863,35 @@ function streamState(text) {
 }
 
 /** Render that reconstruction as one assistant message. */
-function groupStream(text) {
+function groupStream(text, rid) {
   const st = streamState(text);
   if (!st) return null;
   const foot = [`finish: ${st.finish || '?'}`];
   if (st.usage) foot.push(`prompt ${fmtTok(st.usage.p || 0)} → completion ${fmtTok(st.usage.c || 0)} tok`);
   foot.push(`${fmtNum(st.chunks)} chunks grouped${st.errs ? ` · ${st.errs} error payload(s)` : ''}${st.cutTail ? ' · tail truncated' : ''}`);
-  return `<div class="msg asst"><span class="role">assistant</span>${thinkBlock(st.think)}`
+  const footDiv = `<div class="lv-foot">${esc(foot.join(' · '))}</div>`;
+  // Same ASST block as any other: same chip, same fold click, same tease.
+  const id = rid != null ? `lv-s-${rid}` : undefined;
+  const shut = id ? LV.msgFold.get(id) === true : false;
+  let h = `<div class="msg asst${shut ? ' fold' : ''}"${id ? ` id="${id}"` : ''}>`
+    + `<span class="role"${id ? ` data-action="msg-fold" data-key="${id}" title="click to ${shut ? 'open' : 'fold'} this reply"` : ''}>${shut ? '▸' : '▾'} ASST`;
+  if (shut)
+    return h + `<span class="mf-pv">${esc(lvWords(st.text) || '…')}</span></span></div>` + footDiv;
+  return h + '</span>' + thinkBlock(st.think)
     + (st.text ? `<div class="mtext">${esc(st.text)}</div>` : '')
     + st.tools.map(t => toolCallBlock(t.name, t.args)).join('')
-    + `</div><div class="lv-foot">${esc(foot.join(' · '))}</div>`;
+    + '</div>' + footDiv;
 }
 
 /** Non-streamed chat response (OpenAI object or Ollama /api/chat object). */
-function responseView(o) {
+function responseView(o, rid) {
   const m = o.choices?.[0]?.message || o.message;
   if (!m) return null;
   const usage = o.usage || (o.prompt_eval_count != null ? { p: o.prompt_eval_count, c: o.eval_count } : null);
   const foot = [`finish: ${o.choices?.[0]?.finish_reason || o.done_reason || '?'}`];
   if (usage) foot.push(`prompt ${fmtTok(usage.prompt_tokens ?? usage.p ?? 0)} → completion ${fmtTok(usage.completion_tokens ?? usage.c ?? 0)} tok`);
-  return `<div class="msg asst"><span class="role">assistant</span>${msgBlock(m, null)}</div>`
+  // One ASST block like the transcript's own — same chip, same fold click.
+  return msgBlock(m, null, rid != null ? `lv-r-${rid}` : undefined)
     + `<div class="lv-foot">${esc(foot.join(' · '))}</div>`;
 }
 
@@ -3137,25 +3471,46 @@ const actions = {
   // The tree's caret is the turn header's caret: one fold, and it moves the
   // same way whichever side you click it on.
   'lv-tree': el => lvToggle(+el.dataset.rid),
-  // The line standing in for re-sent history: show those messages here too, in
-  // the body and in the tree at once.
-  'lv-carry': async el => {
-    const rid = +el.dataset.rid;
-    if (LV.hist.has(rid)) LV.hist.delete(rid);
-    else LV.hist.add(rid);
+  // A run header (body or tree) folds the whole run to its one line.
+  'lv-run': el => {
+    const k = +el.dataset.run;
+    if (LV.closedRuns.has(k)) LV.closedRuns.delete(k);
+    else LV.closedRuns.add(k);
+    return lvDraw({ scroll: false });
+  },
+  // The tree's RESP row: land on the Response section, not the turn top.
+  'lv-resp': el => lvFocusSec(+el.dataset.rid, 'a'),
+  // One switch decides increment-vs-full-prompt for every request at once.
+  'lv-inc': async el => {
+    S.lv.inc = el.checked;
+    saveLv();
     await lvDraw({ scroll: false });
+  },
+  'lv-auto': el => {
+    S.lv.auto = el.checked;
+    saveLv();
+    if (el.checked) lvAutoStart(); else lvAutoStop();
+  },
+  // A message block folds on its label — the system prompt defaults to one
+  // line, every block is the user's to open or shut.
+  'msg-fold': el => {
+    const shutNow = el.closest('.msg').classList.contains('fold');
+    LV.msgFold.set(el.dataset.key, !shutNow);
+    lvDraw();
   },
   // A message row inside a request: jump to that message in the body.
   'lv-msg': el => lvFocusMsg(+el.dataset.rid, +el.dataset.idx),
   'lv-expand': async () => {
-    const rids = lvTurns().map(t => t.rid);
-    LV.open = new Set(rids); LV.hist = new Set(rids);
+    LV.open = new Set(lvTurns().map(t => t.rid));
+    LV.closedRuns.clear();
     await lvDraw();
   },
   'lv-collapse': async () => {
-    const keep = LV.rid != null ? [LV.rid] : [];
-    LV.open = new Set(keep); LV.hist = new Set(keep);
-    await lvDraw({ scroll: true });
+    // All means all — the request you arrived on folds with the rest; a row
+    // that refuses to close is what made Collapse all read as broken.
+    LV.open = new Set();
+    LV.closedRuns = new Set(lvRuns().map((_, k) => k));
+    await lvDraw();
   },
 };
 
@@ -3163,7 +3518,12 @@ document.addEventListener('click', e => {
   const el = e.target.closest('[data-action]');
   if (!el || el.disabled) return;
   const fn = actions[el.dataset.action];
-  if (fn) { e.preventDefault(); fn(el); }
+  if (!fn) return;
+  // A checkbox's new state IS its click activation — cancelling it leaves the
+  // box stuck on the old value (a redraw used to paper over that while the
+  // Show-incremental switch lived inside the rail).
+  if (!(el instanceof HTMLInputElement && el.type === 'checkbox')) e.preventDefault();
+  fn(el);
 });
 
 // Following a nav link closes the drawer, even for the page already shown
@@ -3176,6 +3536,8 @@ document.addEventListener('keydown', e => {
 
 // Click on a dialog's backdrop closes it.
 $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close('cancel'); }));
+// A closed viewer must leave no poller behind.
+$('#dlg-log').addEventListener('close', lvAutoStop);
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
 // Grouped or per-request: which view of the same ring, remembered like the
@@ -3191,6 +3553,17 @@ $$('#log-group input[name="log-group"]').forEach(r => {
 });
 // Round-viewer controls: choices persist like the other view preferences.
 $('#lv-jump').addEventListener('click', () => { S.lv.rail = !S.lv.rail; saveLv(); lvDrawRail(); $('#lv-jump').classList.toggle('active', S.lv.rail); });
+/* One reading position: as the log is scrolled, the rail row of the block at
+   its top lights up and the rail scrolls it into view, so the hand on the
+   wheel always sees where it is. Scroll does not bubble, but a capture-phase
+   listener on the dialog sees it and re-checks which element it came from. */
+let lvTrackPending = false;
+$('#dlg-log').addEventListener('scroll', e => {
+  if (!e.target.classList?.contains('lv-body')) return;
+  if (lvTrackPending) return;
+  lvTrackPending = true;
+  setTimeout(() => { lvTrackPending = false; lvTrackRail(); }, 50);
+}, true);
 // Drag the tree wider or narrower; the width is remembered, double-click (or
 // Home) puts it back, arrow keys nudge it for anyone not using a mouse.
 (() => {

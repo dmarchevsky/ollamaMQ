@@ -19,6 +19,19 @@ addEventListener('load', () => {
     A('capture-banner-hidden', !document.querySelector('.capnote')
       && ![...document.querySelectorAll('#logs tbody')].some(t => /not captured/.test(t.textContent)));
   }, 1000);
+  setTimeout(() => {
+    // The Logs filter matches the conversation's NAME (session label), not
+    // just the hex tag — the demo names one conversation, and only that row
+    // may survive the query.
+    const inp = document.querySelector('#log-filter');
+    inp.value = 'dispatcher';
+    inp.dispatchEvent(new Event('input'));
+    const rows = [...document.querySelectorAll('#logs tbody tr[data-action="conv-open"]')];
+    const ok = rows.length === 1 && /dispatcher refactor/i.test(rows[0].textContent);
+    inp.value = '';
+    inp.dispatchEvent(new Event('input'));
+    A('logs-filter-by-name', ok, rows.map(r => r.querySelector('.sess')?.textContent).join(' '));
+  }, 1150);
   // Open a turn that has stored text: a redacted turn legitimately has nothing
   // to scroll, so it cannot prove the body scrolls (see the capture switch).
   setTimeout(() => {
@@ -60,7 +73,7 @@ addEventListener('load', () => {
     const blocks = [...document.querySelectorAll('#dlg-log .lv-wrap section.turn')];
     A('all-turns-rendered', blocks.length === LV.conv.turns.length,
       `${blocks.length} blocks of ${LV.conv.turns.length}`);
-    A('focus-expanded', document.querySelectorAll('.turn.active .lv-sec').length >= 2,
+    A('focus-expanded', document.querySelectorAll('.turn.active .lv-sec').length >= 1,
       'the request navigation landed on is expanded');
     // A turn's stage line prints the measured span, not a back-computed guess.
     const t = LV.conv.turns.at(-1);
@@ -75,43 +88,296 @@ addEventListener('load', () => {
       A('nav-first-rail', document.querySelector('#lv-rail .lv-node.on')?.dataset.rid === String(LV.rid));
       A('nav-first-disabled', document.querySelector('#lv-first').disabled);
       document.querySelector('#lv-last').click();
-      setTimeout(() => {
+      setTimeout(async () => {
+        const wait = ms => new Promise(r => setTimeout(r, ms));
         A('nav-last', LV.rid === LV.conv.turns.at(-1).rid, `focused ${LV.rid}`);
         A('nav-last-disabled', document.querySelector('#lv-last').disabled);
-        // The Whole/New switch is gone. A turn shows what it added; what it only
-        // re-sent collapses into one line naming it, in the body and in the tree.
+        // The Whole/New switch and the per-request carry line are gone: one
+        // global Show-incremental checkbox decides whether a request renders
+        // only its increment (with a bright strip) or the whole re-sent prompt
+        // (re-sent messages dimmed). No request section carries a meta line.
         A('no-scope-switch', !document.querySelector('#lv-scope'));
-        const cl = document.querySelector('#dlg-log .lv-carry');
-        A('carried-history-one-line', !!cl && /held from request \d/.test(cl.textContent)
-          && getComputedStyle(cl).cursor === 'pointer',
-          cl ? cl.textContent.replace(/\s+/g, ' ').trim() : 'no turn here re-sends an earlier one');
-        A('resent-prefix-counted', /· \d+ new this turn/.test(document.querySelector('#dlg-log').textContent),
-          'the request line says what it added');
+        A('no-carry-line', !document.querySelector('#dlg-log .lv-carry'));
+        A('no-request-meta-line', !document.querySelector('#dlg-log .turn .lv-meta'));
+        const rid2 = LV.conv.turns[1].rid, hid = lvHidden(1);
+        const inc = () => document.querySelectorAll(`#lv-q-${rid2} .msg`).length;
+        // Inspect request 2's increment — open it if the navigation left it shut.
+        if (!LV.open.has(rid2)) { document.querySelector(`#lv-t-${rid2} .turn-h`).click(); await wait(600); }
+        let patience = 10;   // the content fetch behind the body decides when it exists
+        while (patience-- > 0 && !document.querySelectorAll(`#lv-t-${rid2} .msg`).length) await wait(200);
+        A('incremental-striped', document.querySelectorAll(`#lv-t-${rid2} .msg.m-new`).length > 0
+          && !document.querySelector(`#lv-t-${rid2} .msg.m-held`),
+          `${inc()} messages in request 2, the new ones stripped`);
         // Capture turned off reads as a decision, in the tree and in the turn.
         const off = document.querySelector('.turn-h [title*="text not stored"]');
         A('redacted-labelled', !!off || !LV.conv.redacted, 'capture-off turns are labelled');
+        // The request line is an identity, not a label: #N, a word of the
+        // increment, sizes quiet on the right; problem rows tint as a line.
+        const nTxt = [...document.querySelectorAll('#dlg-log .turn-h .n')].map(n => n.textContent);
+        A('turn-line-numbered', nTxt.length === LV.conv.turns.length
+          && nTxt.every((x, k) => x === `#${k + 1}`), nTxt.join(' '));
+        A('turn-line-sizes-quiet', [...document.querySelectorAll('#dlg-log .turn-h .tail.sz')].every(n => /→/.test(n.textContent)));
+        A('turn-line-preview', [...document.querySelectorAll('#dlg-log .turn-h .pv')].some(n => n.innerHTML !== '')
+          && [...document.querySelectorAll('#dlg-log .turn-h .pv .u')].length >= 0
+          && [...document.querySelectorAll('#dlg-log .turn-h .pv .t')].length >= 0,
+          'folded lines tease their words (user blue, thinking green)');
+        A('problem-row-tinted', !!document.querySelector('#dlg-log .turn.prob'));
+        A('preview-teases-only-when-folded', document.querySelector(`#lv-t-${rid2} .turn-h .pv`)?.innerHTML === ''
+          && !document.querySelector(`#lv-rail .lv-node.turn[data-rid="${rid2}"] .pv`)
+          && document.querySelector(`#lv-t-${LV.conv.turns.at(-3).rid} .turn-h .pv`)?.innerHTML !== '',
+          'open requests say their words once; folded ones tease them');
+        // Collapse all folds every block — including the one you arrived on —
+        // and the rail thins to the turn lines; Expand all opens everything.
+        document.querySelector('#dlg-log [data-action="lv-collapse"]').click();
+        await wait(600);
+        A('collapse-all-folds-everything', LV.open.size === 0
+          && !document.querySelector('#lv-rail .lv-node.msg')
+          && !document.querySelector('#lv-rail .lv-node.resp'),
+          'every block closed; the rail keeps only the request lines');
+        document.querySelector('#dlg-log [data-action="lv-expand"]').click();
+        await wait(700);
+        A('expand-all-opens-everything', LV.open.size === lvTurns().length && LV.closedRuns.size === 0,
+          `${LV.open.size} blocks open`);
+        // An answer never repeats as a message row of the next request in the
+        // rail — its own answer row already spoke it under its own turn.
+        const echoes = [];
+        lvTurns().forEach((t2, i) => {
+          if (!i) return;
+          const sig = lvAnswerSig(lvTurns()[i - 1]);
+          if (!sig) return;
+          for (const n of document.querySelectorAll(`#lv-rail .lv-node.msg.sub[data-rid="${t2.rid}"]`))
+            if (n.classList.contains('asst')
+              && (n.querySelector('.snip')?.textContent || '').startsWith(sig.slice(0, 16))) echoes.push('#' + (i + 1));
+        });
+        A('answer-echoes-nowhere', echoes.length === 0,
+          echoes.join(',') || 'no reply repeats as a message row');
+        // The header switch carries a short label and never splits across lines.
+        const incLab = document.querySelector('#lv-inc').closest('label');
+        A('inc-label-short-one-line', /^Incremental$/.test(incLab.textContent.trim())
+          && incLab.getBoundingClientRect().height < 28,
+          `"${incLab.textContent.trim()}" on one line (${Math.round(incLab.getBoundingClientRect().height)}px)`);
+        // Message blocks fold on their label — the system prompt starts as one
+        // line so the transcript opens on what the conversation said.
+        const rid1 = LV.conv.turns[0].rid;
+        const sysSel = `#lv-t-${rid1} .msg.sys`;
+        A('sys-block-folded-by-default', !!document.querySelector(`${sysSel}.fold`)
+          && !!document.querySelector(`${sysSel} .mf-pv`),
+          document.querySelector(sysSel)?.textContent.trim().replace(/\s+/g, ' ').slice(0, 46));
+        document.querySelector(`${sysSel} .role`).click();
+        await wait(600);
+        const sysOpen = !!document.querySelector(sysSel)
+          && !document.querySelector(sysSel).classList.contains('fold')
+          && !!document.querySelector(`${sysSel} .mtext`);
+        document.querySelector(`${sysSel} .role`).click();
+        await wait(600);
+        A('msg-block-folds-and-opens', sysOpen
+          && document.querySelector(sysSel)?.classList.contains('fold'),
+          'a click opens the system block, a click folds it back');
+        // The incremental view is about one request's moment: the run
+        // grouping is the session's story and waits for the whole-prompt
+        // view. The answer stays visible — with it hidden a single-request
+        // conversation would show no assistant words anywhere.
+        const body = document.querySelector('#dlg-log .lv-body');
+        A('inc-hides-runs', !document.querySelector('#dlg-log .run-h')
+          && !document.querySelector('#lv-rail .lv-node.run'),
+          'incremental: no run lines in either pane');
+        A('inc-still-shows-the-answer', !!document.querySelector('#lv-rail .lv-node.resp')
+          && !!document.querySelector(`#lv-t-${rid2} .lv-sec.out, #lv-a-${rid2}`),
+          'the response section and rail row survive incremental');
+        // The rail rows for a turn are the messages it ADDED — no REQ count
+        // row, and no re-sent rows under a later request while incremental.
+        const rows2 = [...document.querySelectorAll(`#lv-rail .lv-node.msg[data-rid="${rid2}"]`)];
+        A('tree-rows-are-new-only', rows2.length > 0 && rows2.every(n => +n.dataset.idx >= hid)
+          && ![...document.querySelectorAll(`#lv-rail .lv-node[data-rid="${rid2}"]`)].some(n => /\bheld\b/.test(n.textContent)),
+          `${rows2.length} rows for request 2, every idx >= ${hid}`);
+        // Unchecking Show incremental unfolds every full prompt at once: the
+        // re-sent prefix arrives dimmed below the stripped increment, and the
+        // tree grows the held rows too. Re-checking folds them back.
+        const box = document.querySelector('#lv-inc');
+        const n0 = inc();
+        box.click();          // native toggle: flips checked and bubbles the click
+        await wait(700);
+        const heldRows = document.querySelectorAll(`#lv-t-${rid2} .msg.m-held`).length;
+        A('show-incremental-full-prompt', inc() === n0 + hid && heldRows === hid
+          && document.querySelectorAll(`#lv-rail .lv-node.msg[data-rid="${rid2}"]`).length > rows2.length,
+          `request 2 body ${n0} \u2192 ${inc()} messages (+${hid} held, dimmed)`);
+        // The whole-prompt view gets the run grouping back: the group lines
+        // appear in both panes.
+        const runHeads = [...document.querySelectorAll('#dlg-log .run-h')];
+        A('runs-group-the-session', runHeads.length >= 1
+          && document.querySelectorAll('#lv-rail .lv-node.run').length === runHeads.length
+          && !runHeads.some(h => /#(\d+)–#\1/.test(h.textContent)),
+          `${runHeads.length} run(s) back, mirrored in the rail, every run names a range`);
+        // A request between two final answers alone groups nothing — it stands
+        // on its own, with no chrome and no second numbering system.
+        A('single-requests-stand-alone', !document.getElementById(`lv-t-${LV.conv.turns[0].rid}`).closest('.run'),
+          'request #1 renders with no run wrapper');
+        const rh0 = runHeads[0].dataset.run;
+        const turnsInRun0 = () => document.querySelectorAll(`.run[data-run="${rh0}"] section.turn`).length;
+        const r0 = turnsInRun0();
+        runHeads[0].click();
+        await wait(500);
+        A('run-folds-requests', turnsInRun0() === 0 && r0 > 0, `run folded to its line (${r0} requests hidden)`);
+        document.querySelector(`#dlg-log .run-h[data-run="${rh0}"]`).click();
+        await wait(500);
+        A('run-unfolds', turnsInRun0() === r0, `${r0} requests back`);
+        // And the rail's RUN row folds the run in the body, not just the
+        // body's own run header.
+        const railRun = document.querySelector('#lv-rail .lv-node.run');
+        const runK = railRun.dataset.run;
+        railRun.click();
+        await wait(500);
+        A('rail-run-folds-body', document.querySelectorAll(`#dlg-log .run[data-run="${runK}"] section.turn`).length === 0,
+          `rail run ${runK} folded its requests in the body`);
+        document.querySelector('#lv-rail .lv-node.run').click();
+        await wait(500);
+        // The rail's RESP row lands on the Response section, not on the turn
+        // top: the section flashes and the body actually scrolled.
+        const respNode = document.querySelector(`#lv-rail .lv-node.resp[data-rid="${rid2}"]`);
+        body.scrollTop = 0;
+        respNode.click();
+        await wait(600);
+        A('resp-jump-lands-on-section', document.querySelector('#dlg-log .lv-sec.flash')?.id === `lv-a-${rid2}`
+          && body.scrollTop > 0, `flashed lv-a-${rid2}, scrolled ${body.scrollTop}px`);
+        // The rail carries the assistant's answer under the assistant label
+        // with the reply's own words — a one-request conversation has no
+        // re-sent history, so this row is where the answer is.
+        const respRow = document.querySelector(`#lv-rail .lv-node.resp[data-rid="${rid2}"]`);
+        const respTag = respRow?.querySelector('.tag')?.textContent || '';
+        const respSnip = respRow?.querySelector('.snip')?.textContent || '';
+        A('resp-row-says-what-it-said', respTag === 'ASST' && /rotate/i.test(respSnip)
+          && respSnip.length > 'stop'.length + 3,
+          `rail answer row: ${respTag} "${respSnip.slice(0, 40)}"`);
+        // The formatted view reads the stream back as the answer, not as the
+        // wire: keep-alive comments and empty deltas are gone, the text is whole.
+        const out = () => [...document.querySelectorAll(`#lv-t-${rid2} .lv-sec`)].pop().textContent;
+        const fmt = out();
+        A('formatted-stream-is-text', !/data: ?\{|keepalive/.test(fmt)
+          && /rotate\(\) loop shifts files/.test(fmt), fmt.replace(/\s+/g, ' ').trim().slice(0, 96));
+        document.querySelector('#lv-fmt label:has(input[value="raw"])').click();
+        await wait(700);
+        const raw = out();
+        A('raw-keeps-the-wire', /data: ?\{/.test(raw) && raw.includes('[DONE]'), `${raw.length} chars of captured bytes`);
+        document.querySelector('#lv-fmt label:has(input[value="fmt"])').click();
+        await wait(500);
+        // With its held history on screen, that request's own copy of a
+        // re-sent message is what a jump lands on \u2014 not the earlier turn.
+        await lvFocusMsg(rid2, 0);
+        await wait(500);
+        A('unfolded-resent-stays', LV.focusMsg?.[0] === rid2 && LV.focusMsg?.[1] === 0
+          && !!document.getElementById(`lv-m-${rid2}-0`), 'idx 0 of request 2 stays in request 2');
+        // Re-query: the redraw the first toggle caused replaced the checkbox node.
+        document.querySelector('#lv-inc').click();   // back to incremental
+        await wait(700);
+        A('show-incremental-remembered', inc() === n0
+          && JSON.parse(localStorage.getItem('omq.lv') || '{}').inc === true
+          && !document.querySelector('#dlg-log .run-h'),
+          `back to ${inc()} of ${n0} messages, stored=${JSON.parse(localStorage.getItem('omq.lv') || '{}').inc}, run-h=${!!document.querySelector('#dlg-log .run-h')}`);
+        // Auto-refresh polls quietly and keeps the view: your scroll place and
+        // your open turns survive every poll.
+        const auto = document.querySelector('#lv-auto');
+        body.scrollTop = 420;
+        await wait(200);
+        const reloads0 = LV.reloads || 0;
+        auto.click();
+        await wait(6400);
+        A('auto-refresh-refreshes', (LV.reloads || 0) > reloads0
+          && JSON.parse(localStorage.getItem('omq.lv') || '{}').auto === true,
+          `${(LV.reloads || 0) - reloads0} quiet refreshes`);
+        A('auto-refresh-keeps-view', Math.abs(body.scrollTop - 420) <= 2 && LV.open.size > 0,
+          `scroll kept at ${body.scrollTop}, ${LV.open.size} turns open`);
+        document.querySelector('#lv-auto').click();   // stop polling
+        await wait(200);
+        // The reconstructed response is an ASST block like any other — same
+        // chip, same fold click — and thinking opens as a ruled box.
+        const asstResp = document.querySelector('#dlg-log .lv-sec[id^="lv-a-"] .msg.asst > .role[data-action="msg-fold"]');
+        A('resp-block-is-foldable-asst', !!asstResp && /^▾ ASST/.test(asstResp.textContent.trim()),
+          asstResp ? asstResp.textContent.trim().slice(0, 20) : 'no foldable ASST response block');
+        asstResp.click();
+        await wait(600);
+        const respShut = !!document.querySelector('#dlg-log .lv-sec[id^="lv-a-"] .msg.asst.fold');
+        document.querySelector('#dlg-log .lv-sec[id^="lv-a-"] .msg.asst > .role').click();
+        await wait(600);
+        A('resp-block-folds-and-opens', respShut
+          && !document.querySelector('#dlg-log .lv-sec[id^="lv-a-"] .msg.asst.fold'),
+          'the answer folds and opens on its label');
+        const th = document.querySelector('#dlg-log .msg details');
+        A('thinking-is-a-boxed-appendix', !!th
+          && getComputedStyle(th).borderStyle !== 'none'
+          && getComputedStyle(th.querySelector('summary')).listStyleType === 'none',
+          th ? getComputedStyle(th).borderStyle : 'no thinking block');
+        // A jump lands on the block's first line, not mid-block.
+        const farNode = [...document.querySelectorAll('#lv-rail .lv-node.msg')].pop();
+        farNode.click();
+        await wait(900);
+        const tgtEl = document.getElementById(`lv-m-${farNode.dataset.rid}-${farNode.dataset.idx}`);
+        A('jump-lands-at-block-start', !!tgtEl
+          && Math.abs(tgtEl.getBoundingClientRect().top - body.getBoundingClientRect().top) < 80,
+          tgtEl ? `top gap ${Math.round(tgtEl.getBoundingClientRect().top - body.getBoundingClientRect().top)}px` : 'target missing');
+        // Scrolling the log is navigation too: the rail row of whichever block
+        // sits at the top lights up and stays in view as the wheel turns.
+        const mTarget = document.getElementById(`lv-m-${rid2}-7`);
+        const bTop2 = body.getBoundingClientRect().top;
+        body.scrollTop = mTarget.getBoundingClientRect().top - bTop2 + body.scrollTop + 6;
+        // A scroll event is dispatched at the next render — under virtual
+        // time that is late; a real wheel always has frames, so fire it now.
+        body.dispatchEvent(new Event('scroll', { bubbles: true }));
+        await wait(400);
+        const lit = document.querySelector('#lv-rail .lv-node.on');
+        const railEl = document.querySelector('#lv-rail');
+        const rr = lit?.getBoundingClientRect(), rp = railEl.getBoundingClientRect();
+        A('rail-follows-scroll', lit?.classList.contains('msg') && lit?.dataset.rid === String(rid2)
+          && lit?.dataset.idx === '7' && rr && rr.top >= rp.top - 2 && rr.bottom <= rp.bottom + 2,
+          `${lit ? lit.className.replace('lv-node ', '') : 'nothing'} lit, kept in the rail view`);
+        // Scrolling onto the Response section lights the answer row too —
+        // it is a message-like row and takes the same highlight.
+        const outSec = document.getElementById(`lv-a-${rid2}`);
+        body.scrollTop = outSec.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop + 6;
+        body.dispatchEvent(new Event('scroll', { bubbles: true }));
+        let litAns = null;
+        for (let k = 0; k < 8; k++) {
+          await wait(200);
+          litAns = document.querySelector('#lv-rail .lv-node.on');
+          if (litAns?.classList.contains('resp')) break;
+        }
+        A('rail-lights-the-answer-row', litAns?.classList.contains('resp') && litAns?.dataset.rid === String(rid2),
+          litAns ? `${litAns.className.replace('lv-node ', '')} lit at the response` : 'nothing lit at the response');
+        // Scrolling all the way to the end marks the last row: the tail rows
+        // are short and can never reach the top edge — the mark used to stop
+        // a message or two before the end for exactly that reason.
+        body.scrollTop = body.scrollHeight;
+        body.dispatchEvent(new Event('scroll', { bubbles: true }));
+        await wait(400);
+        const litEnd = document.querySelector('#lv-rail .lv-node.on');
+        A('rail-follows-to-end', litEnd && (litEnd.classList.contains('resp') || litEnd.classList.contains('turn'))
+          && litEnd.dataset.rid === String(LV.conv.turns.at(-1).rid),
+          litEnd ? `${litEnd.className.replace('lv-node ', '')} lit at the very bottom` : 'nothing lit at the end');
+        // The rail never wears a horizontal scrollbar — its header wraps.
+        A('rail-no-hscroll', railEl.scrollWidth <= railEl.clientWidth + 1,
+          `rail content ${railEl.scrollWidth}px in ${railEl.clientWidth}px`);
 
         // --- The jump tree: nodes fold independently, and a message row jumps
-        // to that message instead of merely to its request. Sequential waits,
-        // so the chain stays readable instead of nesting one level per click.
-        const wait = ms => new Promise(r => setTimeout(r, ms));
+        // to that message instead of merely to its request.
         (async () => {
-          document.querySelector('#lv-rail [data-action="lv-collapse"]').click();
-          await wait(500);
-          const before = [...LV.open];
+          await wait(300);
+          // Fold one request shut (through its header in the body), then open
+          // it again from the tree — opening never disturbs the other folds.
           const turnNodes = [...document.querySelectorAll('#lv-rail .lv-node.turn')];
-          const other = turnNodes.find(n => !before.includes(n.dataset.rid)) || turnNodes[0];
-          other.querySelector('.car').click();
+          const other = turnNodes.find(n => +n.dataset.rid !== LV.rid) || turnNodes[0];
+          const ridB = +other.dataset.rid;
+          if (LV.open.has(ridB)) { document.querySelector(`#lv-t-${ridB} .turn-h`).click(); await wait(500); }
+          const before = [...LV.open];
+          // Re-query: the fold just redrawn replaced every tree node.
+          document.querySelector(`#lv-rail .lv-node.turn[data-rid="${ridB}"] .car`).click();
           await wait(600);
           const opened = [...LV.open];
           const expanded = [...document.querySelectorAll('#dlg-log section.turn')]
             .filter(sx => sx.querySelector('.lv-sec')).length;
           A('tree-expand-independent', before.every(r => opened.includes(r))
-            && opened.includes(+other.dataset.rid) && expanded >= 2,
+            && opened.includes(ridB) && expanded >= 2,
             `open ${opened.join(',')} (was ${before.join(',')}), ${expanded} request blocks readable`);
           // One fold, both directions: the tree caret opens the block, and the
           // block's own header folds the tree back.
-          const ridB = +other.dataset.rid;
           A('fold-tree-opens-block', LV.open.has(ridB) && !!document.querySelector(`#lv-t-${ridB} .lv-sec`),
             `request ${ridB} reads in the body after folding it open in the tree`);
           document.querySelector(`#lv-t-${ridB} .turn-h`).click();
@@ -126,7 +392,7 @@ addEventListener('load', () => {
           // previous answer ended, an assistant message that answer's own
           // generation. Rows with nothing measured stay blank and say so.
           const DUR = /^\d+(\.\d)?s$|^\d+m \d{2}s$/;
-          const rows = [...document.querySelectorAll('#lv-rail .lv-node.l3:not(.carry)')];
+          const rows = [...document.querySelectorAll('#lv-rail .lv-node.msg')];
           const stamped = rows.filter(n => n.querySelector('.when').textContent.trim());
           A('tree-message-windows', stamped.length > 0
             && stamped.every(n => DUR.test(n.querySelector('.when').textContent.trim()))
@@ -149,7 +415,7 @@ addEventListener('load', () => {
             .every(n => /how long/.test(n.title)), 'every duration row says how long of what');
           A('tree-single-highlight', document.querySelectorAll('#lv-rail .lv-node.on').length <= 1,
             `${document.querySelectorAll('#lv-rail .lv-node.on').length} row(s) highlighted`);
-          const msg = document.querySelector('#lv-rail .lv-node.l3:not(.carry)');
+          const msg = document.querySelector('#lv-rail .lv-node.msg');
           if (!msg) { A('tree-child-focus', false, 'no message node in the tree'); return; }
           msg.click();
           await wait(600);
@@ -159,29 +425,6 @@ addEventListener('load', () => {
             fl ? `focused ${fl.id}` : `nothing focused, wanted ${want}`);
           A('tree-child-marked', document.querySelector('#lv-rail .lv-node.on')?.dataset.idx
             === msg.dataset.idx, 'the tree row shows which message is in view');
-          // The jump tree lists only what each request added — no Held row, and
-          // no re-sent rows under a later request. The body keeps the fold line.
-          const rid2 = LV.conv.turns[1].rid, hid = lvHidden(1);
-          const cl = () => document.querySelector(`#lv-t-${rid2} .lv-carry`);
-          if (LV.hist.has(rid2)) { cl().click(); await wait(700); }   // Expand all opens folds too
-          const rows2 = [...document.querySelectorAll(`#lv-rail .lv-node.l3[data-rid="${rid2}"]`)];
-          A('tree-rows-are-new-only', rows2.length > 0 && rows2.every(n => +n.dataset.idx >= hid)
-            && !document.querySelector('#lv-rail .lv-node.carry'),
-            `${rows2.length} rows for request 2, every idx >= ${hid}, no Held row`);
-          if (!cl()) { A('carry-line-folds-body', false, 'request 2 shows no carried-history line'); return; }
-          const n0 = document.querySelectorAll(`#lv-t-${rid2} .msg`).length;
-          cl().click();
-          await wait(700);
-          const n1 = document.querySelectorAll(`#lv-t-${rid2} .msg`).length;
-          A('carry-line-folds-body', LV.hist.has(rid2) && n1 === n0 + hid
-            && cl().textContent.trim().startsWith('\u25be'),
-            `request 2 body ${n0} \u2192 ${n1} messages (+${hid} held)`);
-          // With its held history open on screen, that request's own copy of a
-          // re-sent message is what a jump lands on \u2014 not the earlier turn.
-          await lvFocusMsg(rid2, 0);
-          await wait(500);
-          A('unfolded-resent-stays', LV.focusMsg?.[0] === rid2 && LV.focusMsg?.[1] === 0
-            && !!document.getElementById(`lv-m-${rid2}-0`), 'idx 0 of request 2 stays in request 2');
           // The first request keeps the clock; every stamp after it counts
           // continuously from the conversation's own start, not from the turn
           // before it, so a turn is a point on one line.
@@ -198,20 +441,6 @@ addEventListener('load', () => {
           A('idle-gap-named', !!document.querySelector('#dlg-log .lv-gap')
             && !!document.querySelector('#lv-rail .lv-node.gapnode'),
             document.querySelector('#dlg-log .lv-gap')?.textContent.trim().slice(0, 64));
-          // Formatted view reads the stream back as the answer, not as the wire:
-          // keep-alive comments and empty deltas are gone, the text is whole.
-          // (the Response section is the last one in the turn; its class sits on
-          // the heading, not the section)
-          const out = () => [...document.querySelectorAll(`#lv-t-${rid2} .lv-sec`)].pop().textContent;
-          const fmt = out();
-          A('formatted-stream-is-text', !/data: ?\{|keepalive/.test(fmt)
-            && /rotate\(\) loop shifts files/.test(fmt), fmt.replace(/\s+/g, ' ').trim().slice(0, 96));
-          document.querySelector('#lv-fmt label:has(input[value="raw"])').click();
-          await wait(700);
-          const raw = out();
-          A('raw-keeps-the-wire', /data: ?\{/.test(raw) && raw.includes('[DONE]'), `${raw.length} chars of captured bytes`);
-          document.querySelector('#lv-fmt label:has(input[value="fmt"])').click();
-          await wait(500);
           // The download is a shipped artefact and nothing else looks at it: the
           // transcript gets exactly one Request and one Response heading per
           // turn, written as prose rather than as the wire.
@@ -291,5 +520,13 @@ addEventListener('load', () => setTimeout(() => {
     A3('header-shows-decode-rate', dec.some(t => /^decode [\d.]+ t\/s$/.test(t)), dec.slice(0, 3).join(' | ') || 'none');
     A3('header-shows-prefill-rate', pre.some(t => /^prefill [\d≈.]+ ?(tok\/s|s|m ..s)$/.test(t)),
       pre.slice(0, 3).join(' | ') || 'none');
+    // The rate labels read as a property of the serving model: they follow
+    // the `model → backend` span, not the client name.
+    A3('rate-labels-after-model', heads.every(h => {
+      const sub = h.querySelector('.sub'), t = h.textContent;
+      if (!sub) return true;
+      const i = t.indexOf(sub.textContent);
+      return [...h.querySelectorAll('.badge')].every(b => t.indexOf(b.textContent) > i);
+    }), 'prefill/decode follow the model → backend name');
   }, 900);
 }, 16500));

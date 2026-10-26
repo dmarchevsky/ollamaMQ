@@ -3,6 +3,24 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.21.0 — 2026-10-26
+
+### Changed
+
+- **The conversation viewer reads like a log now, not like a dump** (pure frontend). Requests
+  between two final answers wrap as one **run** (`#1–#3 · 2m 30s · ×6`), folding per run as well
+  as per request; failures tint every row they touch (`client gone` stays neutral). Message blocks
+  fold on their label — system prompts start folded — and thinking renders as a ruled appendix box.
+  The jump tree speaks the transcript's vocabulary: answers are green `ASST` rows (opening words +
+  duration, no re-sent echoes), clicks land on the block's first line, and the tree follows the
+  wheel. `Incremental` and a quiet 5 s `Auto-refresh` (keeps scroll, open blocks and folds) join
+  the header; `⟳` keeps your place now too.
+
+### Fixed
+
+- A `[data-action]` checkbox click no longer has its toggle cancelled by the global click handler —
+  static header checkboxes toggle on the first click.
+
 ## v0.20.0 — 2026-10-26
 
 ### Added

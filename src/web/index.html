@@ -134,7 +134,7 @@
       <div class="page-h">
         <h1>Logs</h1>
         <div class="toolbar">
-          <input type="search" id="log-filter" placeholder="Filter by user, model, backend, info…" autocomplete="off">
+          <input type="search" id="log-filter" placeholder="Filter by name, user, model, backend, info…" autocomplete="off">
           <div class="seg" id="log-group" role="radiogroup" aria-label="One row per conversation or per request">
             <label><input type="radio" name="log-group" value="session" checked><span>By conversation</span></label>
             <label><input type="radio" name="log-group" value="request"><span>By request</span></label>
@@ -279,6 +279,8 @@
         <label><input type="radio" name="lv-fmt" value="raw"><span>Raw</span></label>
         <label><input type="radio" name="lv-fmt" value="fmt"><span>Formatted</span></label>
       </div>
+      <label class="inc" title="incremental: each request shows only what it added; unchecked: the full prompt with re-sent messages dimmed"><input type="checkbox" id="lv-inc" data-action="lv-inc"> Incremental</label>
+      <label class="inc" title="auto-refresh: check for new turns every few seconds — open blocks, folds and your scroll position are kept"><input type="checkbox" id="lv-auto" data-action="lv-auto"> Auto-refresh</label>
       <button class="btn sm" id="lv-dl" title="download this conversation (the format above decides which)">⤓ Download</button>
       <button class="btn sm" id="lv-jump" title="show the request tree">≣ Jump</button>
       <button class="btn sm" id="lv-reload" title="reload — pull in the newest turns">⟳</button>
