@@ -939,11 +939,17 @@ body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-selec
 /* Message and RESP rows share one column geometry at whatever level they sit,
    so a RESP label never stands out from the messages beside it. */
 .lv-node.sub .tag { width: 40px; }
+/* The message rows borrow their chip box from the body .msg rule (same class
+   name); the answer row wears the same box — it stands in for a message too,
+   and it must light up (accent-soft above) the same way when it scrolls in. */
+.lv-node.resp { border: 1px solid var(--border); border-radius: 8px; }
+.lv-node.resp:not(.on):not(:hover) { background: var(--surface); }
 .lv-node.run .tag { color: var(--text); }
 .lv-node .tb { flex: none; margin-left: 6px; }
 .lv-node .snip .u { color: var(--accent); } .lv-node .snip .t { color: var(--ok); }
-/* The rail header is the Show-incremental switch beside the fold buttons. */
-.lv-rail-h label.inc { display: inline-flex; gap: 5px; align-items: center; margin-right: auto;
+/* The viewer header carries the Show-incremental switch beside Raw/Formatted;
+   the rail's own header is only the two fold buttons. */
+label.inc { display: inline-flex; gap: 5px; align-items: center;
   font: 600 11.5px var(--sans); color: var(--text); cursor: pointer; white-space: nowrap; }
 
 #dlg-log .flash { outline: 2px solid var(--accent); outline-offset: 1px; animation: lv-flash 1.3s ease-out; }

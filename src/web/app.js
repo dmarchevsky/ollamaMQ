@@ -1827,12 +1827,14 @@ async function openConv({ rid, session, user } = {}) {
   LV.content = new Map();
   $('#dlg-log [data-title]').textContent =
     `${conv.model || 'traffic'} · ${conv.user}${conv.backend ? ` → ${bkName(conv.backend)}` : ''}`;
-  const sub = [`#${sessName(conv) || conv.key}`];
+  const sub = [`#${conv.session || conv.key}`];
+  if (conv.session_label) sub.push(`#${conv.session_label}`);
   sub.push(`${conv.turns.length} ${conv.turns.length === 1 ? 'request' : 'requests'}`);
   if (conv.turns.length) sub.push(`${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`);
   if (conv.redacted) sub.push('no text');
   $('#dlg-log [data-sub]').textContent = sub.join(' · ');
   $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
+  $('#lv-inc').checked = S.lv.inc;
   const dlg = $('#dlg-log');
   if (!dlg.open) dlg.showModal();
   await lvDraw({ scroll: true });
@@ -2010,6 +2012,16 @@ function lvFacts(i) {
     }
   } else if (!msgs) fromMeta();
   return (c.facts = f);
+}
+
+/** The opening signature of a turn's answer text — enough to recognize the
+ *  very same reply when the next request re-sends it as a message. */
+function lvAnswerSig(t) {
+  const c = t && LV.content.get(t.rid);
+  if (!c || c.resp == null) return '';
+  if (c.ansSig != null) return c.ansSig;
+  const st = streamState(c.resp) || lvPlainResp(c.resp);
+  return (c.ansSig = lvWords((st && st.text) || ''));
 }
 
 /** Runs in index ranges: the requests from the previous final answer up to the
@@ -2292,7 +2304,7 @@ function lvTrackRail() {
   // Document order is visual order; the lit row is the last block whose top
   // has crossed the container's top edge — at the end, the last block there
   // is at all.
-  for (const el of document.querySelectorAll('#dlg-log .run-h, #dlg-log section.turn, #dlg-log .msg[id], #dlg-log .lv-sec.out')) {
+  for (const el of document.querySelectorAll('#dlg-log .run-h, #dlg-log section.turn, #dlg-log .msg[id], #dlg-log .lv-sec[id^="lv-a-"]')) {
     let sel = null;
     if (el.classList.contains('run-h')) sel = `.lv-node.run[data-run="${el.dataset.run}"]`;
     else if (el.matches('section.turn')) sel = `.lv-node.turn[data-rid="${el.dataset.rid}"]`;
@@ -2556,7 +2568,6 @@ function lvDrawRail() {
   const turns = lvTurns();
   const runs = lvRuns();
   const items = [`<div class="lv-rail-h">
-    <label class="inc" title="checked: each request shows only what it added; unchecked: the full prompt, re-sent messages dimmed"><input type="checkbox" data-action="lv-inc"${S.lv.inc ? ' checked' : ''}> Show incremental</label>
     <button class="btn sm" data-action="lv-expand">Expand all</button>
     <button class="btn sm" data-action="lv-collapse">Collapse all</button></div>`];
   let prevRun = -1;
@@ -2604,8 +2615,14 @@ function lvDrawRail() {
     // The messages this request re-sent stay out of the tree while incremental
     // mode is on — they are drawn under the request that first sent them.
     const hid = lvHidden(i);
+    // The answer this turn gave re-enters the next request as a message —
+    // the answer row under its own turn already speaks it, so the increment
+    // below does not repeat it (it read as a duplicated assistant).
+    const prevAns = i ? lvAnswerSig(turns[i - 1]) : '';
     for (const [mi, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
       if (S.lv.inc && mi < hid) continue;
+      if (S.lv.inc && m.role === 'assistant' && prevAns
+        && lvWords(msgText(m.content, m.images)) === prevAns) continue;
       const w = lvMsgWhen(lvIdxOf(t.rid), mi)
         || { when: '', tip: 'older than this log \u2014 the request that produced it was never captured' };
       items.push(lvNode({ level: subLevel, rid: t.rid, idx: mi, when: w.when, tip: w.tip,
@@ -3430,12 +3447,11 @@ const actions = {
     await lvDraw();
   },
   'lv-collapse': async () => {
-    const keep = LV.rid != null ? [LV.rid] : [];
-    LV.open = new Set(keep);
-    const runs = lvRuns();
-    const focusRun = LV.rid != null ? lvRunOf(runs, lvIdxOf(LV.rid)) : -1;
-    LV.closedRuns = new Set(runs.map((_, k) => k).filter(k => k !== focusRun));
-    await lvDraw({ scroll: true });
+    // All means all — the request you arrived on folds with the rest; a row
+    // that refuses to close is what made Collapse all read as broken.
+    LV.open = new Set();
+    LV.closedRuns = new Set(lvRuns().map((_, k) => k));
+    await lvDraw();
   },
 };
 
@@ -3443,7 +3459,12 @@ document.addEventListener('click', e => {
   const el = e.target.closest('[data-action]');
   if (!el || el.disabled) return;
   const fn = actions[el.dataset.action];
-  if (fn) { e.preventDefault(); fn(el); }
+  if (!fn) return;
+  // A checkbox's new state IS its click activation — cancelling it leaves the
+  // box stuck on the old value (a redraw used to paper over that while the
+  // Show-incremental switch lived inside the rail).
+  if (!(el instanceof HTMLInputElement && el.type === 'checkbox')) e.preventDefault();
+  fn(el);
 });
 
 // Following a nav link closes the drawer, even for the page already shown

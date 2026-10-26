@@ -19,6 +19,19 @@ addEventListener('load', () => {
     A('capture-banner-hidden', !document.querySelector('.capnote')
       && ![...document.querySelectorAll('#logs tbody')].some(t => /not captured/.test(t.textContent)));
   }, 1000);
+  setTimeout(() => {
+    // The Logs filter matches the conversation's NAME (session label), not
+    // just the hex tag — the demo names one conversation, and only that row
+    // may survive the query.
+    const inp = document.querySelector('#log-filter');
+    inp.value = 'dispatcher';
+    inp.dispatchEvent(new Event('input'));
+    const rows = [...document.querySelectorAll('#logs tbody tr[data-action="conv-open"]')];
+    const ok = rows.length === 1 && /dispatcher refactor/i.test(rows[0].textContent);
+    inp.value = '';
+    inp.dispatchEvent(new Event('input'));
+    A('logs-filter-by-name', ok, rows.map(r => r.querySelector('.sess')?.textContent).join(' '));
+  }, 1150);
   // Open a turn that has stored text: a redacted turn legitimately has nothing
   // to scroll, so it cannot prove the body scrolls (see the capture switch).
   setTimeout(() => {
@@ -113,6 +126,31 @@ addEventListener('load', () => {
           && !document.querySelector(`#lv-rail .lv-node.turn[data-rid="${rid2}"] .pv`)
           && document.querySelector(`#lv-t-${LV.conv.turns.at(-3).rid} .turn-h .pv`)?.innerHTML !== '',
           'open requests say their words once; folded ones tease them');
+        // Collapse all folds every block — including the one you arrived on —
+        // and the rail thins to the turn lines; Expand all opens everything.
+        document.querySelector('#dlg-log [data-action="lv-collapse"]').click();
+        await wait(600);
+        A('collapse-all-folds-everything', LV.open.size === 0
+          && !document.querySelector('#lv-rail .lv-node.msg')
+          && !document.querySelector('#lv-rail .lv-node.resp'),
+          'every block closed; the rail keeps only the request lines');
+        document.querySelector('#dlg-log [data-action="lv-expand"]').click();
+        await wait(700);
+        A('expand-all-opens-everything', LV.open.size === lvTurns().length && LV.closedRuns.size === 0,
+          `${LV.open.size} blocks open`);
+        // An answer never repeats as a message row of the next request in the
+        // rail — its own answer row already spoke it under its own turn.
+        const echoes = [];
+        lvTurns().forEach((t2, i) => {
+          if (!i) return;
+          const sig = lvAnswerSig(lvTurns()[i - 1]);
+          if (!sig) return;
+          for (const n of document.querySelectorAll(`#lv-rail .lv-node.msg.sub[data-rid="${t2.rid}"]`))
+            if (n.classList.contains('asst')
+              && (n.querySelector('.snip')?.textContent || '').startsWith(sig.slice(0, 16))) echoes.push('#' + (i + 1));
+        });
+        A('answer-echoes-nowhere', echoes.length === 0,
+          echoes.join(',') || 'no reply repeats as a message row');
         // The incremental view is about one request's moment: the run
         // grouping is the session's story and waits for the whole-prompt
         // view. The answer stays visible — with it hidden a single-request
@@ -133,7 +171,7 @@ addEventListener('load', () => {
         // Unchecking Show incremental unfolds every full prompt at once: the
         // re-sent prefix arrives dimmed below the stripped increment, and the
         // tree grows the held rows too. Re-checking folds them back.
-        const box = document.querySelector('#lv-rail label.inc input');
+        const box = document.querySelector('#lv-inc');
         const n0 = inc();
         box.click();          // native toggle: flips checked and bubbles the click
         await wait(700);
@@ -207,12 +245,12 @@ addEventListener('load', () => {
         A('unfolded-resent-stays', LV.focusMsg?.[0] === rid2 && LV.focusMsg?.[1] === 0
           && !!document.getElementById(`lv-m-${rid2}-0`), 'idx 0 of request 2 stays in request 2');
         // Re-query: the redraw the first toggle caused replaced the checkbox node.
-        document.querySelector('#lv-rail label.inc input').click();   // back to incremental
+        document.querySelector('#lv-inc').click();   // back to incremental
         await wait(700);
         A('show-incremental-remembered', inc() === n0
           && JSON.parse(localStorage.getItem('omq.lv') || '{}').inc === true
           && !document.querySelector('#dlg-log .run-h'),
-          `back to ${n0} messages, choice stored, the run grouping tucked away again`);
+          `back to ${inc()} of ${n0} messages, stored=${JSON.parse(localStorage.getItem('omq.lv') || '{}').inc}, run-h=${!!document.querySelector('#dlg-log .run-h')}`);
         // Scrolling the log is navigation too: the rail row of whichever block
         // sits at the top lights up and stays in view as the wheel turns.
         const mTarget = document.getElementById(`lv-m-${rid2}-7`);
@@ -228,6 +266,19 @@ addEventListener('load', () => {
         A('rail-follows-scroll', lit?.classList.contains('msg') && lit?.dataset.rid === String(rid2)
           && lit?.dataset.idx === '7' && rr && rr.top >= rp.top - 2 && rr.bottom <= rp.bottom + 2,
           `${lit ? lit.className.replace('lv-node ', '') : 'nothing'} lit, kept in the rail view`);
+        // Scrolling onto the Response section lights the answer row too —
+        // it is a message-like row and takes the same highlight.
+        const outSec = document.getElementById(`lv-a-${rid2}`);
+        body.scrollTop = outSec.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop + 6;
+        body.dispatchEvent(new Event('scroll', { bubbles: true }));
+        let litAns = null;
+        for (let k = 0; k < 8; k++) {
+          await wait(200);
+          litAns = document.querySelector('#lv-rail .lv-node.on');
+          if (litAns?.classList.contains('resp')) break;
+        }
+        A('rail-lights-the-answer-row', litAns?.classList.contains('resp') && litAns?.dataset.rid === String(rid2),
+          litAns ? `${litAns.className.replace('lv-node ', '')} lit at the response` : 'nothing lit at the response');
         // Scrolling all the way to the end marks the last row: the tail rows
         // are short and can never reach the top edge — the mark used to stop
         // a message or two before the end for exactly that reason.
