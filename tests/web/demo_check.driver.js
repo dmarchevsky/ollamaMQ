@@ -88,7 +88,7 @@ addEventListener('load', () => {
         A('resent-prefix-counted', /· \d+ new this turn/.test(document.querySelector('#dlg-log').textContent),
           'the request line says what it added');
         // Capture turned off reads as a decision, in the tree and in the turn.
-        const off = document.querySelector('.turn-h [title*="no body text"]');
+        const off = document.querySelector('.turn-h [title*="text not stored"]');
         A('redacted-labelled', !!off || !LV.conv.redacted, 'capture-off turns are labelled');
 
         // --- The jump tree: nodes fold independently, and a message row jumps
