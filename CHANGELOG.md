@@ -3,6 +3,29 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.20.0 — 2026-10-26
+
+### Added
+
+- **Per-request log redaction — the `X-Redact-Log` header.** Any request can keep its own body
+  text out of the conversation log by carrying the header: its *presence* is the flag, the value
+  is ignored (even empty), and no client key is required — keyless requests honor it too. The
+  entry is still written with status, size, timing and message roles; only the text is left out,
+  exactly as with the per-client/key/backend `redact_log` rules. The flag is one-way: a request
+  can hide its own text, but can never force text to be stored that a client, key or backend has
+  switched off. Like its sibling headers it reaches the backend forwarded unchanged
+  (see README [Request logging](README.md#request-logging)).
+
+### Changed
+
+- **The UI says `redacted` where it said `no text`.** The badge in the Logs list (both views),
+  the conversation viewer and the client/key/backend rows, the jump-rail stamps and the
+  downloaded transcript all carry the new word, dialog checkboxes now read
+  **Redact log — do not save …**, and tooltips and help lines name the sources of redaction —
+  including the new header — so the mechanism is discoverable from the UI. Stored log format and
+  the admin API are untouched (`redacted` was already the field name); old log lines render with
+  the new word.
+
 ## v0.19.0 — 2026-10-24
 
 ### Breaking

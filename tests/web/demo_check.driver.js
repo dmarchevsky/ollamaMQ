@@ -46,7 +46,7 @@ addEventListener('load', () => {
       convRows.map(r => r.querySelector('.rline')?.textContent.trim().slice(0, 28)).join(' | '));
     A('logs-row-names-session', convRows.some(r => /#dispatcher refactor/.test(r.textContent)),
       convRows.map(r => r.querySelector('.sess')?.textContent).join(' '));
-    const tr = convRows.find(r => !/no text/.test(r.textContent));
+    const tr = convRows.find(r => !/redacted/.test(r.textContent));
     if (tr) tr.click();
   }, 1500);
   setTimeout(() => {
@@ -109,7 +109,7 @@ addEventListener('load', () => {
           && !document.querySelector(`#lv-t-${rid2} .msg.m-held`),
           `${inc()} messages in request 2, the new ones stripped`);
         // Capture turned off reads as a decision, in the tree and in the turn.
-        const off = document.querySelector('.turn-h [title*="no body text"]');
+        const off = document.querySelector('.turn-h [title*="text not stored"]');
         A('redacted-labelled', !!off || !LV.conv.redacted, 'capture-off turns are labelled');
         // The request line is an identity, not a label: #N, a word of the
         // increment, sizes quiet on the right; problem rows tint as a line.

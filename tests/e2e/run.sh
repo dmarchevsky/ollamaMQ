@@ -134,9 +134,13 @@ R=$(curl -s -w '\n%{http_code}' -H "$AH" -H "$JH" -X POST $P/admin/models/load -
 check "J: duplicate 409" "409" "$(echo "$R" | tail -1)"
 sleep 2.5  # let the 2s mock load finish
 
-echo "=== M: a client with capture off keeps the entry, drops the text ==="
+echo "=== M: capture off keeps the entry, drops the text — by client key and by the X-Redact-Log header ==="
 curl -s -o /dev/null -X POST $P/api/chat -H "Authorization: Bearer e2e-redact-key" \
   -H "$JH" -d '{"model":"qwen2.5:7b","messages":[{"role":"user","content":"a secret prompt"}]}'
+# The header hides a single request's text with no key and no configuration:
+# presence is the flag, the value is ignored.
+curl -s -o /dev/null -X POST $P/api/chat -H "X-User-ID: e2e" -H "X-Redact-Log: 1" \
+  -d '{"model":"qwen2.5:7b","messages":[{"role":"user","content":"a header secret"}]}'
 # A line is written once the conversation has been quiet for
 # request_log_flush_secs (5 s by default), so give the flush its time.
 sleep 7
@@ -145,6 +149,8 @@ import json, sys
 rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 red = [r for r in rows if r.get("redacted")]
 plain = [r for r in rows if not r.get("redacted")]
+# the keyless X-Redact-Log request landed under user "e2e", redacted like a config rule
+hdr = [r for r in red if r.get("user") == "e2e"]
 def texts(line):
     return [t.get("content") for t in line.get("turns", []) if t.get("content")]
 def sizes(line):
@@ -154,12 +160,17 @@ ok = (bool(red)
       and not any(texts(r) for r in red)
       and all(all(sizes(r)) for r in red)
       and not any("a secret prompt" in json.dumps(r) for r in rows)
+      and not any("a header secret" in json.dumps(r) for r in rows)
       # and the ones that allowed capture really did store it
       and any(texts(r) for r in plain))
-print("yes" if ok else "no")
+hdr_ok = (bool(hdr) and not any(texts(r) for r in hdr)
+          and all(all(sizes(r)) for r in hdr)
+          and not any("a header secret" in json.dumps(r) for r in rows))
+print(("yes" if ok else "no") + " " + ("yes" if hdr_ok else "no"))
 PY
 )
-check "M: redacted lines hold no text, plain ones do" "yes" "$MRESULT"
+check "M: redacted lines hold no text, plain ones do" "yes" "$(echo "$MRESULT" | cut -d' ' -f1)"
+check "M: X-Redact-Log header redacted the keyless request" "yes" "$(echo "$MRESULT" | cut -d' ' -f2)"
 
 echo "=== final call log ==="
 cat "$SCRATCH/calls.jsonl"

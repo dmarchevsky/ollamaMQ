@@ -98,8 +98,10 @@ pub struct Task {
     /// Correlation id shared by this request's IN and OUT log events
     /// (see [`LogEvent::rid`]).
     pub rid: u64,
-    /// True when its client or key switched body-text capture off: this
-    /// request's log entries keep their metadata and carry no content.
+    /// True when body-text capture is switched off for this request: its
+    /// client or key does, or the request itself carries `X-Redact-Log`
+    /// (see [`redact_log_header`]). Log entries keep their metadata and
+    /// carry no content.
     pub redact_text: bool,
     /// Tools the request's messages name — what the agent did between the
     /// previous turn and this one. Names the idle line in the Overview.
@@ -1847,6 +1849,15 @@ fn session_label_header(headers: &HeaderMap) -> Option<String> {
             .get("x-session-name")
             .and_then(|v| v.to_str().ok()),
     )
+}
+
+/// Whether the client asked to keep this request's body text out of the log:
+/// the `X-Redact-Log` header, whose *presence* is the whole flag — the value
+/// is ignored. One-way by construction: a client can only ever reduce what is
+/// stored about its own request; clearing a client/key/backend `redact_log`
+/// from the request side is not possible.
+fn redact_log_header(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-redact-log")
 }
 
 /// The level a request goes out at: the operator's pin if there is one (a pin
@@ -4667,7 +4678,8 @@ pub async fn proxy_handler(
     let rid = state.next_rid();
     // Request-log content is captured before `body` moves into the Task.
     let body_len = body.len() as u64;
-    let redact_text = client.as_ref().is_some_and(|c| c.redact_log);
+    let redact_text =
+        client.as_ref().is_some_and(|c| c.redact_log) || redact_log_header(&headers);
     let content = (!redact_text).then(|| {
         Arc::new(crate::convlog::truncate_utf8(
             &body,
@@ -5871,6 +5883,117 @@ mod tests {
         .into_response();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
         assert!(state.queues.lock_or_recover().is_empty());
+    }
+
+    /// The newest IN line of the log ring — the event one `proxy_chat` wrote.
+    fn last_in_event(state: &Arc<AppState>) -> LogEvent {
+        state
+            .logs
+            .lock_or_recover()
+            .iter()
+            .rev()
+            .find(|e| e.dir == "IN")
+            .cloned()
+            .expect("no IN event in the log ring")
+    }
+
+    /// Run one `POST /api/chat` with a body whose text is identifiable if it
+    /// ends up stored, through the real handler, and drain it fully.
+    async fn proxy_chat(state: &Arc<AppState>, extra: &[(&'static str, &'static str)]) {
+        let mut headers = HeaderMap::new();
+        for (name, value) in extra {
+            headers.insert(
+                axum::http::header::HeaderName::from_static(name),
+                value.parse().expect("header value"),
+            );
+        }
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proxy_handler(
+                State(state.clone()),
+                ConnectInfo("127.0.0.1:41020".parse().expect("addr")),
+                Method::POST,
+                headers,
+                axum::extract::OriginalUri("/api/chat".parse().expect("uri")),
+                Bytes::from_static(
+                    br#"{"model":"llama3","messages":[{"role":"user","content":"secret sauce"}]}"#,
+                ),
+            ),
+        )
+        .await
+        .expect("request not answered within 10s")
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(res.into_body(), usize::MAX).await;
+    }
+
+    /// `X-Redact-Log` is a client-side per-request switch: its *presence*
+    /// keeps the request's text out of the log (the IN entry keeps metadata,
+    /// carries no content), the value is ignored — even an empty one — and
+    /// keyless requests are honored like any other.
+    #[tokio::test]
+    async fn redact_log_header_stores_no_text() {
+        let (url, _calls) = spawn_recording_backend().await;
+        let state = new_test_state(vec![url]);
+        arm_ollama_backend(&state, None);
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        proxy_chat(&state, &[("x-redact-log", "1")]).await;
+        let ev = last_in_event(&state);
+        assert!(ev.redacted, "redacted flag not set");
+        assert!(ev.content.is_none(), "redacted IN event must carry no content");
+
+        proxy_chat(&state, &[("x-redact-log", "")]).await;
+        assert!(
+            last_in_event(&state).redacted,
+            "a valueless header still means redact"
+        );
+
+        proxy_chat(&state, &[("x-redact-log", "whatever")]).await;
+        assert!(
+            last_in_event(&state).redacted,
+            "the value is never read"
+        );
+
+        worker.abort();
+    }
+
+    /// Without the header text is still stored (no regression), and the
+    /// header can never switch *on* what a client key's `redact_log` switched
+    /// off — the flag is one-way even when it asks nicely (`: 0`).
+    #[tokio::test]
+    async fn redact_log_header_is_one_way() {
+        let (url, _calls) = spawn_recording_backend().await;
+        let state = new_test_state(vec![url]);
+        arm_ollama_backend(&state, None);
+        {
+            let mut clients = state.clients.lock_or_recover();
+            clients.create_client("alice", "").expect("create client");
+            clients
+                .add_key("alice", Some("alice-key-123"), "", true)
+                .expect("add key");
+        }
+        let worker = tokio::spawn(run_worker(state.clone()));
+
+        proxy_chat(&state, &[("x-user-id", "plain")]).await;
+        let ev = last_in_event(&state);
+        assert!(!ev.redacted, "plain request must not be redacted");
+        assert!(ev.content.is_some(), "plain request's text must be stored");
+
+        proxy_chat(
+            &state,
+            &[
+                ("authorization", "Bearer alice-key-123"),
+                ("x-redact-log", "0"),
+            ],
+        )
+        .await;
+        assert!(
+            last_in_event(&state).redacted,
+            "the header cannot un-redact a key configured redact_log, nor does ': 0' mean off"
+        );
+
+        worker.abort();
     }
 
     /// A key no client owns changes nothing: `X-User-ID` still decides.

@@ -1375,8 +1375,8 @@ function clientRow(r, st) {
 }
 
 /** Says why a record has no body text: switched off, not missing. */
-const redactBadge = title => `<span class="badge warn" title="${title}">no text</span>`;
-const REDACT_BADGE = redactBadge('No request/response text is stored — the log entry keeps user, model, backend, status, size, session and timing');
+const redactBadge = title => `<span class="badge warn" title="${title}">redacted</span>`;
+const REDACT_BADGE = redactBadge("Text not stored — the client's X-Redact-Log header or its client, key or backend setting; the log entry keeps user, model, backend, status, size, session and timing");
 
 /** Level 2: the client's keys, while its own row is open. */
 function keyRows(r) {
@@ -1848,7 +1848,7 @@ function lvSubline(conv) {
   if (conv.session_label) sub.push(`#${conv.session_label}`);
   sub.push(`${conv.turns.length} ${conv.turns.length === 1 ? 'request' : 'requests'}`);
   if (conv.turns.length) sub.push(`${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}`);
-  if (conv.redacted) sub.push('no text');
+  if (conv.redacted) sub.push('redacted');
   return sub.join(' · ');
 }
 
@@ -2074,7 +2074,7 @@ function lvRunInfo(runs, k) {
 }
 
 /** Capture switched off is a decision, not a gap: say so and show what was kept. */
-const lvOff = () => '<div class="lv-off">capture turned off — no request or response text is stored for this client, key or backend. Its timeline, sizes and message roles are still recorded.</div>';
+const lvOff = () => '<div class="lv-off">text redacted — the client\'s <code>X-Redact-Log</code> header or its client, key or backend setting kept this text out of the log. Its timeline, sizes and message roles are still recorded.</div>';
 
 /** What a turn re-sent that an earlier request already delivered, as one line:
  *  how many, where they first appeared, and what they were (roles, size). The
@@ -2256,7 +2256,7 @@ function lvTurnHead(t, i) {
       <span class="ts"${sp.tip ? ` title="${esc(sp.tip)}"` : ''}>${sp.txt}</span>
       <span>${lvStages(t)}</span>
       ${pv}${tb}
-      ${t.redacted ? '<span class="badge warn" title="no body text is stored for this client, key or backend">no text</span>' : ''}
+      ${t.redacted ? '<span class="badge warn" title="text not stored for this request — the client\'s X-Redact-Log header or its client, key or backend setting">redacted</span>' : ''}
       ${tail}</h3>`;
 }
 
@@ -2471,11 +2471,11 @@ function lvMarkdown(conv, content, turns) {
     out.push(`**Request** ${[t.method, t.path, t.req?.bytes != null ? fmtBytes(t.req.bytes) : null,
       msgs.length ? `${msgs.length} messages${cut ? `, ${msgs.length - cut} new` : ''}` : null]
       .filter(Boolean).join(' ')}`, '');
-    if (c.req == null) out.push(t.redacted ? '_capture turned off — no text is stored for this client, key or backend_' : '_no request text stored_', '');
+    if (c.req == null) out.push(t.redacted ? '_text redacted — X-Redact-Log header or client/key/backend setting_' : '_no request text stored_', '');
     else if (msgs.length) for (const m of msgs.slice(cut)) out.push(...lvMsgMd(m));
     else out.push('```', c.req, '```', '');
     out.push(`**Response**${t.resp?.bytes != null ? ` · ${fmtBytes(t.resp.bytes)}` : ''}`, '');
-    if (c.resp == null) out.push(t.redacted ? '_capture turned off_' : '_no response text stored_', '');
+    if (c.resp == null) out.push(t.redacted ? '_text redacted_' : '_no response text stored_', '');
     else {
       const st = streamState(c.resp) || lvPlainResp(c.resp);
       if (!st) out.push('```', c.resp, '```', '');
@@ -2672,7 +2672,7 @@ function lvDrawRail() {
       tip: t.tl?.end != null
         ? `the assistant's answer — how long it took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)})${fin ? ` — ${fin}` : ''} — click to jump to it`
         : 'no response recorded yet',
-      snip: (f.words || fin || lvFinish(t)) + (c && c.resp == null ? ' · no text' : ''), caret: '' }));
+      snip: (f.words || fin || lvFinish(t)) + (c && c.resp == null ? (t.redacted ? ' · redacted' : ' · no text') : ''), caret: '' }));
   });
   if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');
   setHTML(rail, items.join(''));
