@@ -2133,7 +2133,7 @@ function lvRespHtml(t, c) {
   if (c.resp == null)
     return (t.redacted ? lvOff() : `<div class="lv-note">${t.tl?.end != null ? 'No response text was stored for this request.' : 'No response recorded yet — still queued, running, or disconnected.'}</div>`)
       + lvRespChips(t);
-  return S.lv.fmt === 'raw' ? rawView(c.resp) : formatContent(c.resp);
+  return S.lv.fmt === 'raw' ? rawView(c.resp) : formatContent(c.resp, t.rid);
 }
 
 /** Without text the turn still lists what it held: one chip per message. */
@@ -2289,7 +2289,7 @@ async function lvFocusSec(rid, side) {
   await lvDraw({ scroll: false });
   const el = document.getElementById(`lv-${side}-${rid}`);
   if (!el) { lvScroll(); lvDrawRail(); return; }
-  el.scrollIntoView({ block: 'center' });
+  el.scrollIntoView({ block: 'start' });
   el.classList.add('flash');
   setTimeout(() => el.classList.remove('flash'), 1300);
   lvDrawRail();
@@ -2368,7 +2368,7 @@ async function lvFocusMsg(rid, idx) {
   const el = document.getElementById(`lv-m-${tgt.rid}-${tgt.idx}`);
   if (!el) { lvScroll(); lvDrawRail(); return; }
   for (const d of [el.closest('details'), ...el.querySelectorAll('details')]) if (d) d.open = true;
-  el.scrollIntoView({ block: 'center' });
+  el.scrollIntoView({ block: 'start' });
   el.classList.add('flash');
   setTimeout(() => el.classList.remove('flash'), 1300);
   lvDrawRail();
@@ -2727,18 +2727,18 @@ function salvageChat(text) {
 
 /** Chat request body → meta line + transcript blocks; chat response →
  *  reconstructed message + footer; any other JSON → collapsible tree. */
-function formatContent(text) {
+function formatContent(text, rid) {
   const trunc = text.includes('[truncated:')
     ? '<div class="lv-note">Body was truncated by the content limit — showing everything the capture kept.</div>' : '';
   const o = tryJson(text);
   if (o && typeof o === 'object' && !Array.isArray(o)) {
-    if (Array.isArray(o.messages)) return transcriptView(o);
-    if (o.choices || o.message) return responseView(o) ?? jsonView(o, text);
+    if (Array.isArray(o.messages)) return transcriptView(o, rid);
+    if (o.choices || o.message) return responseView(o, rid) ?? jsonView(o, text);
     return jsonView(o, text);
   }
   const salv = salvageChat(text);
-  if (salv) return trunc + transcriptView(salv);
-  const gs = groupStream(text);
+  if (salv) return trunc + transcriptView(salv, rid);
+  const gs = groupStream(text, rid);
   if (gs) return gs + trunc;
   return rawView(text);
 }
@@ -2800,12 +2800,13 @@ function reqMeta(body) {
   return bits.join(' · ');
 }
 
-function transcriptView(body) {
+function transcriptView(body, rid) {
   const toolNames = new Map();
   for (const m of body.messages || [])
     for (const tc of m.tool_calls || []) if (tc.id) toolNames.set(tc.id, tc.function?.name ?? tc.name);
   return `<div class="lv-meta">${esc(reqMeta(body))}</div>`
-    + (body.messages || []).map(m => msgBlock(m, toolNames)).join('');
+    + (body.messages || []).map((m, k) =>
+        msgBlock(m, toolNames, rid != null ? `lv-x-${rid}-${k}` : undefined)).join('');
 }
 
 /** Parse a streamed capture into its parts — reconstructed text, thinking,
@@ -2862,26 +2863,35 @@ function streamState(text) {
 }
 
 /** Render that reconstruction as one assistant message. */
-function groupStream(text) {
+function groupStream(text, rid) {
   const st = streamState(text);
   if (!st) return null;
   const foot = [`finish: ${st.finish || '?'}`];
   if (st.usage) foot.push(`prompt ${fmtTok(st.usage.p || 0)} → completion ${fmtTok(st.usage.c || 0)} tok`);
   foot.push(`${fmtNum(st.chunks)} chunks grouped${st.errs ? ` · ${st.errs} error payload(s)` : ''}${st.cutTail ? ' · tail truncated' : ''}`);
-  return `<div class="msg asst"><span class="role">assistant</span>${thinkBlock(st.think)}`
+  const footDiv = `<div class="lv-foot">${esc(foot.join(' · '))}</div>`;
+  // Same ASST block as any other: same chip, same fold click, same tease.
+  const id = rid != null ? `lv-s-${rid}` : undefined;
+  const shut = id ? LV.msgFold.get(id) === true : false;
+  let h = `<div class="msg asst${shut ? ' fold' : ''}"${id ? ` id="${id}"` : ''}>`
+    + `<span class="role"${id ? ` data-action="msg-fold" data-key="${id}" title="click to ${shut ? 'open' : 'fold'} this reply"` : ''}>${shut ? '▸' : '▾'} ASST`;
+  if (shut)
+    return h + `<span class="mf-pv">${esc(lvWords(st.text) || '…')}</span></span></div>` + footDiv;
+  return h + '</span>' + thinkBlock(st.think)
     + (st.text ? `<div class="mtext">${esc(st.text)}</div>` : '')
     + st.tools.map(t => toolCallBlock(t.name, t.args)).join('')
-    + `</div><div class="lv-foot">${esc(foot.join(' · '))}</div>`;
+    + '</div>' + footDiv;
 }
 
 /** Non-streamed chat response (OpenAI object or Ollama /api/chat object). */
-function responseView(o) {
+function responseView(o, rid) {
   const m = o.choices?.[0]?.message || o.message;
   if (!m) return null;
   const usage = o.usage || (o.prompt_eval_count != null ? { p: o.prompt_eval_count, c: o.eval_count } : null);
   const foot = [`finish: ${o.choices?.[0]?.finish_reason || o.done_reason || '?'}`];
   if (usage) foot.push(`prompt ${fmtTok(usage.prompt_tokens ?? usage.p ?? 0)} → completion ${fmtTok(usage.completion_tokens ?? usage.c ?? 0)} tok`);
-  return `<div class="msg asst"><span class="role">assistant</span>${msgBlock(m, null)}</div>`
+  // One ASST block like the transcript's own — same chip, same fold click.
+  return msgBlock(m, null, rid != null ? `lv-r-${rid}` : undefined)
     + `<div class="lv-foot">${esc(foot.join(' · '))}</div>`;
 }
 

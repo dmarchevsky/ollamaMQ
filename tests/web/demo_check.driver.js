@@ -288,6 +288,32 @@ addEventListener('load', () => {
           `scroll kept at ${body.scrollTop}, ${LV.open.size} turns open`);
         document.querySelector('#lv-auto').click();   // stop polling
         await wait(200);
+        // The reconstructed response is an ASST block like any other — same
+        // chip, same fold click — and thinking opens as a ruled box.
+        const asstResp = document.querySelector('#dlg-log .lv-sec[id^="lv-a-"] .msg.asst > .role[data-action="msg-fold"]');
+        A('resp-block-is-foldable-asst', !!asstResp && /^▾ ASST/.test(asstResp.textContent.trim()),
+          asstResp ? asstResp.textContent.trim().slice(0, 20) : 'no foldable ASST response block');
+        asstResp.click();
+        await wait(600);
+        const respShut = !!document.querySelector('#dlg-log .lv-sec[id^="lv-a-"] .msg.asst.fold');
+        document.querySelector('#dlg-log .lv-sec[id^="lv-a-"] .msg.asst > .role').click();
+        await wait(600);
+        A('resp-block-folds-and-opens', respShut
+          && !document.querySelector('#dlg-log .lv-sec[id^="lv-a-"] .msg.asst.fold'),
+          'the answer folds and opens on its label');
+        const th = document.querySelector('#dlg-log .msg details');
+        A('thinking-is-a-boxed-appendix', !!th
+          && getComputedStyle(th).borderStyle !== 'none'
+          && getComputedStyle(th.querySelector('summary')).listStyleType === 'none',
+          th ? getComputedStyle(th).borderStyle : 'no thinking block');
+        // A jump lands on the block's first line, not mid-block.
+        const farNode = [...document.querySelectorAll('#lv-rail .lv-node.msg')].pop();
+        farNode.click();
+        await wait(900);
+        const tgtEl = document.getElementById(`lv-m-${farNode.dataset.rid}-${farNode.dataset.idx}`);
+        A('jump-lands-at-block-start', !!tgtEl
+          && Math.abs(tgtEl.getBoundingClientRect().top - body.getBoundingClientRect().top) < 80,
+          tgtEl ? `top gap ${Math.round(tgtEl.getBoundingClientRect().top - body.getBoundingClientRect().top)}px` : 'target missing');
         // Scrolling the log is navigation too: the rail row of whichever block
         // sits at the top lights up and stays in view as the wheel turns.
         const mTarget = document.getElementById(`lv-m-${rid2}-7`);

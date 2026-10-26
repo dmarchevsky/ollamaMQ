@@ -1030,6 +1030,8 @@ dialog label.inc input, label.inc input { display: inline-block; width: auto; ma
 /* Transcript blocks (chat request, reconstructed response). */
 .msg { border: 1px solid var(--border); background: var(--surface); border-radius: 8px;
   margin-bottom: 10px; overflow: hidden; }
+/* A jump lands on a block's first line, not a hair under the dialog edge. */
+.msg, .lv-sec { scroll-margin-top: 12px; }
 /* Message labels fold their block: a click on SYS/USER/TOOL shuts it to one
    line, with the fold preview wearing the muted voice of a tease. */
 .msg > .role[data-action] { cursor: pointer; user-select: none; }
@@ -1052,10 +1054,17 @@ dialog label.inc input, label.inc input { display: inline-block; width: auto; ma
 .msg.m-held { opacity: .55; background: var(--surface-2); border-left: 3px solid var(--border); }
 .msg-slot.m-held { opacity: .55; }
 .msg .msg { margin: 0 12px 10px; }
-.msg details > summary { cursor: pointer; margin: 8px 12px; padding: 4px 10px; font-size: 12px;
-  color: var(--muted); border: 1px dashed var(--border); border-radius: 6px; }
-.msg details[open] > summary { margin-bottom: 0; }
-.msg details .mtext { padding-top: 6px; }
+/* Thinking is an appendix to its message: one box with the summary as its
+   lid, the body ruled off under it — not a text blob hanging in the margin. */
+.msg details { margin: 0 12px 10px; border: 1px dashed var(--border);
+  border-radius: 6px; background: var(--surface-2); overflow: hidden; }
+.msg details > summary { cursor: pointer; list-style: none; display: flex;
+  align-items: center; gap: 7px; padding: 4px 10px; font-size: 12px; color: var(--muted); }
+.msg details > summary::-webkit-details-marker { display: none; }
+.msg details > summary::before { content: '▸'; font-size: 10px; color: var(--faint); }
+.msg details[open] > summary::before { content: '▾'; }
+.msg details[open] > summary { border-bottom: 1px dashed var(--border); }
+.msg details .mtext { color: var(--muted); }
 .tc { margin: 0 12px 10px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .tc .tc-h { padding: 4px 10px; font: 600 12px var(--mono); background: var(--surface-2); }
 .tc .tc-h .fn { color: var(--accent); }
