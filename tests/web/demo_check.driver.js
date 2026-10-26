@@ -113,16 +113,17 @@ addEventListener('load', () => {
           && !document.querySelector(`#lv-rail .lv-node.turn[data-rid="${rid2}"] .pv`)
           && document.querySelector(`#lv-t-${LV.conv.turns.at(-3).rid} .turn-h .pv`)?.innerHTML !== '',
           'open requests say their words once; folded ones tease them');
-        // The incremental view is strict: only what each request added. The
-        // run grouping and the answers belong to the whole prompt's story —
-        // they appear when the switch is off and never while it is on, in
-        // either pane.
+        // The incremental view is about one request's moment: the run
+        // grouping is the session's story and waits for the whole-prompt
+        // view. The answer stays visible — with it hidden a single-request
+        // conversation would show no assistant words anywhere.
         const body = document.querySelector('#dlg-log .lv-body');
-        A('inc-hides-runs-and-responses', !document.querySelector('#dlg-log .run-h')
-          && !document.querySelector('#dlg-log .lv-sec.out')
-          && !document.querySelector('#lv-rail .lv-node.run')
-          && !document.querySelector('#lv-rail .lv-node.resp'),
-          'incremental: no run lines, no response sections or rows');
+        A('inc-hides-runs', !document.querySelector('#dlg-log .run-h')
+          && !document.querySelector('#lv-rail .lv-node.run'),
+          'incremental: no run lines in either pane');
+        A('inc-still-shows-the-answer', !!document.querySelector('#lv-rail .lv-node.resp')
+          && !!document.querySelector(`#lv-t-${rid2} .lv-sec.out, #lv-a-${rid2}`),
+          'the response section and rail row survive incremental');
         // The rail rows for a turn are the messages it ADDED — no REQ count
         // row, and no re-sent rows under a later request while incremental.
         const rows2 = [...document.querySelectorAll(`#lv-rail .lv-node.msg[data-rid="${rid2}"]`)];
@@ -140,8 +141,8 @@ addEventListener('load', () => {
         A('show-incremental-full-prompt', inc() === n0 + hid && heldRows === hid
           && document.querySelectorAll(`#lv-rail .lv-node.msg[data-rid="${rid2}"]`).length > rows2.length,
           `request 2 body ${n0} \u2192 ${inc()} messages (+${hid} held, dimmed)`);
-        // The whole-prompt view gets the rest of the story back: the run
-        // grouping and the answers, in both panes.
+        // The whole-prompt view gets the run grouping back: the group lines
+        // appear in both panes.
         const runHeads = [...document.querySelectorAll('#dlg-log .run-h')];
         A('runs-group-the-session', runHeads.length >= 1
           && document.querySelectorAll('#lv-rail .lv-node.run').length === runHeads.length
@@ -208,8 +209,8 @@ addEventListener('load', () => {
         await wait(700);
         A('show-incremental-remembered', inc() === n0
           && JSON.parse(localStorage.getItem('omq.lv') || '{}').inc === true
-          && !document.querySelector('#dlg-log .run-h') && !document.querySelector('#dlg-log .lv-sec.out'),
-          `back to ${n0} messages, choice stored, runs and answers tucked away again`);
+          && !document.querySelector('#dlg-log .run-h'),
+          `back to ${n0} messages, choice stored, the run grouping tucked away again`);
         // Scrolling the log is navigation too: the rail row of whichever block
         // sits at the top lights up and stays in view as the wheel turns.
         const mTarget = document.getElementById(`lv-m-${rid2}-7`);

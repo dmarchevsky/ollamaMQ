@@ -2017,9 +2017,10 @@ function lvFacts(i) {
  *  merges forward — and a conversation with nothing to split renders flat,
  *  exactly as before runs existed. */
 function lvRuns() {
-  // The incremental view is strict: it shows what each request ADDED, and a
-  // request added no group line and no answer. Groups and responses belong to
-  // the whole-prompt view — uncheck the switch to see them.
+  // The incremental view is about one request's moment: the run grouping is
+  // the whole session's story and waits for the whole-prompt view. The answer
+  // to the request stays visible — hide it and a single-request conversation
+  // shows no assistant words anywhere.
   if (S.lv.inc) return [];
   const turns = lvTurns(); const runs = []; let s = 0;
   for (let i = 0; i < turns.length; i++)
@@ -2143,11 +2144,10 @@ async function lvTurnInner(t) {
   const reqTip = [c.reqObj ? reqMeta(c.reqObj) : null,
     carry ? `${(c.reqObj?.messages || []).length - carry.hidden} new · ${lvCarryTip(carry)}` : null
   ].filter(Boolean).join(' · ');
-  const reqSec = lvSec({ cls: 'req', title: 'Request', info: [t.method, t.path, reqSize].filter(Boolean).join(' '),
-    tip: reqTip || null, id: `lv-q-${t.rid}` }, lvReqHtml(t, c, i));
-  if (S.lv.inc) return reqSec;   // the answer is not part of what this request sent
-  return reqSec + lvSec({ cls: 'out', title: 'Response', info: [t.status ?? '—', respSize].filter(Boolean).join(' '),
-    id: `lv-a-${t.rid}` }, lvRespHtml(t, c));
+  return lvSec({ cls: 'req', title: 'Request', info: [t.method, t.path, reqSize].filter(Boolean).join(' '),
+    tip: reqTip || null, id: `lv-q-${t.rid}` }, lvReqHtml(t, c, i))
+    + lvSec({ cls: 'out', title: 'Response', info: [t.status ?? '—', respSize].filter(Boolean).join(' '),
+      id: `lv-a-${t.rid}` }, lvRespHtml(t, c));
 }
 
 /** Render the whole conversation. `scroll` lands on the focused request. */
@@ -2615,11 +2615,9 @@ function lvDrawRail() {
     }
     // A response is a length: how long it took, not when it ended. Clicking it
     // lands on the Response section in the body, not on the turn header.
-    // Incremental mode shows only what the request sent — the answer is not
-    // part of that, so no row for it there.
     const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
     const fin = f.finish;
-    if (!S.lv.inc) items.push(lvNode({ level: subLevel, rid: t.rid, cls: 'resp sub', tag: 'resp', action: 'lv-resp',
+    items.push(lvNode({ level: subLevel, rid: t.rid, cls: 'resp sub', tag: 'resp', action: 'lv-resp',
       when: dur == null ? '' : fmtDur(dur / 1000),
       tip: t.tl?.end != null
         ? `how long this response took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)}) — click to jump to it`
