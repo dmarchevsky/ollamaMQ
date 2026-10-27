@@ -1,8 +1,12 @@
 // Demo-mode assertion driver for the conversation viewer. Append this file's
 // body to a copy of src/web/index.html and run it headless:
-//   <chromium> --virtual-time-budget=10000 --window-size=1280,800 \
+//   <chromium> --virtual-time-budget=42000 --window-size=1280,800 \
 //     --screenshot=out.png "file://<copy>/index.html?demo=1"
 // Console prints "ASSERT PASS/FAIL <name>" per check.
+// The budget must outlast the whole timeline: the compaction checks run at
+// 26 s and 34 s, and a budget under ~40 s makes the viewer checks race the
+// page (a rail jump fires while its turn is still folded, and reports a
+// missing target that is only folded away).
 // Screenshot caveat: chrome-headless-shell with --virtual-time-budget races the
 // modal-open repaint and sometimes captures a stale frame (empty strip where
 // the dialog header should be). Real Chromium over CDP (playwright-core,
@@ -530,3 +534,72 @@ addEventListener('load', () => setTimeout(() => {
     }), 'prefill/decode follow the model → backend name');
   }, 900);
 }, 16500));
+
+// Compaction: the summarization a client sends when its context fills up is
+// drawn as one striped block inside the conversation it summarizes, never as a
+// mystery conversation of its own — and when nothing could be attached, it says
+// so instead of pretending.
+addEventListener('load', () => setTimeout(() => {
+  const A4 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  document.querySelector('a[data-page="overview"]').click();
+  setTimeout(() => {
+    const segs = [...document.querySelectorAll('#ov-timeline .tl-track .sg.c')];
+    A4('graph-draws-compaction-blocks', segs.length >= 2, `${segs.length} striped blocks`);
+    A4('graph-block-says-what-it-read', segs.some(s => /tok → .*tok/.test(s.title)),
+      segs.map(s => s.title).slice(0, 2).join(' | '));
+    A4('graph-block-says-how-it-was-attached', segs.some(s => /recency/.test(s.title)),
+      segs.map(s => s.title).find(t => /recency/.test(t)) || 'no provenance');
+    // It is a block for the whole request: one segment, not prefill + decode.
+    const row = segs[0]?.closest('.tl-row');
+    A4('compaction-is-one-block-not-two-stages',
+      row && ![...row.querySelectorAll('.sg')].filter(s => /tok →/.test(s.title)).every(s => false)
+        && row.querySelectorAll('.sg.c').length >= 1, 'striped block stands in for prefill+decode');
+    // The row that carries it is labelled, and keeps its own identity.
+    const lab = row?.querySelector('.tl-lab')?.textContent || '';
+    A4('carrying-row-is-marked', /⤓/.test(lab) && /refactor-auth|a3f19c/.test(lab), lab.trim());
+    // An unlinked summary gets its own row, and says it is unlinked.
+    const orph = [...document.querySelectorAll('#ov-timeline .tl-lab')].filter(l => /unlinked/.test(l.textContent));
+    A4('unlinked-compaction-says-so', orph.length >= 1, orph.map(l => l.textContent.trim()).join(' | ') || 'none');
+    A4('legend-explains-the-mark',
+      [...document.querySelectorAll('#ov-timeline .tl-legend .sw.c')].length === 1, 'striped swatch in the legend');
+    // The window counter counts conversations, not summarization requests.
+    const cmp = document.querySelector('#stats .stat.cmp');
+    A4('window-counter-counts-conversations', !!cmp && /\b2\b/.test(cmp.textContent),
+      cmp ? cmp.textContent.trim() : 'no counter');
+    // Details: the conversation's header carries the same count as the graph.
+    const head = [...document.querySelectorAll('#ov-now .det-h')]
+      .find(h => /refactor-auth|a3f19c/.test(h.textContent) && h.querySelector('.badge.cmp'));
+    A4('details-header-carries-count', !!head, head ? head.querySelector('.badge.cmp').textContent.trim() : 'none');
+    const lines = [...document.querySelectorAll('#ov-now .det-row .st.c')];
+    A4('details-stage-line-for-compaction', lines.some(s => /compaction/.test(s.textContent)),
+      lines.map(s => s.textContent.trim()).slice(0, 2).join(' | ') || 'none');
+    A4('details-line-names-attachment',
+      [...document.querySelectorAll('#ov-now .det-row .val')].some(l => /recency/.test(l.textContent)),
+      'provenance printed beside the stage');
+    // The turn that resumes after a summary is marked, so its cold prefill is
+    // not read as an eviction.
+    A4('post-compaction-turn-marked',
+      [...document.querySelectorAll('#ov-now .det-row .val')].some(l => /cold after the summary/.test(l.textContent)),
+      'cold-after-the-summary on the resuming prefill');
+  }, 900);
+}, 26000));
+
+// The conversation viewer: a stored turn says it was a summarization call.
+addEventListener('load', () => setTimeout(() => {
+  const A5 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  location.hash = '#logs';
+  setTimeout(() => {
+    // A later block of this driver leaves the Logs page grouped per request;
+    // this check is about the conversation row, so ask for that grouping.
+    const radio = document.querySelector('#log-group input[value="session"]');
+    if (radio && !radio.checked) { radio.checked = true; radio.dispatchEvent(new Event('change')); }
+    const row = [...document.querySelectorAll('#logs tbody tr[data-action="conv-open"]')]
+      .find(r => /b7c2d9/.test(r.textContent));
+    A5('logs-row-badges-compaction', !!row && /⤓/.test(row.textContent), row ? row.textContent.replace(/\s+/g, ' ').trim().slice(0, 70) : 'no row');
+    row?.click();
+    setTimeout(() => {
+      const badged = [...document.querySelectorAll('#dlg-log .turn-h .badge.cmp')].map(b => b.textContent.trim());
+      A5('viewer-turn-badged', badged.some(t => /compaction/.test(t)), badged.join(' | ') || 'none');
+    }, 700);
+  }, 800);
+}, 34000));

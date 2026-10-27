@@ -82,6 +82,9 @@
 
   const LOG_SAMPLES = [
     ['IN', 'codex-laptop', 'Qwen3.8-Flash-Next', null, 'queued', true],
+    // A summarization request as the request log records it: the line says what
+    // it was, so a reader never has to spot the prompt.
+    ['IN', 'codex-laptop', 'Qwen3.8-Flash-Next', null, 'POST /v1/chat/completions body=285694B · compaction', true],
     ['OUT', 'openwebui', 'Qwen3.8-27B', 'http://192.168.255.224:8000', '200 · 7.9s · 912 tok', true],
     ['IN', 'openwebui', 'Qwen3.8-27B', null, 'queued', true],
     ['OUT', 'codex-laptop', 'Qwen3.8-Flash-Next', 'http://192.168.6.11:8731', '200 · 12.4s · 2.1k tok', true],
@@ -143,6 +146,14 @@
     1202: streamOut,
   };
   logs.unshift(
+    // A summarization request of the same conversation: the log line says what
+    // it was, and the conversation row counts it.
+    { seq: 1206, at_ms: now - 40_000, dir: 'OUT', user: 'n8n-agents', model: 'llama3.3:70b',
+      backend: 'http://gpu-box.lan:11434', info: 'POST /v1/chat/completions -> 200 resp=6120B', has_content: false,
+      redacted: true, rid: 907, session: 'b7c2d9' },
+    { seq: 1205, at_ms: now - 95_000, dir: 'IN', user: 'n8n-agents', model: 'llama3.3:70b',
+      backend: null, info: 'POST /v1/chat/completions body=285694B · compaction', has_content: false,
+      redacted: true, rid: 907, session: 'b7c2d9' },
     // A round whose text was never stored: the entry is there, the body is not.
     { seq: 1204, at_ms: now - 4_000, dir: 'OUT', user: 'n8n-agents', model: 'BGE-M3',
       backend: 'http://192.168.255.224:8001', info: 'POST /v1/embeddings -> 200 resp=51208B', has_content: false,
@@ -211,8 +222,7 @@
      { tool_calls: [{ index: 0, id: 'c20', function: { name: 'bash', arguments: '{"command":' } }] },
      { tool_calls: [{ index: 0, function: { arguments: '"cargo test rotate"}' } }] }],
     { prompt_tokens: 1310, completion_tokens: 210 }, 'tool_calls');
-  const out905 = sse(
-    [{ role: 'assistant', content: '' },
+  const out905 = sse(    [{ role: 'assistant', content: '' },
      { reasoning: 'The suite is green with the corrected expectation — this answers the original request.' },
      ...'All green: 142 tests pass. The rotation chain walks from the newest slot.'
        .match(/.{1,14}/g).map(s => ({ content: s }))],
@@ -263,8 +273,19 @@
       // only the bodies are deliberately absent.
       v: 2, key: 'n8n-agents#b7c2d9', user: 'n8n-agents', session: 'b7c2d9', model: 'BGE-M3',
       backend: 'http://192.168.255.224:8001', priority: 'normal', redacted: true,
-      start_ms: now - 6_000, end_ms: now - 4_000,
+      start_ms: now - 95_000, end_ms: now - 3_000,
       turns: [
+        // The thread behind this client filled up, and its client asked for a
+        // summary: 71k tokens read, about a thousand written back. Its text is
+        // not stored like the rest here — but the request was still recognized
+        // as what it is, because the marker was read from the body in memory,
+        // not from whatever reached the log file.
+        { rid: 907, at_ms: now - 95_000, tl: { queue: now - 95_000, dispatch: now - 93_800, first_token: now - 69_000, end: now - 40_000 },
+          kind: 'compaction', link: 'recency',
+          method: 'POST', path: '/v1/chat/completions', model: 'llama3.3:70b',
+          backend: 'http://gpu-box.lan:11434', status: 200, outcome: 'ok', priority: 'top',
+          req: { bytes: 285_694 }, resp: { bytes: 6_120 }, redacted: true,
+          prompt_tokens: 71_355, completion_tokens: 1_120 },
         { rid: 903, at_ms: now - 6_000, tl: { queue: now - 6_000, dispatch: now - 5_600, end: now - 4_000 },
           method: 'POST', path: '/v1/embeddings', model: 'BGE-M3',
           backend: 'http://192.168.255.224:8001', status: 200, outcome: 'ok', priority: 'normal',
@@ -546,6 +567,59 @@
       r.tools = r.rid === 901 ? ['edit'] : [];
     });
 
+    // Compactions, as the proxy records them: the two summarization calls one
+    // client sends for one thread (the history, then the split turn's prefix),
+    // the ordinary turn that resumes after them with a cold cache, and a summary
+    // that could not be attached to anything. Times sit inside the window, and
+    // each is placed before the ordinary row it belongs under.
+    // summaries inside the window, ahead of the ordinary rows it belongs under
+    const base = t - 260_000;
+    const cmpRows = [
+      {
+        at_ms: base + 101_000, client: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
+        backend: '192.168.6.11:8731', outcome: 'ok', error: false, status: 200,
+        waited_secs: 0.4, session: 'a3f19c', session_label: 'refactor-auth', priority: 'top',
+        kind: 'compaction', link: 'recency', rid: 941,
+        prompt_tokens: 1_204, completion_tokens: 210, cache_pct: 0,
+        prefill_secs: 1.1, prefill_tokens: 1_204, gen_secs: 1.6, gen_tps: 131, ttft_secs: 1.1,
+        stage: { queue: base + 101_000, dispatch: base + 101_400, first_token: base + 102_500, end: base + 104_100 },
+      },
+      {
+        at_ms: base, client: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
+        backend: '192.168.6.11:8731', outcome: 'ok', error: false, status: 200,
+        waited_secs: 1.2, session: 'a3f19c', session_label: 'refactor-auth', priority: 'top',
+        // The interesting pair: 70k read in, 1k written out — and the next turn
+        // then pays for a prompt the backend has never seen.
+        kind: 'compaction', link: 'recency', rid: 940,
+        prompt_tokens: 71_355, completion_tokens: 1_120, cache_pct: 0,
+        prefill_secs: 14.2, prefill_tokens: 71_355, gen_secs: 9.8, gen_tps: 114, ttft_secs: 14.2,
+        stage: { queue: base, dispatch: base + 1_200, first_token: base + 15_400, end: base + 25_200 },
+      },
+      {
+        at_ms: base + 118_000, client: 'openwebui', model: 'llama3.3:70b',
+        backend: 'gpu-box.lan:11434', outcome: 'ok', error: false, status: 200,
+        waited_secs: 0.2, session: 'c9d104', priority: 'normal',
+        // No candidate in the window: honest, and the UI has to say `unlinked`.
+        kind: 'compaction', rid: 942,
+        prompt_tokens: 51_908, completion_tokens: 940, cache_pct: 0,
+        prefill_secs: 9.6, prefill_tokens: 51_908, gen_secs: 7.4, gen_tps: 127, ttft_secs: 9.6,
+        stage: { queue: base + 118_000, dispatch: base + 118_200, first_token: base + 127_800, end: base + 135_200 },
+      },
+      {
+        at_ms: base + 132_000, client: 'codex-laptop', model: 'Qwen3.8-Flash-Next',
+        backend: '192.168.6.11:8731', outcome: 'ok', error: false, status: 200,
+        waited_secs: 0.6, session: 'a3f19c', session_label: 'refactor-auth', priority: 'top',
+        kind: 'post-compact', rid: 943,
+        // The turn that reads as waste without the mark: cache 0%, no waste
+        // charged, because the history was rewritten rather than evicted.
+        prompt_tokens: 18_402, completion_tokens: 610, cache_pct: 0, waste_secs: null,
+        prefill_secs: 8.4, prefill_tokens: 18_402, gen_secs: 7.1, gen_tps: 86, ttft_secs: 8.4,
+        stage: { queue: base + 132_000, dispatch: base + 132_600, first_token: base + 141_000, end: base + 148_100 },
+      },
+    ];
+    recent.push(...cmpRows);
+    recent.sort((a, b) => b.at_ms - a.at_ms);
+
     const view = {
       window_secs: secs, now_ms: t, lane_from_ms: from, lane_span_ms: secs * 1000,
       status: {
@@ -555,6 +629,9 @@
         loading: backends.filter(b => b.active_op).map(loadingOf),
         errors, error_pct: requests ? errors * 100 / requests : null,
         done: recent.filter(r => r.outcome === 'ok').length, dropped: recent.filter(r => r.outcome === 'backend_error').length,
+        // One per conversation that compacted, not one per summarization request.
+        compactions: new Set(recent.filter(r => r.kind === 'compaction')
+          .map(r => r.session ?? `rid:${r.rid}`)).size,
         pins: [['a3f19c', 'top'], ['7e04d2', 'high'], ['b7c2d9', 'top']],
         priority_sessions: new Set([...demoRuns, ...demoQueue].filter(r => (r.prio || 'normal') !== 'normal').map(r => r.session || r.client)).size,
       },

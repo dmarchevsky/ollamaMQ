@@ -325,6 +325,7 @@ function renderStats(st) {
     <span class="stat q">Queue <b>${fmtNum(scoped ? w.queued : s.queued + s.processing)}</b></span>
     <span class="stat">Running <b>${fmtNum(scoped ? w.running : s.processing)}</b></span>
     <span class="stat ok"${w ? ' title="requests that completed in the selected window"' : ''}>Done <b>${fmtNum(w ? w.done : s.done)}</b></span>
+    ${w && w.compactions ? `<span class="stat cmp" title="conversations that compacted in the selected window — one per conversation, not one per summarization request">⤓ Compact <b>${fmtNum(w.compactions)}</b></span>` : ''}
     <span class="stat vip">VIP <b>${esc(st.vip ?? '—')}</b></span>
     <span class="stat q">Boost <b>${esc(st.boost ?? '—')}</b></span>`);
 }
@@ -703,10 +704,17 @@ function renderCapacity(st, ov) {
  * A backend with nothing in the window takes no row.
  */
 const TL_ROWS = 12;          // sessions per backend before the oldest fold away
-const STAGE = { w: 'waiting', p: 'prefill', g: 'decode', e: 'error' };
+const STAGE = { w: 'waiting', p: 'prefill', g: 'decode', e: 'error', c: 'compaction' };
 const TL_LEGEND = '<div class="tl-legend"><span><i class="sw w"></i>waiting</span>'
   + '<span><i class="sw p"></i>prefill</span><span><i class="sw g"></i>decode</span>'
-  + '<span><i class="sw e"></i>error</span></div>';
+  + '<span><i class="sw e"></i>error</span>'
+  + '<span><i class="sw c"></i>compaction</span></div>';
+
+/** What a compaction's own segment says: what it read, what it left behind. */
+const compactionLine = o => `${fmtTok(o.prompt_tokens)} tok → ${fmtTok(o.completion_tokens)} tok`
+  // How it was attached to this conversation, so an inferred link never reads as
+  // a stated one (`link` is absent when nothing could be matched).
+  + (o.link ? `<span class="more"> · ${esc(o.link)}</span>` : '<span class="more"> · unlinked</span>');
 
 function renderTimeline(st, ov) {
   const el = $('#ov-timeline');
@@ -769,6 +777,25 @@ function renderTimeline(st, ov) {
 /** One session's row: its stages laid along the track at their own times. */
 function tlRow(rows, pctOf, span) {
   const head = rows[0];
+  // A conversation carrying summarization requests says so beside its name; a
+  // summary nothing could be attached to stands on its own and says that too,
+  // instead of passing for a conversation of its own.
+  const cmp = rows.filter(r => r.o.kind === 'compaction');
+  const loose = cmp.filter(r => !r.o.link).length;
+  // A summary nothing could be attached to keeps a row of its own, and that row
+  // is named for what it is instead of pretending to be a conversation.
+  const orphan = cmp.length > 0 && loose === cmp.length && loose === rows.length;
+  const mark = cmp.length
+    ? '<span class="cmp" title="' + cmp.length + ' summarization request'
+      + (cmp.length > 1 ? 's' : '')
+      + (loose === cmp.length
+        ? ' · nothing to attach them to'
+        : ` attached to this conversation${loose ? ` · ${loose} unlinked` : ''}`)
+      + '">⤓</span>'
+    : '';
+  const name = orphan
+    ? 'compaction <span class="unl">· unlinked</span>'
+    : esc(head.o.session_label ? `#${head.o.session_label}` : fmtWho(head.o));
   // Each stage is placed in the track by itself: left = when it began, width =
   // how long it ran. A stage that runs off either edge is clipped there and the
   // row gets a `‹` so its left edge is not read as the request's beginning.
@@ -779,7 +806,7 @@ function tlRow(rows, pctOf, span) {
       + `width:${Math.max(0, e.dur * 1000 / span * 100).toFixed(3)}%" title="${esc(stageTip(e))}"></i>`);
   }).join('');
   return `<div class="tl-row" data-key="${esc(head.key)}" style="--c:var(--${cvar(colorClass(fmtWho(head.o)))})">`
-    + `<div class="tl-lab" title="${esc(fmtWho(head.o))}${head.s ? ` · session ${esc(head.s)}` : ''} · ${esc(priOf(head.o))} priority">${swatch(fmtWho(head.o))}<b>${esc(head.o.session_label ? `#${head.o.session_label}` : fmtWho(head.o))}</b>${head.o.session_label || head.s ? priMark(head.o) : ''}</div>`
+    + `<div class="tl-lab" title="${esc(fmtWho(head.o))}${head.s ? ` · session ${esc(head.s)}` : ''} · ${esc(priOf(head.o))} priority">${swatch(fmtWho(head.o))}<b>${mark}${name}</b>${head.o.session_label || head.s ? priMark(head.o) : ''}</div>`
     + `<div class="tl-track">${cut}${segs}<span class="now"></span></div></div>`;
 }
 
@@ -903,12 +930,30 @@ function stagePlan(row, now) {
   }
   const out = [];
   // A request that left without an error and without serving cleanly (the
-  // client hung up, the queue refused it) still has to say so here.
+  // client hung up, the queue refused it) still has to say so here — ahead of
+  // the compaction branch below, or a summary the client abandoned mid-call
+  // would draw as one clean striped block.
   if (o.outcome && o.outcome !== 'ok') out.push(ev('e', end, 0, outcomePhrase(o)));
+  // A compaction is one striped block for the whole request, not a prefill and a
+  // decode: what it read and what it left behind is the interesting number, and
+  // splitting it would put a summarization prompt next to a tool call as if they
+  // were the same kind of turn.
+  if (o.kind === 'compaction') {
+    if (wM >= .05) out.push(ev('w', at, wM, `${fmtDur(wM)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
+    out.push(ev('c', dispatch, Math.max(0, preM + genM), compactionLine(o)));
+    return done(out, at, end);
+  }
   if (wM >= .05) out.push(ev('w', at, wM, `${fmtDur(wM)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
   if (preM >= .05) {
     out.push(ev('p', dispatch, preM, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(preM)}`
       + (o.cache_pct != null ? ` · cache ${o.cache_pct}%` : '')
+      // The thread's own history was just rewritten, so there is nothing of it
+      // left cached — the reason this prefill is cold, and the reason it is not
+      // counted as cache waste. Only said when the cache really did come back
+      // cold: a short turn after a summary can still hit a warm cache, and then
+      // the note would contradict the number in front of it.
+      + (o.kind === 'post-compact' && (o.cache_pct ?? 0) < 20
+        ? '<span class="more"> · cold after the summary</span>' : '')
       // Time this turn burned re-reading context the backend had evicted.
       + (o.waste_secs ? `<span class="st-bad"> · waste ${fmtSec1(o.waste_secs)}</span>` : '')
       // The rate divides the tokens actually evaluated (cache-excluded), like
@@ -961,6 +1006,9 @@ function renderDetails(rows) {
         : `<span class="badge warn" title="the first token has not arrived${pre ? ` \u2014 prefill runs at ${pre.txt} tok/s here (${pre.tip})` : ''}">prefill ${fmtDur(run.o.elapsed_secs)}</span>`)
       : wait ? `<span class="badge q" title="Position in this client's own queue">waiting #${wait.o.pos}</span>`
       : '';
+    // How many of this conversation's requests were summarization calls — the
+    // `⤓` that ties the striped blocks on the graph to the number beside the name.
+    const cmpN = unit.filter(x => x.o.kind === 'compaction').length;
     // The summary is three right-aligned columns so the numbers line up
     // across headers; on phones the columns drop their min-widths and wrap.
     const sum = `<span class="sum"><i>${unit.length} req</i><i>${fmtTok(unit.reduce((a, x) => a + rowTokens(x), 0))} tok</i>`
@@ -970,6 +1018,7 @@ function renderDetails(rows) {
       <span class="chev">${shut ? '▸' : '▾'}</span><span class="who">${esc(fmtWho(head.o))}</span>
       ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>${chip}
+      ${cmpN ? `<span class="badge cmp" title="${cmpN} summarization request${cmpN > 1 ? 's' : ''} attached to this conversation">⤓ ${cmpN}</span>` : ''}
       ${sum}
       ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(head.o.client)}" title="open this conversation in the viewer">\u2263 View</span>` : ''}</button>`);
     if (shut) continue;
@@ -1651,7 +1700,7 @@ function logConvs(rounds) {
       g = { kind: 'conv', key, user: e.user, session: e.session, label: e.session_label || null,
         models: new Set(), backends: new Set(), reqs: 0, inBytes: 0, outBytes: 0, errors: 0,
         first: e.at_ms, at: e.at_ms, rid: e.rid ?? null, lastStatus: null,
-        statusAt: 0, redacted: false, waiting: false };
+        statusAt: 0, redacted: false, waiting: false, cmp: 0 };
       byKey.set(key, g);
       items.push(g);
     }
@@ -1660,7 +1709,7 @@ function logConvs(rounds) {
     if (e.model) g.models.add(e.model);
     if (e.backend) g.backends.add(e.backend);
     if (e.redacted) g.redacted = true;
-    if (r.in) { g.reqs++; g.inBytes += num(/body=(\d+)B/, r.in.info); }
+    if (r.in) { g.reqs++; g.inBytes += num(/body=(\d+)B/, r.in.info); if (/· compaction/.test(r.in.info || '')) g.cmp++; }
     if (r.out) {
       g.outBytes += num(/resp=(\d+)B/, r.out.info);
       const st = num(/-> (\d{3})/, r.out.info);
@@ -1677,6 +1726,7 @@ function convSegs(g) {
   return `<span class="rl in"><span class="ar">\u2192</span>${g.reqs} req \u00b7 ${fmtBytes(g.inBytes)}</span>`
     + ` <span class="rl out${g.errors ? ' err' : ''}"><span class="ar">\u2190</span>${g.lastStatus ?? '…'} \u00b7 ${fmtBytes(g.outBytes)}</span>`
     + (g.waiting ? ' <span class="badge q">waiting</span>' : '')
+    + (g.cmp ? ` <span class="badge cmp" title="${g.cmp} summarization request${g.cmp > 1 ? 's' : ''} in this conversation">⤓ ${g.cmp}</span>` : '')
     + (g.errors ? ` <span class="badge bad">${g.errors} failed</span>` : '')
     + (g.redacted ? ' ' + REDACT_BADGE : '')
     + (captureOff() ? ' ' + NOCAP_BADGE : '');
@@ -2257,6 +2307,8 @@ function lvTurnHead(t, i) {
       <span>${lvStages(t)}</span>
       ${pv}${tb}
       ${t.redacted ? '<span class="badge warn" title="text not stored for this request — the client\'s X-Redact-Log header or its client, key or backend setting">redacted</span>' : ''}
+      ${t.kind === 'compaction' ? `<span class="badge cmp" title="${t.link ? `summarization request, attached to this conversation by ${esc(t.link)}` : 'summarization request — no conversation was found to attach it to'}">⤓ compaction</span>` : ''}
+      ${t.kind === 'post-compact' ? '<span class="badge cmp" title="the first request after a summarization call: its prefill is cold because the history was rewritten">⤑ post-compaction</span>' : ''}
       ${tail}</h3>`;
 }
 

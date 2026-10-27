@@ -17,6 +17,12 @@
   /* The decode stage's own green — deliberately not --ok (a softer teal, the
      colour decoding had before the short blue-prefill experiment). */
   --decode: #1baf7a;
+  /* A client's context-compaction request. Every status hue is taken (blue
+     waiting, amber prefill, teal decode, red error, violet/berry priority) and
+     so are the eight client identity hues, so this one is deliberately neutral
+     graphite and carries its meaning as a stripe pattern, not as a hue. */
+  --compact: #5b6478;
+  --compact-soft: #eceef2;
   --vip: #8a3ffc;
   --vip-soft: #f1e8ff;
   /* The two priority levels. Deliberately two different hues and neither a stage
@@ -63,6 +69,8 @@
     --bad: #ff6b66;
     --bad-soft: #321716;
     --decode: #199e70;
+    --compact: #939cb0;
+    --compact-soft: #262c38;
     --vip: #b48cff;
     --vip-soft: #261b3d;
     --pri-top: #b48cff;
@@ -134,6 +142,8 @@ main { min-width: 0; }
 .stat b { color: var(--text); font-variant-numeric: tabular-nums; }
 .stat.q b { color: var(--warn); } .stat.ok b { color: var(--ok); } .stat.bad b { color: var(--bad); }
 .stat.vip b { color: var(--vip); }
+/* The window's compaction count: same graphite as the stage it counts. */
+.stat.cmp, .stat.cmp b { color: var(--compact); }
 .page { display: none; padding: 24px 28px 48px; max-width: 1400px; }
 .page.active { display: block; }
 .page-h { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -177,6 +187,12 @@ tr.selected > td { background: var(--accent-soft); }
 .badge.q { background: transparent; color: var(--accent); border-color: var(--accent); }
 /* decoding / generating — the stage's own teal, matching the graph chip */
 .badge.dec { background: color-mix(in srgb, var(--decode) 14%, transparent); color: var(--decode); border-color: transparent; }
+/* A summarization request, wherever it is named: graph row label, Details
+   header, the conversation viewer's request header. */
+.badge.cmp { background: var(--compact-soft); color: var(--compact); border-color: transparent; }
+.tl-lab .cmp { color: var(--compact); font-weight: 700; margin-right: 4px; }
+.tl-lab .unl { color: var(--faint); font-weight: 500; font-size: 10.5px; }
+.det-h .cmp, .turn-h .cmp { color: var(--compact); font-weight: 700; }
 /* Session priority: one glyph, colour carries the level, no pill and no word —
    the tooltip says what it means and what a click does. `top` violet ▲, `high`
    berry △, and a grey ○ for "nothing yet": every live session wears one, because
@@ -752,6 +768,8 @@ tr.is-off td { color: var(--muted); }
 .tl-track .sg.p { background: var(--warn); }
 .tl-track .sg.g { background: var(--decode); }
 .tl-track .sg.e { background: var(--bad); }
+.tl-track .sg.c { background: repeating-linear-gradient(135deg, var(--compact) 0 3px,
+    color-mix(in srgb, var(--compact) 40%, transparent) 3px 6px); }
 .tl-track .now { position: absolute; right: 0; top: -1px; bottom: -1px;
   border-left: 1px solid var(--muted); }
 .tl-foot { padding: 7px 0 0; font-size: 11.5px; color: var(--faint); }
@@ -763,6 +781,8 @@ tr.is-off td { color: var(--muted); }
 .tl-legend .sw.p { background: var(--warn); }
 .tl-legend .sw.g { background: var(--decode); }
 .tl-legend .sw.e { background: var(--bad); }
+.tl-legend .sw.c { background: repeating-linear-gradient(135deg, var(--compact) 0 3px,
+    color-mix(in srgb, var(--compact) 40%, transparent) 3px 6px); }
 /* Details: one collapsible block per session. */
 .det-h { display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left;
   background: color-mix(in srgb, var(--c, var(--accent)) 7%, var(--surface));
@@ -799,6 +819,8 @@ tr.is-off td { color: var(--muted); }
 .det-row .st.p::before { background: var(--warn); }
 .det-row .st.g::before { background: var(--decode); }
 .det-row .st.e::before { background: var(--bad); }
+.det-row .st.c::before { background: repeating-linear-gradient(135deg, var(--compact) 0 3px,
+    color-mix(in srgb, var(--compact) 40%, transparent) 3px 6px); }
 .det-row .st.i::before { background: none; border: 1px dotted var(--faint); }
 .det-row .val { color: var(--muted); min-width: 0; }
 .det-row.dim .st, .det-row.dim .val { color: var(--faint); }

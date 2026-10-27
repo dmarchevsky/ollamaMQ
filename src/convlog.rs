@@ -177,6 +177,16 @@ pub struct Turn {
     pub outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// What this turn turned out to be: `Some("compaction")` for a client's
+    /// summarization request, `Some("post-compact")` for the turn that resumed
+    /// right after one; absent for ordinary turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// How a compaction turn was attached to this conversation (`recency`,
+    /// `recency, clear among 3`, `client header`) — display provenance only,
+    /// so an inferred link never reads as a stated one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub req: Option<BodyMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,6 +325,11 @@ pub struct Begin {
     pub queue_ms: Option<u64>,
     pub redacted: bool,
     pub msgs: Vec<MsgMeta>,
+    /// See [`Turn::kind`] — set where the request was recognized
+    /// (see [`crate::classify`]), not here.
+    pub kind: Option<String>,
+    /// See [`Turn::link`].
+    pub link: Option<String>,
 }
 
 pub struct Resp {
@@ -877,6 +892,8 @@ impl ConvLogger {
                     status: None,
                     outcome: None,
                     priority: Some(b.priority),
+                    kind: b.kind,
+                    link: b.link,
                     req: Some(BodyMeta {
                         bytes: b.bytes,
                         chars: None,
@@ -1221,6 +1238,8 @@ mod tests {
 
     fn begin(key: &str, rid: u64, at: u64) -> Note {
         Note::Begin(Box::new(Begin {
+            kind: None,
+            link: None,
             key: key.into(),
             rid,
             user: key.split('#').next().unwrap().into(),
@@ -1509,6 +1528,8 @@ mod tests {
         for (key, end) in [("a#s", 1000u64), ("b#s", 2000)] {
             store.entry(key, key.split('#').next().unwrap()).conv.end_ms = end;
             store.entries.get_mut(key).unwrap().conv.turns.push(Turn {
+                kind: None,
+                link: None,
                 rid: end,
                 at_ms: end,
                 tl: StageMs::default(),

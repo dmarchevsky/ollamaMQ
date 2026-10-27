@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
 };
 use crate::config::{ClientPriority, StickyMode};
+use crate::classify;
 use serde::Deserializer as _;
 use std::hash::Hasher;
 use crate::lock::LockExt;
@@ -106,6 +107,14 @@ pub struct Task {
     /// Tools the request's messages name — what the agent did between the
     /// previous turn and this one. Names the idle line in the Overview.
     pub tools: Vec<String>,
+    /// `Some("compaction")` when this is a client's summarization request, or
+    /// `Some("post-compact")` when it is the thread resuming right after one
+    /// (see [`classify`]); `None` for ordinary traffic. Carried to the stats
+    /// record and the log, and it exempts the turn from cache-waste accounting.
+    pub kind: Option<&'static str>,
+    /// How a compaction was attached to its conversation (`recency`,
+    /// `client header`, …) — display provenance, `None` when unlinked.
+    pub link: Option<String>,
 }
 
 /// Which API flavours a backend speaks — and, on the route side of the
@@ -3627,6 +3636,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     rid: Some(dropped.rid),
                                     queue_wait: Some(dropped.queued_at.elapsed().as_secs_f64()),
                                     tools: dropped.tools.clone(),
+                                    session_key: dropped.session_key.clone(),
+                                    kind: dropped.kind,
+                                    link: dropped.link.clone(),
                                     stage: crate::convlog::StageMs {
                                         queue: Some(dropped.queue_ms),
                                         dispatch: None,
@@ -3889,6 +3901,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                     // (never reconstructed from durations afterwards).
                     let conv_key = task.conv_key.clone();
                     let tools = task.tools.clone();
+                    let session_key = task.session_key.clone();
+                    let kind = task.kind;
+                    let comp_link = task.link.clone();
                     let queue_ms = task.queue_ms;
                     let dispatch_ms = crate::convlog::now_unix_millis();
                     state_clone.convlog.note(crate::convlog::Note::Stage {
@@ -3932,6 +3947,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                             rid: Some(rid),
                             queue_wait: Some(queue_wait),
                             tools: tools.clone(),
+                            session_key: session_key.clone(),
+                            kind,
+                            link: comp_link.clone(),
                             stage: crate::convlog::StageMs {
                                 queue: Some(queue_ms),
                                 dispatch: Some(dispatch_ms),
@@ -4184,11 +4202,21 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     // `estimate_cache_waste`). Read before the
                                     // entry below overwrites it.
                                     let served = status.is_success() && !client_disconnected;
-                                    let prior = served
+                                    // A compaction shares no prefix with the thread it
+                                    // summarizes — its body starts with its own
+                                    // summarization prompt — so its cold prefill is
+                                    // neither a cache loss nor cache state: charging it
+                                    // would blame the thread's backend for evicting
+                                    // context the summary never re-fed, and recording it
+                                    // would overwrite what that thread's next turn may
+                                    // still expect from its own prefix.
+                                    let cache_watched =
+                                        served && task.kind != Some(classify::KIND_COMPACTION);
+                                    let prior = cache_watched
                                         .then_some(task.session_key.as_ref())
                                         .flatten()
                                         .and_then(|k| conv_cache_prior(&state_clone, k, &backend_url));
-                                    let waste_secs = served
+                                    let waste_secs = cache_watched
                                         .then(|| {
                                             let u = usage?;
                                             let ps = u.prompt_secs?;
@@ -4218,8 +4246,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                                         // call) keeps queue priority while the
                                         // session visibly stays active.
                                         reserve_slot(&state_clone, key);
-                                        if let Some(hit) =
-                                            usage.and_then(|u| cache_hit_pct(u.prompt, u.prompt_eval))
+                                        if cache_watched
+                                            && let Some(hit) =
+                                                usage.and_then(|u| cache_hit_pct(u.prompt, u.prompt_eval))
                                         {
                                             // What the next turn must re-feed
                                             // if the cache keeps nothing of
@@ -4557,6 +4586,8 @@ pub async fn proxy_handler(
                 queue_ms: None,
                 redacted: false,
                 msgs: vec![],
+                kind: None,
+                link: None,
             },
         )));
         state.convlog.note(crate::convlog::Note::Resp(Box::new(
@@ -4644,15 +4675,16 @@ pub async fn proxy_handler(
     }
 
     let task_method = method.as_str().to_string();
+    let sticky = StickyMode::from_u8(
+        state
+            .sticky_mode
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
     // Sticky routing needs to know which conversation this request belongs to,
     // and that can only be answered while the body is here (see
     // [`derive_session_key`]).
     let session_key = derive_session_key(
-        StickyMode::from_u8(
-            state
-                .sticky_mode
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
+        sticky,
         &path,
         &headers,
         &body,
@@ -4661,18 +4693,76 @@ pub async fn proxy_handler(
     );
     // Before the queues lock below: this takes the backends lock.
     let model_label = state.model_label(requested_model.as_deref());
+    // Which API key sent it, resolved once: the same string the stats ring and
+    // the per-key metrics label carry, so it is also what a compaction links
+    // its candidate parents on.
+    let key_label = client.as_ref().map(|c| {
+        if c.key_label.is_empty() {
+            c.key_id.clone()
+        } else {
+            c.key_label.clone()
+        }
+    });
+    // A client that ran out of context does not say so: it sends an ordinary
+    // completion with its own summarization prompt and a fresh conversation id,
+    // which would otherwise appear as a brand-new conversation with an enormous
+    // prompt and a cold prefill. Recognize it here — while the body is in hand —
+    // and attach it to the thread it summarizes, so it reads as one conversation
+    // and is served at that thread's level (see [`crate::classify`],
+    // [`crate::link`]). The scan is a bounded prefix of bytes we already hash.
+    let mut kind: Option<&'static str> = None;
+    let mut compaction_link: Option<String> = None;
+    let mut inherited: Option<&str> = None;
+    let mut inherited_label: Option<String> = None;
+    let mut session_key = session_key;
+    if classify::header_flag(&headers) || classify::is_compaction(&body) {
+        kind = Some(classify::KIND_COMPACTION);
+        let named = classify::header_of(&headers);
+        let cands = state.stats.compaction_candidates(
+            &user_id,
+            &crate::stats::key_or_none(&key_label),
+            &model_label,
+            session_key.as_ref().map(|k| k.conversation.as_str()),
+            named.as_deref(),
+        );
+        if let Some(att) = crate::link::resolve(&cands, named.is_some()) {
+            // The attachment replaces the summary's own identity: the parent's
+            // affinity (the model is already loaded there), its scheduling level,
+            // and its conversation row and log. Unlinked stays exactly as it was.
+            compaction_link = Some(att.provenance);
+            inherited = Some(att.priority);
+            inherited_label = att.label;
+            if sticky != StickyMode::Off {
+                session_key = Some(att.key);
+            }
+        }
+    } else if let Some(key) = session_key.as_ref()
+        && state.stats.last_kind(key) == Some(classify::KIND_COMPACTION)
+    {
+        // The turn right after a summary: its cold prefill now says why.
+        kind = Some(classify::KIND_POST_COMPACT);
+    }
     // Kept copy of the conversation tag: `session_key` moves into the task.
     let session_tag = session_key.as_ref().map(SessionKey::tag);
     // The label is display-only and the priority is resolved here, once: the
     // pin can also come from the operator, and the client's claim is capped by
-    // `settings.client_priority`.
-    let session_label = session_label_header(&headers);
-    let priority = resolve_priority(
-        state.as_ref(),
-        &headers,
-        client.is_some(),
-        session_key.as_ref(),
-    );
+    // `settings.client_priority`. A linked compaction goes out at the level its
+    // thread is being served at — so an inherited `top` also takes the one extra
+    // overbook slot that level buys, which is what "same priority as the parent"
+    // means taken literally.
+    // A summary carries no name of its own (the client sends its summarization
+    // prompt with a fresh id and nothing else), so it wears the thread's — the
+    // one row should not read as a hex tag beside the conversation it names.
+    let session_label = session_label_header(&headers).or(inherited_label);
+    let priority = match inherited.and_then(Priority::from_name) {
+        Some(level) => level,
+        None => resolve_priority(
+            state.as_ref(),
+            &headers,
+            client.is_some(),
+            session_key.as_ref(),
+        ),
+    };
     // Correlation id shared by this request's IN/OUT log events (the web UI
     // pairs the two records with it).
     let rid = state.next_rid();
@@ -4705,19 +4795,15 @@ pub async fn proxy_handler(
         queued_at: std::time::Instant::now(),
         queue_ms: crate::convlog::now_unix_millis(),
         conv_key: crate::convlog::key_for(&user_id, session_tag.as_deref(), rid),
-        key_label: client.as_ref().map(|c| {
-            if c.key_label.is_empty() {
-                c.key_id.clone()
-            } else {
-                c.key_label.clone()
-            }
-        }),
+        key_label: key_label.clone(),
         session_key,
         session_label: session_label.clone(),
         priority,
         rid,
         redact_text,
         tools,
+        kind,
+        link: compaction_link.clone(),
     };
     // `task` moves into the queue below; the log needs its key afterwards too.
     let conv_key = task.conv_key.clone();
@@ -4770,6 +4856,9 @@ pub async fn proxy_handler(
                 priority: priority.as_str(),
                 rid: Some(task.rid),
                 tools: task.tools.clone(),
+                session_key: task.session_key.clone(),
+                kind: task.kind,
+                link: task.link.clone(),
                 queue_wait: None,
                 stage: crate::convlog::StageMs::default(),
                 timing: Default::default(),
@@ -4831,6 +4920,9 @@ pub async fn proxy_handler(
                 priority: priority.as_str(),
                 rid: Some(task.rid),
                 tools: task.tools.clone(),
+                session_key: task.session_key.clone(),
+                kind: task.kind,
+                link: task.link.clone(),
                 queue_wait: None,
                 stage: crate::convlog::StageMs::default(),
                 timing: Default::default(),
@@ -4880,6 +4972,8 @@ pub async fn proxy_handler(
             queue_ms: Some(queue_ms),
             redacted: redact_text,
             msgs,
+            kind: kind.map(str::to_string),
+            link: compaction_link.clone(),
         },
     )));
     if let Some(text) = content.clone() {
@@ -4897,7 +4991,15 @@ pub async fn proxy_handler(
         user: user_id.clone(),
         model: requested_model.clone(),
         backend: None,
-        info: format!("{} {} body={}B", task_method, path, body_len),
+        info: format!("{} {} body={}B{}", task_method, path, body_len,
+            // The request log is read as text, so what the request turned out to
+            // be belongs on its own line: whoever is reading the log should not
+            // have to recognize a summarization call again by eye.
+            match kind {
+                Some(classify::KIND_COMPACTION) => " \u{b7} compaction",
+                Some(classify::KIND_POST_COMPACT) => " \u{b7} post-compact",
+                _ => "",
+            }),
         content,
         rid: Some(rid),
         session: session_tag.clone(),
@@ -5624,6 +5726,8 @@ mod tests {
         {
             let mut queues = state.queues.lock_or_recover();
             queues.entry("tester".to_string()).or_default().push_back(Task {
+                kind: None,
+                link: None,
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
@@ -5718,6 +5822,8 @@ mod tests {
             .entry("tester".to_string())
             .or_default()
             .push_back(Task {
+                kind: None,
+                link: None,
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
@@ -6119,6 +6225,8 @@ mod tests {
         add_test_client(&state, "old", "rename-key-01");
         let (tx, _rx) = mpsc::channel(1);
         state.queues.lock_or_recover().entry("old".into()).or_default().push_back(Task {
+            kind: None,
+            link: None,
             method: Method::POST,
             queue_ms: crate::convlog::now_unix_millis(),
             conv_key: "t·1".into(),
@@ -6395,6 +6503,9 @@ mod tests {
             ..Default::default()
         };
         state.stats.record(crate::stats::Finished {
+            session_key: None,
+            kind: None,
+            link: None,
             at_ms: crate::stats::now_ms(),
             client: "tester".into(),
             key: "none".into(),
@@ -6784,6 +6895,8 @@ mod tests {
             .entry("tester".to_string())
             .or_default()
             .push_back(Task {
+                kind: None,
+                link: None,
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
@@ -7559,6 +7672,8 @@ mod tests {
                 let (tx, rx) = mpsc::channel(32);
                 keep_alive.push(rx);
                 q.push_back(Task {
+                    kind: None,
+                    link: None,
                     method: Method::POST,
                     queue_ms: crate::convlog::now_unix_millis(),
                     conv_key: "t·1".into(),
@@ -7659,6 +7774,8 @@ mod tests {
     fn task_with(level: Priority) -> Task {
         let (tx, _rx) = mpsc::channel(1);
         Task {
+            kind: None,
+            link: None,
             method: Method::POST,
             queue_ms: crate::convlog::now_unix_millis(),
             conv_key: "t·1".into(),
@@ -7926,6 +8043,8 @@ mod tests {
             .entry("tester".to_string())
             .or_default()
             .push_back(Task {
+                kind: None,
+                link: None,
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
@@ -8354,6 +8473,8 @@ mod tests {
                 .entry("waiting".to_string())
                 .or_default()
                 .push_back(Task {
+                    kind: None,
+                    link: None,
                     method: Method::POST,
                     queue_ms: crate::convlog::now_unix_millis(),
                     conv_key: "t·1".into(),
@@ -8814,6 +8935,8 @@ mod tests {
             .entry("tester".to_string())
             .or_default()
             .push_back(Task {
+                kind: None,
+                link: None,
                 method: Method::GET,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
@@ -8982,6 +9105,8 @@ mod tests {
             .entry("tester".to_string())
             .or_default()
             .push_back(Task {
+                kind: None,
+                link: None,
                 method: Method::POST,
                 queue_ms: crate::convlog::now_unix_millis(),
                 conv_key: "t·1".into(),
