@@ -17,7 +17,7 @@
 //!   "Summarize the nature of the changes", and a mislabelled row is worse than
 //!   a missing one.
 //! * **A bounded head window.** Every marker below sits in the first message the
-//!   client sends (pi's is at byte 83 of the body), so a 32 KiB prefix is
+//!   client sends (pi's marker sits at byte 73 of the captured body), so a 32 KiB prefix is
 //!   enough and a 4 MB body is never scanned. This runs on the request path, on
 //!   the same buffer [`crate::dispatcher::derive_session_key`] already
 //!   fingerprints.
@@ -137,7 +137,7 @@ mod tests {
     use super::*;
 
     /// The head of a real captured pi compaction request
-    /// (`logs/ollamamq-requests.jsonl.2`, 285 694 B), marker at byte 83.
+    /// (`logs/ollamamq-requests.jsonl.2`, 285 694 B), marker at byte 73.
     const PI_BODY: &str = r#"{"model":"Qwen3.8-Flash-Next","messages":[{"role":"developer","content":"You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation."},{"role":"user","content":"<conversation>\n[User]: fix the auth\n"}]}"#;
 
     #[test]

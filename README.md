@@ -808,7 +808,7 @@ where they belong.
 
 **Recognition.** Nothing on the routes this proxy serves marks the call, so the marker is the
 client's own prompt — one of these whole sentences, looked for in the first 32 KiB of the body
-(every known marker sits in the first message; pi's is at byte 83):
+(every known marker sits in the first message; pi's sits at byte 73 of a real capture):
 
 | client | its summarization prompt begins |
 | --- | --- |
@@ -873,7 +873,7 @@ client caused. The proxy therefore recognizes those requests and puts them where
 
 **Recognition.** Nothing on the routes this proxy serves marks a summarization call, so the
 marker is the client's own prompt text — one of these whole sentences, searched for in the
-first 32 KiB of the body (every known marker sits in the first message; pi's is at byte 83):
+first 32 KiB of the body (every known marker sits in the first message; pi's sits at byte 73 of a real capture):
 
 | client | marker sentence (start of its summarization prompt) |
 | --- | --- |
