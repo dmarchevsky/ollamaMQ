@@ -781,12 +781,20 @@ function tlRow(rows, pctOf, span) {
   // summary nothing could be attached to stands on its own and says that too,
   // instead of passing for a conversation of its own.
   const cmp = rows.filter(r => r.o.kind === 'compaction');
-  const orphan = cmp.length && cmp.length === rows.length && cmp.every(r => !r.o.link);
+  const loose = cmp.filter(r => !r.o.link).length;
+  // A summary nothing could be attached to keeps a row of its own, and that row
+  // is named for what it is instead of pretending to be a conversation.
+  const orphan = cmp.length > 0 && loose === cmp.length && loose === rows.length;
   const mark = cmp.length
     ? '<span class="cmp" title="' + cmp.length + ' summarization request'
-      + (cmp.length > 1 ? 's' : '') + (orphan ? ' · nothing to attach them to' : ' attached to this conversation') + '">⤓</span>'
+      + (cmp.length > 1 ? 's' : '')
+      + (loose === cmp.length
+        ? ' · nothing to attach them to'
+        : ` attached to this conversation${loose ? ` · ${loose} unlinked` : ''}`)
+      + '">⤓</span>'
     : '';
-  const name = orphan ? 'compaction <span class="unl">· unlinked</span>'
+  const name = orphan
+    ? 'compaction <span class="unl">· unlinked</span>'
     : esc(head.o.session_label ? `#${head.o.session_label}` : fmtWho(head.o));
   // Each stage is placed in the track by itself: left = when it began, width =
   // how long it ran. A stage that runs off either edge is clipped there and the
@@ -921,6 +929,11 @@ function stagePlan(row, now) {
     return done(out, at, end);
   }
   const out = [];
+  // A request that left without an error and without serving cleanly (the
+  // client hung up, the queue refused it) still has to say so here — ahead of
+  // the compaction branch below, or a summary the client abandoned mid-call
+  // would draw as one clean striped block.
+  if (o.outcome && o.outcome !== 'ok') out.push(ev('e', end, 0, outcomePhrase(o)));
   // A compaction is one striped block for the whole request, not a prefill and a
   // decode: what it read and what it left behind is the interesting number, and
   // splitting it would put a summarization prompt next to a tool call as if they
@@ -930,9 +943,6 @@ function stagePlan(row, now) {
     out.push(ev('c', dispatch, Math.max(0, preM + genM), compactionLine(o)));
     return done(out, at, end);
   }
-  // A request that left without an error and without serving cleanly (the
-  // client hung up, the queue refused it) still has to say so here.
-  if (o.outcome && o.outcome !== 'ok') out.push(ev('e', end, 0, outcomePhrase(o)));
   if (wM >= .05) out.push(ev('w', at, wM, `${fmtDur(wM)} · prompt ${fmtTok(o.prompt_tokens)} tok`));
   if (preM >= .05) {
     out.push(ev('p', dispatch, preM, `${fmtTok(o.prompt_tokens)} tok · ${fmtSec1(preM)}`
