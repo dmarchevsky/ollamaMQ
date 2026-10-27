@@ -88,7 +88,7 @@ static ANCHORS: [&[u8]; 2] = [b"\"content\":", b"\"text\":"];
 const ANCHOR_SLACK: usize = 32;
 
 /// The whitespace a JSON writer may put between a colon and its value.
-const WS: [u8; 4] = [b' ', b'\n', b'\t', b'\r'];
+const WS: [u8; 4] = *b" \n\t\r";
 
 fn trim_ws(b: &[u8]) -> &[u8] {
     match b.iter().rposition(|c| !WS.contains(c)) {
@@ -269,7 +269,7 @@ mod tests {
         // message that does open with it is still found, because every hit in
         // the window is checked, not just the first.
         let mut deep = b"{\"messages\":[{\"content\":\"".to_vec();
-        deep.extend_from_slice(&vec![b'x'; ANCHOR_SLACK + 8]);
+        deep.extend_from_slice(&[b'x'; ANCHOR_SLACK + 8]);
         deep.extend_from_slice(MARKERS[0].phrase);
         deep.extend_from_slice(b"\"}]}");
         assert!(!is_compaction(&deep));
