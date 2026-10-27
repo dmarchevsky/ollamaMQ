@@ -11,9 +11,9 @@ since upstream `v0.5.0`.
   runs out of context it asks the model to summarize what it has and carries on from that summary —
   and on the proxy that call arrived as a brand-new conversation with an enormous prompt and a cold
   cache on a warm backend. The proxy now recognizes those requests (pi / pi-web / OpenClaw,
-  opencode, Claude Code, Cline, Roo Code — matched on the whole marker sentence in the first 32 KiB
-  of the body, never on a keyword, so the commit-message prompt cannot trigger it; `X-Compaction: 1`
-  is the explicit path), attaches each one to the conversation it summarizes (same client, key and
+  opencode, Claude Code, Cline, Roo Code — matched on the whole marker sentence **opening a
+  message** in the first 32 KiB of the body, never on a keyword and never on a quoted mention, so a
+  turn that merely talks about summarizing stays ordinary; `X-Compaction: 1` is the explicit path), attaches each one to the conversation it summarizes (same client, key and
   model, active within 120 s; `X-Compaction-Of: <tag>` names the parent exactly, and a tie stays
   explicitly **unlinked** rather than being guessed), and hands it the parent's affinity, priority
   and conversation row. In Activity the summary is one striped graphite block on its parent's row,

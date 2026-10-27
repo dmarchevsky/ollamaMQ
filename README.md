@@ -817,11 +817,17 @@ client's own prompt — one of these whole sentences, looked for in the first 32
 | Claude Code, Cline, Roo Code | `Your task is to create a detailed summary of the conversation so far` |
 
 Whole sentences, never keywords — the commit-message tool prompt in ordinary traffic says
-*“Summarize the nature of the changes”*, and a mislabelled row is worse than a missing one. The
-scan runs on the raw body in memory, so a client whose body text is redacted is still recognized
-and nothing new is stored either way; a client that knows what it is doing can skip the guess
-with **`X-Compaction: 1`**. Not recognized: **OpenAI Codex CLI**, which appends its compaction
-prompt *after* the history — past any bounded window. Its summaries arrive as ordinary requests.
+*“Summarize the nature of the changes”*, and a mislabelled row is worse than a missing one. And
+the sentence has to **open** a message (`"content":"You are a context…`), not merely appear in
+one: a request that quotes a summarization prompt is ordinary traffic, and it cannot be mistaken
+for the real thing, because text inside a message arrives JSON-escaped (`\"content\":\"You are…`)
+and never reads as that boundary. That rule was earned the hard way — an operator debugging the
+proxy pasted the pi marker into a `curl` example, and every later turn of that session carried it
+in a tool call and filed itself as a compaction. The scan runs on the raw body in memory, so a
+client whose body text is redacted is still recognized and nothing new is stored either way; a
+client that knows what it is doing can skip the guess with **`X-Compaction: 1`**. Not recognized:
+**OpenAI Codex CLI**, which appends its compaction prompt *after* the history — past any bounded
+window. Its summaries arrive as ordinary requests.
 
 **Attachment.** The summary belongs to the conversation it summarizes, and it has to be attached
 before dispatch because the answer also decides where the request is queued. Candidates are
@@ -861,68 +867,6 @@ text still redacted when the client asked for that.
 
 In the request log a turn may carry `kind` (`compaction`, `post-compact`) and `link` (the
 provenance string above); ordinary turns carry neither.
-
-### 🧩 Context Compaction
-
-A coding agent that fills its context window does not open a new conversation — it asks the
-model to summarize the one it has, then continues from that summary. The summarization call is
-an ordinary chat completion on this proxy, and left alone it reads as nonsense: a brand-new
-conversation with an enormous prompt (a captured pi summary read 71 355 tokens and wrote 1 120),
-a cold cache on a warm backend, and a `waste` figure that blames the backend for a re-read the
-client caused. The proxy therefore recognizes those requests and puts them where they belong.
-
-**Recognition.** Nothing on the routes this proxy serves marks a summarization call, so the
-marker is the client's own prompt text — one of these whole sentences, searched for in the
-first 32 KiB of the body (every known marker sits in the first message; pi's sits at byte 73 of a real capture):
-
-| client | marker sentence (start of its summarization prompt) |
-| --- | --- |
-| pi, pi-web, OpenClaw | `You are a context summarization assistant. Your task is to read a conversation` |
-| opencode | `You are a helpful AI assistant tasked with summarizing conversations.` |
-| Claude Code, Cline, Roo Code | `Your task is to create a detailed summary of the conversation so far` |
-
-Whole sentences, never keywords: the git commit-message prompt in ordinary traffic says
-*“Summarize the nature of the changes”*, and a mislabelled row is worse than a missing one.
-The scan runs on the raw body in memory, so it works for a client whose body text is
-redacted (nothing new is stored either way), and a client that knows what it is doing can skip
-the guess entirely with **`X-Compaction: 1`**. Not recognized: **OpenAI Codex CLI**, which
-appends its compaction prompt *after* the history — past any bounded window. A summary it
-sends will appear as an ordinary request.
-
-**Attachment.** A summary belongs to the conversation it summarizes, and it has to be attached
-*before* dispatch, because the answer also decides where the request is queued. Candidates are
-the same authenticated client and key with a request in the last 120 seconds (the socket is
-never part of this — one pi thread arrived over `:48290` and its summary over `:50302`). One
-candidate wins; several need a clear winner — the newest no more than 30 s old **and** the
-runner-up at least 3× older. Anything else stays an explicitly **unlinked** row, and each
-attachment says in its tooltip whether it came from `client header`, plain `recency`, or
-`recency, clear among N`. The client can settle it exactly with **`X-Compaction-Of:
-<session tag>`**, which must match a candidate or it is ignored rather than guessed at.
-
-Attaching a summary to its parent means it inherits the parent's backend affinity and its
-priority level, and it shows up as one striped block on the parent's Activity row instead of a
-mystery session of its own.
-
-**What it changes about the numbers.** A summary's cold prefill is not an eviction, so
-compactions are excluded from the cache-waste accounting (otherwise every compaction would
-charge the backend tens of seconds of waste it never caused). The turn that resumes right
-after a summary is stored as `post-compact`: its prefill is cold because the history was
-rewritten, and the stage line says `cache 0% · cold after the summary` instead of looking like
-a cache miss. Token and request totals per client are unchanged — a compaction is real traffic
-and is counted as one.
-
-**Where it shows.** In **Activity** the block is striped graphite (no status hue or client hue
-was free, so it carries its meaning as texture), the conversation's label gains a `⤓`, and an
-unlinked summary keeps its own row labelled `compaction · unlinked`. The window counter
-`⤓ Compact N` counts conversations that compacted in the window, not summarization requests —
-pi writes two per compaction (the history, then the split turn's prefix). In **Details** the
-stage line reads `compaction 71k tok → 1.1k tok · recency`: what it read, what it left
-behind, and how it was attached. On the **Logs** page the request line carries
-`body=285694B · compaction`, the conversation row a `⤓ N` badge, and the conversation viewer
-marks the turn itself — with the text still redacted if the client asked for that.
-
-In the request log each turn may carry `kind` (`compaction`, `post-compact`) and `link`
-(the provenance string above); ordinary turns carry neither.
 
 ### Cache-Aware Hold-Back
 
