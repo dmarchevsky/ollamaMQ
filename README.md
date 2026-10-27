@@ -24,6 +24,7 @@
 - **Cache-Aware Hold-Back**: On a backend that reports KV-cache telemetry (llama.cpp/halogen with `--metrics`), a conversation whose last turn mostly *missed* that cache — and whose estimated next-turn prefill does not fit the free KV — lines up behind the conversations served most recently instead of forcing a context switch and a full re-prefill every round. A session that just finished a turn also keeps queue priority for its follow-up for ~5 s (adaptive: 1.5x the session's own worst recent pause, 2–30 s), so an agent runs its whole cycle on its backend undisturbed; at most 64 reserved wins in a row, and any held request yields at most 16 times, so neither mechanism can starve anyone. Plain Ollama (no telemetry) keeps the plain fair order.
 - **Sticky Routing (Session Affinity)**: A conversation goes back to the backend that served its previous turn, so a long multi-turn prompt is not re-prefilled on a backend with no KV slot for it. The key is an explicit session id when the client sends one, else a fingerprint of the conversation's first turn (see [Sticky Routing](#-sticky-routing-session-affinity)).
 - **Session Labels & Priority**: A client can name its conversation (`X-Session-Name`) so it reads as `#refactor-auth` instead of `#a3f19c`, and ask for it to jump the queue (`X-Session-Priority: high|top`) as far as `settings.client_priority` allows. The operator can pin any live session from the icon beside it or from the API. `top` goes first on the whole board and may overbook its own backend by one slot (see [Session Labels & Priority](#-session-labels--priority)).
+- **Compaction Awareness**: When a coding agent runs out of context it asks the model to summarize the conversation, and that summarization call lands on the same proxy as everything else — a huge prompt, a cold cache, a conversation that appears from nowhere. The proxy recognizes those requests (pi/OpenClaw, opencode, Claude Code, Cline/Roo, or an explicit `X-Compaction` header), draws them inside the conversation they summarize instead of as a mystery session, and stops charging their cold prefill to the backend as cache waste (see [Context Compaction](#-context-compaction)).
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **Per-Request Log Redaction**: Any request can keep its own body text out of the conversation log by sending the `X-Redact-Log` header — its presence is the flag, the value is ignored, no API key required. The entry still records status, size, timing and message roles, and the request is served exactly as before (see [Request logging](#request-logging)).
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
@@ -415,6 +416,7 @@ Each turn is one proxied request and its response:
 | `method`, `path`, `status`, `outcome`, `model`, `backend`, `priority` | the request line, its answer, and how it ended (`ok`, `timeout`, `client_gone`, `dropped`, …) |
 | `req`, `resp` | `{bytes, chars, truncated}` per direction — sizes, never text |
 | `prompt_tokens`, `completion_tokens`, `waste_secs` | usage as reported, plus prefill seconds lost to a KV-cache eviction |
+| `kind`, `link` | `"compaction"` on a request that summarizes a conversation (or `"post-compact"` on the first turn after one), plus how it was attached to the conversation it belongs to (`header`, `recency`, `content`) — both absent on ordinary traffic |
 | `msgs[]` | one entry per request message — `role`, `chars`, and `name`/`calls` when it carries a tool name or issues tool calls. Roles and sizes, never text |
 | `redacted` | body capture was switched off for this turn |
 | `content` | `req`/`resp` captured text, cut to `log_content_limit` with a `...[truncated: N bytes total]` marker; absent when nothing was stored |
@@ -793,6 +795,134 @@ there is nothing yet to look the conversation up in. It takes effect on that con
 away mid-flight). The icon beside the session shows the pin, so the click visibly sticks even
 on a finished row. Pins live in memory and are dropped once nothing carries the tag for
 `sticky_ttl`, so a restart returns everything to `normal`.
+
+### 🧩 Context Compaction
+
+A coding agent that runs out of context does not start a new conversation: it asks the model to
+summarize the one it has and continues from the summary. That summarization call is an ordinary
+chat completion on this proxy, and on its own it reads as nonsense — pi hands it a fresh session
+id and no `prompt_cache_key`, so a conversation that has been running for an hour arrives as a
+brand-new session with an enormous prompt (one captured summary read 71 355 tokens and wrote
+1 120) and a cold cache on a warm backend. The proxy recognizes those requests and puts them
+where they belong.
+
+**Recognition.** Nothing on the routes this proxy serves marks the call, so the marker is the
+client's own prompt — one of these whole sentences, looked for in the first 32 KiB of the body
+(every known marker sits in the first message; pi's is at byte 83):
+
+| client | its summarization prompt begins |
+| --- | --- |
+| pi, pi-web, OpenClaw | `You are a context summarization assistant. Your task is to read a conversation` |
+| opencode | `You are a helpful AI assistant tasked with summarizing conversations.` |
+| Claude Code, Cline, Roo Code | `Your task is to create a detailed summary of the conversation so far` |
+
+Whole sentences, never keywords — the commit-message tool prompt in ordinary traffic says
+*“Summarize the nature of the changes”*, and a mislabelled row is worse than a missing one. The
+scan runs on the raw body in memory, so a client whose body text is redacted is still recognized
+and nothing new is stored either way; a client that knows what it is doing can skip the guess
+with **`X-Compaction: 1`**. Not recognized: **OpenAI Codex CLI**, which appends its compaction
+prompt *after* the history — past any bounded window. Its summaries arrive as ordinary requests.
+
+**Attachment.** The summary belongs to the conversation it summarizes, and it has to be attached
+before dispatch because the answer also decides where the request is queued. Candidates are
+finished requests from the same authenticated client, the same key and the same model that were
+active in the last 120 seconds (the socket is never part of it — one pi thread arrived over
+`:48290` and its summary over `:50302`). One candidate wins; several need a clear winner: the
+newest no more than 30 s old **and** the runner-up at least 3× older. Anything else stays an
+explicitly **unlinked** row, because two live threads cannot be told apart by their clocks — and
+not by their size either: that 285 KB summary compressed a 4.3 MB context, because clients
+truncate tool results when they serialize a thread. Every attachment names how it was chosen
+(`client header`, `recency`, `recency, clear among 3`), so an inferred link never reads as a
+stated one. A client can settle it exactly with **`X-Compaction-Of: <session tag>`**; if that tag
+matches nothing the guess is dropped rather than made anyway.
+
+An attached summary takes the parent's backend affinity (its model is loaded there already), its
+priority level — an inherited `top` also takes the one overbook slot that level buys — and its
+conversation row and log entry.
+
+**What it changes about the numbers.** A summary's cold prefill is not an eviction, so
+compactions are left out of the cache-waste accounting; without that, every compaction charges
+its backend tens of seconds of waste it never caused. The turn that resumes right after a
+summary is stored as `post-compact`, so its cold prefill says why: the stage line reads
+`cache 0% · cold after the summary` instead of looking like the backend dropped the context.
+Per-client request and token totals are untouched — a compaction is real traffic and counts as
+one request.
+
+**Where it shows.** In Activity the summary is one striped graphite block on the parent's row
+(no status hue or client hue was free, so it carries its meaning as texture, not as colour);
+the conversation's label gains a `⤓`, and a summary nothing could be attached to keeps its own
+row, labelled `compaction · unlinked`. The top bar counts `⤓ Compact N` — conversations that
+compacted in the window, not summarization requests, since pi writes two per compaction (the
+history, then the split turn's prefix). A Details line reads
+`compaction 71k tok → 1.1k tok · recency`: what it read, what it left behind, how it was
+attached. On the Logs page the request line carries `body=285694B · compaction`, the
+conversation row a `⤓ N` badge, and the conversation viewer marks the turn itself — with its
+text still redacted when the client asked for that.
+
+In the request log a turn may carry `kind` (`compaction`, `post-compact`) and `link` (the
+provenance string above); ordinary turns carry neither.
+
+### 🧩 Context Compaction
+
+A coding agent that fills its context window does not open a new conversation — it asks the
+model to summarize the one it has, then continues from that summary. The summarization call is
+an ordinary chat completion on this proxy, and left alone it reads as nonsense: a brand-new
+conversation with an enormous prompt (a captured pi summary read 71 355 tokens and wrote 1 120),
+a cold cache on a warm backend, and a `waste` figure that blames the backend for a re-read the
+client caused. The proxy therefore recognizes those requests and puts them where they belong.
+
+**Recognition.** Nothing on the routes this proxy serves marks a summarization call, so the
+marker is the client's own prompt text — one of these whole sentences, searched for in the
+first 32 KiB of the body (every known marker sits in the first message; pi's is at byte 83):
+
+| client | marker sentence (start of its summarization prompt) |
+| --- | --- |
+| pi, pi-web, OpenClaw | `You are a context summarization assistant. Your task is to read a conversation` |
+| opencode | `You are a helpful AI assistant tasked with summarizing conversations.` |
+| Claude Code, Cline, Roo Code | `Your task is to create a detailed summary of the conversation so far` |
+
+Whole sentences, never keywords: the git commit-message prompt in ordinary traffic says
+*“Summarize the nature of the changes”*, and a mislabelled row is worse than a missing one.
+The scan runs on the raw body in memory, so it works for a client whose body text is
+redacted (nothing new is stored either way), and a client that knows what it is doing can skip
+the guess entirely with **`X-Compaction: 1`**. Not recognized: **OpenAI Codex CLI**, which
+appends its compaction prompt *after* the history — past any bounded window. A summary it
+sends will appear as an ordinary request.
+
+**Attachment.** A summary belongs to the conversation it summarizes, and it has to be attached
+*before* dispatch, because the answer also decides where the request is queued. Candidates are
+the same authenticated client and key with a request in the last 120 seconds (the socket is
+never part of this — one pi thread arrived over `:48290` and its summary over `:50302`). One
+candidate wins; several need a clear winner — the newest no more than 30 s old **and** the
+runner-up at least 3× older. Anything else stays an explicitly **unlinked** row, and each
+attachment says in its tooltip whether it came from `client header`, plain `recency`, or
+`recency, clear among N`. The client can settle it exactly with **`X-Compaction-Of:
+<session tag>`**, which must match a candidate or it is ignored rather than guessed at.
+
+Attaching a summary to its parent means it inherits the parent's backend affinity and its
+priority level, and it shows up as one striped block on the parent's Activity row instead of a
+mystery session of its own.
+
+**What it changes about the numbers.** A summary's cold prefill is not an eviction, so
+compactions are excluded from the cache-waste accounting (otherwise every compaction would
+charge the backend tens of seconds of waste it never caused). The turn that resumes right
+after a summary is stored as `post-compact`: its prefill is cold because the history was
+rewritten, and the stage line says `cache 0% · cold after the summary` instead of looking like
+a cache miss. Token and request totals per client are unchanged — a compaction is real traffic
+and is counted as one.
+
+**Where it shows.** In **Activity** the block is striped graphite (no status hue or client hue
+was free, so it carries its meaning as texture), the conversation's label gains a `⤓`, and an
+unlinked summary keeps its own row labelled `compaction · unlinked`. The window counter
+`⤓ Compact N` counts conversations that compacted in the window, not summarization requests —
+pi writes two per compaction (the history, then the split turn's prefix). In **Details** the
+stage line reads `compaction 71k tok → 1.1k tok · recency`: what it read, what it left
+behind, and how it was attached. On the **Logs** page the request line carries
+`body=285694B · compaction`, the conversation row a `⤓ N` badge, and the conversation viewer
+marks the turn itself — with the text still redacted if the client asked for that.
+
+In the request log each turn may carry `kind` (`compaction`, `post-compact`) and `link`
+(the provenance string above); ordinary turns carry neither.
 
 ### Cache-Aware Hold-Back
 

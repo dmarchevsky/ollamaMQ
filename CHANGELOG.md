@@ -3,6 +3,28 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## Unreleased
+
+### Added
+
+- **Compaction is visible now, instead of looking like a mystery conversation.** When a coding agent
+  runs out of context it asks the model to summarize what it has and carries on from that summary —
+  and on the proxy that call arrived as a brand-new conversation with an enormous prompt and a cold
+  cache on a warm backend. The proxy now recognizes those requests (pi / pi-web / OpenClaw,
+  opencode, Claude Code, Cline, Roo Code — matched on the whole marker sentence in the first 32 KiB
+  of the body, never on a keyword, so the commit-message prompt cannot trigger it; `X-Compaction: 1`
+  is the explicit path), attaches each one to the conversation it summarizes (same client, key and
+  model, active within 120 s; `X-Compaction-Of: <tag>` names the parent exactly, and a tie stays
+  explicitly **unlinked** rather than being guessed), and hands it the parent's affinity, priority
+  and conversation row. In Activity the summary is one striped graphite block on its parent's row,
+  the row is marked `⤓`, Details reads `compaction 71k tok → 1.1k tok · recency`, the window counter
+  says `⤓ Compact N` per conversation that compacted, the Logs page names the request
+  (`body=285694B · compaction`) and the conversation viewer marks the turn — text redacted or not,
+  because the marker is read from the body in memory and nothing new is stored. The summarization
+  call is no longer charged as cache waste: its cold prefill is the client rewriting its own
+  history, not the backend losing it.
+  [README](README.md#-context-compaction)
+
 ## v0.21.0 — 2026-10-26
 
 ### Changed

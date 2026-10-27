@@ -37,6 +37,10 @@ pub struct Candidate {
     /// The level the parent was served at, inherited by the compaction.
     pub priority: &'static str,
     pub at_ms: u64,
+    /// The label the parent's client gave that conversation — display only, and
+    /// inherited by the summary, which arrives with no name of its own and would
+    /// otherwise read as a bare hex tag beside the thread it names.
+    pub label: Option<String>,
     /// This request's own conversation, excluded from its own candidates.
     pub is_self: bool,
     /// A tag from `X-Compaction-Of` matched this candidate exactly.
@@ -48,6 +52,7 @@ pub struct Candidate {
 pub struct Attachment {
     pub key: SessionKey,
     pub priority: &'static str,
+    pub label: Option<String>,
     pub provenance: String,
 }
 
@@ -92,6 +97,7 @@ fn attach(c: &Candidate, provenance: String) -> Attachment {
     Attachment {
         key: c.key.clone(),
         priority: c.priority,
+        label: c.label.clone(),
         provenance,
     }
 }
@@ -113,9 +119,21 @@ mod tests {
             key: key(conv),
             priority,
             at_ms: now_ms().saturating_sub(age_ms),
+            label: None,
             is_self: false,
             named: false,
         }
+    }
+
+    #[test]
+    fn the_parent_label_comes_along_with_the_parent() {
+        // A summary brings no name of its own; wearing the thread's is what keeps
+        // one conversation under one name instead of a bare hex tag.
+        let mut warm = cand("thread-a", 4_000, "normal");
+        warm.label = Some("refactor-auth".into());
+        let att = resolve(&[warm], false).expect("linked");
+        assert_eq!(att.label.as_deref(), Some("refactor-auth"));
+        assert_eq!(att.provenance, "recency");
     }
 
     #[test]

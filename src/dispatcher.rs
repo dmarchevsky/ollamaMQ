@@ -4713,6 +4713,7 @@ pub async fn proxy_handler(
     let mut kind: Option<&'static str> = None;
     let mut compaction_link: Option<String> = None;
     let mut inherited: Option<&str> = None;
+    let mut inherited_label: Option<String> = None;
     let mut session_key = session_key;
     if classify::header_flag(&headers) || classify::is_compaction(&body) {
         kind = Some(classify::KIND_COMPACTION);
@@ -4730,6 +4731,7 @@ pub async fn proxy_handler(
             // and its conversation row and log. Unlinked stays exactly as it was.
             compaction_link = Some(att.provenance);
             inherited = Some(att.priority);
+            inherited_label = att.label;
             if sticky != StickyMode::Off {
                 session_key = Some(att.key);
             }
@@ -4748,7 +4750,10 @@ pub async fn proxy_handler(
     // thread is being served at — so an inherited `top` also takes the one extra
     // overbook slot that level buys, which is what "same priority as the parent"
     // means taken literally.
-    let session_label = session_label_header(&headers);
+    // A summary carries no name of its own (the client sends its summarization
+    // prompt with a fresh id and nothing else), so it wears the thread's — the
+    // one row should not read as a hex tag beside the conversation it names.
+    let session_label = session_label_header(&headers).or(inherited_label);
     let priority = match inherited.and_then(Priority::from_name) {
         Some(level) => level,
         None => resolve_priority(
@@ -4986,7 +4991,15 @@ pub async fn proxy_handler(
         user: user_id.clone(),
         model: requested_model.clone(),
         backend: None,
-        info: format!("{} {} body={}B", task_method, path, body_len),
+        info: format!("{} {} body={}B{}", task_method, path, body_len,
+            // The request log is read as text, so what the request turned out to
+            // be belongs on its own line: whoever is reading the log should not
+            // have to recognize a summarization call again by eye.
+            match kind {
+                Some(classify::KIND_COMPACTION) => " \u{b7} compaction",
+                Some(classify::KIND_POST_COMPACT) => " \u{b7} post-compact",
+                _ => "",
+            }),
         content,
         rid: Some(rid),
         session: session_tag.clone(),

@@ -195,6 +195,7 @@ impl Stats {
                 Some(crate::link::Candidate {
                     key: k.clone(),
                     priority: f.priority,
+                    label: f.session_label.clone(),
                     at_ms: f.at_ms,
                     is_self: self_conversation.is_some_and(|c| *c == k.conversation),
                     named: named_tag.is_some_and(|t| t == k.tag()),
