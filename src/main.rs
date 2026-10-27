@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 mod admin;
 mod auth;
+mod classify;
 mod clients;
 mod config;
 mod config_store;
@@ -23,6 +24,7 @@ mod lock;
 mod metrics;
 mod model_policy;
 mod convlog;
+mod link;
 mod session;
 mod settings;
 mod snapshot;

@@ -1510,6 +1510,8 @@ mod tests {
         use crate::convlog::{Begin, MsgMeta, Note, Resp};
         let key = "alice#a3f19c".to_string();
         state.convlog.note(Note::Begin(Box::new(Begin {
+            kind: None,
+            link: None,
             key: key.clone(),
             rid: 7,
             user: "alice".into(),
@@ -1558,6 +1560,8 @@ mod tests {
             text: std::sync::Arc::new("hello back".into()),
         });
         state.convlog.note(Note::Begin(Box::new(Begin {
+            kind: None,
+            link: None,
             key: key.clone(),
             rid: 8,
             user: "alice".into(),

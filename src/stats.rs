@@ -74,6 +74,17 @@ pub struct Finished {
     pub tools: Vec<String>,
     /// Seconds it waited in the queue; `None` when refused before queuing.
     pub queue_wait: Option<f64>,
+    /// The conversation's full sticky key, not just its display tag: what a
+    /// linked compaction inherits (see [`crate::link`]). In-memory only — the
+    /// log and the API keep carrying the tag.
+    pub session_key: Option<crate::dispatcher::SessionKey>,
+    /// What the request turned out to be, `Some("compaction")` for a client's
+    /// summarization call (see [`crate::classify`]); `None` is ordinary traffic.
+    pub kind: Option<&'static str>,
+    /// How a compaction was attached to this conversation (`recency`,
+    /// `client header`, …); `None` when it is no compaction, or one that stayed
+    /// unlinked. Display provenance, shown in the UI's tooltip.
+    pub link: Option<String>,
     /// Absolute stage times (unix ms) of this request, measured as they happened.
     /// The Overview draws its timeline from these; `None` halves (an old record,
     /// or a stage that never happened) fall back to duration maths.
@@ -153,6 +164,57 @@ impl Stats {
         let q = self.finished.lock_or_recover();
         let start = q.partition_point(|f| f.at_ms < from_ms);
         q.range(start..).cloned().collect()
+    }
+
+    /// The finished requests that could parent a compaction from this client
+    /// (see [`crate::link`]): same client, same API key, same model (so the
+    /// parent's affinity key is the right one to inherit), inside the linking
+    /// window, and not themselves compactions. Collected here rather than by
+    /// cloning the window because the request path calls it on every summary.
+    pub fn compaction_candidates(
+        &self,
+        client: &str,
+        key: &str,
+        model: &str,
+        self_conversation: Option<&str>,
+        named_tag: Option<&str>,
+    ) -> Vec<crate::link::Candidate> {
+        let cutoff = now_ms().saturating_sub(crate::link::WINDOW_MS);
+        let q = self.finished.lock_or_recover();
+        q.iter()
+            .rev()
+            .take_while(|f| f.at_ms >= cutoff)
+            .filter(|f| {
+                f.client == client
+                    && f.key == key
+                    && f.model == model
+                    && f.kind != Some(crate::classify::KIND_COMPACTION)
+            })
+            .filter_map(|f| {
+                let k = f.session_key.as_ref()?;
+                Some(crate::link::Candidate {
+                    key: k.clone(),
+                    priority: f.priority,
+                    at_ms: f.at_ms,
+                    is_self: self_conversation.is_some_and(|c| *c == k.conversation),
+                    named: named_tag.is_some_and(|t| t == k.tag()),
+                })
+            })
+            .collect()
+    }
+
+    /// The `kind` of the newest finished record of one conversation, if any:
+    /// [`crate::classify::KIND_COMPACTION`] means this conversation has just
+    /// resumed after a summary. Bounded scan — the ring is hours of traffic and
+    /// only the newest turn of one conversation matters.
+    pub fn last_kind(&self, key: &crate::dispatcher::SessionKey) -> Option<&'static str> {
+        self.finished
+            .lock_or_recover()
+            .iter()
+            .rev()
+            .take(512)
+            .find(|f| f.session_key.as_ref().is_some_and(|k| k == key))
+            .and_then(|f| f.kind)
     }
 }
 
@@ -296,7 +358,124 @@ mod tests {
             queue_wait: Some(1.0),
             stage: Default::default(),
             timing,
+            session_key: None,
+            kind: None,
+            link: None,
         }
+    }
+
+    /// The same record carrying a conversation, for the compaction-linking tests.
+    fn sess(
+        at_ms: u64,
+        conversation: &str,
+        priority: &'static str,
+        kind: Option<&'static str>,
+    ) -> Finished {
+        Finished {
+            at_ms,
+            client: "pi".into(),
+            key: "main".into(),
+            model: "qwen".into(),
+            backend: Some("gpu1".into()),
+            outcome: "ok",
+            session: Some("t".into()),
+            session_label: None,
+            priority,
+            rid: None,
+            tools: vec![],
+            queue_wait: Some(1.0),
+            stage: Default::default(),
+            timing: Default::default(),
+            session_key: Some(crate::dispatcher::SessionKey {
+                conversation: conversation.into(),
+                model: "qwen".into(),
+            }),
+            kind,
+            link: None,
+        }
+    }
+
+    #[test]
+    fn compaction_candidates_keep_only_the_likely_parents() {
+        let s = Stats::default();
+        let now = now_ms();
+        // Recorded oldest first, like the ring really is: the scan stops at the
+        // first record past the window, so a stale record has to come first.
+        s.record(sess(
+            now - crate::link::WINDOW_MS - 1,
+            "stale",
+            "normal",
+            None,
+        ));
+        s.record(sess(now - 1_000, "thread-a", "normal", None));
+        s.record(Finished {
+            client: "other".into(),
+            ..sess(now - 500, "other-client", "normal", None)
+        });
+        s.record(Finished {
+            key: "second-key".into(),
+            ..sess(now - 500, "other-key", "normal", None)
+        });
+        s.record(Finished {
+            model: "gpt".into(),
+            ..sess(now - 500, "other-model", "normal", None)
+        });
+        s.record(sess(
+            now - 400,
+            "already-a-summary",
+            "normal",
+            Some(crate::classify::KIND_COMPACTION),
+        ));
+        let c = s.compaction_candidates("pi", "main", "qwen", None, None);
+        let convs: Vec<&str> = c.iter().map(|x| x.key.conversation.as_str()).collect();
+        assert_eq!(convs, vec!["thread-a"]);
+        // The summary request's own fingerprinted conversation is marked so it
+        // cannot be attached to itself.
+        let c = s.compaction_candidates("pi", "main", "qwen", Some("thread-a"), None);
+        assert!(c[0].is_self);
+        // A named tag is matched on the parent's own tag, so a client can name
+        // the conversation the UI shows it by.
+        let tag = crate::dispatcher::SessionKey {
+            conversation: "thread-a".into(),
+            model: "qwen".into(),
+        }
+        .tag();
+        let c = s.compaction_candidates("pi", "main", "qwen", None, Some(&tag));
+        assert!(c[0].named);
+        let c = s.compaction_candidates("pi", "main", "qwen", None, Some("deadbeef"));
+        assert!(!c.iter().any(|x| x.named));
+    }
+
+    #[test]
+    fn last_kind_names_the_boundary_after_a_summary() {
+        let s = Stats::default();
+        let now = now_ms();
+        let a = crate::dispatcher::SessionKey {
+            conversation: "thread-a".into(),
+            model: "qwen".into(),
+        };
+        let b = crate::dispatcher::SessionKey {
+            conversation: "thread-b".into(),
+            model: "qwen".into(),
+        };
+        s.record(sess(now - 3_000, "thread-a", "normal", None));
+        assert_eq!(s.last_kind(&a), None);
+        s.record(sess(
+            now - 2_000,
+            "thread-a",
+            "normal",
+            Some(crate::classify::KIND_COMPACTION),
+        ));
+        assert_eq!(
+            s.last_kind(&a),
+            Some(crate::classify::KIND_COMPACTION)
+        );
+        // Another conversation's summary says nothing about this one…
+        assert_eq!(s.last_kind(&b), None);
+        // …and the thread resuming ends the boundary.
+        s.record(sess(now - 1_000, "thread-a", "normal", None));
+        assert_eq!(s.last_kind(&a), None);
+        assert_eq!(s.last_kind(&b), None);
     }
 
     #[test]

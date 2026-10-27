@@ -125,6 +125,10 @@ struct StatusView {
     /// Requests dropped in the window — same outcomes as the lifetime `Drop`
     /// counter: timeout, blocked, client gone, backend error (not 429s).
     dropped: u64,
+    /// Conversations that compacted in the window. Counted per conversation, not
+    /// per summarization request: pi (and OpenClaw) send a second one for a split
+    /// turn seconds later, and that is still one compaction of one thread.
+    compactions: usize,
     /// Conversations currently running or waiting above `normal` priority.
     priority_sessions: usize,
     /// Operator pins as `(session tag, level)`. The UI shows a session's pin
@@ -259,6 +263,16 @@ struct Recent {
     session_label: Option<String>,
     /// Scheduling level the request was served at.
     priority: &'static str,
+    /// What this request was: `Some("compaction")` for a client's summarization
+    /// call, `Some("post-compact")` for the turn right after one; `None` for
+    /// ordinary traffic (see [`crate::classify`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    /// How a compaction was attached to this conversation (`recency`,
+    /// `recency, clear among 3`, `client header`); `None` when unlinked, so the
+    /// UI can say so instead of implying certainty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link: Option<String>,
     /// Log correlation id, so the row can jump to the request's log round.
     /// `None` for model-load records, which were never proxied requests.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -713,6 +727,8 @@ pub async fn get_overview(
             session: f.session.clone(),
             session_label: f.session_label.clone(),
             priority: f.priority,
+            kind: f.kind,
+            link: f.link.clone(),
             rid: f.rid,
             stage: f.stage.clone(),
             tools: f.tools.clone(),
@@ -781,6 +797,21 @@ pub async fn get_overview(
     finished.iter().for_each(|f| all.add(f));
     let totals = all.summary();
     let done_window = finished.iter().filter(|f| f.outcome == "ok").count() as u64;
+    // One per conversation that compacted (see `StatusView::compactions`): the
+    // session tag is what identifies it, and an unlinked summary has its own.
+    let compactions = {
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        for f in &finished {
+            if f.kind == Some(crate::classify::KIND_COMPACTION) {
+                seen.insert(
+                    f.session
+                        .clone()
+                        .unwrap_or_else(|| format!("rid:{}", f.rid.unwrap_or_default())),
+                );
+            }
+        }
+        seen.len()
+    };
     // Mirrors the lifetime Drop counter (dropped_counts in the dispatcher):
     // dropped requests, not 429 refusals.
     let dropped_window = finished
@@ -833,6 +864,7 @@ pub async fn get_overview(
                 .then(|| totals.errors as f64 * 100.0 / totals.requests as f64),
             done: done_window,
             dropped: dropped_window,
+            compactions,
             priority_sessions,
             pins: state.session_pins(),
         },
@@ -989,6 +1021,9 @@ mod tests {
         let label = backend_label(url);
         for client in clients {
             state.stats.record(crate::stats::Finished {
+                session_key: None,
+                kind: None,
+                link: None,
                 at_ms: stats::now_ms(),
                 client: (*client).to_string(),
                 key: "none".into(),
