@@ -3,6 +3,7 @@ ollamamq.log
 blocked_items.json
 appconf.yaml
 ollamamq-requests.jsonl
+ollamamq-activity.jsonl
 # docker-compose.yml run in the checkout
 /config/
 /logs/

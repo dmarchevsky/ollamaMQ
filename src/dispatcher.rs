@@ -2084,6 +2084,16 @@ impl AppState {
         self.rid_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
 
+    /// Raise the rid counter to at least `floor` before serving. Ids restart
+    /// at 1 every boot while the retained journal and conversation log still
+    /// carry ids from earlier boots; without this, a click on restored
+    /// history would open whatever new request borrowed the id. Call once at
+    /// startup with [`crate::stats::Stats::replayed_rid_floor`] and the
+    /// conversation log's max — never later, live ids are already out.
+    pub fn seed_rid_floor(&self, floor: u64) {
+        self.rid_seq.fetch_max(floor, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Pin the API family of backends whose `appconf.yaml` entry carried a
     /// `kind:` (`[(url, token)]` order is the config order — the caller passes
     /// one entry per backend, in the same order, empty when the backends came

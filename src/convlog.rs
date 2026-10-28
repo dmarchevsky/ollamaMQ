@@ -1003,6 +1003,31 @@ impl ConvLogger {
         out
     }
 
+    /// The largest turn `rid` any retained record carries (hot store and disk
+    /// index). The rid counter restarts at 1 every boot; a fresh process must
+    /// start its counter above this so restored history keeps pointing at the
+    /// request its rid names (see [`crate::dispatcher::AppState::seed_rid_floor`]).
+    pub fn max_rid(&self) -> u64 {
+        let mut m = 0u64;
+        {
+            let store = self.store.lock_or_recover();
+            for e in store.entries.values() {
+                for t in &e.conv.turns {
+                    m = m.max(t.rid);
+                }
+            }
+        }
+        if let Some(disk) = &self.disk {
+            let ents = disk.entries.lock_or_recover();
+            for e in ents.values() {
+                if let Some(r) = e.rids.iter().max() {
+                    m = m.max(*r);
+                }
+            }
+        }
+        m
+    }
+
     /// The conversation named by `q`, with captured text stripped (fetch one
     /// turn's text with [`Self::content`]). Hot store first, then disk.
     pub fn index(&self, q: &Find) -> Option<Conv> {
@@ -1807,6 +1832,38 @@ mod tests {
             Some("hello erin")
         );
         handle.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The rid floor a new process needs must see everything retained:
+    /// hot conversations and the disk index loaded at open.
+    #[tokio::test]
+    async fn max_rid_covers_hot_store_and_disk_index() {
+        let path = tmp("maxrid.jsonl");
+        let (log, handle) =
+            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_millis(20)).unwrap();
+        log.note(begin("erin#e1", 7, 1000));
+        log.note(resp("erin#e1", 7, 2000));
+        log.note(begin("erin#e1", 13, 3000));
+        log.note(resp("erin#e1", 13, 4000));
+        let disk = log.disk.clone().unwrap();
+        loop {
+            if disk
+                .find(&find_key("erin#e1"))
+                .is_some_and(|e| e.summary.turns >= 2)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(log.max_rid(), 13, "the hot conversation's newest rid");
+        handle.abort();
+        drop(log);
+        // A fresh process: empty hot store, the floor comes off the disk index.
+        let (log2, handle2) =
+            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
+        assert_eq!(log2.max_rid(), 13, "the startup disk index carries the rid");
+        handle2.abort();
         let _ = std::fs::remove_file(&path);
     }
 

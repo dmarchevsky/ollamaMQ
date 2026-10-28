@@ -479,6 +479,13 @@ async fn main() {
             ),
         }
     }
+    // Rids restart at 1 every boot while the journal and the conversation log
+    // still carry ids from earlier boots. Start the counter above every rid
+    // on disk so a click on restored history opens the request it names.
+    let rid_floor = state.stats.replayed_rid_floor().max(state.convlog.max_rid());
+    if rid_floor > 0 {
+        state.seed_rid_floor(rid_floor);
+    }
     if !state.model_aliases.lock_or_recover().is_empty() {
         info!("{} model alias(es) loaded", state.model_aliases.lock_or_recover().len());
     }

@@ -1671,7 +1671,14 @@ function logTable(rounds) {
   return `<table class="logs">
     <tr><th>Time</th><th>Client</th><th>Model</th><th>Backend</th><th>Round</th></tr>
     ${rounds.map(r => { const e = ev(r); const rid = r.in?.rid ?? r.out?.rid;
-      return `<tr class="clickable" ${rid ? `data-action="log-round" data-rid="${rid}"` : `data-action="log-detail" data-seq="${e.seq}"`}>
+      // A journal-restored row without a rid (refused traffic, control records)
+      // is information only: seq addresses the live ring, so clicking it could
+      // open nothing. Rows that name a conversation still open it.
+      const open = rid ? `data-action="log-round" data-rid="${rid}"`
+        : e.hist ? (e.session ? `data-action="conv-open" data-user="${esc(e.user)}" data-session="${esc(e.session)}"` : '')
+        : `data-action="log-detail" data-seq="${e.seq}"`;
+      const inert = e.hist && !rid && !e.session;
+      return `<tr class="${inert ? '' : 'clickable'}" ${open}>
       <td class="time">${fmtTime(e.at_ms)}</td>
       <td class="mono">${esc(e.user)}</td>
       <td class="trunc ${e.model ? '' : 'none'}">${esc(e.model ?? '—')}</td>

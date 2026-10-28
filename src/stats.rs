@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
+#[cfg(test)]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -25,8 +26,6 @@ use crate::lock::LockExt;
 pub const DEFAULT_HISTORY_HOURS: u64 = 24;
 /// Default cap on finished-request records — `history_max_records`' fallback.
 pub const DEFAULT_MAX_RECORDS: usize = 50_000;
-/// How far back the history goes by default (the longest Overview window).
-pub const HISTORY: Duration = Duration::from_secs(DEFAULT_HISTORY_HOURS * 3600);
 /// Points in each sparkline.
 pub const SPARK_BUCKETS: usize = 30;
 
@@ -227,6 +226,10 @@ pub struct Stats {
     /// finished record is sent to the writer thread; the channel is unbounded
     /// by intent — a stalled disk must never stall a served request.
     journal: Mutex<Option<Sender<JournalLine>>>,
+    /// Largest `rid` seen while replaying the journal. `rid`s restart at 1
+    /// every boot, so the process must start its counter above everything the
+    /// retained files already carry — see [`Self::replayed_rid_floor`].
+    replayed_rid_max: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Stats {
@@ -237,6 +240,7 @@ impl Default for Stats {
             history_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HISTORY_HOURS * 3_600_000),
             max_records: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_RECORDS),
             journal: Mutex::new(None),
+            replayed_rid_max: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -286,6 +290,10 @@ impl Stats {
     fn replay_journal(&self, path: &str) {
         let cutoff = now_ms().saturating_sub(self.history_ms());
         let mut loaded: VecDeque<Finished> = VecDeque::new();
+        // Ids already on disk must never be reissued by the fresh counter, or
+        // a click on restored history opens whatever new request borrowed the
+        // id. Taken from every replayable line — pruned ones included.
+        let mut rid_floor = 0u64;
         let mut files: Vec<String> = (1..=JOURNAL_MAX_FILES)
             .rev()
             .map(|i| format!("{}.{i}", path))
@@ -297,6 +305,9 @@ impl Stats {
                 let Ok(rec) = serde_json::from_str::<JournalLine>(line.trim()) else {
                     continue; // torn tail or a newer schema — skip
                 };
+                if let Some(r) = rec.rid {
+                    rid_floor = rid_floor.max(r);
+                }
                 if rec.at_ms < cutoff {
                     continue;
                 }
@@ -307,8 +318,27 @@ impl Stats {
         while loaded.len() > max {
             loaded.pop_front();
         }
+        let prev = self.replayed_rid_max.load(std::sync::atomic::Ordering::Relaxed);
+        self.replayed_rid_max
+            .store(prev.max(rid_floor), std::sync::atomic::Ordering::Relaxed);
         let mut q = self.finished.lock_or_recover();
         q.extend(loaded);
+    }
+
+    /// The largest `rid` the replayed journal carries: 0 when no journal was
+    /// attached or none of its records had one. A new process must raise its
+    /// rid counter to at least this before serving (see
+    /// [`crate::dispatcher::AppState::seed_rid_floor`]).
+    pub fn replayed_rid_floor(&self) -> u64 {
+        self.replayed_rid_max.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The newest `need` finished records, newest first — the Logs page's
+    /// file-backed tail under the live ring.
+    pub fn finished_tail(&self, need: usize) -> Vec<Finished> {
+        let q = self.finished.lock_or_recover();
+        let n = q.len();
+        q.range(n.saturating_sub(need)..n).rev().cloned().collect()
     }
 }
 impl Stats {
@@ -803,7 +833,7 @@ mod tests {
     #[test]
     fn history_is_pruned_by_age_and_window_reads_are_ordered() {
         let s = Stats::default();
-        let hour = HISTORY.as_millis() as u64;
+        let hour = DEFAULT_HISTORY_HOURS * 3_600_000; // the default window: past it, records fall out
         s.record(fin(1_000, "a", "b:1", "ok", Timing::default()));
         s.record(fin(2_000, "a", "b:1", "ok", Timing::default()));
         // An hour after the first: it falls out, the second stays.
@@ -922,6 +952,41 @@ mod tests {
         assert_eq!(all.iter().map(|f| f.at_ms).collect::<Vec<_>>(), vec![now - 2_000, now - 1_000]);
         assert_eq!((all[0].client.as_str(), all[0].outcome, all[0].timing.ttft), ("ada", "ok", Some(1.5)));
         assert_eq!((all[1].client.as_str(), all[1].outcome), ("dm", "backend_error"));
+    }
+
+    /// Rids restart at 1 every boot; the replayed records carry ids the kept
+    /// files already use, so the replay must surface their maximum and the
+    /// tail accessor must hand the Logs page its records newest-first.
+    #[test]
+    fn journal_replay_seeds_the_rid_floor_and_the_tail_orders() {
+        let path = tmpj("ridfloor.jsonl");
+        let now = now_ms();
+        let mut old = fin(now - 3_000, "ada", "gpu1", "ok", Timing::default());
+        old.rid = Some(41);
+        let mut newer = fin(now - 2_000, "dm", "gpu1", "ok", Timing::default());
+        newer.rid = Some(7);
+        {
+            let s1 = Stats::default();
+            s1.attach_journal(path.clone()).expect("attach");
+            s1.record(fin(now - 1_000, "pi", "gpu1", "ok", Timing::default())); // no rid
+            s1.record(old);
+            s1.record(newer);
+            assert!(
+                wait_until(|| line_at_ms(&path).len() == 3),
+                "the writer journalled all three records"
+            );
+        }
+        let s2 = Stats::default();
+        s2.attach_journal(path).expect("re-attach");
+        assert_eq!(s2.replayed_rid_floor(), 41, "the highest journalled rid");
+        let tail = s2.finished_tail(2);
+        assert_eq!(tail.len(), 2, "the tail is capped at the request");
+        assert!(
+            tail[0].at_ms >= tail[1].at_ms,
+            "newest first: {:?}",
+            tail.iter().map(|f| f.at_ms).collect::<Vec<_>>()
+        );
+        assert_eq!(s2.finished_tail(99).len(), 3, "asking past the end is fine");
     }
 
     /// Replay is the retention boundary: records older than the configured

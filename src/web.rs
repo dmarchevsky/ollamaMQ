@@ -717,6 +717,18 @@ struct LogView {
     /// six-hex tag, which is what makes one row per conversation recognisable.
     #[serde(skip_serializing_if = "Option::is_none")]
     session_label: Option<String>,
+    /// True on rows synthesized from the Activity journal rather than the
+    /// live ring: older than anything the ring held, restored at boot. The UI
+    /// opens such a row through the conversation log, never `logs/{seq}`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    hist: bool,
+}
+
+fn ring_at_ms(ev: &crate::dispatcher::LogEvent) -> u64 {
+    ev.at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn log_view(
@@ -727,11 +739,7 @@ fn log_view(
 ) -> LogView {
     LogView {
         seq,
-        at_ms: ev
-            .at
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
+        at_ms: ring_at_ms(ev),
         dir: ev.dir,
         user: ev.user.clone(),
         model: ev.model.clone(),
@@ -742,6 +750,7 @@ fn log_view(
         rid: ev.rid,
         session: ev.session.clone(),
         session_label,
+        hist: false,
         content: if with_content {
             ev.content.as_deref().map(|c| c.to_string())
         } else {
@@ -767,17 +776,23 @@ struct LogQuery {
     limit: Option<usize>,
 }
 
-/// Newest first, without content (fetch one event for that).
+/// Newest first, without content (fetch one event for that). The live ring
+/// comes first; under it the Activity journal fills everything the ring has
+/// forgotten — including everything from before this process started, so the
+/// panel opens with its history instead of a blank page. Replayed records the
+/// ring still holds are the same requests (deduped by rid); rids are unique
+/// across restarts because the counter is seeded from the retained files.
 async fn list_logs(
     State(state): State<Arc<AppState>>,
     Query(q): Query<LogQuery>,
 ) -> Json<Vec<LogView>> {
     let limit = q.limit.unwrap_or(300).min(MAX_LOG_LIMIT);
-    let logs = state.logs.lock_or_recover();
-    let base = state.logs_evicted.load(Ordering::Relaxed);
     let labels = session_labels(&state);
-    Json(
-        logs.iter()
+    let (mut views, oldest_ring, seen_rids, next_seq) = {
+        let logs = state.logs.lock_or_recover();
+        let base = state.logs_evicted.load(Ordering::Relaxed);
+        let views: Vec<LogView> = logs
+            .iter()
             .enumerate()
             .rev()
             .take(limit)
@@ -788,8 +803,53 @@ async fn list_logs(
                     .and_then(|s| labels.get(s).cloned());
                 log_view(base + i as u64, ev, false, label)
             })
-            .collect(),
-    )
+            .collect();
+        (
+            views,
+            logs.front().map(ring_at_ms).unwrap_or(u64::MAX),
+            logs.iter()
+                .filter_map(|e| e.rid)
+                .collect::<std::collections::HashSet<u64>>(),
+            base + logs.len() as u64,
+        )
+    };
+    if views.len() < limit {
+        let need = limit - views.len();
+        // Margin: ring-resident replays are filtered out below, and there
+        // can be at most one per rid the ring holds.
+        for (i, f) in state
+            .stats
+            .finished_tail(need + seen_rids.len())
+            .into_iter()
+            .filter(|f| f.at_ms < oldest_ring && !f.rid.is_some_and(|r| seen_rids.contains(&r)))
+            .take(need)
+            .enumerate()
+        {
+            let label = f
+                .session_label
+                .clone()
+                .or_else(|| f.session.as_ref().and_then(|s| labels.get(s).cloned()));
+            views.push(LogView {
+                seq: next_seq + i as u64,
+                at_ms: f.at_ms,
+                dir: "OUT",
+                user: f.client,
+                model: if f.model == "none" { None } else { Some(f.model) },
+                backend: f.backend,
+                info: f.outcome.to_string(),
+                // The row opens through the conversation log; without a
+                // session tag (or without capture) there is nothing to open.
+                has_content: state.convlog.enabled() && f.session.is_some(),
+                redacted: false,
+                content: None,
+                rid: f.rid,
+                session: f.session,
+                session_label: label,
+                hist: true,
+            });
+        }
+    }
+    Json(views)
 }
 
 async fn get_log(State(state): State<Arc<AppState>>, Path(seq): Path<u64>) -> ApiResult<LogView> {
@@ -1753,6 +1813,70 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// The Logs page's file-backed tail: journal records below the live ring
+    /// so a restart opens with history, the requests the ring still holds are
+    /// not listed twice, and restored rows announce themselves as history.
+    #[tokio::test]
+    async fn logs_page_serves_journal_history_under_the_ring() {
+        let state = test_state();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        state.log_event(LogEvent {
+            at: std::time::UNIX_EPOCH + std::time::Duration::from_millis(now),
+            dir: "IN",
+            user: "alice".into(),
+            model: Some("qwen".into()),
+            backend: None,
+            info: "POST /v1/chat/completions body=20B".into(),
+            content: None,
+            rid: Some(3),
+            session: Some("a3f19c".into()),
+            redacted: false,
+        });
+        let rec = |at_ms: u64, rid: Option<u64>, outcome: &'static str| crate::stats::Finished {
+            at_ms,
+            client: "dm".into(),
+            key: "main".into(),
+            model: "qwen".into(),
+            backend: Some("gpu1".into()),
+            outcome,
+            session: Some("c342d9".into()),
+            session_label: Some("nightly".into()),
+            priority: "normal",
+            rid,
+            tools: vec![],
+            queue_wait: Some(1.0),
+            stage: Default::default(),
+            timing: Default::default(),
+            session_key: None,
+            kind: None,
+            link: None,
+        };
+        state.stats.record(rec(now - 60_000, Some(41), "ok")); // restored history
+        state.stats.record(rec(now, Some(3), "ok")); // the live round, not yet evicted
+        let base = serve(state).await;
+        let list: Vec<serde_json::Value> = http()
+            .get(format!("{base}/ui/api/logs?limit=50"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 2, "the live event and one restored row: {list:?}");
+        assert_eq!(list[0]["dir"], "IN");
+        assert!(list[0]["hist"].is_null(), "ring rows are not marked history");
+        assert_eq!(list[1]["hist"], true);
+        assert_eq!(list[1]["rid"], 41, "restored rows keep their rid (unique across boots)");
+        assert_eq!(list[1]["session"], "c342d9");
+        assert_eq!(list[1]["session_label"], "nightly");
+        assert_eq!(list[1]["info"], "ok", "the outcome is the compact segment");
+        assert_eq!(list[1]["has_content"], true, "capture on: the row opens");
     }
 
     async fn serve(state: Arc<AppState>) -> String {
