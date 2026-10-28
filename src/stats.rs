@@ -471,6 +471,11 @@ fn journal_writer(path: &str, rx: Receiver<JournalLine>) {
         let Ok(first) = rx.recv() else { break };
         let mut burst = vec![first];
         burst.extend(rx.try_iter());
+        if file.is_none() {
+            // Self-heal: a full disk or a briefly missing folder must not
+            // silence the journal for the rest of the process.
+            file = open(path);
+        }
         for rec in burst {
             let Ok(mut data) = serde_json::to_string(&rec) else {
                 continue;
@@ -482,9 +487,8 @@ fn journal_writer(path: &str, rx: Receiver<JournalLine>) {
                 size = 0;
                 file = open(path);
             }
-            if let Some(f) = &mut file
-                && let Err(e) = f.write_all(data.as_bytes())
-            {
+            let Some(f) = file.as_mut() else { continue };
+            if let Err(e) = f.write_all(data.as_bytes()) {
                 tracing::warn!("activity journal: cannot append to {path}: {e}");
                 file = None;
             } else {

@@ -1724,17 +1724,22 @@ function logConvs(rounds) {
     if (e.backend) g.backends.add(e.backend);
     if (e.redacted) g.redacted = true;
     if (r.in) { g.reqs++; g.inBytes += num(/body=(\d+)B/, r.in.info); if (/· compaction/.test(r.in.info || '')) g.cmp++; }
-    else if (r.out && r.out.hist) g.reqs++; // a restored round is a whole request
+    else if (r.out?.hist || r.solo?.hist) {
+      // A restored round is a whole request. It carries no HTTP code — the
+      // journalled outcome (ok, timeout, backend_error…) stands in, so the
+      // arrow never reads `…`; a failed outcome tints the row.
+      // Refused-before-dispatch records ride `solo` (they never got an rid).
+      g.reqs++;
+      const h = r.out || r.solo;
+      if (h.at_ms >= g.statusAt) {
+        g.lastOutcome = h.info; g.statusAt = h.at_ms;
+        if (/error|timeout|drop|fail|refus|gone/i.test(h.info)) g.errors++;
+      }
+    }
     if (r.out) {
       g.outBytes += num(/resp=(\d+)B/, r.out.info);
       const st = num(/-> (\d{3})/, r.out.info);
       if (st && r.out.at_ms >= g.statusAt) { g.lastStatus = st; g.statusAt = r.out.at_ms; if (st >= 400) g.errors++; }
-      // Restored rows carry no HTTP code — their journalled outcome (ok,
-      // timeout, backend_error…) stands in, so the arrow never reads `…`.
-      if (!st && r.out.hist && r.out.at_ms >= g.statusAt) {
-        g.lastOutcome = r.out.info; g.statusAt = r.out.at_ms;
-        if (/error|timeout|drop|fail|refus|gone/i.test(r.out.info)) g.errors++;
-      }
     }
     if (r.in && !r.out) g.waiting = true;
   }

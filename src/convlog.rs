@@ -1003,8 +1003,9 @@ impl ConvLogger {
         out
     }
 
-    /// The largest turn `rid` any retained record carries (hot store and disk
-    /// index). The rid counter restarts at 1 every boot; a fresh process must
+    /// The largest turn `rid` any retained record carries (hot store — seeded
+    /// from the newest lines at open — and whatever the disk index has scanned
+    /// so far). The rid counter restarts at 1 every boot; a fresh process must
     /// start its counter above this so restored history keeps pointing at the
     /// request its rid names (see [`crate::dispatcher::AppState::seed_rid_floor`]).
     pub fn max_rid(&self) -> u64 {
