@@ -2,27 +2,36 @@
 //!
 //! [`crate::metrics`] gives Prometheus cumulative counters and histograms;
 //! the Overview needs "the last 15 minutes" without a Prometheus server. This
-//! keeps the last hour in memory: one record per finished request. Nothing
-//! here survives a restart.
+//! keeps `settings.history_hours` of finished requests in memory: one record
+//! per finished request.
+//!
+//! When [`Stats::attach_journal`] runs at startup, the same records are also
+//! journalled as JSONL lines next to the conversation log and read back after
+//! a restart — the Activity view keeps its curve across a restart, up to the
+//! configured retention (size-rotated like the conversation log, so the
+//! journal cannot grow without bound).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::Write;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
+#[cfg(test)]
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::lock::LockExt;
 
-/// How far back the history goes (the longest Overview window).
-pub const HISTORY: Duration = Duration::from_secs(24 * 3600);
-/// Cap on finished-request records, whatever their age.
-const MAX_FINISHED: usize = 20_000;
+/// Default Activity retention in hours — what `history_hours` falls back to.
+pub const DEFAULT_HISTORY_HOURS: u64 = 24;
+/// Default cap on finished-request records — `history_max_records`' fallback.
+pub const DEFAULT_MAX_RECORDS: usize = 50_000;
 /// Points in each sparkline.
 pub const SPARK_BUCKETS: usize = 30;
 
 /// What was measured while serving one request. Parts the backend or the
 /// response shape did not allow measuring stay `None`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Timing {
     /// HTTP status from the backend.
     pub status: Option<u16>,
@@ -114,9 +123,92 @@ impl Finished {
             .filter(|(secs, n)| *secs > 0.0 && *n >= 2)
             .map(|(secs, n)| n as f64 / secs)
     }
+
+    /// The journal form of this record (see [`Stats::attach_journal`]).
+    fn to_journal(&self) -> JournalLine {
+        JournalLine {
+            at_ms: self.at_ms,
+            client: self.client.clone(),
+            key: self.key.clone(),
+            model: self.model.clone(),
+            backend: self.backend.clone(),
+            outcome: self.outcome.to_string(),
+            session: self.session.clone(),
+            session_label: self.session_label.clone(),
+            priority: self.priority.to_string(),
+            rid: self.rid,
+            tools: self.tools.clone(),
+            queue_wait: self.queue_wait,
+            kind: self.kind.map(str::to_string),
+            link: self.link.clone(),
+            stage: self.stage.clone(),
+            timing: self.timing,
+        }
+    }
 }
 
-#[derive(Default)]
+/// One [`Finished`] as it sits in the Activity journal. `Finished` itself
+/// cannot round-trip: `outcome`, `priority` and `kind` are `&'static` labels
+/// in memory, and `session_key` only feeds compaction linking, whose window
+/// is minutes wide — replayed records are outside it by construction.
+#[derive(Serialize, Deserialize)]
+struct JournalLine {
+    at_ms: u64,
+    client: String,
+    key: String,
+    model: String,
+    backend: Option<String>,
+    outcome: String,
+    session: Option<String>,
+    session_label: Option<String>,
+    priority: String,
+    rid: Option<u64>,
+    tools: Vec<String>,
+    queue_wait: Option<f64>,
+    kind: Option<String>,
+    link: Option<String>,
+    stage: crate::convlog::StageMs,
+    timing: Timing,
+}
+
+impl JournalLine {
+    /// Rebuild the in-memory record. `outcome`/`priority`/`kind` become
+    /// `&'static` by leaking the journal string: replay is bounded by
+    /// `history_max_records` and runs once per process, so the total leak is
+    /// a few MB at worst — cheaper than widening every caller of these
+    /// `&'static` labels to owned strings.
+    fn into_finished(self) -> Finished {
+        let leak = |s: String| -> &'static str {
+            if s.is_empty() { "" } else { Box::leak(s.into_boxed_str()) }
+        };
+        Finished {
+            at_ms: self.at_ms,
+            client: self.client,
+            key: self.key,
+            model: self.model,
+            backend: self.backend,
+            outcome: leak(self.outcome),
+            session: self.session,
+            session_label: self.session_label,
+            priority: leak(self.priority),
+            rid: self.rid,
+            tools: self.tools,
+            queue_wait: self.queue_wait,
+            stage: self.stage,
+            timing: self.timing,
+            session_key: None,
+            kind: self.kind.map(leak),
+            link: self.link,
+        }
+    }
+}
+
+/// Journal size before it rotates (the chain drops the oldest slot, like the
+/// conversation log).
+const JOURNAL_MAX_BYTES: u64 = 10 << 20;
+/// Rotated journal slots kept besides the live file.
+const JOURNAL_MAX_FILES: usize = 2;
+
 pub struct Stats {
     finished: Mutex<VecDeque<Finished>>,
     /// Per backend label: `(prefill secs, waste secs)` summed over every request
@@ -125,8 +217,130 @@ pub struct Stats {
     /// scrape or a UI poll used to copy the whole 20k-record history and search
     /// it per backend on every call.
     waste: Mutex<HashMap<String, (f64, f64)>>,
+    /// `settings.history_hours` as ms — the longest Overview window and the
+    /// age records fall out at (`set_history`, read via `history_ms`).
+    history_ms: std::sync::atomic::AtomicU64,
+    /// `settings.history_max_records` — the count cap on finished records.
+    max_records: std::sync::atomic::AtomicUsize,
+    /// Journal writer handle, `Some` after [`Self::attach_journal`]. Each
+    /// finished record is sent to the writer thread; the channel is unbounded
+    /// by intent — a stalled disk must never stall a served request.
+    journal: Mutex<Option<Sender<JournalLine>>>,
+    /// Largest `rid` seen while replaying the journal. `rid`s restart at 1
+    /// every boot, so the process must start its counter above everything the
+    /// retained files already carry — see [`Self::replayed_rid_floor`].
+    replayed_rid_max: std::sync::atomic::AtomicU64,
 }
 
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            finished: Mutex::new(VecDeque::new()),
+            waste: Mutex::new(HashMap::new()),
+            history_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HISTORY_HOURS * 3_600_000),
+            max_records: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_RECORDS),
+            journal: Mutex::new(None),
+            replayed_rid_max: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl Stats {
+    /// Apply `settings.history_hours` / `settings.history_max_records`. Live:
+    /// a smaller value prunes lazily as records arrive, a larger one simply
+    /// lets the queue grow before the next prune round.
+    pub fn set_history(&self, hours: u64, max_records: usize) {
+        self.history_ms
+            .store(hours.max(1) * 3_600_000, std::sync::atomic::Ordering::Relaxed);
+        self.max_records
+            .store(max_records.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The configured Activity retention, in whole hours.
+    pub fn history_hours(&self) -> u64 {
+        self.history_ms.load(std::sync::atomic::Ordering::Relaxed) / 3_600_000
+    }
+
+    /// The configured Activity retention, in ms.
+    pub fn history_ms(&self) -> u64 {
+        self.history_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn max_records(&self) -> usize {
+        self.max_records.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Read the journal back into memory and start its writer thread.
+    /// Callers that fail to attach simply keep the history in memory only.
+    pub fn attach_journal(&self, path: String) -> Result<(), String> {
+        self.replay_journal(&path);
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("activity-journal".into())
+            .spawn(move || journal_writer(&path, rx))
+            .map_err(|e| format!("cannot start the journal writer: {e}"))?;
+        *self.journal.lock_or_recover() = Some(tx);
+        Ok(())
+    }
+
+    /// Load the journal chain (oldest slot first) into the queue, dropping
+    /// records outside the retention window and past the count cap. Intended
+    /// to run before traffic arrives — the queue order beyond that is the
+    /// best-effort one of the load order.
+    fn replay_journal(&self, path: &str) {
+        let cutoff = now_ms().saturating_sub(self.history_ms());
+        let mut loaded: VecDeque<Finished> = VecDeque::new();
+        // Ids already on disk must never be reissued by the fresh counter, or
+        // a click on restored history opens whatever new request borrowed the
+        // id. Taken from every replayable line — pruned ones included.
+        let mut rid_floor = 0u64;
+        let mut files: Vec<String> = (1..=JOURNAL_MAX_FILES)
+            .rev()
+            .map(|i| format!("{}.{i}", path))
+            .collect();
+        files.push(path.to_string());
+        for file in files {
+            let Ok(data) = std::fs::read(&file) else { continue };
+            for line in String::from_utf8_lossy(&data).lines() {
+                let Ok(rec) = serde_json::from_str::<JournalLine>(line.trim()) else {
+                    continue; // torn tail or a newer schema — skip
+                };
+                if let Some(r) = rec.rid {
+                    rid_floor = rid_floor.max(r);
+                }
+                if rec.at_ms < cutoff {
+                    continue;
+                }
+                loaded.push_back(rec.into_finished());
+            }
+        }
+        let max = self.max_records();
+        while loaded.len() > max {
+            loaded.pop_front();
+        }
+        let prev = self.replayed_rid_max.load(std::sync::atomic::Ordering::Relaxed);
+        self.replayed_rid_max
+            .store(prev.max(rid_floor), std::sync::atomic::Ordering::Relaxed);
+        let mut q = self.finished.lock_or_recover();
+        q.extend(loaded);
+    }
+
+    /// The largest `rid` the replayed journal carries: 0 when no journal was
+    /// attached or none of its records had one. A new process must raise its
+    /// rid counter to at least this before serving (see
+    /// [`crate::dispatcher::AppState::seed_rid_floor`]).
+    pub fn replayed_rid_floor(&self) -> u64 {
+        self.replayed_rid_max.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The newest `need` finished records, newest first — the Logs page's
+    /// file-backed tail under the live ring.
+    pub fn finished_tail(&self, need: usize) -> Vec<Finished> {
+        let q = self.finished.lock_or_recover();
+        let n = q.len();
+        q.range(n.saturating_sub(need)..n).rev().cloned().collect()
+    }
+}
 impl Stats {
     pub fn record(&self, f: Finished) {
         if let Some(waste_secs) = f.timing.waste_secs
@@ -141,12 +355,24 @@ impl Stats {
             acc.0 += prefill;
             acc.1 += waste_secs;
         }
-        let cutoff = f.at_ms.saturating_sub(HISTORY.as_millis() as u64);
+        // Snapshot for the journal before `f` is moved into the queue.
+        let line = self
+            .journal
+            .lock_or_recover()
+            .is_some()
+            .then(|| f.to_journal());
+        let cutoff = f.at_ms.saturating_sub(self.history_ms());
+        let max = self.max_records();
         let mut q = self.finished.lock_or_recover();
-        while q.front().is_some_and(|x| x.at_ms < cutoff) || q.len() >= MAX_FINISHED {
+        while q.front().is_some_and(|x| x.at_ms < cutoff) || q.len() >= max {
             q.pop_front();
         }
         q.push_back(f);
+        if let Some(line) = line {
+            if let Some(tx) = self.journal.lock_or_recover().as_ref() {
+                let _ = tx.send(line);
+            }
+        }
     }
 
     /// Lifetime `(prefill secs, waste secs)` remembered for one backend label,
@@ -224,6 +450,72 @@ pub fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// The journal writer thread: append one line per finished record, flush per
+/// batch, and rotate the chain at the size cap — same shape as the
+/// conversation log's writer, so a slow disk costs a thread, never a request.
+fn journal_writer(path: &str, rx: Receiver<JournalLine>) {
+    let open = |path: &str| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    };
+    let mut file = open(path);
+    let mut size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    loop {
+        // Block for the next record, then drain everything queued behind it:
+        // one wake and one flush per burst, not one per record.
+        let Ok(first) = rx.recv() else { break };
+        let mut burst = vec![first];
+        burst.extend(rx.try_iter());
+        if file.is_none() {
+            // Self-heal: a full disk or a briefly missing folder must not
+            // silence the journal for the rest of the process.
+            file = open(path);
+        }
+        for rec in burst {
+            let Ok(mut data) = serde_json::to_string(&rec) else {
+                continue;
+            };
+            data.push('\n');
+            if size + data.len() as u64 > JOURNAL_MAX_BYTES {
+                drop(file.take());
+                rotate_journal(path);
+                size = 0;
+                file = open(path);
+            }
+            let Some(f) = file.as_mut() else { continue };
+            if let Err(e) = f.write_all(data.as_bytes()) {
+                tracing::warn!("activity journal: cannot append to {path}: {e}");
+                file = None;
+            } else {
+                size += data.len() as u64;
+            }
+        }
+        if let Some(f) = &mut file {
+            let _ = f.flush();
+        }
+    }
+    if let Some(mut f) = file {
+        let _ = f.flush();
+    }
+}
+
+/// Shift the journal chain like the conversation log's rotation: the oldest
+/// slot (`.{JOURNAL_MAX_FILES}`) falls off, every slot shifts one older, and
+/// the live file becomes `.1` — the same order [`Stats::replay_journal`] reads
+/// (oldest slot first, live last). A failed rename leaves the live file alone;
+/// the writer keeps appending to it and the age filter on replay still bounds
+/// the history.
+fn rotate_journal(path: &str) {
+    let _ = std::fs::remove_file(format!("{}.{JOURNAL_MAX_FILES}", path));
+    for i in (1..JOURNAL_MAX_FILES).rev() {
+        let _ = std::fs::rename(format!("{}.{i}", path), format!("{}.{}", path, i + 1));
+    }
+    let _ = std::fs::rename(path, format!("{path}.1"));
 }
 
 /// Nearest-rank percentile (`p` in 0..=100); sorts `v`. `None` when empty.
@@ -545,7 +837,7 @@ mod tests {
     #[test]
     fn history_is_pruned_by_age_and_window_reads_are_ordered() {
         let s = Stats::default();
-        let hour = HISTORY.as_millis() as u64;
+        let hour = DEFAULT_HISTORY_HOURS * 3_600_000; // the default window: past it, records fall out
         s.record(fin(1_000, "a", "b:1", "ok", Timing::default()));
         s.record(fin(2_000, "a", "b:1", "ok", Timing::default()));
         // An hour after the first: it falls out, the second stays.
@@ -598,5 +890,150 @@ mod tests {
         assert_eq!(b[1], vec![3]);
         assert_eq!(b[SPARK_BUCKETS - 1], vec![4]);
         assert_eq!(b.iter().map(Vec::len).sum::<usize>(), 4);
+    }
+
+    fn tmpj(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("ollamamq_journal_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        for i in 0..=JOURNAL_MAX_FILES {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}.{}", path.display(), i));
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    fn line_at_ms(path: &str) -> Vec<u64> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<JournalLine>(l.trim()).ok())
+            .map(|r| r.at_ms)
+            .collect()
+    }
+
+    /// A restart is the whole point: what the writer journalled, the next
+    /// process replays — fields intact, order preserved.
+    #[test]
+    fn journal_roundtrips_records_through_a_restart() {
+        let path = tmpj("roundtrip.jsonl");
+        let now = now_ms();
+        {
+            let s1 = Stats::default();
+            s1.attach_journal(path.clone()).expect("attach");
+            s1.record(fin(
+                now - 2_000,
+                "ada",
+                "gpu1",
+                "ok",
+                Timing {
+                    status: Some(200),
+                    ttft: Some(1.5),
+                    prompt_tokens: 7,
+                    completion_tokens: 9,
+                    ..Default::default()
+                },
+            ));
+            s1.record(fin(now - 1_000, "dm", "gpu1", "backend_error", Timing::default()));
+            assert!(
+                wait_until(|| line_at_ms(&path).len() == 2),
+                "the writer journalled both records"
+            );
+        } // sender dropped here; the writer thread exits on disconnect
+        let s2 = Stats::default();
+        s2.attach_journal(path).expect("re-attach");
+        let all = s2.finished_since(0);
+        assert_eq!(all.iter().map(|f| f.at_ms).collect::<Vec<_>>(), vec![now - 2_000, now - 1_000]);
+        assert_eq!((all[0].client.as_str(), all[0].outcome, all[0].timing.ttft), ("ada", "ok", Some(1.5)));
+        assert_eq!((all[1].client.as_str(), all[1].outcome), ("dm", "backend_error"));
+    }
+
+    /// Rids restart at 1 every boot; the replayed records carry ids the kept
+    /// files already use, so the replay must surface their maximum and the
+    /// tail accessor must hand the Logs page its records newest-first.
+    #[test]
+    fn journal_replay_seeds_the_rid_floor_and_the_tail_orders() {
+        let path = tmpj("ridfloor.jsonl");
+        let now = now_ms();
+        let mut old = fin(now - 3_000, "ada", "gpu1", "ok", Timing::default());
+        old.rid = Some(41);
+        let mut newer = fin(now - 2_000, "dm", "gpu1", "ok", Timing::default());
+        newer.rid = Some(7);
+        {
+            let s1 = Stats::default();
+            s1.attach_journal(path.clone()).expect("attach");
+            s1.record(fin(now - 1_000, "pi", "gpu1", "ok", Timing::default())); // no rid
+            s1.record(old);
+            s1.record(newer);
+            assert!(
+                wait_until(|| line_at_ms(&path).len() == 3),
+                "the writer journalled all three records"
+            );
+        }
+        let s2 = Stats::default();
+        s2.attach_journal(path).expect("re-attach");
+        assert_eq!(s2.replayed_rid_floor(), 41, "the highest journalled rid");
+        let tail = s2.finished_tail(2);
+        assert_eq!(tail.len(), 2, "the tail is capped at the request");
+        assert!(
+            tail[0].at_ms >= tail[1].at_ms,
+            "newest first: {:?}",
+            tail.iter().map(|f| f.at_ms).collect::<Vec<_>>()
+        );
+        assert_eq!(s2.finished_tail(99).len(), 3, "asking past the end is fine");
+    }
+
+    /// Replay is the retention boundary: records older than the configured
+    /// window do not come back, and a torn tail line is skipped, not fatal.
+    #[test]
+    fn replay_honours_the_window_and_skips_torn_lines() {
+        let path = tmpj("window.jsonl");
+        let now = now_ms();
+        let rec = |at_ms: u64| {
+            serde_json::to_string(&fin(at_ms, "a", "b", "ok", Timing::default()).to_journal())
+                .unwrap()
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n{{trunc\n", rec(now - 30 * 3_600_000), rec(now - 60_000)),
+        )
+        .unwrap();
+        let s = Stats::default(); // 24 h window
+        s.attach_journal(path).expect("attach");
+        assert_eq!(
+            s.finished_since(0).iter().map(|f| f.at_ms).collect::<Vec<_>>(),
+            vec![now - 60_000],
+            "only the record inside the window replays, the torn line is skipped"
+        );
+    }
+
+    /// The count cap bounds replay too — a journal far past `max_records`
+    /// keeps its newest tail.
+    #[test]
+    fn replay_caps_at_history_max_records() {
+        let path = tmpj("cap.jsonl");
+        let now = now_ms();
+        let body: String = (0..5)
+            .map(|i| {
+                let j = fin(now - 5 + i, "a", "b", "ok", Timing::default()).to_journal();
+                format!("{}\n", serde_json::to_string(&j).unwrap())
+            })
+            .collect();
+        std::fs::write(&path, body).unwrap();
+        let s = Stats::default();
+        s.set_history(24, 2);
+        s.attach_journal(path).expect("attach");
+        assert_eq!(s.finished_since(0).len(), 2);
+        assert_eq!(s.finished_since(0)[0].at_ms, now - 2, "the newest tail survives");
     }
 }

@@ -3,6 +3,37 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.23.0 — 2026-10-28
+
+### Added
+
+- **The Activity history and the Logs page now survive a restart.** Until now the
+  Overview's Activity remembered only what the current process had served — every
+  finished request journaled to `ollamamq-activity.jsonl` (next to the request log,
+  size-rotated like it) comes back at boot, so a restart no longer blanks the
+  Overview or the Activity curve, and a conversation can be opened from the log file
+  even when its text long ago left memory: the conversation log is now indexed over
+  the whole rotation chain (each conversation's place in the files, body text read
+  lazily), not just the last seeded tail. The **Logs** page opens with its history
+  too — restored rows carry the recorded outcome (`← ok`, `← timeout`), count as
+  requests in the grouped activity line, and open their conversation straight from
+  disk like any other row; refused traffic without a conversation stays listed but
+  inert. Restored rows also land on the right request after a restart: the log
+  correlation ids restart at 1 with every boot, so the counter now starts above
+  every id the journal and the conversation log still carry.
+- `history_hours` (default 24) sets how far the Activity history reaches: the
+  longest Overview window, the age journaled records replay at, and the ceiling of
+  the filter modal's window picker — at `48` the modal grows `24 h` and `48 h`
+  presets and the custom window follows. `history_max_records` (default 50 000)
+  caps how many finished requests are kept whatever their age; retention is sized
+  by the request log's rotation (`request_log_max_files`), and both are live-editable
+  in Settings.
+
+### Changed
+
+- The conversation viewer's *Expand all* / *Collapse all* are now the same `⊞`/`⊟`
+  icon buttons as in the Activity list.
+
 ## v0.22.0 — 2026-10-27
 
 ### Added

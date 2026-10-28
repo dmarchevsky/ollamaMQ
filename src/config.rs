@@ -188,6 +188,20 @@ pub struct Settings {
     /// request log; values below 1024 are raised to 1024 (default 1048576).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_content_limit: Option<usize>,
+    /// How far back the Activity history behind the Overview page reaches, in
+    /// hours (default 24). It is the longest window the Overview offers, the
+    /// age at which finished-request records fall out of memory, and the age
+    /// at which journaled records are dropped when read back after a restart.
+    /// Records are journalled next to the request log, so the history now
+    /// survives restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_hours: Option<u64>,
+    /// Cap on finished-request records kept in memory for the Overview,
+    /// whatever their age (default 50000). Each record is a few hundred bytes;
+    /// raise it past your busiest 2 × `history_hours` of requests so the cap
+    /// never trims inside the retention window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_max_records: Option<usize>,
     /// Largest request body accepted on normal routes, in bytes (default
     /// 64 MiB). Bodies are buffered whole — they have to be, since a request
     /// may wait in a queue before a backend takes it — so this is the per
@@ -428,6 +442,7 @@ impl Settings {
             sticky_routing, sticky_ttl, sticky_lag, sticky_max_entries, client_priority,
             request_log_path, request_log_max_bytes, request_log_max_files,
             request_log_flush_secs, log_content_limit,
+            history_hours, history_max_records,
             max_body_bytes, max_queued_bytes, clients_file, models_file,
             metrics_token, web_ui
         )
@@ -445,6 +460,12 @@ impl Settings {
         at_least(self.max_queued_bytes, 1024 * 1024, "max_queued_bytes")?;
         at_least(self.max_body_bytes.map(|v| v as u64), 1024, "max_body_bytes")?;
         at_least(self.log_content_limit.map(|v| v as u64), 1024, "log_content_limit")?;
+        at_least(self.history_hours, 1, "history_hours")?;
+        at_least(
+            self.history_max_records.map(|v| v as u64),
+            100,
+            "history_max_records",
+        )?;
         at_least(self.request_log_flush_secs, 5, "request_log_flush_secs")?;
         at_least(self.sticky_ttl, 1, "sticky_ttl")?;
         at_least(self.sticky_max_entries.map(|v| v as u64), 1, "sticky_max_entries")?;

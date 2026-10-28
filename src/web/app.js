@@ -52,7 +52,7 @@ function storedFilters() {
     }
     const w = localStorage.getItem('omq.window');
     const c = localStorage.getItem('omq.client');
-    return { ...d, win: ['5m', '15m', '1h'].includes(w) ? w : '15m', clients: c ? [c] : [] };
+    return { ...d, win: ['5m', '15m', '30m', '1h', '24h', '48h'].includes(w) ? w : '15m', clients: c ? [c] : [] };
   } catch { /* storage blocked */ }
   return d;
 }
@@ -339,6 +339,13 @@ function clientIds(st) {
 // ---------------------------------------------------------------- filters
 
 const FPRESETS = ['5m', '15m', '30m', '1h'];
+/** The Overview's retention as served with the last payload (hours). */
+const historyHours = () => Number(S.overview && S.overview.history_hours) || 24;
+/** Preset windows, extended to the configured retention (24 h, 48 h, …). */
+function fPresets() {
+  const h = historyHours();
+  return [...FPRESETS, ...(h >= 24 ? ['24h'] : []), ...(h >= 48 ? ['48h'] : [])];
+}
 const saveFilters = () => {
   try { localStorage.setItem('omq.filters', JSON.stringify(S.filters)); } catch { /* storage blocked */ }
 };
@@ -429,10 +436,10 @@ const flhead = (title, id, sel, n) => `<div class="fhead"><b>${title}</b><span c
 function drawFilters() {
   const f = S.filters, st = S.state, ov = S.overview || {};
   const cm = /^(\d+)(m|h)$/.exec(f.win);
-  const preset = FPRESETS.includes(f.win);
-  setHTML($('#f-time'), `<div class="fhead"><b>Time interval</b><span class="hint">or last N — history is kept for 24 h</span></div>
+  const preset = fPresets().includes(f.win);
+  setHTML($('#f-time'), `<div class="fhead"><b>Time interval</b><span class="hint">or last N — history is kept for ${historyHours()} h</span></div>
     <div class="frow"><span class="seg" role="radiogroup" aria-label="Time window">
-      ${FPRESETS.map(w => `<label><input type="radio" name="fwin" value="${w}"${preset && f.win === w ? ' checked' : ''}><span>${winLabel(w)}</span></label>`).join('')}
+      ${fPresets().map(w => `<label><input type="radio" name="fwin" value="${w}"${preset && f.win === w ? ' checked' : ''}><span>${winLabel(w)}</span></label>`).join('')}
     </span><input type="text" id="f-win-n" inputmode="numeric" placeholder="last" value="${preset ? '' : cm[1]}">
     <select id="f-win-u"><option value="m"${!preset && cm?.[2] === 'm' ? ' selected' : ''}>minutes</option><option value="h"${cm?.[2] === 'h' ? ' selected' : ''}>hours</option></select></div>`);
   setHTML($('#f-mode'), `<div class="fhead"><b>Client identity</b><span class="hint">label mode lists and shows client:key (API key label)</span></div>
@@ -488,7 +495,7 @@ function collectFilters() {
   const win = $('#dlg-filters input[name="fwin"]:checked')?.value;
   const n = ($('#f-win-n').value || '').trim();
   const custom = /^\d+$/.test(n)
-    ? Math.min(+n || 1, $('#f-win-u').value === 'h' ? 24 : 1440) + $('#f-win-u').value
+    ? Math.min(+n || 1, $('#f-win-u').value === 'h' ? historyHours() : historyHours() * 60) + $('#f-win-u').value
     : null;
   f.win = win || custom || '15m';
   f.mode = $('#dlg-filters input[name="fmode"]:checked').value;
@@ -1664,7 +1671,14 @@ function logTable(rounds) {
   return `<table class="logs">
     <tr><th>Time</th><th>Client</th><th>Model</th><th>Backend</th><th>Round</th></tr>
     ${rounds.map(r => { const e = ev(r); const rid = r.in?.rid ?? r.out?.rid;
-      return `<tr class="clickable" ${rid ? `data-action="log-round" data-rid="${rid}"` : `data-action="log-detail" data-seq="${e.seq}"`}>
+      // A journal-restored row without a rid (refused traffic, control records)
+      // is information only: seq addresses the live ring, so clicking it could
+      // open nothing. Rows that name a conversation still open it.
+      const open = rid ? `data-action="log-round" data-rid="${rid}"`
+        : e.hist ? (e.session ? `data-action="conv-open" data-user="${esc(e.user)}" data-session="${esc(e.session)}"` : '')
+        : `data-action="log-detail" data-seq="${e.seq}"`;
+      const inert = e.hist && !rid && !e.session;
+      return `<tr class="${inert ? '' : 'clickable'}" ${open}>
       <td class="time">${fmtTime(e.at_ms)}</td>
       <td class="mono">${esc(e.user)}</td>
       <td class="trunc ${e.model ? '' : 'none'}">${esc(e.model ?? '—')}</td>
@@ -1699,7 +1713,7 @@ function logConvs(rounds) {
     if (!g) {
       g = { kind: 'conv', key, user: e.user, session: e.session, label: e.session_label || null,
         models: new Set(), backends: new Set(), reqs: 0, inBytes: 0, outBytes: 0, errors: 0,
-        first: e.at_ms, at: e.at_ms, rid: e.rid ?? null, lastStatus: null,
+        first: e.at_ms, at: e.at_ms, rid: e.rid ?? null, lastStatus: null, lastOutcome: null,
         statusAt: 0, redacted: false, waiting: false, cmp: 0 };
       byKey.set(key, g);
       items.push(g);
@@ -1710,6 +1724,18 @@ function logConvs(rounds) {
     if (e.backend) g.backends.add(e.backend);
     if (e.redacted) g.redacted = true;
     if (r.in) { g.reqs++; g.inBytes += num(/body=(\d+)B/, r.in.info); if (/· compaction/.test(r.in.info || '')) g.cmp++; }
+    else if (r.out?.hist || r.solo?.hist) {
+      // A restored round is a whole request. It carries no HTTP code — the
+      // journalled outcome (ok, timeout, backend_error…) stands in, so the
+      // arrow never reads `…`; a failed outcome tints the row.
+      // Refused-before-dispatch records ride `solo` (they never got an rid).
+      g.reqs++;
+      const h = r.out || r.solo;
+      if (h.at_ms >= g.statusAt) {
+        g.lastOutcome = h.info; g.statusAt = h.at_ms;
+        if (/error|timeout|drop|fail|refus|gone/i.test(h.info)) g.errors++;
+      }
+    }
     if (r.out) {
       g.outBytes += num(/resp=(\d+)B/, r.out.info);
       const st = num(/-> (\d{3})/, r.out.info);
@@ -1723,8 +1749,12 @@ function logConvs(rounds) {
 
 /** The Activity cell: what the session sent and got, plus what it is doing. */
 function convSegs(g) {
-  return `<span class="rl in"><span class="ar">\u2192</span>${g.reqs} req \u00b7 ${fmtBytes(g.inBytes)}</span>`
-    + ` <span class="rl out${g.errors ? ' err' : ''}"><span class="ar">\u2190</span>${g.lastStatus ?? '…'} \u00b7 ${fmtBytes(g.outBytes)}</span>`
+  // A restored round carries no byte size — a zero on a history row would
+  // read as an empty request, so the byte segments drop when there is none.
+  const inPart = `${g.reqs} req` + (g.inBytes ? ` \u00b7 ${fmtBytes(g.inBytes)}` : '');
+  const outPart = (g.lastStatus ?? g.lastOutcome ?? '…') + (g.outBytes ? ` \u00b7 ${fmtBytes(g.outBytes)}` : '');
+  return `<span class="rl in"><span class="ar">\u2192</span>${inPart}</span>`
+    + ` <span class="rl out${g.errors ? ' err' : ''}"><span class="ar">\u2190</span>${outPart}</span>`
     + (g.waiting ? ' <span class="badge q">waiting</span>' : '')
     + (g.cmp ? ` <span class="badge cmp" title="${g.cmp} summarization request${g.cmp > 1 ? 's' : ''} in this conversation">⤓ ${g.cmp}</span>` : '')
     + (g.errors ? ` <span class="badge bad">${g.errors} failed</span>` : '')
@@ -2651,8 +2681,10 @@ function lvDrawRail() {
   const turns = lvTurns();
   const runs = lvRuns();
   const items = [`<div class="lv-rail-h">
-    <button class="btn sm" data-action="lv-expand">Expand all</button>
-    <button class="btn sm" data-action="lv-collapse">Collapse all</button></div>`];
+    <span class="btn-group">
+      <button class="btn sm" data-action="lv-expand" title="Expand all" aria-label="Expand all">⊞</button>
+      <button class="btn sm" data-action="lv-collapse" title="Collapse all" aria-label="Collapse all">⊟</button>
+    </span></div>`];
   let prevRun = -1;
   turns.forEach((t, i) => {
     const prev = turns[i - 1];
