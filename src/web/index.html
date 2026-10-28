@@ -19,7 +19,7 @@
       <a href="#models" data-page="models"><span class="ico">◇</span>Models<span class="count" id="nav-models"></span></a>
       <a href="#clients" data-page="clients"><span class="ico">⚿</span>Clients<span class="count" id="nav-clients"></span></a>
       <a href="#blocked" data-page="blocked"><span class="ico">⊘</span>Blocked<span class="count" id="nav-blocked"></span></a>
-      <a href="#logs" data-page="logs"><span class="ico">≡</span>Logs</a>
+      <a href="#logs" data-page="logs"><span class="ico">≡</span>Logs<span class="count" id="nav-logs"></span></a>
       <a href="#settings" data-page="settings"><span class="ico">⚙</span>Settings<span class="count" id="nav-settings"></span></a>
     </nav>
     <div class="nav-foot">
@@ -138,6 +138,10 @@
           <div class="seg" id="log-group" role="radiogroup" aria-label="One row per conversation or per request">
             <label><input type="radio" name="log-group" value="session" checked><span>By conversation</span></label>
             <label><input type="radio" name="log-group" value="request"><span>By request</span></label>
+          </div>
+          <div class="seg" id="log-flag" role="radiogroup" aria-label="Show only flagged rows">
+            <label><input type="radio" name="log-flag" value="all" checked><span>All</span></label>
+            <label><input type="radio" name="log-flag" value="flagged"><span>⚑ Flagged</span></label>
           </div>
           <select id="log-dir">
             <option value="">All</option><option value="awaiting">Awaiting response</option><option value="CTL">Control</option>

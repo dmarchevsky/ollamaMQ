@@ -603,3 +603,40 @@ addEventListener('load', () => setTimeout(() => {
     }, 700);
   }, 800);
 }, 34000));
+
+// --- Security audit flags ---------------------------------------------------
+// Runs AFTER the pre-existing timeline (which navigates the viewer itself):
+// flagged rows in the log list, the Flagged filter, the verdict block under a
+// flagged turn. The demo audit marks the codex conversation (rid 901: confirmed
+// exfil + watch-level injection) and one sessionless row (a recon).
+addEventListener('load', () => setTimeout(() => {
+  const A6 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  setTimeout(() => { location.hash = '#logs'; }, 400);
+  setTimeout(() => {
+    const txt = [...document.querySelectorAll('#logs .rline .badge')].map(b => b.textContent).join(',');
+    A6('flag-badges-in-list', /⚑ exfil/.test(txt) && /⚑ injection/.test(txt) && /⚑ recon/.test(txt), txt);
+    document.querySelector('#log-flag input[value="flagged"]').click();
+  }, 900);
+  setTimeout(() => {
+    const rows = [...document.querySelectorAll('#logs table.logs tr')].slice(1);
+    A6('flagged-filter', rows.length > 0 && rows.every(r => r.textContent.includes('⚑')), `${rows.length} rows, every one flagged`);
+    document.querySelector('#log-flag input[value="all"]').click();
+  }, 1400);
+  setTimeout(() => {
+    const row = document.querySelector('#logs tr[data-session="a3f19c"]');
+    if (row) row.click();   // opens the viewer on the flagged conversation
+  }, 1900);
+  setTimeout(async () => {
+    const wait = ms => new Promise(r => setTimeout(r, ms));
+    await wait(600);
+    if (document.querySelector('#lv-t-901 .turn-h') && !LV.open.has(901)) {
+      document.querySelector('#lv-t-901 .turn-h').click();   // expand the flagged request
+      await wait(700);
+    }
+    A6('turn-audit-badge', !!document.querySelector('#lv-t-901 .turn-h .badge.bad'),
+      document.querySelector('#lv-t-901 .turn-h')?.textContent.trim().slice(0, 60));
+    A6('audit-block', !!document.querySelector('#dlg-log .audit'), 'verdict block under the flagged turn');
+    A6('audit-block-rows', document.querySelectorAll('#dlg-log .audit .a-row').length === 2,
+      `${document.querySelectorAll('#dlg-log .audit .a-row').length} verdict lines`);
+  }, 2600);
+}, 9800));

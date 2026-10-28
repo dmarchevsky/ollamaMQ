@@ -1016,6 +1016,9 @@ function renderDetails(rows) {
     // How many of this conversation's requests were summarization calls — the
     // `⤓` that ties the striped blocks on the graph to the number beside the name.
     const cmpN = unit.filter(x => x.o.kind === 'compaction').length;
+    // The audit's worst flags ride the header: a folded conversation still
+    // says it carries one, and the line that earned it spells its own badges.
+    const unitFlags = mergeFlags(unit.flatMap(x => x.o.flags || []));
     // The summary is three right-aligned columns so the numbers line up
     // across headers; on phones the columns drop their min-widths and wrap.
     const sum = `<span class="sum"><i>${unit.length} req</i><i>${fmtTok(unit.reduce((a, x) => a + rowTokens(x), 0))} tok</i>`
@@ -1026,6 +1029,7 @@ function renderDetails(rows) {
       ${head.s || head.o.session_label ? `<span class="who">#${esc(sessName(head.o))}</span>${priCtl(head.o, head.s || head.o.session)}` : ''}
       <span class="sub" title="${esc(head.o.model)}${bk}">${esc(head.o.model)}${bk}</span>${chip}
       ${cmpN ? `<span class="badge cmp" title="${cmpN} summarization request${cmpN > 1 ? 's' : ''} attached to this conversation">⤓ ${cmpN}</span>` : ''}
+      ${unitFlags.length ? flagBadges(unitFlags) : ''}
       ${sum}
       ${head.s ? `<span class="logs-link jump-chip" data-action="conv-open" data-session="${esc(head.s)}" data-user="${esc(head.o.client)}" title="open this conversation in the viewer">\u2263 View</span>` : ''}</button>`);
     if (shut) continue;
@@ -1042,14 +1046,19 @@ function renderDetails(rows) {
             + (tools ? ` <span class="dim">\u00b7 tool ${esc(tools)}</span>` : '') + '</span></div>' });
         }
       }
-      for (const e of asc[i].plan.events) {
+      const evs = asc[i].plan.events;
+      const rFlags = mergeFlags(asc[i].o.flags || []);
+      evs.forEach((e, ei) => {
         // Live stage lines (the running request's now-still-unfinished ones)
         // wear the client's own colour wash. The line
         // belongs to one request, so it opens the conversation on that request.
         const rid = asc[i].o.rid;
+        // The audit's verdict arrives after the request is done, so it lands
+        // on the request's last stage line — where its numbers already sit.
+        const fl = ei === evs.length - 1 && rFlags.length ? ' ' + flagBadges(rFlags) : '';
         lines.push({ t: e.at, html: `<div class="det-row${e.live ? ' live' : ''}"${rid ? ` data-action="log-jump" data-rid="${rid}" title="open this conversation at this request"` : ''}><span class="when">${fmtTime(e.at)}</span>`
-          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}</span>${rid ? '<span class="jump jump-chip">\u2263 View</span>' : ''}</div>` });
-      }
+          + `<span class="st ${e.k}">${STAGE[e.k]}</span><span class="val">${e.line}${fl}</span>${rid ? '<span class="jump jump-chip">\u2263 View</span>' : ''}</div>` });
+      });
     }
     lines.sort((a, b) => b.t - a.t);
     out.push(`<div class="det-body" style="--c:var(--${c})">${lines.map(l => l.html).join('')}</div>`);
@@ -1664,6 +1673,38 @@ function roundSegs(r) {
   return segs.join(' ');
 }
 
+// --- Security-audit flags (see src/audit.rs) ------------------------------
+// A flag is {kind, src, by, prob?, category?, detail?, excerpt?, bad}. Badges
+// are worst-first: a confirmed kind (red) always precedes its watch twin
+// (amber), and within a severity kinds keep a fixed order so a row's point
+// survives the truncation a phone applies.
+const FLAG_ORDER = ['injection', 'exfil', 'privesc', 'recon', 'harm'];
+const flagRank = f => (f.bad ? 0 : 10) + FLAG_ORDER.indexOf(f.kind ?? 'harm');
+const flagTitle = f => [
+  `${f.src} · ${f.kind}`,
+  `${f.by}${f.category ? `: ${f.category}` : ''}${f.detail ? ` — ${f.detail}` : ''}`,
+  f.prob != null ? `confidence ${Math.round(f.prob * 100)}%` : 'rule hit',
+  f.bad ? 'confirmed' : 'watch',
+].filter(Boolean).join(' · ');
+const flagBadges = flags => (flags || []).map(f =>
+  `<span class="badge ${f.bad ? 'bad' : 'warn'}" title="${esc(flagTitle(f))}">⚑ ${esc(f.kind)}</span>`).join(' ');
+/** Dedupe by (kind, severity) and sort worst-first — the view of many turns'
+ *  flags a conversation row or an Activity header needs. */
+const mergeFlags = list => {
+  const seen = new Set();
+  const out = [];
+  for (const f of list || []) {
+    const k = `${f.kind}!${f.bad ? 1 : 0}`;
+    if (!seen.has(k)) { seen.add(k); out.push(f); }
+  }
+  out.sort((a, b) => flagRank(a) - flagRank(b));
+  return out;
+};
+const roundFlags = r => mergeFlags([
+  ...(r.in?.flags || []), ...(r.out?.flags || []), ...(r.solo?.flags || [])]);
+// Flagged-only view of the log (segment in the Logs toolbar).
+let logFlagOnly = false;
+
 function logTable(rounds) {
   if (!rounds.length) return '<div class="empty">No matching log events</div>';
   const off = captureOff();
@@ -1683,7 +1724,7 @@ function logTable(rounds) {
       <td class="mono">${esc(e.user)}</td>
       <td class="trunc ${e.model ? '' : 'none'}">${esc(e.model ?? '—')}</td>
       <td class="dim ${e.backend ? '' : 'none'}">${e.backend ? bkCell(e.backend) : '—'}</td>
-      <td class="round"><div class="rline">${roundSegs(r)}${off && rid ? NOCAP_BADGE : ''}</div></td></tr>`; }).join('')}
+      <td class="round"><div class="rline">${roundSegs(r)}${roundFlags(r).length ? ' ' + flagBadges(roundFlags(r)) : ''}${off && rid ? NOCAP_BADGE : ''}</div></td></tr>`; }).join('')}
     </table>`;
 }
 
@@ -1714,7 +1755,7 @@ function logConvs(rounds) {
       g = { kind: 'conv', key, user: e.user, session: e.session, label: e.session_label || null,
         models: new Set(), backends: new Set(), reqs: 0, inBytes: 0, outBytes: 0, errors: 0,
         first: e.at_ms, at: e.at_ms, rid: e.rid ?? null, lastStatus: null, lastOutcome: null,
-        statusAt: 0, redacted: false, waiting: false, cmp: 0 };
+        statusAt: 0, redacted: false, waiting: false, cmp: 0, flagList: [] };
       byKey.set(key, g);
       items.push(g);
     }
@@ -1723,6 +1764,7 @@ function logConvs(rounds) {
     if (e.model) g.models.add(e.model);
     if (e.backend) g.backends.add(e.backend);
     if (e.redacted) g.redacted = true;
+    if (e.flags) g.flagList.push(...e.flags);
     if (r.in) { g.reqs++; g.inBytes += num(/body=(\d+)B/, r.in.info); if (/· compaction/.test(r.in.info || '')) g.cmp++; }
     else if (r.out?.hist || r.solo?.hist) {
       // A restored round is a whole request. It carries no HTTP code — the
@@ -1743,6 +1785,7 @@ function logConvs(rounds) {
     }
     if (r.in && !r.out) g.waiting = true;
   }
+  for (const it of items) if (it.kind === 'conv') it.flags = mergeFlags(it.flagList);
   items.sort((a, b) => b.at - a.at);
   return items;
 }
@@ -1755,6 +1798,7 @@ function convSegs(g) {
   const outPart = (g.lastStatus ?? g.lastOutcome ?? '…') + (g.outBytes ? ` \u00b7 ${fmtBytes(g.outBytes)}` : '');
   return `<span class="rl in"><span class="ar">\u2192</span>${inPart}</span>`
     + ` <span class="rl out${g.errors ? ' err' : ''}"><span class="ar">\u2190</span>${outPart}</span>`
+    + (g.flags && g.flags.length ? ` ${flagBadges(g.flags)}` : '')
     + (g.waiting ? ' <span class="badge q">waiting</span>' : '')
     + (g.cmp ? ` <span class="badge cmp" title="${g.cmp} summarization request${g.cmp > 1 ? 's' : ''} in this conversation">⤓ ${g.cmp}</span>` : '')
     + (g.errors ? ` <span class="badge bad">${g.errors} failed</span>` : '')
@@ -1776,7 +1820,7 @@ function convTable(rounds) {
         <td class="time">${fmtTime(e.at_ms)}</td>
         <td><span class="mono">${esc(e.user)}</span> <span class="dim">\u00b7 no session</span></td>
         <td class="trunc none">\u2014</td><td class="dim none">\u2014</td>
-        <td class="round"><div class="rline">${roundSegs(it.r)}</div></td></tr>`;
+        <td class="round"><div class="rline">${roundSegs(it.r)}${roundFlags(it.r).length ? ' ' + flagBadges(roundFlags(it.r)) : ''}</div></td></tr>`;
     }
     const g = it, model = listSome(g.models), bk = listSome(g.backends);
     return `<tr class="clickable" data-action="conv-open" data-session="${esc(g.session)}" data-user="${esc(g.user)}"${g.rid != null ? ` data-rid="${g.rid}"` : ''}
@@ -1800,12 +1844,20 @@ const captureOff = () => S.capture && S.capture.log === false;
 function renderLogs() {
   const q = $('#log-filter').value.trim().toLowerCase();
   const dir = $('#log-dir').value;
-  const rounds = logRounds(S.logs).filter(r =>
+  // The flag count is over everything the filter would otherwise show: it is
+  // the nav badge and the segment's number, and it must not vanish when the
+  // Flagged segment itself is what filters the rows.
+  const all = logRounds(S.logs);
+  const flagged = all.reduce((n, r) => n + (roundFlags(r).length ? 1 : 0), 0);
+  segCount('#log-flag', 1, flagged);
+  $('#nav-logs').textContent = flagged || '';
+  const rounds = all.filter(r =>
     (dir === '' || (dir === 'awaiting' ? r.in && !r.out : r.ctl)) &&
     (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.in?.session_label, r.out?.user, r.out?.model,
       r.out?.backend, r.out?.session, r.out?.session_label,
       r.in?.info, r.out?.info, r.solo?.user, r.solo?.model, r.solo?.backend, r.solo?.session, r.solo?.info]
-      .some(v => v && String(v).toLowerCase().includes(q))));
+      .some(v => v && String(v).toLowerCase().includes(q))) &&
+    (!logFlagOnly || roundFlags(r).length));
   const warn = captureOff()
     ? `<div class="capnote">Body capture is <b>off</b> — these requests are listed from memory, but their conversations are not written to disk, so a row has nothing to open. Set a writable <b>Request log path</b> in Settings and restart to capture them${S.capture.path ? ` (current path: <code>${esc(S.capture.path)}</code>)` : ''}.</div>`
     : '';
@@ -2273,7 +2325,7 @@ async function lvDraw({ scroll = false } = {}) {
     } else parts.push(gap);
     if (rk !== -1 && LV.closedRuns.has(rk)) continue; // folded run: its header says it all
     let sec = lvTurnHead(t, i);
-    if (LV.open.has(t.rid)) sec += await lvTurnInner(t);
+    if (LV.open.has(t.rid)) sec += lvAuditBlock(t) + await lvTurnInner(t);
     parts.push(sec + '</section>');
   }
   if (openRun) parts.push('</div>');
@@ -2293,6 +2345,21 @@ async function lvDraw({ scroll = false } = {}) {
  *  client that walked away is not one — that row just carries no status. */
 const lvProb = t => (t.status != null && t.status >= 400)
   || t.outcome === 'timeout' || t.outcome === 'backend_error';
+
+/** The verdict block a flagged turn shows when open: one line per flag —
+ *  where it was seen, what kind it is, who said so with what confidence,
+ *  and the excerpt (absent whenever the turn's text is not stored). A clean
+ *  turn shows nothing: the block's absence is the healthy state. */
+function lvAuditBlock(t) {
+  const fl = t.audit || [];
+  if (!fl.length) return '';
+  return `<div class="audit${fl.every(f => !f.bad) ? ' watch' : ''}">
+    <h4>⚑ Security audit — ${fl.length} flag${fl.length > 1 ? 's' : ''}</h4>
+    ${fl.map(f => `<div class="a-row"><b>${esc(f.src)}</b><span>· ${esc(f.kind)} — ${esc(f.by)}${f.category ? `: ${esc(f.category)}` : ''}${f.detail ? ` — ${esc(f.detail)}` : ''}</span>`
+      + (f.prob != null ? `<span class="p">${f.prob.toFixed(2)}</span>` : '<span class="p">rule</span>')
+      + (f.excerpt ? `<q>“${esc(f.excerpt)}”</q>` : '') + '</div>').join('')}
+  </div>`;
+}
 
 /** One collapsed run: the range it covers, how long it ran, its first words,
  *  and how many tools it fired. A run is named by that range — `#1–#3`, the
@@ -2339,6 +2406,7 @@ function lvTurnHead(t, i) {
       ${t.redacted ? '<span class="badge warn" title="text not stored for this request — the client\'s X-Redact-Log header or its client, key or backend setting">redacted</span>' : ''}
       ${t.kind === 'compaction' ? `<span class="badge cmp" title="${t.link ? `summarization request, attached to this conversation by ${esc(t.link)}` : 'summarization request — no conversation was found to attach it to'}">⤓ compaction</span>` : ''}
       ${t.kind === 'post-compact' ? '<span class="badge cmp" title="the first request after a summarization call: its prefill is cold because the history was rewritten">⤑ post-compaction</span>' : ''}
+      ${(t.audit || []).length ? flagBadges(t.audit) : ''}
       ${tail}</h3>`;
 }
 
@@ -3020,11 +3088,16 @@ const FIELD_META = {
   allow_all_routes: { label: 'Proxy unknown routes', kind: 'bool', help: 'Forward paths ollamaMQ does not know to the backends.' },
   metrics_token: { label: 'Metrics token', kind: 'secret', help: 'Bearer token that <code>GET /metrics</code> requires.' },
   log_content_limit: { label: 'Captured text per log record', unit: 'KiB', scale: 1024, min: 1, help: 'Request and response text kept for the Logs page.' },
+  audit_mode: { label: 'Audit mode', kind: 'seg', options: [['off', 'Off'], ['scanner', 'Scanner'], ['full', 'Full']], help: 'Scanner = local rules only. Full adds d3-nano + Qwen3Guard verdicts on the audit backend. The audit marks suspicious activity after the request is served — it never blocks, holds or changes a reply.' },
+  audit_flag_threshold: { label: 'Flag threshold', kind: 'float', unit: '(0–1)', help: 'Probability at or above which a model verdict is confirmed (red badge) instead of watch (amber). Rule hits are always confirmed.' },
+  audit_scan_redacted: { label: 'Scan redacted requests', kind: 'bool', help: 'X-Redact-Log traffic is judged in memory; verdicts and probabilities are stored, its text never is.' },
+  audit_backend: { label: 'Audit backend', kind: 'text', help: 'The server running <code>qwen3guard-gen</code> and <code>d3-nano</code>. Empty: the first backend that lists them. While it is unreachable the scanner keeps working alone.' },
 };
 const SET_GROUPS = [
   ['Scheduling & limits', ['timeout', 'stuck_timeout', 'max_concurrent_per_backend', 'detect_backend_slots', 'max_queued_bytes', 'max_body_bytes', 'load_keep_alive']],
   ['Routing', ['model_aliases', 'ip_identity', 'sticky_routing', 'sticky_ttl', 'sticky_lag', 'sticky_max_entries', 'allow_all_routes']],
   ['Security', ['@password', 'metrics_token']],
+  ['Security audit', ['audit_mode', 'audit_flag_threshold', 'audit_scan_redacted', 'audit_backend', '@auditstate']],
   ['Logging & server', ['log_content_limit', '@startup']],
 ];
 const STARTUP_LABEL = {
@@ -3065,6 +3138,15 @@ function setControl(f) {
   }
   if (m.kind === 'select') {
     return `<select id="set-${f.key}" data-key="${f.key}" ${dis}>${m.options.map(([val, text]) => `<option value="${val}" ${v === val ? 'selected' : ''}>${text}</option>`).join('')}</select>`;
+  }
+  if (m.kind === 'seg') {
+    return `<span class="seg set-seg">${m.options.map(([val, text]) => `<label><input type="radio" data-key="${f.key}" name="set-${f.key}" value="${val}" ${v === val ? 'checked' : ''} ${dis}><span>${text}</span></label>`).join('')}</span>`;
+  }
+  if (m.kind === 'float') {
+    return `<span class="num-in"><input type="number" id="set-${f.key}" data-key="${f.key}" value="${esc(v ?? '')}" min="0" max="1" step="0.05" ${dis}><span class="dim">${m.unit}</span></span>`;
+  }
+  if (m.kind === 'text') {
+    return `<input type="text" id="set-${f.key}" data-key="${f.key}" value="${esc(v ?? '')}" placeholder="auto-detect" ${dis} style="min-width:260px">`;
   }
   if (m.kind === 'secret') {
     const shown = S.revealToken && S.draft.get(f.key) === S.revealToken;
@@ -3130,6 +3212,23 @@ function startupRows() {
 }
 
 /** The whole form; called on demand only (see above). */
+/** The audit's status line on the Settings page: one quiet row, filled from
+ *  GET /audit — the numbers that show the audit falling behind or losing its
+ *  backend, which is the whole reason the line exists. */
+function auditStateRow() {
+  return `<div class="set-row" data-row="auditstate">
+    <div class="set-l"><label>Audit status</label><div class="set-help">Live state of the audit worker: what it is judging, how far behind, what it dropped.</div></div>
+    <div class="set-c" id="audit-state"><span class="dim">probing…</span></div>
+    <div class="set-s"></div></div>`;
+}
+function fillAuditState() {
+  const el = $('#audit-state');
+  if (!el || !S.auditState) return;
+  const a = S.auditState;
+  el.innerHTML = `<span class="${a.backend_online ? 'st-ok' : 'st-bad'}">● ${esc(a.mode)}</span> <span class="dim">backend</span> ${esc(a.backend)} · queue ${a.queue}/${a.queue_max}`
+    + (a.dropped ? ` · <span class="st-warn">${fmtNum(a.dropped)} dropped</span>` : ' · dropped 0');
+}
+
 function renderSettingsForm() {
   if (!S.settings) return;
   S.formShown = true;
@@ -3137,9 +3236,10 @@ function renderSettingsForm() {
   $('#dl-set-models').innerHTML = [...models].sort().map(m => `<option value="${esc(m)}">`).join('');
   $('#set-form').innerHTML = SET_GROUPS.map(([title, keys]) => `<div class="panel set-panel">
     <div class="panel-h"><h2>${title}</h2></div>
-    ${keys.map(k => k === '@password' ? passwordRow() : k === '@startup' ? startupRows() : setRow(setField(k))).join('')}
+    ${keys.map(k => k === '@password' ? passwordRow() : k === '@startup' ? startupRows() : k === '@auditstate' ? auditStateRow() : setRow(setField(k))).join('')}
   </div>`).join('');
   renderSettingsBar();
+  fillAuditState();
 }
 
 function renderSettingsBar() {
@@ -3156,6 +3256,7 @@ function renderSettings() {
   if (!set) return;
   if (!S.formShown) renderSettingsForm();
   renderSettingsBar();
+  api('GET', 'audit').then(a => { S.auditState = a; fillAuditState(); }).catch(() => {});
   const names = Object.fromEntries([...set.fields, ...set.startup].map(f => [f.key, FIELD_META[f.key]?.label ?? STARTUP_LABEL[f.key] ?? f.key]));
   setHTML($('#set-banner'), set.restart_pending.length
     ? `<div class="note warn-note"><b>Restart needed.</b> ${set.restart_pending.map(k => esc(names[k])).join(', ')} take${set.restart_pending.length === 1 ? 's' : ''} effect after ollamaMQ restarts.</div>` : '');
@@ -3201,7 +3302,9 @@ function onSettingsInput(e) {
   if (!f) return;
   const m = FIELD_META[key];
   if (m.kind === 'bool') { setDraft(key, el.checked); return; }
-  if (m.kind === 'select') { setDraft(key, el.value); return; }
+  if (m.kind === 'select' || m.kind === 'seg') { setDraft(key, el.value); return; }
+  if (m.kind === 'float') { const n = Number(el.value); if (Number.isFinite(n)) setDraft(key, n); return; }
+  if (m.kind === 'text') { if (el.value !== '') setDraft(key, el.value); return; }
   if (el.value === '') { S.draft.delete(key); el.closest('.set-row')?.classList.remove('dirty'); renderSettingsBar(); return; }
   const n = Number(el.value);
   if (Number.isFinite(n)) setDraft(key, Math.round(n * (m.scale || 1)));
@@ -3624,6 +3727,10 @@ $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d)
 $('#dlg-log').addEventListener('close', lvAutoStop);
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
+$$('#log-flag input').forEach(r => r.addEventListener('change', () => {
+  logFlagOnly = $('#log-flag input:checked').value === 'flagged';
+  renderLogs();
+}));
 // Grouped or per-request: which view of the same ring, remembered like the
 // other view choices.
 S.logGroup = storedLogGroup();
