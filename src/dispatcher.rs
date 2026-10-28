@@ -924,6 +924,9 @@ pub struct AppState {
     pub logs_evicted: std::sync::atomic::AtomicU64,
     /// Assigns per-request log correlation ids (see [`LogEvent::rid`]).
     pub rid_seq: std::sync::atomic::AtomicU64,
+    /// The security audit: its runtime switches, its queue, and the verdicts the
+    /// live views still show (see [`crate::audit`]).
+    pub audit: crate::audit::Audit,
 }
 
 /// One line of the Logs panel: a request entering ("IN") or leaving
@@ -2068,6 +2071,7 @@ impl AppState {
             allow_all_routes: std::sync::atomic::AtomicBool::new(false),
             metrics_token: Mutex::new(None),
             config: Mutex::new(crate::settings::Layers::default()),
+            audit: crate::audit::Audit::new(),
             queued_bytes: std::sync::atomic::AtomicU64::new(0),
             clients: Mutex::new(crate::clients::ClientStore::in_memory()),
             model_policy: Mutex::new(crate::model_policy::ModelPolicyStore::in_memory()),
@@ -4053,6 +4057,10 @@ pub async fn run_worker(state: Arc<AppState>) {
                         // The real prompt count arrives with the response usage;
                         // this rough estimate is what capacity can size by now.
                         let est_prompt_tokens = (task.body.len() / 4) as u64;
+                        // The audit gets this round once it is over. Cloning the
+                        // body is a refcount bump (it goes to the backend whole);
+                        // judging it happens later, off this task.
+                        let audit_body = task.body.clone();
                         let run = state_clone.runs.start(
                             &user_id,
                             m_key.as_deref().unwrap_or("none"),
@@ -4381,6 +4389,27 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     }
                                 } else {
                                     outcome("client_gone", Default::default());
+                                }
+                                // Mark-only, and after the fact on purpose: the
+                                // client already has its answer. The audit judges
+                                // this round — including a redacted one, in memory
+                                // — and records what it saw seconds later, never
+                                // holding anything up.
+                                if state_clone.audit.mode() != crate::audit::Mode::Off {
+                                    crate::audit::submit(
+                                        &state_clone,
+                                        crate::audit::Job {
+                                            key: conv_key.clone(),
+                                            rid,
+                                            redacted: redact,
+                                            body: audit_body.clone(),
+                                            resp: (total_bytes > 0).then(|| {
+                                                Bytes::copy_from_slice(
+                                                    &content_acc[..content_acc.len().min(crate::audit::RESPONSE_CHARS)],
+                                                )
+                                            }),
+                                        },
+                                    );
                                 }
                             }
                             Err(e) => {

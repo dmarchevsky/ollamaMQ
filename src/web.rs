@@ -1734,7 +1734,7 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(conv["v"], 2);
+        assert_eq!(conv["v"], crate::convlog::SCHEMA_V);
         assert_eq!(conv["turns"].as_array().unwrap().len(), 2);
         // Turn order is oldest first, and every stage carries its measured time.
         assert_eq!(conv["turns"][0]["rid"], 7);

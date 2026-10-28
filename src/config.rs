@@ -233,6 +233,141 @@ pub struct Settings {
     /// set here or in `OLLAMA_MQ_UI_PASSWORD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_ui: Option<WebUiSettings>,
+    /// Suspicious-activity audit (see [`crate::audit`]). Mark-only: it records
+    /// what it saw and never touches the reply the client gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<AuditSettings>,
+}
+
+/// `settings.audit`: how hard the proxy looks at the traffic it already sees.
+///
+/// ```yaml
+/// settings:
+///   audit:
+///     enabled: scanner        # off | scanner | full
+///     backend: ""             # defaults to the first configured backend
+///     flag_threshold: 0.85    # at or above this a verdict is confirmed, not a watch
+///     max_questions_per_turn: 6
+///     concurrency: 2
+///     queue: 64
+///     scan_redacted: true     # judge redacted traffic, store no text of it
+///     extra_watch_hosts: []
+/// ```
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuditSettings {
+    /// `off` judges nothing, `scanner` runs the free local rules, `full` adds
+    /// the decision model and the guard on the audit backend (default).
+    #[serde(default = "audit_default_mode", skip_serializing_if = "String::is_empty")]
+    pub enabled: String,
+    /// Where the verdict models live. Empty: the first backend the proxy routes
+    /// to, which is where the guard usually is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub backend: String,
+    /// Probability at or above which a model verdict gets a red badge instead of
+    /// an amber one. A rule hit is always red.
+    #[serde(default = "audit_default_threshold", skip_serializing_if = "is_default_threshold")]
+    pub flag_threshold: f64,
+    /// Noul questions one turn may ask the decision model — the NPU budget, per
+    /// turn rather than per byte of resent context.
+    #[serde(default = "audit_default_questions", skip_serializing_if = "is_default_questions")]
+    pub max_questions_per_turn: u32,
+    /// Audit jobs in flight at once against the backend (read at startup).
+    #[serde(default = "audit_default_concurrency", skip_serializing_if = "is_default_concurrency")]
+    pub concurrency: u32,
+    /// Jobs the audit queue may hold; past it a turn is dropped and counted
+    /// rather than waiting (read at startup).
+    #[serde(default = "audit_default_queue", skip_serializing_if = "is_default_queue")]
+    pub queue: usize,
+    /// Judge `X-Redact-Log` traffic in memory. Verdicts are stored, its text
+    /// never is. False: that traffic is not scanned at all.
+    #[serde(default = "audit_yes", skip_serializing_if = "std::ops::Not::not")]
+    pub scan_redacted: bool,
+    /// Hosts added to the built-in watchlist (a transfer to one of these, with a
+    /// payload, is an exfil flag).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_watch_hosts: Vec<String>,
+    /// Moderation model asked on the backend.
+    #[serde(default = "audit_default_guard_model", skip_serializing_if = "is_default_guard_model")]
+    pub guard_model: String,
+    /// Decision (noul) model asked on the backend.
+    #[serde(default = "audit_default_decision_model", skip_serializing_if = "is_default_decision_model")]
+    pub decision_model: String,
+}
+
+impl Default for AuditSettings {
+    /// The free layer is on: the local rules cost nothing, need no network and
+    /// catch the recon/exfil class outright. The model layer is one switch away
+    /// in Settings, because it sends traffic to a backend and spends its NPU.
+    fn default() -> Self {
+        Self {
+            enabled: audit_default_mode(),
+            backend: String::new(),
+            flag_threshold: audit_default_threshold(),
+            max_questions_per_turn: audit_default_questions(),
+            concurrency: audit_default_concurrency(),
+            queue: audit_default_queue(),
+            scan_redacted: audit_yes(),
+            extra_watch_hosts: Vec::new(),
+            guard_model: audit_default_guard_model(),
+            decision_model: audit_default_decision_model(),
+        }
+    }
+}
+
+fn audit_default_mode() -> String {
+    "scanner".to_string()
+}
+
+fn audit_default_threshold() -> f64 {
+    crate::audit::DEFAULT_FLAG_THRESHOLD
+}
+
+fn audit_default_questions() -> u32 {
+    6
+}
+
+fn audit_default_concurrency() -> u32 {
+    2
+}
+
+fn audit_default_queue() -> usize {
+    64
+}
+
+fn audit_yes() -> bool {
+    true
+}
+
+fn audit_default_guard_model() -> String {
+    "qwen3guard-gen-0.6b".to_string()
+}
+
+fn audit_default_decision_model() -> String {
+    "d3-nano".to_string()
+}
+
+fn is_default_threshold(v: &f64) -> bool {
+    *v == audit_default_threshold()
+}
+
+fn is_default_questions(v: &u32) -> bool {
+    *v == audit_default_questions()
+}
+
+fn is_default_concurrency(v: &u32) -> bool {
+    *v == audit_default_concurrency()
+}
+
+fn is_default_queue(v: &usize) -> bool {
+    *v == audit_default_queue()
+}
+
+fn is_default_guard_model(v: &String) -> bool {
+    *v == audit_default_guard_model()
+}
+
+fn is_default_decision_model(v: &String) -> bool {
+    *v == audit_default_decision_model()
 }
 
 /// `settings.web_ui`. The environment variables `OLLAMA_MQ_UI_USER` and
@@ -444,7 +579,7 @@ impl Settings {
             request_log_flush_secs, log_content_limit,
             history_hours, history_max_records,
             max_body_bytes, max_queued_bytes, clients_file, models_file,
-            metrics_token, web_ui
+            metrics_token, web_ui, audit
         )
     }
 
@@ -469,6 +604,28 @@ impl Settings {
         at_least(self.request_log_flush_secs, 5, "request_log_flush_secs")?;
         at_least(self.sticky_ttl, 1, "sticky_ttl")?;
         at_least(self.sticky_max_entries.map(|v| v as u64), 1, "sticky_max_entries")?;
+        if let Some(audit) = &self.audit {
+            if !["off", "scanner", "full"].contains(&audit.enabled.as_str()) {
+                return Err("audit.enabled is off, scanner or full".into());
+            }
+            if !(0.0..=1.0).contains(&audit.flag_threshold) {
+                return Err("audit.flag_threshold is a probability between 0 and 1".into());
+            }
+            if audit.concurrency < 1 || audit.concurrency > 8 {
+                return Err("audit.concurrency is between 1 and 8".into());
+            }
+            if audit.queue < 1 {
+                return Err("audit.queue must be at least 1".into());
+            }
+            if audit.max_questions_per_turn > 24 {
+                return Err("audit.max_questions_per_turn is at most 24".into());
+            }
+            for host in &audit.extra_watch_hosts {
+                if host.trim().is_empty() {
+                    return Err("audit.extra_watch_hosts holds host names, not blanks".into());
+                }
+            }
+        }
         if self.load_keep_alive.is_some_and(|v| v < -1) {
             return Err("load_keep_alive must be -1 (forever) or more".into());
         }

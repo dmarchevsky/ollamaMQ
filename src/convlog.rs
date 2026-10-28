@@ -33,7 +33,16 @@ use crate::lock::LockExt;
 
 /// Schema marker of a conversation line. Lines from the old per-request format
 /// (`{"dir":"IN"|"OUT", …}`) carry no `v` and are ignored when reading back.
-pub const SCHEMA_V: u64 = 2;
+///
+/// v3 added the per-turn `audit` flags (see [`crate::audit`]); v2 lines are
+/// still read and gain no flags, so a log written before the audit existed keeps
+/// opening after an upgrade.
+pub const SCHEMA_V: u64 = 3;
+
+/// Schema versions a reader accepts. A new version is appended, never replaces:
+/// an upgrade that silently drops the retained history is the failure mode to
+/// avoid here, and additive fields read back as empty on their own.
+pub const SCHEMA_READS: [u64; 2] = [2, SCHEMA_V];
 
 /// Default conversation-log file name: used when no path is configured, and
 /// again by [`ConvLogger::open_candidates`] when the configured one is
@@ -205,6 +214,12 @@ pub struct Turn {
     /// backend: the entry is complete, only the text is deliberately absent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub redacted: bool,
+    /// Suspicious-activity flags this turn earned, worst first (`[]` = clean).
+    /// They arrive **after** the turn was served: the audit never holds the
+    /// reply, so a healthy turn simply carries none. Absent on lines written
+    /// before the audit existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit: Vec<crate::audit::Flag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<TurnContent>,
 }
@@ -309,6 +324,15 @@ pub enum Note {
         bytes: Option<u64>,
         text: Arc<String>,
     },
+    /// The audit's verdict for a turn that already finished (see
+    /// [`crate::audit`]). Lands seconds after the turn was written, so it marks
+    /// the conversation dirty again and moves its clock to when the verdict
+    /// arrived — that is what makes the re-written line win on read-back.
+    Audit {
+        key: String,
+        rid: u64,
+        flags: Vec<crate::audit::Flag>,
+    },
 }
 
 pub struct Begin {
@@ -383,6 +407,38 @@ pub struct ConvSummary {
     /// True while a turn is still waiting for its response.
     pub live: bool,
     pub dropped_turns: usize,
+    /// The worst flags across this conversation's turns, deduplicated per kind
+    /// and order, worst first — what a Logs row and the nav count show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<crate::audit::Flag>,
+}
+
+/// The conversation's flags for its row: one entry per (kind, severity) that any
+/// of its turns earned, worst first. A row is a summary, not a transcript.
+fn worst_flags(turns: &[Turn]) -> Vec<crate::audit::Flag> {
+    let mut out: Vec<crate::audit::Flag> = Vec::new();
+    for t in turns {
+        for f in &t.audit {
+            if !out
+                .iter()
+                .any(|k: &crate::audit::Flag| k.kind == f.kind && k.bad == f.bad)
+            {
+                out.push(crate::audit::Flag {
+                    kind: f.kind,
+                    src: f.src,
+                    by: f.by.clone(),
+                    prob: f.prob,
+                    category: f.category.clone(),
+                    detail: f.detail.clone(),
+                    excerpt: None,
+                    bad: f.bad,
+                });
+            }
+        }
+    }
+    crate::audit::Flag::sort_worst_first(&mut out);
+    out.truncate(4);
+    out
 }
 
 /// Names of the tools a request's messages carry — the results the agent ran
@@ -922,6 +978,7 @@ impl ConvLogger {
                     waste_secs: None,
                     msgs: b.msgs,
                     redacted: b.redacted,
+                    audit: Vec::new(),
                     content: None,
                 });
                 e.dirty = true;
@@ -953,6 +1010,21 @@ impl ConvLogger {
                     t.tl.first_token = first_token.or(t.tl.first_token);
                 }
                 store.touch(&key);
+            }
+            Note::Audit { key, rid, flags } => {
+                if let Some(t) = store.turn_mut(&key, rid) {
+                    t.audit = flags;
+                }
+                if let Some(e) = store.entries.get_mut(&key) {
+                    let now = now_unix_millis();
+                    // A verdict is an event of its own: the conversation's clock
+                    // moves to it, which is also what lets the longer line win
+                    // against the copy that was already flushed without flags.
+                    e.conv.end_ms = e.conv.end_ms.max(now);
+                    e.dirty = true;
+                    e.rev += 1;
+                    e.last_ms = now;
+                }
             }
             Note::Resp(r) => {
                 let key = r.key.clone();
@@ -1116,7 +1188,11 @@ fn seed_from_tail(path: &str) -> Vec<Conv> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if v.get("v").and_then(|v| v.as_u64()) != Some(SCHEMA_V) {
+        if !v
+            .get("v")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|v| SCHEMA_READS.contains(&v))
+        {
             continue;
         }
         let Ok(conv) = serde_json::from_value::<Conv>(v) else {
@@ -1148,6 +1224,7 @@ fn conv_summary(c: &Conv) -> ConvSummary {
         redacted: c.redacted,
         live: c.turns.iter().any(|t| t.tl.end.is_none()),
         dropped_turns: c.dropped_turns,
+        flags: worst_flags(&c.turns),
     }
 }
 
@@ -1307,7 +1384,7 @@ fn parse_disk_entry(raw: &[u8], slot: usize, offset: u64, len: u64) -> Option<Di
         return None;
     }
     let conv = serde_json::from_str::<Conv>(trimmed.trim()).ok()?;
-    if conv.v != SCHEMA_V {
+    if !SCHEMA_READS.contains(&conv.v) {
         return None;
     }
     let rids = conv.turns.iter().map(|t| t.rid).collect();
@@ -1973,6 +2050,7 @@ mod tests {
                 waste_secs: None,
                 msgs: vec![],
                 redacted: false,
+                audit: Vec::new(),
                 content: None,
             });
         }
