@@ -37,6 +37,14 @@ pub const EDITABLE: &[(&str, bool)] = &[
     ("log_content_limit", true),
     ("history_hours", true),
     ("history_max_records", true),
+    // The audit knobs: flat names the UI can set, stored under
+    // `settings.audit` (see [`crate::config::AuditSettings`]). The web layer
+    // folds each into the section, so a save writes `audit: {…}`, never a flat
+    // key nobody reads.
+    ("audit_mode", true),
+    ("audit_flag_threshold", true),
+    ("audit_scan_redacted", true),
+    ("audit_backend", true),
 ];
 
 /// Settings shown read-only: they are read once at startup.

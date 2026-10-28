@@ -204,6 +204,7 @@ pub fn router_with_state(auth: Arc<AuthState>) -> Router<Arc<AppState>> {
         .route("/logs", get(list_logs))
         .route("/logs/{seq}", get(get_log))
         .route("/capture", get(capture_state))
+        .route("/audit", get(audit_status))
         .route("/convs", get(list_convs))
         .route("/conv", get(get_conv))
         .route("/conv/content", get(get_conv_content))
@@ -722,6 +723,11 @@ struct LogView {
     /// opens such a row through the conversation log, never `logs/{seq}`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     hist: bool,
+    /// Security-audit flags this request earned, worst first (empty = clean).
+    /// They land seconds after the request finished, so a row can gain them
+    /// while the page sits open — that is the point of the audit, not a bug.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    flags: Vec<crate::audit::Flag>,
 }
 
 fn ring_at_ms(ev: &crate::dispatcher::LogEvent) -> u64 {
@@ -736,6 +742,7 @@ fn log_view(
     ev: &crate::dispatcher::LogEvent,
     with_content: bool,
     session_label: Option<String>,
+    flags: Vec<crate::audit::Flag>,
 ) -> LogView {
     LogView {
         seq,
@@ -751,6 +758,7 @@ fn log_view(
         session: ev.session.clone(),
         session_label,
         hist: false,
+        flags,
         content: if with_content {
             ev.content.as_deref().map(|c| c.to_string())
         } else {
@@ -801,7 +809,11 @@ async fn list_logs(
                     .session
                     .as_ref()
                     .and_then(|s| labels.get(s).cloned());
-                log_view(base + i as u64, ev, false, label)
+                let flags = ev
+                    .rid
+                    .and_then(|rid| state.audit.flags_for(rid))
+                    .unwrap_or_default();
+                log_view(base + i as u64, ev, false, label, flags)
             })
             .collect();
         (
@@ -846,6 +858,10 @@ async fn list_logs(
                 session: f.session,
                 session_label: label,
                 hist: true,
+                flags: f
+                    .rid
+                    .and_then(|rid| state.audit.flags_for(rid))
+                    .unwrap_or_default(),
             });
         }
     }
@@ -863,7 +879,11 @@ async fn get_log(State(state): State<Arc<AppState>>, Path(seq): Path<u64>) -> Ap
                 .session
                 .as_ref()
                 .and_then(|s| labels.get(s).cloned());
-            Json(log_view(seq, ev, true, label))
+            let flags = ev
+                .rid
+                .and_then(|rid| state.audit.flags_for(rid))
+                .unwrap_or_default();
+            Json(log_view(seq, ev, true, label, flags))
         })
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "log event has expired"))
 }
@@ -914,6 +934,13 @@ async fn capture_state(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         "log": state.convlog.enabled(),
         "path": state.convlog.path(),
     }))
+}
+
+/// How the security audit stands: mode, backend and its state, queue and drops.
+/// The Settings page shows one quiet line built from this; the numbers are the
+/// ones the operator needs to see the audit fall behind or lose its backend.
+async fn audit_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(state.audit.status(&state))
 }
 
 async fn get_conv(

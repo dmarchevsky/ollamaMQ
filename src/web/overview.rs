@@ -293,6 +293,11 @@ struct Recent {
     ttft_secs: Option<f64>,
     completion_tokens: u64,
     gen_tps: Option<f64>,
+    /// Security-audit flags this request earned, worst first (absent = clean).
+    /// A verdict arrives after the request is finished, which is exactly why
+    /// the Activity panel is where a flag appears.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    flags: Vec<crate::audit::Flag>,
 }
 
 /// Items the scope selects on the client axis (per-request precision).
@@ -745,6 +750,10 @@ pub async fn get_overview(
             model: f.model.clone(),
             backend: f.backend.clone(),
             outcome: f.outcome,
+            flags: f
+                .rid
+                .and_then(|rid| state.audit.flags_for(rid))
+                .unwrap_or_default(),
         })
         .collect();
 
