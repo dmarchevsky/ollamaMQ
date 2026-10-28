@@ -168,8 +168,9 @@ pub struct Settings {
     /// wins over what the client claims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_priority: Option<ClientPriority>,
-    /// Path of the size-rotated request log file (default
-    /// "ollamamq-requests.jsonl" in the working directory).
+    /// Path of the size-rotated request log file. Relative paths (and the
+    /// default "ollamamq-requests.jsonl") resolve from the folder holding
+    /// `appconf.yaml`, like every other state file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_log_path: Option<String>,
     /// Max bytes per request-log file before rotation (default 10 MiB).
