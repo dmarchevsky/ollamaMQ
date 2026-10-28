@@ -1713,7 +1713,7 @@ function logConvs(rounds) {
     if (!g) {
       g = { kind: 'conv', key, user: e.user, session: e.session, label: e.session_label || null,
         models: new Set(), backends: new Set(), reqs: 0, inBytes: 0, outBytes: 0, errors: 0,
-        first: e.at_ms, at: e.at_ms, rid: e.rid ?? null, lastStatus: null,
+        first: e.at_ms, at: e.at_ms, rid: e.rid ?? null, lastStatus: null, lastOutcome: null,
         statusAt: 0, redacted: false, waiting: false, cmp: 0 };
       byKey.set(key, g);
       items.push(g);
@@ -1724,10 +1724,17 @@ function logConvs(rounds) {
     if (e.backend) g.backends.add(e.backend);
     if (e.redacted) g.redacted = true;
     if (r.in) { g.reqs++; g.inBytes += num(/body=(\d+)B/, r.in.info); if (/· compaction/.test(r.in.info || '')) g.cmp++; }
+    else if (r.out && r.out.hist) g.reqs++; // a restored round is a whole request
     if (r.out) {
       g.outBytes += num(/resp=(\d+)B/, r.out.info);
       const st = num(/-> (\d{3})/, r.out.info);
       if (st && r.out.at_ms >= g.statusAt) { g.lastStatus = st; g.statusAt = r.out.at_ms; if (st >= 400) g.errors++; }
+      // Restored rows carry no HTTP code — their journalled outcome (ok,
+      // timeout, backend_error…) stands in, so the arrow never reads `…`.
+      if (!st && r.out.hist && r.out.at_ms >= g.statusAt) {
+        g.lastOutcome = r.out.info; g.statusAt = r.out.at_ms;
+        if (/error|timeout|drop|fail|refus|gone/i.test(r.out.info)) g.errors++;
+      }
     }
     if (r.in && !r.out) g.waiting = true;
   }
@@ -1737,8 +1744,12 @@ function logConvs(rounds) {
 
 /** The Activity cell: what the session sent and got, plus what it is doing. */
 function convSegs(g) {
-  return `<span class="rl in"><span class="ar">\u2192</span>${g.reqs} req \u00b7 ${fmtBytes(g.inBytes)}</span>`
-    + ` <span class="rl out${g.errors ? ' err' : ''}"><span class="ar">\u2190</span>${g.lastStatus ?? '…'} \u00b7 ${fmtBytes(g.outBytes)}</span>`
+  // A restored round carries no byte size — a zero on a history row would
+  // read as an empty request, so the byte segments drop when there is none.
+  const inPart = `${g.reqs} req` + (g.inBytes ? ` \u00b7 ${fmtBytes(g.inBytes)}` : '');
+  const outPart = (g.lastStatus ?? g.lastOutcome ?? '…') + (g.outBytes ? ` \u00b7 ${fmtBytes(g.outBytes)}` : '');
+  return `<span class="rl in"><span class="ar">\u2192</span>${inPart}</span>`
+    + ` <span class="rl out${g.errors ? ' err' : ''}"><span class="ar">\u2190</span>${outPart}</span>`
     + (g.waiting ? ' <span class="badge q">waiting</span>' : '')
     + (g.cmp ? ` <span class="badge cmp" title="${g.cmp} summarization request${g.cmp > 1 ? 's' : ''} in this conversation">⤓ ${g.cmp}</span>` : '')
     + (g.errors ? ` <span class="badge bad">${g.errors} failed</span>` : '')
