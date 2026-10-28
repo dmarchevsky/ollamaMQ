@@ -13,10 +13,12 @@ use serde::Serialize;
 
 use crate::lock::LockExt;
 
-/// How far back the history goes (the longest Overview window).
-pub const HISTORY: Duration = Duration::from_secs(24 * 3600);
-/// Cap on finished-request records, whatever their age.
-const MAX_FINISHED: usize = 20_000;
+/// Default Activity retention in hours — what `history_hours` falls back to.
+pub const DEFAULT_HISTORY_HOURS: u64 = 24;
+/// Default cap on finished-request records — `history_max_records`' fallback.
+pub const DEFAULT_MAX_RECORDS: usize = 50_000;
+/// How far back the history goes by default (the longest Overview window).
+pub const HISTORY: Duration = Duration::from_secs(DEFAULT_HISTORY_HOURS * 3600);
 /// Points in each sparkline.
 pub const SPARK_BUCKETS: usize = 30;
 
@@ -116,7 +118,6 @@ impl Finished {
     }
 }
 
-#[derive(Default)]
 pub struct Stats {
     finished: Mutex<VecDeque<Finished>>,
     /// Per backend label: `(prefill secs, waste secs)` summed over every request
@@ -125,8 +126,49 @@ pub struct Stats {
     /// scrape or a UI poll used to copy the whole 20k-record history and search
     /// it per backend on every call.
     waste: Mutex<HashMap<String, (f64, f64)>>,
+    /// `settings.history_hours` as ms — the longest Overview window and the
+    /// age records fall out at (`set_history`, read via `history_ms`).
+    history_ms: std::sync::atomic::AtomicU64,
+    /// `settings.history_max_records` — the count cap on finished records.
+    max_records: std::sync::atomic::AtomicUsize,
 }
 
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            finished: Mutex::new(VecDeque::new()),
+            waste: Mutex::new(HashMap::new()),
+            history_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HISTORY_HOURS * 3_600_000),
+            max_records: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_RECORDS),
+        }
+    }
+}
+
+impl Stats {
+    /// Apply `settings.history_hours` / `settings.history_max_records`. Live:
+    /// a smaller value prunes lazily as records arrive, a larger one simply
+    /// lets the queue grow before the next prune round.
+    pub fn set_history(&self, hours: u64, max_records: usize) {
+        self.history_ms
+            .store(hours.max(1) * 3_600_000, std::sync::atomic::Ordering::Relaxed);
+        self.max_records
+            .store(max_records.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The configured Activity retention, in whole hours.
+    pub fn history_hours(&self) -> u64 {
+        self.history_ms.load(std::sync::atomic::Ordering::Relaxed) / 3_600_000
+    }
+
+    /// The configured Activity retention, in ms.
+    pub fn history_ms(&self) -> u64 {
+        self.history_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn max_records(&self) -> usize {
+        self.max_records.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 impl Stats {
     pub fn record(&self, f: Finished) {
         if let Some(waste_secs) = f.timing.waste_secs
@@ -141,9 +183,10 @@ impl Stats {
             acc.0 += prefill;
             acc.1 += waste_secs;
         }
-        let cutoff = f.at_ms.saturating_sub(HISTORY.as_millis() as u64);
+        let cutoff = f.at_ms.saturating_sub(self.history_ms());
+        let max = self.max_records();
         let mut q = self.finished.lock_or_recover();
-        while q.front().is_some_and(|x| x.at_ms < cutoff) || q.len() >= MAX_FINISHED {
+        while q.front().is_some_and(|x| x.at_ms < cutoff) || q.len() >= max {
             q.pop_front();
         }
         q.push_back(f);

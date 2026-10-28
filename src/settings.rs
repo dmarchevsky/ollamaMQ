@@ -35,6 +35,8 @@ pub const EDITABLE: &[(&str, bool)] = &[
     ("allow_all_routes", true),
     ("metrics_token", true),
     ("log_content_limit", true),
+    ("history_hours", true),
+    ("history_max_records", true),
 ];
 
 /// Settings shown read-only: they are read once at startup.
@@ -72,6 +74,8 @@ pub fn defaults() -> Settings {
         request_log_max_files: Some(5),
         request_log_flush_secs: Some(5),
         log_content_limit: Some(1024 * 1024),
+        history_hours: Some(24),
+        history_max_records: Some(50_000),
         max_body_bytes: Some(64 * 1024 * 1024),
         max_queued_bytes: Some(512 * 1024 * 1024),
         clients_file: Some(crate::clients::DEFAULT_CLIENTS_FILE.into()),
@@ -226,6 +230,12 @@ pub fn apply(state: &AppState, eff: &Settings) {
     state.log_content_limit.store(
         eff.log_content_limit.map(|v| v.max(1024)).unwrap_or(1024 * 1024),
         Relaxed,
+    );
+    // Activity history caps (Overview). The journal file itself is fixed at
+    // startup next to the request log; only the window and count move live.
+    state.stats.set_history(
+        eff.history_hours.or(d.history_hours).unwrap_or(24),
+        eff.history_max_records.or(d.history_max_records).unwrap_or(50_000),
     );
     *state.metrics_token.lock_or_recover() = eff.metrics_token.clone().filter(|t| !t.is_empty());
     state.set_model_aliases(eff.model_aliases.as_ref());
@@ -438,6 +448,76 @@ mod tests {
     fn the_conversation_log_flushes_after_five_seconds_by_default() {
         assert_eq!(defaults().request_log_flush_secs, Some(5));
         defaults().validate().expect("the defaults validate");
+    }
+
+    /// The Activity retention knobs: defaults validate, `validate` rejects
+    /// broken values, and `apply` carries them onto the live stats (the
+    /// Overview clamp and the prune caps).
+    #[test]
+    fn history_retention_defaults_apply_and_validates() {
+        assert_eq!(defaults().history_hours, Some(24));
+        assert_eq!(defaults().history_max_records, Some(50_000));
+        defaults().validate().expect("defaults validate");
+        let bad = Settings {
+            history_hours: Some(0),
+            ..defaults()
+        };
+        let err = bad.validate().expect_err("zero hours must not validate");
+        assert!(err.contains("history_hours"), "{err}");
+        let bad = Settings {
+            history_max_records: Some(50),
+            ..defaults()
+        };
+        let err = bad.validate().expect_err("50 records must not validate");
+        assert!(err.contains("history_max_records"), "{err}");
+
+        let eff = Settings {
+            history_hours: Some(48),
+            history_max_records: Some(10_000),
+            ..defaults()
+        };
+        let state = Arc::new(AppState::new(
+            vec![("http://a:1".to_string(), None)],
+            5,
+            86400,
+            60,
+            1,
+            "appconf.yaml".into(),
+            Vec::new(),
+            crate::convlog::ConvLogger::disabled(),
+            65_536,
+            512 * 1024 * 1024,
+        ));
+        apply(&state, &eff);
+        assert_eq!(state.stats.history_hours(), 48);
+        // The count cap bites immediately at the configured size.
+        state.stats.set_history(48, 2);
+        for at_ms in [1, 2, 3] {
+            state.stats.record(crate::stats::Finished {
+                at_ms,
+                client: "a".into(),
+                key: "none".into(),
+                model: "m".into(),
+                backend: None,
+                outcome: "ok",
+                session: None,
+                session_label: None,
+                priority: "normal",
+                rid: None,
+                tools: vec![],
+                queue_wait: None,
+                stage: Default::default(),
+                timing: Default::default(),
+                session_key: None,
+                kind: None,
+                link: None,
+            });
+        }
+        assert_eq!(
+            state.stats.finished_since(0).iter().map(|f| f.at_ms).collect::<Vec<_>>(),
+            vec![2, 3],
+            "the oldest record falls out at the configured cap"
+        );
     }
 
     /// A backend's capture switch follows the file, in both directions.
