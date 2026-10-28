@@ -3,6 +3,27 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.23.1 — 2026-10-28
+
+### Changed
+
+- **The request log now follows the config folder, not the launch directory.**
+  `request_log_path` was the last state path still resolved against the process's
+  working directory: the same `appconf.yaml` left its rotation chain wherever the
+  proxy happened to be started, and a container path that does not exist on the
+  host silently dumped the chain next to the config — the classic "where did my
+  logs go after a restart" report. A relative path (the default
+  `ollamamq-requests.jsonl` included) now resolves from the folder holding
+  `appconf.yaml`, exactly like `clients_file` and `models_file`, so
+  `ollamaMQ -c config/appconf.yaml` works from anywhere; the Settings page and
+  the fallback warning always name the file actually being written. An install
+  whose log already lives in the old working directory keeps using that file and
+  says so at startup — move it next to `appconf.yaml` (or point
+  `request_log_path` at it) when convenient. The shipped `docker-compose.yml`
+  mirrors the host layout (`logs/` mounted at `/logs`, appconf setting
+  `request_log_path: ../logs/ollamamq-requests.jsonl`), so host and container
+  now agree on one logs folder by construction instead of by launch discipline.
+
 ## v0.23.0 — 2026-10-28
 
 ### Added
