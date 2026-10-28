@@ -350,7 +350,7 @@ settings:
                                  # models without max_concurrent_requests may then use all of them (default true)
   max_queued_bytes: 536870912    # total bytes of request bodies waiting in all queues, 503 beyond it
                                  # (default 512 MiB); a request is always admitted when the queues are empty
-  request_log_path: ollamamq-requests.jsonl   # conversation JSONL log file (default shown)
+  request_log_path: ollamamq-requests.jsonl   # conversation JSONL log file (default shown; a relative path resolves from the appconf.yaml folder)
   request_log_max_bytes: 10485760             # rotate when the file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
   request_log_flush_secs: 5                   # quiet time after which a conversation is written out (default 5)
@@ -427,7 +427,7 @@ Each turn is one proxied request and its response:
 
 **When a line is written.** A conversation is appended once it has been quiet for `request_log_flush_secs` (default 5 s — a crash should cost the last few seconds of a conversation, not the last minute; nothing is `fsync`-ed, so a hard power loss can still take what the operating system had not written), and a longer line follows if it resumes, so **the last line for a `key` is the complete one** — readers take that and ignore earlier lines of the same key. Earlier lines of the same key are therefore *superseded snapshots*, not separate conversations: each one contains what the conversation had up to that point, which is why consecutive lines overlap (the newer response of line 1 appears again inside line 2, because the client resent it). Appending is kept instead of rewriting in place so a crash mid-flush costs at most the last line. Folding the file by `key` and keeping the longest line per key yields exactly **one record per conversation**. At startup the log re-seeds from the file's tail, so open conversations survive a restart without reading the whole file. The in-memory log keeps the 200 most recent conversations and at most 64 MiB of captured text.
 
-**Where the file goes, and what happens if it cannot be opened.** Missing directories inside `request_log_path` are created at startup. A path that still cannot be opened — a container path such as `/data/…` on a host without one — falls back to `ollamamq-requests.jsonl` next to `appconf.yaml`, the store folder the other state files live in, and the log says so (`conversation log: <configured> is unusable here, writing to <actual> instead`) instead of starting with capture off and leaving every log row unopenable. Capture applies from boot: changing the path in Settings takes effect on restart. The Logs page shows the path being written to, and when nothing could be opened it says so above the table and badges the rows `not captured`.
+**Where the file goes, and what happens if it cannot be opened.** A relative `request_log_path` (the default bare name included) resolves from the folder holding `appconf.yaml` — where the proxy was launched no longer matters, like every other state file. An older install whose log already lives in the working directory keeps using that file (the startup log says so) until it is moved next to `appconf.yaml`. Missing directories inside `request_log_path` are created at startup. A path that still cannot be opened — a container path such as `/data/…` on a host without one — falls back to `ollamamq-requests.jsonl` next to `appconf.yaml`, the store folder the other state files live in, and the log says so (`conversation log: <configured> is unusable here, writing to <actual> instead`) instead of starting with capture off and leaving every log row unopenable. Capture applies from boot: changing the path in Settings takes effect on restart. The Logs page shows the path being written to, and when nothing could be opened it says so above the table and badges the rows `not captured`.
 
 **Log capture.** Every client, every API key and every backend carries a `redact_log` switch (web UI checkbox **Redact log — do not save request/response text**, `redact_log: true` in `clients.yaml` / `appconf.yaml`). When it is on, the request is served exactly as before and the turn is still written — timeline, sizes, message roles, status, token counts — with no body text, so `content` is absent and `redacted` is `true`. Nothing about the traffic changes: queues, priority, metrics and the response the client sees are untouched. Only *new* requests are affected; lines already in the file keep what they stored. The web viewer renders those conversations in full — turn blocks, gaps and timeline — and says *text redacted* where the text would be, instead of pretending the structure is missing.
 
@@ -462,11 +462,11 @@ The included [`docker-compose.yml`](docker-compose.yml) keeps everything in one 
 ollamamq/
 ├── docker-compose.yml
 ├── config/   → /config   appconf.yaml, .env, clients.yaml, models.yaml
-└── logs/     → /data     ollamamq-requests.jsonl* (the service log: docker logs ollamamq)
+└── logs/     → /logs     ollamamq-requests.jsonl* (request log; appconf.yaml sets request_log_path: ../logs/ollamamq-requests.jsonl)
 ```
 
 1. Copy `docker-compose.yml` into an empty folder (or run it in this checkout).
-2. Create `config/appconf.yaml` and `config/.env` (`OLLAMA_MQ_UI_PASSWORD=…`).
+2. Create `config/appconf.yaml` and `config/.env` (`OLLAMA_MQ_UI_PASSWORD=…`). Set `request_log_path: ../logs/ollamamq-requests.jsonl` in `appconf.yaml` so the conversation log lands in `logs/`.
 3. Run `docker compose up -d --build`.
 
 Set `build.context` to where the source is:
@@ -478,11 +478,11 @@ Set `build.context` to where the source is:
 
 **Moving to another server:** stop the service and copy the folder. The files in `config/` are written by the container as root with mode 600, so copy them with `sudo` (or `docker run --rm -v "$PWD":/s alpine tar …`).
 
-**Where store files go:** relative paths for `clients_file` and `models_file` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. Logs (`request_log_path`) stay relative to the working directory — except that a conversation log whose configured path cannot be opened lands in the `appconf.yaml` folder (see [Request logging](#request-logging)).
+**Where store files go:** relative paths for `clients_file`, `models_file`, and `request_log_path` are resolved from the folder that holds `appconf.yaml`, so by default they sit next to it. A conversation log whose configured path cannot be opened also lands in the `appconf.yaml` folder (see [Request logging](#request-logging)).
 
 Older setups also had a `settings.json` (the web UI's overlay) and an `admin.json` (the password changed in the UI). At startup their values are merged into `appconf.yaml` once and both files retire to `.bak`.
 
-Earlier versions kept the store files in the working directory. If such a file exists there and not next to `appconf.yaml`, it keeps being used, and the startup log says so. To switch, move it next to `appconf.yaml`.
+Earlier versions kept the store files (and the request log) in the working directory. If such a file exists there and not next to `appconf.yaml`, it keeps being used, and the startup log says so. To switch, move it next to `appconf.yaml`.
 
 ### Dockerfile
 

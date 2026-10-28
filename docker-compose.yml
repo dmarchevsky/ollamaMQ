@@ -4,11 +4,14 @@
 #   ├── docker-compose.yml   (this file)
 #   ├── config/              -> /config  appconf.yaml, .env, and what the web UI
 #   │                                    saves: clients.yaml, models.yaml
-#   └── logs/                -> /data    request logs (ollamamq-requests.jsonl*)
+#   └── logs/                -> /logs    request logs (ollamamq-requests.jsonl*)
 #
 # Every path is relative to this file, so moving the server is copying the
 # folder. Store files named in appconf.yaml without a path are kept next to
-# it, i.e. in config/.
+# it, i.e. in config/. The request log lives here because appconf.yaml sets
+#   request_log_path: ../logs/ollamamq-requests.jsonl
+# — a relative path resolves from the folder holding appconf.yaml, so the
+# same value works on a plain host and in this container layout.
 services:
   ollamamq:
     # Published image, tagged by CI from the release tag (see
@@ -30,7 +33,9 @@ services:
     # The container has no terminal: the service log goes to
     # `docker logs ollamamq`, and the web UI at /ui is the dashboard.
     command: ["-c", "/config/appconf.yaml"]
-    working_dir: /data
+    # cwd for cwd-relative strays (blocked_items.json): /logs keeps them in
+    # the mounted logs folder instead of the image.
+    working_dir: /logs
     # OLLAMA_MQ_UI_USER / OLLAMA_MQ_UI_PASSWORD: the web UI's first-run (and
     # recovery) password; a password changed in the UI is kept as a hash in
     # config/appconf.yaml.
@@ -39,7 +44,7 @@ services:
       - RUST_LOG=info
     volumes:
       - ./config:/config
-      - ./logs:/data
+      - ./logs:/logs
     # Memory, sized for the queue rather than guessed at: the default
     # max_queued_bytes is 512 MiB, and a limit below what the queues may hold
     # turns a flood into an OOM restart instead of a 503. 1 GiB covers the

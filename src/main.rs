@@ -225,9 +225,8 @@ async fn main() {
         pinned_by.insert("metrics_token", "OLLAMA_MQ_METRICS_TOKEN".to_string());
     }
 
-    // Store files (clients, model rules) live next to appconf.yaml unless a
-    // path says otherwise; logs go to the working directory. See
-    // `settings::store_path`.
+    // Store files (clients, model rules) and the request log live next to
+    // appconf.yaml unless a path says otherwise. See `settings::store_path`.
     let config_dir = settings::config_dir(&args.model_config);
     let mut resolved = std::collections::BTreeMap::new();
     let mut legacy_notes = Vec::new();
@@ -273,10 +272,6 @@ async fn main() {
             .max()
             .unwrap_or(1)
     });
-    let request_log_path = eff
-        .request_log_path
-        .clone()
-        .unwrap_or_else(|| crate::convlog::DEFAULT_LOG_FILE.to_string());
     let request_log_max_bytes = eff.request_log_max_bytes.unwrap_or(10 * 1024 * 1024);
     let request_log_max_files = eff.request_log_max_files.unwrap_or(5);
     let request_log_flush =
@@ -294,6 +289,26 @@ async fn main() {
     let max_queued_bytes = config::queue_budget(eff.max_queued_bytes.unwrap_or(512 * 1024 * 1024));
     let clients_file = store_file("clients_file", eff.clients_file.clone(), clients::DEFAULT_CLIENTS_FILE);
     let models_file = store_file("models_file", eff.models_file.clone(), model_policy::DEFAULT_MODELS_FILE);
+    // The request log follows the same store-file rule: a relative path (the
+    // default bare name included) resolves from the appconf.yaml folder, so
+    // the launch directory no longer decides where captured bodies land. An
+    // install whose log already lives in the working directory keeps its
+    // rotation chain (legacy note, like the store files).
+    let (log_path, log_legacy) = settings::store_path(
+        eff.request_log_path
+            .as_deref()
+            .unwrap_or(crate::convlog::DEFAULT_LOG_FILE),
+        &config_dir,
+        std::path::Path::new(""),
+    );
+    let request_log_path = log_path.to_string_lossy().into_owned();
+    if log_legacy {
+        legacy_notes.push(format!(
+            "request log: writing {request_log_path} in the working directory; move it next to {} to keep the configuration in one folder",
+            args.model_config
+        ));
+    }
+    resolved.insert("request_log_path", request_log_path.clone());
     layers.resolved = resolved;
     // Web UI credentials: a hash in appconf.yaml (`password_hash`, written by
     // the UI's "Change password") wins; otherwise the env password, then the
@@ -372,14 +387,9 @@ async fn main() {
     // silently off, so no conversation could be looked up later. The writer
     // task handle is kept alive for the process lifetime, bound to
     // `_convlog_guard` below.
-    let store_dir = std::path::Path::new(&args.model_config)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."))
-        .to_path_buf();
     let mut opened = None;
     let mut attempts = Vec::new();
-    for cand in crate::convlog::ConvLogger::open_candidates(&request_log_path, &store_dir) {
+    for cand in crate::convlog::ConvLogger::open_candidates(&request_log_path, &config_dir) {
         match crate::convlog::ConvLogger::start(
             cand.clone(),
             request_log_max_bytes,

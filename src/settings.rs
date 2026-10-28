@@ -285,10 +285,11 @@ pub fn reload(state: &Arc<AppState>) -> Result<usize, String> {
 ///
 /// An absolute path is used as given. A relative one is resolved from
 /// `config_dir`, the folder holding `appconf.yaml`, so the whole
-/// configuration can live in one folder while logs go to the working
-/// directory. Older layouts kept these files in the working directory
-/// (`cwd`): when the file exists there and not next to the config, that copy
-/// is used, and the second value is true so the caller can say so.
+/// configuration — store files and the request log alike — lives in one
+/// folder no matter where the proxy was started. Older layouts kept these
+/// files in the working directory (`cwd`): when the file exists there and not
+/// next to the config, that copy is used, and the second value is true so the
+/// caller can say so.
 pub fn store_path(name: &str, config_dir: &Path, cwd: &Path) -> (PathBuf, bool) {
     let p = Path::new(name);
     if p.is_absolute() {
@@ -639,6 +640,31 @@ mod tests {
         assert_eq!(config_dir("/config/appconf.yaml"), PathBuf::from("/config"));
         assert_eq!(config_dir("appconf.yaml"), PathBuf::from("."));
         assert_eq!(config_dir("conf/app.yaml"), PathBuf::from("conf"));
+    }
+
+    #[test]
+    fn log_path_keeps_a_running_install_on_its_file() {
+        // The request log follows the store-file rule: the default bare name
+        // resolves next to appconf.yaml — but an install whose log already
+        // lives in the working directory keeps using it, so an upgrade never
+        // splits a rotation chain across folders.
+        let root = std::env::temp_dir().join(format!("omq-logpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, cwd) = (root.join("config"), root.join("data"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        // Fresh install: the default name lands next to the config.
+        assert_eq!(
+            store_path("ollamamq-requests.jsonl", &cfg, &cwd),
+            (cfg.join("ollamamq-requests.jsonl"), false)
+        );
+        // Running install: the log in the old working directory keeps winning.
+        std::fs::write(cwd.join("ollamamq-requests.jsonl"), "{}").unwrap();
+        assert_eq!(
+            store_path("ollamamq-requests.jsonl", &cfg, &cwd),
+            (cwd.join("ollamamq-requests.jsonl"), true)
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
