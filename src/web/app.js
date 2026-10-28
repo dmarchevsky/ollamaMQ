@@ -2676,8 +2676,10 @@ function lvDrawRail() {
   const turns = lvTurns();
   const runs = lvRuns();
   const items = [`<div class="lv-rail-h">
-    <button class="btn sm" data-action="lv-expand">Expand all</button>
-    <button class="btn sm" data-action="lv-collapse">Collapse all</button></div>`];
+    <span class="btn-group">
+      <button class="btn sm" data-action="lv-expand" title="Expand all" aria-label="Expand all">⊞</button>
+      <button class="btn sm" data-action="lv-collapse" title="Collapse all" aria-label="Collapse all">⊟</button>
+    </span></div>`];
   let prevRun = -1;
   turns.forEach((t, i) => {
     const prev = turns[i - 1];
