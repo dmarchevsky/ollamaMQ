@@ -294,13 +294,13 @@ pub async fn put_settings(
                 }
                 Value::String(s) if SECRET.contains(&key.as_str()) && s == MASK => {}
                 v => {
-                if key.starts_with("audit_") {
-                    // Folded into the `audit:` section, never written flat.
-                    fold_audit_key(&mut settings, &key, v);
-                } else {
-                    settings.insert(key, v);
+                    if key.starts_with("audit_") {
+                        // Folded into the `audit:` section, never written flat.
+                        fold_audit_key(&mut settings, &key, v);
+                    } else {
+                        settings.insert(key, v);
+                    }
                 }
-            }
             }
         }
     }

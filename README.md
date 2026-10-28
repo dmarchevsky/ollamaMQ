@@ -27,6 +27,7 @@
 - **Compaction Awareness**: When a coding agent runs out of context it asks the model to summarize the conversation, and that summarization call lands on the same proxy as everything else — a huge prompt, a cold cache, a conversation that appears from nowhere. The proxy recognizes those requests (pi/OpenClaw, opencode, Claude Code, Cline/Roo, or an explicit `X-Compaction` header), draws them inside the conversation they summarize instead of as a mystery session, and stops charging their cold prefill to the backend as cache waste (see [Context Compaction](#-context-compaction)).
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from the backend, ensuring compatibility with tools like **Claude Code**.
 - **Per-Request Log Redaction**: Any request can keep its own body text out of the conversation log by sending the `X-Redact-Log` header — its presence is the flag, the value is ignored, no API key required. The entry still records status, size, timing and message roles, and the request is served exactly as before (see [Request logging](#request-logging)).
+- **Security Audit (Mark-Only)**: After each turn is served, the proxy judges the traffic it already saw — the prompt, the tool results that came back, the reply and the tool calls it asked to run — and flags suspicious activity: prompt injection, exfiltration, machine recon, sandbox pushes, unsafe content. A local rule scanner is free and always on; optionally a decision model and Qwen3Guard moderation add verdicts on the audit backend. Flags ride the log, Activity and the conversation viewer; nothing is ever blocked, held or rewritten (see [Security Audit](#-security-audit-mark-only)).
 - **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
 - **Prometheus Metrics**: `GET /metrics` reports requests, outcomes, tokens, bytes and latency **per client and per model**, plus live queue and backend state — including `ollamamq_cache_waste_seconds_total`, the prefill time lost re-evaluating a conversation's context after it was evicted from a backend's KV cache (the waste share is `rate(cache_waste_seconds_total) / rate(prompt_seconds_total)`; only backends reporting per-request prefill telemetry contribute).
 - **Web Dashboard**: live backend health, active requests, queue depths, throughput and the request log in a browser at `/ui` behind a sign-in page — plus model control and management of clients and their API keys.
@@ -642,6 +643,22 @@ The **Models** page decides which models the proxy serves. Rules are case-insens
 - Model load/unload from the web UI still works on hidden models (to warm one before serving it). `/api/ps` is not filtered.
 - Rules are stored in `settings.models_file` (default `models.yaml`), written atomically. A file that exists but cannot be parsed stops the proxy at startup rather than serving everything. It is hand-editable YAML — a plain hide rule may be written as just its pattern (`- unsloth/Qwen3.8-27B-GGUF:*`).
 
+### 🛡️ Security Audit (Mark-Only)
+
+The proxy sits inside every agent loop: it sees the prompt a client sent, the tool results that came back, and what the model answered and asked to run. The audit judges that traffic **after the turn has been served** and records what it found — it never blocks, holds or rewrites a reply, and the serving path never waits on a verdict. (Mark first, act later: what a flag can safely do once humans trust it is a separate decision.)
+
+Five flag kinds, each shown as a red **confirmed** or amber **watch** badge: `injection` (text trying to hijack the model), `exfil` (data leaving — transfers with payloads, cloud-metadata probes, credential reads), `recon` (machine inventory — deliberately a watch by default: dev agents do this legitimately all day; a chain of probes or a probe next to a transfer confirms it), `privesc` (sandbox-boundary pushes: `unshare`, tmpfs mounts, setuid), `harm` (the guard's own content categories). Chains matter more than single lines: an inventory in a tool result plus an upload to an object store in the reply is one story.
+
+Three detectors, cheapest first:
+
+- **Rule scanner** (free, no network, on by default) — substring rules over the turn's new content: cloud-metadata endpoints (`169.254.169.254`, `metadata.google.internal`, …), a watch-host list (`*.aliyuncs.com`, `webhook.site`, … plus your `extra_watch_hosts`), transfer-with-payload shapes, credential paths, inventory commands, sandbox commands, and classic instruction-override phrases.
+- **`d3-nano` noul intent questions** on the audit backend (`/v1/systemone`): does this text ask an assistant to override its instructions, disclose a secret, or send data to a third party. One bounded batch per turn.
+- **`qwen3guard-gen` moderation** (`/v1/moderations`, strict) on the last user message and the reply; the guard's `Jailbreak` lands as `injection`, its other categories as `harm`.
+
+Configure with `settings.audit` (`enabled: off | scanner | full` — `scanner` is the default): the model layer is opt-in because it copies judged text to the audit backend and spends its NPU, so that traffic is bounded (default: 2 in flight, queue 64 — past it turns are dropped and counted, never waited on) and a backend that stops answering degrades the audit to scanner-only until it replies. `flag_threshold` (default 0.85) is where a model verdict becomes confirmed instead of a watch; rule hits are always confirmed. `X-Redact-Log` traffic is judged in memory by default: verdicts are stored, its text never is.
+
+Flags appear as `⚑` badges on log rows, Activity lines and conversation headers, with a verdict block (who said so, on what, with what confidence, the matched excerpt where text is stored) inside each flagged turn; the Logs page has a **Flagged** filter, Settings shows mode, queue depth, drops and backend state, and `/metrics` counts scans, flags by kind, drops and backend-down seconds. A verdict arrives seconds after its turn is served — a row gaining a badge while the page sits open is the point, not a bug.
+
 ### 📈 Prometheus Metrics
 
 `GET /metrics` serves Prometheus text format. Like `/health` it is open by default; set `settings.metrics_token` (or `OLLAMA_MQ_METRICS_TOKEN`) to require `Authorization: Bearer <token>`.
@@ -672,6 +689,9 @@ scrape_configs:
 | `ollamamq_prompt_seconds_total` / `ollamamq_prompt_eval_tokens_total` | counter | client, model, backend — prefill time and the prompt tokens evaluated (cache hits excluded) |
 | `ollamamq_affinity_decisions_total` | counter | result — `hit` (a conversation stayed on its backend) / `moved` (it went elsewhere) |
 | `ollamamq_cache_scheduling_total` | counter | action — `held_back` (a KV-cache-cold conversation gave its turn to a cache-hot one) or `reserved_first` (a session's follow-up went ahead of other waiting users inside its slot reservation) |
+| `ollamamq_audit_scanned_total` / `ollamamq_audit_dropped_total` | counter | turns the security audit judged; turns its queue had no room for (the audit fell behind rather than hold anything) |
+| `ollamamq_audit_flags_total` | counter | kind (`injection` `exfil` `recon` `privesc` `harm`) — suspicious-activity flags raised; mark-only, nothing was ever blocked |
+| `ollamamq_audit_backend_down_seconds_total` | counter | seconds the audit backend was not answering and the audit ran scanner-only |
 | `ollamamq_generation_speed_tokens_per_second` | histogram | model, backend — one observation per finished request |
 | `ollamamq_queue_depth`, `ollamamq_queue_oldest_seconds` | gauge | client, model — waiting requests and the age of the oldest |
 | `ollamamq_requests_in_flight`, `ollamamq_client_fair_share_score` | gauge | client |

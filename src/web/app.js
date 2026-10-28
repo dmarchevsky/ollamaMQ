@@ -3091,7 +3091,7 @@ const FIELD_META = {
   audit_mode: { label: 'Audit mode', kind: 'seg', options: [['off', 'Off'], ['scanner', 'Scanner'], ['full', 'Full']], help: 'Scanner = local rules only. Full adds d3-nano + Qwen3Guard verdicts on the audit backend. The audit marks suspicious activity after the request is served — it never blocks, holds or changes a reply.' },
   audit_flag_threshold: { label: 'Flag threshold', kind: 'float', unit: '(0–1)', help: 'Probability at or above which a model verdict is confirmed (red badge) instead of watch (amber). Rule hits are always confirmed.' },
   audit_scan_redacted: { label: 'Scan redacted requests', kind: 'bool', help: 'X-Redact-Log traffic is judged in memory; verdicts and probabilities are stored, its text never is.' },
-  audit_backend: { label: 'Audit backend', kind: 'text', help: 'The server running <code>qwen3guard-gen</code> and <code>d3-nano</code>. Empty: the first backend that lists them. While it is unreachable the scanner keeps working alone.' },
+  audit_backend: { label: 'Audit backend', kind: 'text', help: 'The server running <code>qwen3guard-gen</code> and <code>d3-nano</code>. Empty: the first enabled backend. While it is unreachable the scanner keeps working alone.' },
 };
 const SET_GROUPS = [
   ['Scheduling & limits', ['timeout', 'stuck_timeout', 'max_concurrent_per_backend', 'detect_backend_slots', 'max_queued_bytes', 'max_body_bytes', 'load_keep_alive']],
