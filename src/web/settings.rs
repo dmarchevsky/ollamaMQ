@@ -183,7 +183,7 @@ fn audit_fields(full: &Settings, layers: &settings::Layers) -> Vec<FieldView> {
     } else {
         "default"
     };
-    let mut make = |key: &'static str, value: Value, fallback: Value| FieldView {
+    let make = |key: &'static str, value: Value, fallback: Value| FieldView {
         key,
         value,
         source,
