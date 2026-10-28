@@ -855,9 +855,14 @@ pub fn parse_moderations(body: &str) -> Vec<GuardVerdict> {
         .filter_map(|item| {
             let flagged = item.get("flagged").and_then(|f| f.as_bool()).unwrap_or(false);
             match (best_category(item), flagged) {
-                (Some((category, score)), _) => Some(GuardVerdict { category, score, flagged }),
+                // A Safe label is the guard clearing the text, not a verdict to
+                // report: its score is the highest number on a clean turn
+                // (Safe 0.99), so filtering on the score alone would flag every
+                // benign request. Only an explicit `flagged` survives a Safe.
+                (Some((category, _)), false) if category.eq_ignore_ascii_case("safe") => None,
+                (Some((category, score)), flagged) => Some(GuardVerdict { category, score, flagged }),
                 (None, true) => Some(GuardVerdict { category: "unspecified".into(), score: 1.0, flagged }),
-                _ => None,
+                (None, false) => None,
             }
         })
         .collect()
@@ -1519,6 +1524,18 @@ mod tests {
         assert_eq!(flags[0].kind, Kind::Harm);
         assert!(!flags[0].bad, "0.5 is a watch");
         assert!(parse_moderations("{ malformed").is_empty());
+        // A clean Qwen3Guard reply: the Safe label carries the top score, and a
+        // Safe that did not flag is the guard clearing the text — never a flag.
+        let clean = parse_moderations(
+            r#"{"results":[{"flagged":false,"label":"Safe","label_scores":{"Safe":0.997,"Unsafe":0.001,"Controversial":0.002}}]}"#,
+        );
+        assert!(guard_flags(&clean, Src::User, 0.85, WATCH_FLOOR).is_empty(), "Safe must not flag: {clean:?}");
+        let controversial = parse_moderations(
+            r#"{"results":[{"flagged":false,"label":"Controversial","label_scores":{"Safe":0.009,"Unsafe":0.41,"Controversial":0.58}}]}"#,
+        );
+        let cf = guard_flags(&controversial, Src::User, 0.85, WATCH_FLOOR);
+        assert_eq!(cf.len(), 1, "Controversial watches: {controversial:?}");
+        assert!(!cf[0].bad, "below threshold stays a watch");
         assert!(guard_flags(&parse_moderations(r#"{"results":[{"flagged":false,"category_scores":{"None":0.01}}]}"#), Src::Reply, 0.85, WATCH_FLOOR).is_empty());
     }
 
