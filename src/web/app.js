@@ -52,7 +52,7 @@ function storedFilters() {
     }
     const w = localStorage.getItem('omq.window');
     const c = localStorage.getItem('omq.client');
-    return { ...d, win: ['5m', '15m', '1h'].includes(w) ? w : '15m', clients: c ? [c] : [] };
+    return { ...d, win: ['5m', '15m', '30m', '1h', '24h', '48h'].includes(w) ? w : '15m', clients: c ? [c] : [] };
   } catch { /* storage blocked */ }
   return d;
 }
@@ -339,6 +339,13 @@ function clientIds(st) {
 // ---------------------------------------------------------------- filters
 
 const FPRESETS = ['5m', '15m', '30m', '1h'];
+/** The Overview's retention as served with the last payload (hours). */
+const historyHours = () => Number(S.overview && S.overview.history_hours) || 24;
+/** Preset windows, extended to the configured retention (24 h, 48 h, …). */
+function fPresets() {
+  const h = historyHours();
+  return [...FPRESETS, ...(h >= 24 ? ['24h'] : []), ...(h >= 48 ? ['48h'] : [])];
+}
 const saveFilters = () => {
   try { localStorage.setItem('omq.filters', JSON.stringify(S.filters)); } catch { /* storage blocked */ }
 };
@@ -429,10 +436,10 @@ const flhead = (title, id, sel, n) => `<div class="fhead"><b>${title}</b><span c
 function drawFilters() {
   const f = S.filters, st = S.state, ov = S.overview || {};
   const cm = /^(\d+)(m|h)$/.exec(f.win);
-  const preset = FPRESETS.includes(f.win);
-  setHTML($('#f-time'), `<div class="fhead"><b>Time interval</b><span class="hint">or last N — history is kept for 24 h</span></div>
+  const preset = fPresets().includes(f.win);
+  setHTML($('#f-time'), `<div class="fhead"><b>Time interval</b><span class="hint">or last N — history is kept for ${historyHours()} h</span></div>
     <div class="frow"><span class="seg" role="radiogroup" aria-label="Time window">
-      ${FPRESETS.map(w => `<label><input type="radio" name="fwin" value="${w}"${preset && f.win === w ? ' checked' : ''}><span>${winLabel(w)}</span></label>`).join('')}
+      ${fPresets().map(w => `<label><input type="radio" name="fwin" value="${w}"${preset && f.win === w ? ' checked' : ''}><span>${winLabel(w)}</span></label>`).join('')}
     </span><input type="text" id="f-win-n" inputmode="numeric" placeholder="last" value="${preset ? '' : cm[1]}">
     <select id="f-win-u"><option value="m"${!preset && cm?.[2] === 'm' ? ' selected' : ''}>minutes</option><option value="h"${cm?.[2] === 'h' ? ' selected' : ''}>hours</option></select></div>`);
   setHTML($('#f-mode'), `<div class="fhead"><b>Client identity</b><span class="hint">label mode lists and shows client:key (API key label)</span></div>
@@ -488,7 +495,7 @@ function collectFilters() {
   const win = $('#dlg-filters input[name="fwin"]:checked')?.value;
   const n = ($('#f-win-n').value || '').trim();
   const custom = /^\d+$/.test(n)
-    ? Math.min(+n || 1, $('#f-win-u').value === 'h' ? 24 : 1440) + $('#f-win-u').value
+    ? Math.min(+n || 1, $('#f-win-u').value === 'h' ? historyHours() : historyHours() * 60) + $('#f-win-u').value
     : null;
   f.win = win || custom || '15m';
   f.mode = $('#dlg-filters input[name="fmode"]:checked').value;

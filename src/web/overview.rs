@@ -89,6 +89,9 @@ fn csv(v: Option<&str>) -> Option<HashSet<String>> {
 #[derive(Serialize)]
 pub struct OverviewView {
     window_secs: u64,
+    /// The configured Activity retention (`settings.history_hours`) — what
+    /// the UI's window picker caps its presets and hint text at.
+    history_hours: u64,
     now_ms: u64,
     /// Aligned start / width of the activity lane scale (bucket edges are
     /// multiples of the width since the epoch, so bars do not slide). Lanes
@@ -303,10 +306,10 @@ fn keep<T>(items: Vec<T>, scope: &Scope, ident: impl Fn(&T) -> (&str, &str)) -> 
         .collect()
 }
 
-fn window_secs(w: Option<&str>) -> u64 {
+fn window_secs(w: Option<&str>, max_secs: u64) -> u64 {
     let s = match w {
         Some(s) => s.trim().to_ascii_lowercase(),
-        None => return 900,
+        None => return 900.min(max_secs),
     };
     let (num, mult) = match s.strip_suffix('h') {
         Some(n) => (n, 3600),
@@ -319,8 +322,8 @@ fn window_secs(w: Option<&str>) -> u64 {
         .parse::<u64>()
         .ok()
         .filter(|v| *v > 0)
-        .map(|v| (v * mult).min(24 * 3600)) // nothing is kept longer than a day
-        .unwrap_or(900)
+        .map(|v| (v * mult).min(max_secs)) // nothing is kept longer than the history
+        .unwrap_or(900.min(max_secs))
 }
 
 /// Percent of the prompt that did not need prefill (prefix-cache hit).
@@ -457,7 +460,7 @@ pub async fn get_overview(
     State(state): State<Arc<AppState>>,
     Query(q): Query<OverviewQuery>,
 ) -> Json<OverviewView> {
-    let window = window_secs(q.window.as_deref());
+    let window = window_secs(q.window.as_deref(), state.stats.history_ms() / 1000);
     let key_mode = q.mode.as_deref() == Some("key");
     let mut clients = csv(q.clients.as_deref());
     if clients.is_none()
@@ -847,6 +850,7 @@ pub async fn get_overview(
     };
     Json(OverviewView {
         window_secs: window,
+        history_hours: state.stats.history_hours(),
         now_ms: now,
         lane_from_ms: lane_from,
         lane_span_ms: n as u64 * w_ms,
@@ -882,14 +886,15 @@ mod tests {
 
     #[test]
     fn window_names() {
-        assert_eq!(window_secs(Some("5m")), 300);
-        assert_eq!(window_secs(Some("15m")), 900);
-        assert_eq!(window_secs(Some("1h")), 3600);
-        assert_eq!(window_secs(Some("90m")), 5400);
-        assert_eq!(window_secs(Some("6h")), 21600);
-        assert_eq!(window_secs(Some("30h")), 24 * 3600); // clamped to retention
-        assert_eq!(window_secs(Some("bogus")), 900);
-        assert_eq!(window_secs(None), 900);
+        assert_eq!(window_secs(Some("5m"), 24 * 3600), 300);
+        assert_eq!(window_secs(Some("15m"), 24 * 3600), 900);
+        assert_eq!(window_secs(Some("1h"), 24 * 3600), 3600);
+        assert_eq!(window_secs(Some("90m"), 24 * 3600), 5400);
+        assert_eq!(window_secs(Some("6h"), 24 * 3600), 21600);
+        assert_eq!(window_secs(Some("30h"), 24 * 3600), 24 * 3600); // clamped to retention
+        assert_eq!(window_secs(Some("60h"), 48 * 3600), 48 * 3600); // follows the setting
+        assert_eq!(window_secs(Some("bogus"), 24 * 3600), 900);
+        assert_eq!(window_secs(None, 24 * 3600), 900);
     }
 
     #[test]
