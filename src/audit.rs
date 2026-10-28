@@ -739,7 +739,7 @@ pub fn parse_decisions(body: &str) -> HashMap<String, f64> {
     fn prob_of(v: &serde_json::Value) -> Option<f64> {
         match v {
             serde_json::Value::Number(n) => n.as_f64(),
-            serde_json::Value::Object(_) => ["probability", "score", "yes", "p", "value"]
+            serde_json::Value::Object(_) => ["noul", "probability", "score", "yes", "p", "value"]
                 .iter()
                 .filter_map(|k| v.get(*k).and_then(|x| x.as_f64()))
                 .next(),
@@ -1490,7 +1490,12 @@ mod tests {
         assert_eq!(objs.get("q0"), Some(&0.2));
         assert_eq!(objs.get("q1"), Some(&0.7));
         let arr = parse_decisions(r#"{"results":[{"question":"secret_disclosure_tool","probability":0.66}]}"#);
-        assert_eq!(arr.get("secret_disclosure_tool"), Some(&0.66));
+        // The live halogen shape: answers.<name>.noul is the P(yes).
+        let noul = parse_decisions(
+            r#"{"model":"d3-nano","answers":{"instruction_override_user":{"type":"noul","noul":0.9986}},"usage":{}}"#,
+        );
+        assert_eq!(noul.get("instruction_override_user").map(|p| (*p * 1000.).round() / 1000.), Some(0.999),
+            "halogen noul shape must parse: {noul:?}");        assert_eq!(arr.get("secret_disclosure_tool"), Some(&0.66));
         assert!(parse_decisions("<html>503</html>").is_empty());
 
         let flags = decision_flags(&HashMap::from([("instruction_override_user".into(), 0.61)]), 0.85, WATCH_FLOOR);
