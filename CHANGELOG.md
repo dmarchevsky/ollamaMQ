@@ -3,6 +3,15 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.23.2 — 2026-10-28
+
+### Changed
+
+- No behavior changes. The contributor playbook now documents the v0.23.1
+  log-placement rule (run `ollamaMQ -c config/appconf.yaml` from the repo
+  root — no `cd logs`), replacing the outdated `/data`-fallback recipe so
+  development agents follow the new convention.
+
 ## v0.23.1 — 2026-10-28
 
 ### Changed

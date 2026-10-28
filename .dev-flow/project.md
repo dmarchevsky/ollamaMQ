@@ -71,11 +71,20 @@ implementation completes, kill it before `flow finish`. Run the worktree binary 
 repo's own config by absolute path: `-c /home/dima/work/ollamaMQ/config/appconf.yaml` — real
 backends, real credentials, sign-in-able with the operator's saved login; no config copy, no
 test password, no `.dev-flow/<slug>/live/` dir (retired). `config/` is untracked, so worktrees
-carry no config of their own — the `flow-check health` probe resolves it the same way. Its
-`request_log_path: /data/…` is the container's log mount and does not exist on this host, but
-since v0.17.0 capture falls back to `config/ollamamq-requests.jsonl` next to appconf.yaml and
-warns (`conversation log: … writing to … instead`); confirm with `GET /ui/api/capture` that
-capture runs and where it writes.
+carry no config of their own — the `flow-check health` probe resolves it the same way.
+
+**Log placement (since v0.23.1):** `request_log_path` resolves from the folder holding
+appconf.yaml, so a local run starts from anywhere — including the main folder, as plain
+`ollamaMQ -c config/appconf.yaml`; the old `cd logs && …` launch convention is retired. The
+ONE log folder is repo-root `logs/` for both worlds, reached by construction: appconf.yaml
+(gitignored — set it once on this machine and on the production deploy) carries
+`request_log_path: ../logs/ollamamq-requests.jsonl`, and the container maps the same folder
+via `./logs:/logs`. An install whose log still lives in an old cwd keeps using that file via
+the legacy fallback (startup says `request log: writing … in the working directory`) until it
+is moved. Confirm with `GET /ui/api/capture` that capture runs and where it writes.
+Gotchas: never run container and native simultaneously (shared rotation chain; port 11435
+collides anyway); `config/`, `logs/`, `logs*/` and `ollamamq-requests.jsonl` are gitignored —
+never commit runtime log state.
 
 Persist as you go: draft findings, calibration constants and mid-stage decisions into
 `plan/plan.md` (or a scratch file under the feature dir) as they happen, not only at stage
