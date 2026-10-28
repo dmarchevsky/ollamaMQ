@@ -3,6 +3,47 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.24.0 — 2026-10-28
+
+### Added
+
+- **Security audit: the proxy now notices suspicious activity — and only marks
+  it.** After every turn has been served, ollamaMQ judges the traffic it already
+  sees — the prompt a client sent, the tool results that came back, and what the
+  model answered and asked to run — and flags five kinds of it:
+  `⚑ injection`, `⚑ exfil`, `⚑ recon`, `⚑ privesc`, `⚑ harm`, each **confirmed**
+  (red) or a **watch** (amber). The signature of the Cohere incident report — a
+  clean reasoning trace over rogue tool calls: an `ls`/`which` inventory, a
+  `curl -X PUT` to an object store, a `169.254.169.254` metadata probe, an
+  `unshare` sandbox push — is exactly what it looks for, and chains matter more
+  than single lines: one `which curl` is a developer, an inventory next to an
+  upload is one story. A **free local rule scanner** catches the machine-side
+  classes outright (metadata endpoints, watch hosts, transfer-with-payload and
+  credential paths, inventory and sandbox commands, classic override phrases);
+  the optional model layer (`settings.audit.enabled: full`) asks **`d3-nano`**
+  for intent verdicts (instruction override, secret disclosure, third-party
+  transfer) and **`qwen3guard-gen`** for content moderation, both on the audit
+  backend and bounded so the audit can never bully the NPU (default two calls in
+  flight, queue 64 — overflow is dropped and counted, never waited on; a backend
+  that stops answering degrades the audit to scanner-only until it replies).
+  The audit is **asynchronous and mark-only**: verdicts land seconds after a
+  turn, responses are byte-identical with the audit on or off, and nothing is
+  ever blocked, held or rewritten — acting on flags is a later feature, once
+  they have earned trust. `X-Redact-Log` traffic is judged in memory: verdicts
+  are stored, its text never is.
+- Flags show up wherever requests are visible: badges on **Logs** rows and
+  Activity lines and conversation headers, a **⚑ Flagged** filter with a count,
+  a verdict block (who said so, on what, with what confidence, and the matched
+  excerpt wherever text is stored) inside every flagged turn, and a `⚑` count
+  on the Logs tab. **Settings** grows a *Security audit* panel — mode, flag
+  threshold, the redaction contract and backend, all live-editable — with a
+  status line showing queue depth, drops and whether the verdict backend is
+  answering; `/metrics` counts scans, flags by kind, drops and backend-outage
+  seconds. The conversation log is schema **v3** (turns can carry `audit`
+  flags; older logs keep opening and simply carry none). The rule scanner is
+  on by default; the model layer and its exact settings are opt-in per
+  `settings.audit` (see the README's *Security Audit* section).
+
 ## v0.23.2 — 2026-10-28
 
 ### Changed

@@ -1113,3 +1113,23 @@ pre.raw { font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-w
   /* the tree is a sheet across the top here — nothing to resize sideways */
   .lv-grip { display: none; }
 }
+
+/* --- Security audit ----------------------------------------------------------
+ * The verdict block a flagged turn shows under its header, plus the small
+ * spacing a badge needs when it rides a log line or an Activity stage line.
+ * Colours come from the shared tokens, so light and dark both hold up; the
+ * block's left edge carries the severity the flags inside earned. */
+.audit { border: 1px solid var(--border); border-left: 3px solid var(--bad); background: var(--surface-2);
+  border-radius: 8px; padding: 8px 12px; margin: 6px 0 4px; font-size: 12.5px; }
+.audit.watch { border-left-color: var(--warn); }
+.audit h4 { margin: 0 0 6px; font: 700 10.5px var(--mono); letter-spacing: .06em;
+  text-transform: uppercase; color: var(--muted); }
+.audit .a-row { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; padding: 3px 0; }
+.audit .a-row + .a-row { border-top: 1px dashed var(--border); }
+.audit .a-row b { font: 700 11px var(--mono); color: var(--muted); }
+.audit .a-row .p { font: 700 11.5px var(--mono); color: var(--bad); }
+.audit.watch .a-row .p { color: var(--warn); }
+.audit .a-row q { color: var(--muted); font-style: italic; }
+.rline .badge.bad, .rline .badge.warn { margin-left: 6px; }
+.det-row .badge.bad, .det-row .badge.warn { margin-left: 8px; }
+.set-c .seg { margin: 0; }

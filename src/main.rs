@@ -13,6 +13,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod admin;
+mod audit;
 mod auth;
 mod classify;
 mod clients;
@@ -473,6 +474,18 @@ async fn main() {
     // layer so the web UI can show and change them.
     settings::apply(&state, &eff);
     settings::apply_backends(&state, &backend_list);
+    // The audit's queue and worker pool, sized from `settings.audit` (now
+    // applied). It runs off the serving path: turns are handed to it after the
+    // client has its answer, and a full queue drops work instead of waiting.
+    if state.audit.mode() != audit::Mode::Off {
+        audit::start(&state);
+        let backend = state.audit.backend(&state);
+        info!(
+            "Security audit: mode {}, backend {}",
+            state.audit.mode().as_str(),
+            if backend.is_empty() { "none configured yet" } else { &backend }
+        );
+    }
     // Activity journal: replay the records that survived the restart into the
     // Overview history and start appending new ones, next to the conversation
     // log (same folder decision, same fallback). Capture off means no journal:

@@ -94,7 +94,12 @@ pub fn view(state: &AppState) -> SettingsView {
             fallback_source: "default",
         }
     };
-    let fields = EDITABLE.iter().map(|(k, live)| make(k, *live)).collect();
+    let fields = EDITABLE
+        .iter()
+        .filter(|(k, _)| !k.starts_with("audit_"))
+        .map(|(k, live)| make(k, *live))
+        .chain(audit_fields(&full, &layers))
+        .collect();
     // Store files: where they were actually found, not the bare name.
     let startup = STARTUP_ONLY
         .iter()
@@ -165,6 +170,66 @@ pub fn view(state: &AppState) -> SettingsView {
     }
 }
 
+/// The audit's own rows on the Settings page. They are flat names the form can
+/// set (`audit_mode`, `audit_flag_threshold`, …) even though the file keeps them
+/// as one `audit:` section, because a set-row wants exactly one control.
+fn audit_fields(full: &Settings, layers: &settings::Layers) -> Vec<FieldView> {
+    let eff = full.audit.clone().unwrap_or_default();
+    let fallback = crate::config::AuditSettings::default();
+    // The section came from appconf.yaml, or it did not: a per-subkey provenance
+    // would mean keeping the file's raw YAML around for nothing.
+    let source = if layers.file.settings.audit.is_some() {
+        "file"
+    } else {
+        "default"
+    };
+    let make = |key: &'static str, value: Value, fallback: Value| FieldView {
+        key,
+        value,
+        source,
+        locked_by: None,
+        live: true,
+        fallback,
+        fallback_source: "default",
+    };
+    vec![
+        make("audit_mode", Value::String(eff.enabled), Value::String(fallback.enabled)),
+        make(
+            "audit_flag_threshold",
+            serde_json::to_value(eff.flag_threshold).unwrap_or_default(),
+            serde_json::to_value(fallback.flag_threshold).unwrap_or_default(),
+        ),
+        make(
+            "audit_scan_redacted",
+            Value::Bool(eff.scan_redacted),
+            Value::Bool(fallback.scan_redacted),
+        ),
+        make("audit_backend", Value::String(eff.backend), Value::String(fallback.backend)),
+    ]
+}
+
+/// Fold a flat `audit_*` key into the `audit:` object the file keeps. A value of
+/// the wrong shape is passed through unchanged and rejected by `Settings`'
+/// validation on the way in, so the operator gets the real message rather than a
+/// silently dropped edit.
+fn fold_audit_key(settings: &mut Map<String, Value>, key: &str, value: Value) {
+    let Some(sub) = (match key {
+        "audit_mode" => Some("enabled"),
+        "audit_flag_threshold" => Some("flag_threshold"),
+        "audit_scan_redacted" => Some("scan_redacted"),
+        "audit_backend" => Some("backend"),
+        _ => None,
+    }) else {
+        return;
+    };
+    let mut audit = match settings.get("audit") {
+        Some(Value::Object(map)) => map.clone(),
+        _ => Map::new(),
+    };
+    audit.insert(sub.to_string(), value);
+    settings.insert("audit".to_string(), Value::Object(audit));
+}
+
 pub async fn get_settings(State(state): State<Arc<AppState>>) -> Json<SettingsView> {
     Json(view(&state))
 }
@@ -229,7 +294,12 @@ pub async fn put_settings(
                 }
                 Value::String(s) if SECRET.contains(&key.as_str()) && s == MASK => {}
                 v => {
-                    settings.insert(key, v);
+                    if key.starts_with("audit_") {
+                        // Folded into the `audit:` section, never written flat.
+                        fold_audit_key(&mut settings, &key, v);
+                    } else {
+                        settings.insert(key, v);
+                    }
                 }
             }
         }

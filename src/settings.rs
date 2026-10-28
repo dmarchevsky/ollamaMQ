@@ -37,6 +37,14 @@ pub const EDITABLE: &[(&str, bool)] = &[
     ("log_content_limit", true),
     ("history_hours", true),
     ("history_max_records", true),
+    // The audit knobs: flat names the UI can set, stored under
+    // `settings.audit` (see [`crate::config::AuditSettings`]). The web layer
+    // folds each into the section, so a save writes `audit: {…}`, never a flat
+    // key nobody reads.
+    ("audit_mode", true),
+    ("audit_flag_threshold", true),
+    ("audit_scan_redacted", true),
+    ("audit_backend", true),
 ];
 
 /// Settings shown read-only: they are read once at startup.
@@ -82,6 +90,8 @@ pub fn defaults() -> Settings {
         models_file: Some(crate::model_policy::DEFAULT_MODELS_FILE.into()),
         metrics_token: None,
         web_ui: None,
+        // The audit's own defaults live with the audit (see AuditSettings).
+        audit: None,
     }
 }
 
@@ -237,6 +247,12 @@ pub fn apply(state: &AppState, eff: &Settings) {
         eff.history_hours.or(d.history_hours).unwrap_or(24),
         eff.history_max_records.or(d.history_max_records).unwrap_or(50_000),
     );
+    // The security audit's runtime switches. Everything about the audit that
+    // could slow a request down lives behind these: mode, threshold, and whether
+    // redacted traffic is judged at all.
+    state
+        .audit
+        .apply(&eff.audit.clone().unwrap_or_default());
     *state.metrics_token.lock_or_recover() = eff.metrics_token.clone().filter(|t| !t.is_empty());
     state.set_model_aliases(eff.model_aliases.as_ref());
     // Capacity or aliases may have changed what can be dispatched.

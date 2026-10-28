@@ -108,6 +108,26 @@ pub const CONTROL_OPS: CounterDef = CounterDef {
     help: "Model load/unload operations by result.",
     labels: &["backend", "model", "action", "result"],
 };
+pub const AUDIT_SCANNED: CounterDef = CounterDef {
+    name: "ollamamq_audit_scanned_total",
+    help: "Turns the security audit judged (all modes: scanner-only and full both count).",
+    labels: &[],
+};
+pub const AUDIT_FLAGS: CounterDef = CounterDef {
+    name: "ollamamq_audit_flags_total",
+    help: "Suspicious-activity flags raised, by kind (injection, exfil, recon, privesc, harm). Mark-only: a flag records what the audit saw, it never blocked anything.",
+    labels: &["kind"],
+};
+pub const AUDIT_DROPPED: CounterDef = CounterDef {
+    name: "ollamamq_audit_dropped_total",
+    help: "Audit jobs the queue had no room for — the audit fell behind and gave up on them rather than hold serving.",
+    labels: &[],
+};
+pub const AUDIT_BACKEND_DOWN_SECONDS: CounterDef = CounterDef {
+    name: "ollamamq_audit_backend_down_seconds_total",
+    help: "Seconds the audit backend was not answering; during those the audit ran scanner-only.",
+    labels: &[],
+};
 pub const CACHE_SCHEDULING: CounterDef = CounterDef {
     name: "ollamamq_cache_scheduling_total",
     help: "Cache-aware dispatch decisions: held_back = a conversation that recently missed the KV prefix cache gave way to a cache-hot one (bounded by a per-request yield budget); reserved_first = a session's own follow-up went ahead of other waiting users inside its slot-reservation window.",
@@ -167,6 +187,10 @@ const COUNTERS: &[&CounterDef] = &[
     &AFFINITY_DECISIONS,
     &CONTROL_OPS,
     &CACHE_SCHEDULING,
+    &AUDIT_SCANNED,
+    &AUDIT_FLAGS,
+    &AUDIT_DROPPED,
+    &AUDIT_BACKEND_DOWN_SECONDS,
 ];
 const HISTOGRAMS: &[&HistogramDef] = &[&QUEUE_WAIT, &TTFB, &TTFT, &DURATION, &GEN_SPEED];
 

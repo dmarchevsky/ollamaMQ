@@ -109,6 +109,26 @@ settings:
                               # journal. The journal rides next to the
                               # request log as ollamamq-activity.jsonl — rotate harder for wider windows
   history_max_records: 50000                  # finished requests kept for the Overview, whatever their age (default 50 000)
+  # --- Security audit -------------------------------------------------------
+  # Judges traffic after it was served and marks what it sees: never blocks,
+  # holds or rewrites a reply. The rule scanner is free and local; the model
+  # layer is opt-in because it copies judged text to the audit backend and
+  # spends its NPU (bounded: `concurrency` in flight, queue of `queue`,
+  # overflow dropped and counted). See the README's Security Audit section.
+  # audit:
+  #   enabled: scanner          # off | scanner (local rules only) | full (+ models)
+  #   backend: ""               # verdict-model host; empty = first enabled backend
+  #   flag_threshold: 0.85      # model confidence at or above which a flag is
+  #                             # confirmed (red) instead of a watch (amber)
+  #   scan_redacted: true       # judge X-Redact-Log traffic in memory; verdicts
+  #                             # are stored, its text never is
+  #   max_questions_per_turn: 6 # decision-model questions per turn (NPU budget)
+  #   concurrency: 2            # audit requests in flight against the backend
+  #   queue: 64                 # turns held while the audit is busy; past it a
+  #                             # turn is dropped and counted, never waited on
+  #   extra_watch_hosts: []     # domains that turn a transfer into an exfil flag
+  #   guard_model: qwen3guard-gen-0.6b
+  #   decision_model: d3-nano
   # Files the web UI writes. A relative path is resolved from the folder
   # holding this file, so by default they sit next to it (logs above stay
   # relative to the working directory). Defaults shown.
