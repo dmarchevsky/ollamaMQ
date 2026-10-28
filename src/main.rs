@@ -463,6 +463,22 @@ async fn main() {
     // layer so the web UI can show and change them.
     settings::apply(&state, &eff);
     settings::apply_backends(&state, &backend_list);
+    // Activity journal: replay the records that survived the restart into the
+    // Overview history and start appending new ones, next to the conversation
+    // log (same folder decision, same fallback). Capture off means no journal:
+    // without a writable log folder there is nowhere to be honest about.
+    if let Some(log_path) = state.convlog.path() {
+        let journal = std::path::Path::new(log_path)
+            .with_file_name("ollamamq-activity.jsonl")
+            .display()
+            .to_string();
+        match state.stats.attach_journal(journal.clone()) {
+            Ok(()) => info!("activity journal: {journal}"),
+            Err(e) => tracing::warn!(
+                "activity journal: {e}; Activity history stays in memory only"
+            ),
+        }
+    }
     if !state.model_aliases.lock_or_recover().is_empty() {
         info!("{} model alias(es) loaded", state.model_aliases.lock_or_recover().len());
     }
