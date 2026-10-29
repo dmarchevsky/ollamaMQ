@@ -3,6 +3,54 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.25.0 — 2026-10-29
+
+### Added
+
+- **The Filters window now scopes the Logs list, not only the Overview panels.**
+  One selection — interval, clients, models, backends — governs both pages, is
+  remembered per browser, and says what it is doing: while it is narrowing the
+  list, the Logs toolbar carries a chip naming the scope (`48 h · 1 clients`), an
+  emptied list names the filter that emptied it instead of looking like an idle
+  system, and a window wider than the log ring prints how far back the list
+  actually reaches rather than implying it looked further. A captured row knows no
+  API key and no priority, so those two axes stay Overview-only — a `client:key`
+  choice scopes Logs by the client (the keys of one client are one actor in a
+  traffic list), and a priority-only selection leaves the list whole and the chip
+  quiet instead of advertising a filter with no effect. The window is cut by the
+  proxy's clock, the same clock the rows' own timestamps came from, so a skewed
+  browser clock no longer shifts which rows fall inside it.
+- **An Activity conversation lights at both ends.** A conversation is drawn
+  twice — a lane in the graph and a header in the list below — and pointing at
+  either now marks both in that conversation's own colour, so the two places
+  stop reading as unrelated lists of names. Nothing scrolls and no filter
+  changes on hover: a header off-screen or hidden behind *Active* simply stays
+  dark, and the click still scrolls, unfolds and flashes as before.
+
+### Changed
+
+- **The jump tree reads as request → response.** An opened request now groups its
+  rows under two tinted heads — `REQ` for what it **sent** (`→ 636 KB · 7 new`)
+  and `RESP` for what it **got** (`7.0s ← Fixed by walking the chain…`), each
+  landing on that half of the turn in the body. The answer is the `RESP` head
+  itself, so the duplicated assistant row it used to spawn is gone; grouping is a
+  background tint and a hairline guide instead of per-row borders, which is what
+  let the indent drop from 18 px to 9 px per level and every row to one type size.
+  A row that owns no moment (`SYS`, `USER`, a request still waiting for its
+  answer) renders no clock cell at all — the empty column aligned with nothing was
+  the worst thief of snippet room in the rail — and message rows finally answer to
+  the pointer, because the rule that flattened them had also cancelled their hover
+  tint. `≡ Jump`'s outline now survives a scroll to any part of a turn again: the
+  scroll-sync followed rows the old class names.
+- **One legend component, one vocabulary per panel.** The Overview board used to
+  ship two legend implementations with two swatch shapes for one board. Capacity
+  now keys the identities it colours by (client, or `client:key` in label mode)
+  plus *free* and *loading a model*; Activity keys the stage chips it draws —
+  waiting, prefill, decode, error, compaction — with square swatches matching the
+  segments on the graph, while round swatches keep meaning "this is a client".
+  The stage key is generated from the same table the chips are built from, so a
+  stage can no longer appear on the graph without appearing in its key.
+
 ## v0.24.1 — 2026-10-29
 
 ### Changed
