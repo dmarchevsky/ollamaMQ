@@ -223,12 +223,12 @@ addEventListener('load', () => {
         A('inc-hides-runs', !document.querySelector('#dlg-log .run-h')
           && !document.querySelector('#lv-rail .lv-node.run'),
           'incremental: no run lines in either pane');
-        A('inc-still-shows-the-answer', !!document.querySelector('#lv-rail .lv-node.resp')
+        A('inc-still-shows-the-answer', !!document.querySelector('#lv-rail .lv-node.resph')
           && !!document.querySelector(`#lv-t-${rid2} .lv-sec.out, #lv-a-${rid2}`),
           'the response section and rail row survive incremental');
         // The rail rows for a turn are the messages it ADDED — no REQ count
         // row, and no re-sent rows under a later request while incremental.
-        const rows2 = [...document.querySelectorAll(`#lv-rail .lv-node.msg[data-rid="${rid2}"]`)];
+        const rows2 = [...document.querySelectorAll(`#lv-rail .lv-node.sub[data-rid="${rid2}"]`)];
         A('tree-rows-are-new-only', rows2.length > 0 && rows2.every(n => +n.dataset.idx >= hid)
           && ![...document.querySelectorAll(`#lv-rail .lv-node[data-rid="${rid2}"]`)].some(n => /\bheld\b/.test(n.textContent)),
           `${rows2.length} rows for request 2, every idx >= ${hid}`);
@@ -241,7 +241,7 @@ addEventListener('load', () => {
         await wait(700);
         const heldRows = document.querySelectorAll(`#lv-t-${rid2} .msg.m-held`).length;
         A('show-incremental-full-prompt', inc() === n0 + hid && heldRows === hid
-          && document.querySelectorAll(`#lv-rail .lv-node.msg[data-rid="${rid2}"]`).length > rows2.length,
+          && document.querySelectorAll(`#lv-rail .lv-node.sub[data-rid="${rid2}"]`).length > rows2.length,
           `request 2 body ${n0} \u2192 ${inc()} messages (+${hid} held, dimmed)`);
         // The whole-prompt view gets the run grouping back: the group lines
         // appear in both panes.
