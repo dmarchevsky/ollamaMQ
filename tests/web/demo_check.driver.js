@@ -135,13 +135,51 @@ addEventListener('load', () => {
         document.querySelector('#dlg-log [data-action="lv-collapse"]').click();
         await wait(600);
         A('collapse-all-folds-everything', LV.open.size === 0
-          && !document.querySelector('#lv-rail .lv-node.msg')
-          && !document.querySelector('#lv-rail .lv-node.resp'),
+          && !document.querySelector('#lv-rail .lv-node.sub')
+          && !document.querySelector('#lv-rail .lv-node.head'),
           'every block closed; the rail keeps only the request lines');
         document.querySelector('#dlg-log [data-action="lv-expand"]').click();
         await wait(700);
         A('expand-all-opens-everything', LV.open.size === lvTurns().length && LV.closedRuns.size === 0,
           `${LV.open.size} blocks open`);
+        // An opened request groups its rows under two heads — what it SENT and
+        // what it GOT — each a tinted block with no border, the messages flat.
+        const heads = [...document.querySelectorAll('#lv-rail .lv-node.head')];
+        A('two-heads-per-open-request', heads.length === 2 * LV.open.size,
+          `${heads.length} heads for ${LV.open.size} open requests`);
+        A('heads-jump-to-their-section', heads.every(n => n.dataset.action
+          === (n.classList.contains('reqh') ? 'lv-req' : 'lv-resp')),
+          [...new Set(heads.map(n => n.dataset.action))].join('/'));
+        A('heads-tinted-not-bordered', heads.every(n => {
+          const s = getComputedStyle(n);
+          return s.borderTopWidth === '0px' && s.backgroundColor !== 'rgba(0, 0, 0, 0)';
+        }), 'both heads carry a background and no border');
+        const subs = [...document.querySelectorAll('#lv-rail .lv-node.sub')];
+        A('messages-flat-under-their-head', subs.length > 0 && subs.every(n => {
+          const s = getComputedStyle(n);
+          return s.borderTopWidth === '0px' && s.backgroundColor === 'rgba(0, 0, 0, 0)';
+        }), `${subs.length} message rows, none wears the transcript chip box`);
+        // No row reserves a clock column it cannot fill: a blank `.when` is not
+        // rendered, and one that carries a time never wraps inside its box.
+        const clocks = [...document.querySelectorAll('#lv-rail .lv-node .when')];
+        A('no-blank-clock-column', clocks.every(c => c.textContent.trim() !== ''
+          || getComputedStyle(c).display === 'none'),
+          `${clocks.filter(c => !c.textContent.trim()).length} blank clocks left in the tree`);
+        const wide = clocks.map(c => [c.textContent.trim(), c.scrollWidth, c.clientWidth]);
+        A('clock-never-wraps', wide.every(([, sw, cw]) => sw <= cw + 1),
+          `widest ${JSON.stringify(wide.sort((a, b) => b[1] - a[1]).slice(0, 2))}`);
+        const rowsEl = [...document.querySelectorAll('#lv-rail .lv-node')];
+        A('tree-rows-single-line', rowsEl.every(n => n.getBoundingClientRect().height <= 26),
+          `tallest row ${Math.round(Math.max(...rowsEl.map(n => n.getBoundingClientRect().height)))}px`);
+        A('group-guides-wrap-the-rows',
+          document.querySelectorAll('#lv-rail .lv-grp').length >= LV.open.size,
+          `${document.querySelectorAll('#lv-rail .lv-grp').length} guides for ${LV.open.size} open requests`);
+        // The REQ head lands on the Request section, the RESP head on Response.
+        document.querySelector('#lv-rail .lv-node.reqh')?.click();
+        await wait(600);
+        A('req-head-focuses-request-section',
+          !!document.querySelector('#dlg-log .lv-sec.flash[id^="lv-q-"]'),
+          document.querySelector('#dlg-log .lv-sec.flash')?.id || 'no flashed section');
         // An answer never repeats as a message row of the next request in the
         // rail — its own answer row already spoke it under its own turn.
         const echoes = [];
@@ -149,7 +187,7 @@ addEventListener('load', () => {
           if (!i) return;
           const sig = lvAnswerSig(lvTurns()[i - 1]);
           if (!sig) return;
-          for (const n of document.querySelectorAll(`#lv-rail .lv-node.msg.sub[data-rid="${t2.rid}"]`))
+          for (const n of document.querySelectorAll(`#lv-rail .lv-node.sub[data-rid="${t2.rid}"]`))
             if (n.classList.contains('asst')
               && (n.querySelector('.snip')?.textContent || '').startsWith(sig.slice(0, 16))) echoes.push('#' + (i + 1));
         });
@@ -561,7 +599,20 @@ addEventListener('load', () => setTimeout(() => {
     const orph = [...document.querySelectorAll('#ov-timeline .tl-lab')].filter(l => /unlinked/.test(l.textContent));
     A4('unlinked-compaction-says-so', orph.length >= 1, orph.map(l => l.textContent.trim()).join(' | ') || 'none');
     A4('legend-explains-the-mark',
-      [...document.querySelectorAll('#ov-timeline .tl-legend .sw.c')].length === 1, 'striped swatch in the legend');
+      [...document.querySelectorAll('#ov-timeline .legend .sw.c')].length === 1, 'striped swatch in the legend');
+    // One legend component, split by section: the stage key lives with the graph
+    // that draws the stages, the identity key with the bar that colours by them.
+    A4('activity-carries-the-stage-key',
+      [...document.querySelectorAll('#ov-timeline .legend .sw')].map(s => s.className.replace('sw ', '')).join(',')
+        === 'w,p,g,e,c', [...document.querySelectorAll('#ov-timeline .legend .sw')].map(s => s.className).join(','));
+    A4('capacity-carries-the-identity-key',
+      document.querySelectorAll('#ov-capacity .legend .sw.free').length === 1
+        && !document.querySelector('#ov-capacity .legend .sw.g'),
+      `${document.querySelectorAll('#ov-capacity .legend .sw').length} swatches under Capacity`);
+    A4('one-legend-shape-both-panels',
+      document.querySelectorAll('.tl-legend').length === 0
+        && document.querySelectorAll('#ov-capacity .legend, #ov-timeline .legend').length === 2,
+      'the old .tl-legend component is gone');
     // The window counter counts conversations, not summarization requests.
     const cmp = document.querySelector('#stats .stat.cmp');
     A4('window-counter-counts-conversations', !!cmp && /\b2\b/.test(cmp.textContent),
@@ -640,3 +691,41 @@ addEventListener('load', () => setTimeout(() => {
       `${document.querySelectorAll('#dlg-log .audit .a-row').length} verdict lines`);
   }, 2600);
 }, 9800));
+
+// The Overview filters reach the Logs list: the same window, the same
+// client/model/backend scope, the same top-bar button — and the list says which
+// scope is holding its rows back. Runs last: it edits S.filters and restores it.
+addEventListener('load', () => setTimeout(() => {
+  const A7 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  setTimeout(() => { location.hash = '#logs'; }, 300);
+  setTimeout(() => {
+    const grouped = document.querySelector('#log-group input[value="session"]');
+    if (grouped && !grouped.checked) { grouped.checked = true; grouped.dispatchEvent(new Event('change')); }
+    const rows = () => [...document.querySelectorAll('#logs tbody tr[data-action="conv-open"]')];
+    const before = rows().length;
+    const users = [...new Set(logRounds(S.logs).map(r => (r.in || r.out || r.solo)?.user).filter(Boolean))];
+    const one = users[0];
+    A7('log-scope-has-two-clients-to-choose', users.length >= 2, users.join(','));
+    S.filters = { ...S.filters, win: '48h', clients: [one], models: [], backends: [], priority: [] };
+    renderFiltersBtn(); renderLogs();
+    const left = rows();
+    A7('client-scope-narrows-list', left.length > 0 && left.length < before
+      && left.every(r => r.querySelector('.mono')?.textContent.trim() === one),
+      `${before} → ${left.length} rows, client ${one}`);
+    A7('scope-chip-names-the-scope', !$('#log-scope').hidden
+      && $('#log-scope').textContent.includes('1 clients'), $('#log-scope').textContent);
+    A7('filters-button-shows-on-logs', getComputedStyle($('#ov-filters')).display !== 'none',
+      $('#ov-filters').title);
+    const wide = left.length;
+    S.filters = { ...S.filters, win: '5m' };
+    renderLogs();
+    A7('window-applies-to-the-list', rows().length <= wide, `${wide} rows in 48 h → ${rows().length} in 5 min`);
+    S.filters = { ...S.filters, clients: [FNONE] };
+    renderLogs();
+    A7('empty-scope-explains-itself', /No row matches the filters/.test($('#logs').textContent),
+      $('#logs').textContent.replace(/\s+/g, ' ').trim().slice(0, 70));
+    S.filters = { ...S.filters, win: '15m', clients: [] };
+    renderFiltersBtn(); renderLogs();
+    A7('scope-restored', rows().length === before && $('#log-scope').hidden, `${rows().length} rows`);
+  }, 1100);
+}, 44000));
