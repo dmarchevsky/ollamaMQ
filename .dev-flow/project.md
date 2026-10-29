@@ -12,7 +12,7 @@ release.artifact = docker buildx imagetools inspect ghcr.io/dmarchevsky/ollamamq
 ## implement
 
 ```flow
-test = node --check src/web/app.js && node --check src/web/demo.js && node --check src/web/login.js && cargo test
+test = cargo clippy --all-targets --locked -- -D warnings && node --check src/web/app.js && node --check src/web/demo.js && node --check src/web/login.js && cargo test
 build = cargo build --release
 run = cargo run
 ```
@@ -95,6 +95,17 @@ boundaries — long implement stages otherwise lose them to context compaction.
 Before `flow release`, `git status --porcelain` in the worktree must be empty: `flow check` and
 `flow release` do not report uncommitted paths (only `flow verify` prints them), and the squash
 ships without them — v0.17.0 released with a review fix to `app.css` left uncommitted.
+
+**No tag on red CI:** the local `test` command runs the same `cargo clippy --all-targets --locked
+-- -D warnings` as the hosted `test` workflow, and `rust-toolchain.toml` pins the toolchain both
+sides use — so lint fallout must surface at implement, never in CI. Still, the merge commit is the
+first commit the hosted workflow actually runs on, and `docker-release` publishes from the tag
+gardless of the `test` verdict: v0.22.0–v0.24.0 all shipped on red CI. So after the merge lands and
+before tagging, wait for the `test` run on the merge commit and require green:
+`concl=$(gh run list --workflow=test --branch master --commit "$(git rev-parse origin/master)" --json conclusion -q '.[0].conclusion // "no run"'); [ "$concl" = success ] || { echo "test workflow on the merge commit: $concl"; exit 1; }`
+A red or missing run means fix-forward with a new PR (or abort the tag), never tag anyway.
+
+- [ ] `test` workflow green on the merge commit before the tag (`gh run list --workflow=test --branch master --commit <merge-sha>`)
 
 Semver: minor for user-facing features, patch for chores/fixes. The version-bump commit must
 include the refreshed `Cargo.lock` — a release commit that leaves the lock stale is incomplete.
