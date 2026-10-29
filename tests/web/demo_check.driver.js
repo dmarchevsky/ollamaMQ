@@ -727,6 +727,21 @@ addEventListener('load', () => setTimeout(() => {
     S.filters = { ...S.filters, win: '15m', clients: [] };
     renderFiltersBtn(); renderLogs();
     A7('scope-restored', rows().length === before && $('#log-scope').hidden, `${rows().length} rows`);
+    // Two axes a captured row cannot answer for. A `client+label` selection still
+    // scopes this list by its client name (the keys of one client are one actor
+    // here), while priority has nothing to bite on — and the chip says exactly
+    // that: no phantom scope, no empty list blamed on a filter that did nothing.
+    S.filters = { ...S.filters, mode: 'key', clients: [`${one}\tany-key`] };
+    renderFiltersBtn(); renderLogs();
+    A7('key-selection-scopes-by-client-name', rows().length > 0
+      && !$('#log-scope').hidden && !/client\+label/.test($('#log-scope').textContent),
+      `${rows().length} rows kept, chip: ${$('#log-scope').textContent}`);
+    S.filters = { ...S.filters, mode: 'client', clients: [], priority: ['top'] };
+    renderFiltersBtn(); renderLogs();
+    A7('priority-leaves-the-list-alone-and-says-so', rows().length === before && $('#log-scope').hidden,
+      `${rows().length} rows, chip ${$('#log-scope').hidden ? 'hidden' : $('#log-scope').textContent}`);
+    S.filters = { ...S.filters, priority: [] };
+    renderFiltersBtn(); renderLogs();
   }, 1100);
 }, 44000));
 

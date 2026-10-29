@@ -383,10 +383,24 @@ const prioSel = p => !S.filters.priority.length || S.filters.priority.includes(p
  *  the Overview panels send to the server, so one control scopes both. */
 const winMs = w => { const m = /^(\d+)(m|h)$/.exec(w || ''); return m ? +m[1] * (m[2] === 'm' ? 6e4 : 36e5) : 9e5; };
 /** Does this log round sit inside the Overview scope? A round's identity is the
- *  side that carries it (IN wins), and a captured row knows no API-key label
- *  and no priority: a `client\tkey` selection therefore matches its client name
- *  on this page, and the priority axis has nothing to bite on. */
-const logScoped = r => { const e = r.in || r.out || r.solo || {}; return clientSel(e.user) && modelSel(e.model) && backendSel(e.backend); };
+ *  side that carries it (IN wins). A captured row knows no API-key label and no
+ *  priority, so the two axes a log cannot answer for are not applied here: a
+ *  `client\tkey` selection scopes by its client name (the keys of one client are
+ *  one actor in this list), and priority simply has nothing to bite on. */
+const logScoped = r => {
+  const e = r.in || r.out || r.solo || {};
+  const cl = S.filters.clients;
+  const who = !cl.length || cl.includes(e.user) || cl.some(v => v.split('\t')[0] === e.user);
+  return who && modelSel(e.model) && backendSel(e.backend);
+};
+/** The scope in words, narrowed to the axes a log row can answer for (no key,
+ *  no priority) — and empty when nothing the list honours is actually scoped, so
+ *  the chip never advertises a filter that has no effect on this page. */
+const logBits = () => {
+  const f = S.filters;
+  if (f.win === '15m' && !f.clients.length && !f.models.length && !f.backends.length) return [];
+  return filterBits().filter(b => b !== 'client+label' && !/\bpriority\b/.test(b));
+};
 /** Priority in the tight places (graph lane, phone card): a glyph in the one
  *  hue that already means "priority", so no new status colour is invented. */
 /** The priority mark: one glyph whose colour carries the level, and the thing
@@ -1899,8 +1913,10 @@ function renderLogs() {
   const rounds = all.filter(r =>
     // The same scope the top-bar Filters button owns: window, client, model,
     // backend. The Overview selection is already persisted per browser, so one
-    // choice now reads the same on both pages and after a reload.
-    ((r.in || r.out || r.solo)?.at_ms ?? 0) >= Date.now() - winMs(S.filters.win) &&
+    // choice now reads the same on both pages and after a reload. The window is
+    // measured on the server's clock (`nowish`), because that is the clock the
+    // rows' own timestamps came from and the clock Overview cuts its window by.
+    ((r.in || r.out || r.solo)?.at_ms ?? 0) >= nowish() - winMs(S.filters.win) &&
     logScoped(r) &&
     (dir === '' || (dir === 'awaiting' ? r.in && !r.out : r.ctl)) &&
     (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.in?.session_label, r.out?.user, r.out?.model,
@@ -1911,18 +1927,20 @@ function renderLogs() {
   // The scope prints where it bites: an Overview panel visibly shrinks, a log
   // list just stops showing rows, so say what is holding them back.
   const chip = $('#log-scope');
-  const scoped = filtersActive();
-  chip.hidden = !scoped;
-  chip.textContent = scoped ? filterBits().join(' · ') : '';
+  const bits = logBits();
+  chip.hidden = !bits.length;
+  chip.textContent = bits.join(' · ');
+  // Priority alone leaves this list untouched, so it neither fills the chip nor
+  // explains an empty one: only the axes that bite get said out loud.
   const warn = captureOff()
     ? `<div class="capnote">Body capture is <b>off</b> — these requests are listed from memory, but their conversations are not written to disk, so a row has nothing to open. Set a writable <b>Request log path</b> in Settings and restart to capture them${S.capture.path ? ` (current path: <code>${esc(S.capture.path)}</code>)` : ''}.</div>`
     : '';
-  const empty = scoped && !rounds.length && all.length
-    ? `<div class="empty">No row matches the filters (${esc(filterBits().join(' · '))}) — open Filters to widen them.</div>`
+  const empty = bits.length && !rounds.length && all.length
+    ? `<div class="empty">No row matches the filters (${esc(bits.join(' · '))}) — open Filters to widen them.</div>`
     : (S.logGroup === 'request' ? logTable(rounds) : convTable(rounds));
   // A window wider than what the ring holds must not read as “nothing happened”.
   const oldest = all.length ? Math.min(...all.map(r => (r.in || r.out || r.solo)?.at_ms ?? Infinity)) : Infinity;
-  const reach = all.length && oldest > Date.now() - winMs(S.filters.win)
+  const reach = all.length && oldest > nowish() - winMs(S.filters.win)
     ? `<p class="hint">The list holds the newest ${LOG_LIMIT} events — that reaches back to ${fmtTime(oldest)}, `
       + `short of ${winLabel(S.filters.win)}.</p>` : '';
   setHTML($('#logs'), warn + empty + reach);
