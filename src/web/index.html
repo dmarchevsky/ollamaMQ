@@ -147,6 +147,7 @@
             <option value="">All</option><option value="awaiting">Awaiting response</option><option value="CTL">Control</option>
           </select>
           <label class="check"><input type="checkbox" id="log-pause"> Pause</label>
+          <span class="chip" id="log-scope" hidden></span>
         </div>
       </div>
       <div class="panel flush" id="logs"></div>
@@ -172,7 +173,7 @@
 <dialog id="dlg-filters">
   <form method="dialog">
     <h3>Filters</h3>
-    <p>Applies to every panel on the Overview page.</p>
+    <p>Applies to every Overview panel and to the Logs list.</p>
     <div id="f-time"></div>
     <div id="f-mode"></div>
     <div class="ftwo"><div id="f-clients"></div><div id="f-backends"></div></div>

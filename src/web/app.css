@@ -535,6 +535,10 @@ pre.content {
 .chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
 .chip { font: 11.5px var(--mono); padding: 1px 7px; border-radius: 9px; background: var(--surface-2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
 .chip.off { text-decoration: line-through; color: var(--bad); background: var(--bad-soft); border-color: transparent; }
+/* The scope chip on the Logs toolbar: it is only ever drawn while the Filters
+   scope is doing something, so it wears the same accent as the button that set
+   it rather than the grey of an ordinary chip. */
+.chip.on { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 .model-hidden { opacity: .6; border-style: dashed; }
 .model-hidden .name { text-decoration: line-through; }
@@ -638,8 +642,19 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 .q-track .seg { border-radius: 4px; min-width: 10px; }
 .q-track .seg.q { background: color-mix(in srgb, var(--c) 42%, transparent); border: 2px dashed var(--c); }
 .bar-gap { width: 1px; align-self: stretch; background: var(--border); margin: 0 4px; }
-.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 12px; font-size: 12px; color: var(--muted); }
 .legend span { display: inline-flex; align-items: center; }
+.legend .sw { margin-right: 5px; }
+/* The stage key squares: a stage chip is square on purpose (a rounded end blurs
+   where a stage stops), so its swatch is square too — identity swatches keep
+   the round shape that means “this is a client”. */
+.legend .sw.w, .legend .sw.p, .legend .sw.g, .legend .sw.e, .legend .sw.c { border-radius: 0; }
+.legend .sw.w { background: var(--accent-soft); border: 1px solid var(--accent); }
+.legend .sw.p { background: var(--warn); }
+.legend .sw.g { background: var(--decode); }
+.legend .sw.e { background: var(--bad); }
+.legend .sw.c { background: repeating-linear-gradient(135deg, var(--compact) 0 3px,
+    color-mix(in srgb, var(--compact) 40%, transparent) 3px 6px); }
 
 .free-chip {
   font-size: 11.5px; font-weight: 650; padding: 2px 9px; border-radius: 9px;
@@ -773,16 +788,6 @@ tr.is-off td { color: var(--muted); }
 .tl-track .now { position: absolute; right: 0; top: -1px; bottom: -1px;
   border-left: 1px solid var(--muted); }
 .tl-foot { padding: 7px 0 0; font-size: 11.5px; color: var(--faint); }
-.tl-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 8px 0 0;
-  font-size: 11.5px; color: var(--muted); }
-.tl-legend .sw { margin-right: 4px; }
-.tl-legend .sw { border-radius: 0; }
-.tl-legend .sw.w { background: var(--accent-soft); border: 1px solid var(--accent); }
-.tl-legend .sw.p { background: var(--warn); }
-.tl-legend .sw.g { background: var(--decode); }
-.tl-legend .sw.e { background: var(--bad); }
-.tl-legend .sw.c { background: repeating-linear-gradient(135deg, var(--compact) 0 3px,
-    color-mix(in srgb, var(--compact) 40%, transparent) 3px 6px); }
 /* Details: one collapsible block per session. */
 .det-h { display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left;
   background: color-mix(in srgb, var(--c, var(--accent)) 7%, var(--surface));
@@ -854,6 +859,19 @@ tr.is-off td { color: var(--muted); }
 .tl-row:hover { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent);
   outline: 1px dashed color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
   outline-offset: -1px; border-radius: 6px; }
+/* A conversation is drawn twice — a lane in the graph, a header in the list —
+   and both ends carry its data-key, so pointing at either lights both in that
+   conversation's own colour. It is the lane's own hover cue (same 12% wash, same
+   dashed outline) mirrored onto the header, which is what makes the two ends
+   read as one thing. Hover never scrolls and never changes the Show filter: a
+   header that is off-screen, or hidden behind "Active", simply stays dark. */
+.tl-row.x-hi { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent);
+  outline: 1px dashed color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
+  outline-offset: -1px; border-radius: 6px; }
+.tl-row.x-hi .tl-lab { color: var(--text); }
+.det-h.x-hi { background: color-mix(in srgb, var(--c, var(--accent)) 12%, var(--surface));
+  outline: 1px dashed color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
+  outline-offset: -1px; }
 .det-h.flash { animation: detflash 1.2s ease-out; }
 @keyframes detflash {
   from { box-shadow: 0 0 0 2px var(--c, var(--accent)); }
@@ -937,36 +955,57 @@ body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-selec
 .lv-rail-h { display: flex; flex-wrap: wrap; align-items: center; column-gap: 6px; row-gap: 4px; margin: 0 2px 8px; }
 .lv-rail-h h4 { margin: 0 auto 0 0; }
 .lv-rail-h .btn { height: 24px; padding: 2px 7px; font-size: 11px; }
-/* The jump tree: request -> request/response -> message -> tool call. Every
-   node carries the timestamp it was measured at, so the outline reads as the
-   timeline it is, and every level is click-through to the block it names. */
+/* The jump tree: a request folds to one line; opened, its rows group under a
+   REQ head (what it sent) and a RESP head (what it got). Every node carries the
+   moment or the length it was measured at, so the outline reads as the
+   timeline it is, and every row is click-through to the block it names. */
 /* Tight columns: the rail is a timeline outline, not a file tree — the indent
-   only has to show three levels, and every pixel of it is taken from the snippet. */
-.lv-node { display: flex; gap: 6px; align-items: baseline; width: 100%; text-align: left; cursor: pointer;
-  border: 0; background: none; padding: 5px 8px; border-radius: 6px; cursor: pointer;
-  font: 12px var(--mono); color: var(--text); }
+   only has to show the groups, and every pixel of it is given to the snippet. */
+.lv-node { display: flex; gap: 4px; align-items: baseline; width: 100%; text-align: left; cursor: pointer;
+  border: 0; background: none; padding: 3px 4px; border-radius: 6px;
+  font: 10.5px var(--mono); color: var(--text); }
 .lv-node:hover, .lv-node.on { background: var(--accent-soft); }
-.lv-node .car { flex: none; width: 10px; color: var(--faint); font-size: 10px; }
-.lv-node .when { flex: none; width: 44px; text-align: right; font: 600 9.5px var(--mono); color: var(--faint); }
-.lv-node .tag { flex: none; width: 58px; white-space: nowrap; font: 700 9.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+.lv-node .car { flex: none; width: 8px; color: var(--faint); font-size: 10px; }
+/* A turn, a run and an idle gap always carry a moment, so the clock column is
+   sized for the longest of them (`+10m 06s`) and never wraps onto two lines.
+   A row with no time of its own renders no clock cell — an empty column aligned
+   with nothing and ate the snippet. */
+.lv-node .when { flex: none; width: 52px; text-align: right; white-space: nowrap;
+  font: 600 10px var(--mono); font-variant-numeric: tabular-nums; color: var(--faint); }
+.lv-node .when:empty { display: none; }
+.lv-node .tag { flex: 0 0 auto; width: auto; min-width: 34px; white-space: nowrap;
+  font: 700 10px var(--mono); letter-spacing: .04em; text-transform: uppercase; }
 .lv-node.user .tag { color: var(--accent); } .lv-node.asst .tag { color: var(--ok); }
 .lv-node.tool .tag { color: var(--warn); } .lv-node.sys .tag { color: var(--vip); }
-.lv-node.req .tag { color: var(--muted); }
-.lv-node.turn .tag { color: var(--text); }
+.lv-node.turn .tag { color: var(--text); } .lv-node.run .tag { color: var(--text); }
 .lv-node.gapnode { color: var(--faint); } .lv-node.gapnode .tag { color: var(--faint); }
-.lv-node .snip { font: 12px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+.lv-node .snip { font: 10.5px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   flex: 1 1 auto; min-width: 0; }
-.lv-node.l2 { padding-left: 10px; } .lv-node.l3 { padding-left: 18px; }
-.lv-node.l3 .tag { width: 40px; }
-/* Message and RESP rows share one column geometry at whatever level they sit,
-   so a RESP label never stands out from the messages beside it. */
-.lv-node.sub .tag { width: 40px; }
-/* The message rows borrow their chip box from the body .msg rule (same class
-   name); the answer row wears the same box — it stands in for a message too,
-   and it must light up (accent-soft above) the same way when it scrolls in. */
-.lv-node.resp { border: 1px solid var(--border); border-radius: 8px; }
-.lv-node.resp:not(.on):not(:hover) { background: var(--surface); }
-.lv-node.run .tag { color: var(--text); }
+/* The indent is the group guide — 9px a level, not the 8/10/18 the fixed
+   columns used to stack up to on top of the snippet's own room. */
+.lv-node.l2, .lv-node.l3, .lv-node.l4 { padding-left: 2px; }
+.lv-grp { margin-left: 5px; padding-left: 4px; border-left: 1px solid var(--border); }
+/* REQ and RESP wear a background tint each — never a border, because a border
+   is what a body transcript block wears, and a bordered head beside bordered
+   children reads as two siblings instead of one group. A head carries its own
+   length after the label, in the same faint voice, in a column that is only as
+   wide as the lengths it holds. */
+.lv-node.head .when, .lv-node.sub .when { width: auto; min-width: 26px; text-align: left; }
+.lv-node.reqh { background: var(--accent-soft); } .lv-node.resph { background: var(--ok-soft); }
+.lv-node.reqh .tag { color: var(--accent); } .lv-node.resph .tag { color: var(--ok); }
+/* The plain tint is the head's resting look, so hover and the scroll mark have
+   to step past it or the row you are on would read as any other. */
+.lv-node.reqh:hover, .lv-node.reqh.on { background: color-mix(in srgb, var(--accent) 22%, var(--surface)); }
+.lv-node.resph:hover, .lv-node.resph.on { background: color-mix(in srgb, var(--ok) 22%, var(--surface)); }
+/* Message rows are rows of the tree, not transcript blocks: they dropped the
+   body `.msg` chip (same class name used to buy it) so only their head tints. */
+.lv-node.sub { border: 0; background: none; margin: 0; border-radius: 0; }
+/* That flatten also cancelled the shared `.lv-node:hover` tint, so a message row
+   never answered to the pointer. It now wears 7% ink — neutral on purpose: the
+   accent/ok tints already say which end of a request a row is, and `--accent-soft`
+   already means "this is where I jumped". A selected row keeps its mark: hovering
+   the row you jumped to must not erase the reason you are looking at it. */
+.lv-node.sub:not(.on):hover { background: color-mix(in srgb, var(--text) 7%, transparent); }
 .lv-node .tb { flex: none; margin-left: 6px; }
 .lv-node .snip .u { color: var(--accent); } .lv-node .snip .t { color: var(--ok); }
 /* The viewer header carries the Show-incremental switch beside Raw/Formatted;

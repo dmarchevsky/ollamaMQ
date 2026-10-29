@@ -135,13 +135,51 @@ addEventListener('load', () => {
         document.querySelector('#dlg-log [data-action="lv-collapse"]').click();
         await wait(600);
         A('collapse-all-folds-everything', LV.open.size === 0
-          && !document.querySelector('#lv-rail .lv-node.msg')
-          && !document.querySelector('#lv-rail .lv-node.resp'),
+          && !document.querySelector('#lv-rail .lv-node.sub')
+          && !document.querySelector('#lv-rail .lv-node.head'),
           'every block closed; the rail keeps only the request lines');
         document.querySelector('#dlg-log [data-action="lv-expand"]').click();
         await wait(700);
         A('expand-all-opens-everything', LV.open.size === lvTurns().length && LV.closedRuns.size === 0,
           `${LV.open.size} blocks open`);
+        // An opened request groups its rows under two heads — what it SENT and
+        // what it GOT — each a tinted block with no border, the messages flat.
+        const heads = [...document.querySelectorAll('#lv-rail .lv-node.head')];
+        A('two-heads-per-open-request', heads.length === 2 * LV.open.size,
+          `${heads.length} heads for ${LV.open.size} open requests`);
+        A('heads-jump-to-their-section', heads.every(n => n.dataset.action
+          === (n.classList.contains('reqh') ? 'lv-req' : 'lv-resp')),
+          [...new Set(heads.map(n => n.dataset.action))].join('/'));
+        A('heads-tinted-not-bordered', heads.every(n => {
+          const s = getComputedStyle(n);
+          return s.borderTopWidth === '0px' && s.backgroundColor !== 'rgba(0, 0, 0, 0)';
+        }), 'both heads carry a background and no border');
+        const subs = [...document.querySelectorAll('#lv-rail .lv-node.sub')];
+        A('messages-flat-under-their-head', subs.length > 0 && subs.every(n => {
+          const s = getComputedStyle(n);
+          return s.borderTopWidth === '0px' && s.backgroundColor === 'rgba(0, 0, 0, 0)';
+        }), `${subs.length} message rows, none wears the transcript chip box`);
+        // No row reserves a clock column it cannot fill: a blank `.when` is not
+        // rendered, and one that carries a time never wraps inside its box.
+        const clocks = [...document.querySelectorAll('#lv-rail .lv-node .when')];
+        A('no-blank-clock-column', clocks.every(c => c.textContent.trim() !== ''
+          || getComputedStyle(c).display === 'none'),
+          `${clocks.filter(c => !c.textContent.trim()).length} blank clocks left in the tree`);
+        const wide = clocks.map(c => [c.textContent.trim(), c.scrollWidth, c.clientWidth]);
+        A('clock-never-wraps', wide.every(([, sw, cw]) => sw <= cw + 1),
+          `widest ${JSON.stringify(wide.sort((a, b) => b[1] - a[1]).slice(0, 2))}`);
+        const rowsEl = [...document.querySelectorAll('#lv-rail .lv-node')];
+        A('tree-rows-single-line', rowsEl.every(n => n.getBoundingClientRect().height <= 26),
+          `tallest row ${Math.round(Math.max(...rowsEl.map(n => n.getBoundingClientRect().height)))}px`);
+        A('group-guides-wrap-the-rows',
+          document.querySelectorAll('#lv-rail .lv-grp').length >= LV.open.size,
+          `${document.querySelectorAll('#lv-rail .lv-grp').length} guides for ${LV.open.size} open requests`);
+        // The REQ head lands on the Request section, the RESP head on Response.
+        document.querySelector('#lv-rail .lv-node.reqh')?.click();
+        await wait(600);
+        A('req-head-focuses-request-section',
+          !!document.querySelector('#dlg-log .lv-sec.flash[id^="lv-q-"]'),
+          document.querySelector('#dlg-log .lv-sec.flash')?.id || 'no flashed section');
         // An answer never repeats as a message row of the next request in the
         // rail — its own answer row already spoke it under its own turn.
         const echoes = [];
@@ -149,7 +187,7 @@ addEventListener('load', () => {
           if (!i) return;
           const sig = lvAnswerSig(lvTurns()[i - 1]);
           if (!sig) return;
-          for (const n of document.querySelectorAll(`#lv-rail .lv-node.msg.sub[data-rid="${t2.rid}"]`))
+          for (const n of document.querySelectorAll(`#lv-rail .lv-node.sub[data-rid="${t2.rid}"]`))
             if (n.classList.contains('asst')
               && (n.querySelector('.snip')?.textContent || '').startsWith(sig.slice(0, 16))) echoes.push('#' + (i + 1));
         });
@@ -185,12 +223,12 @@ addEventListener('load', () => {
         A('inc-hides-runs', !document.querySelector('#dlg-log .run-h')
           && !document.querySelector('#lv-rail .lv-node.run'),
           'incremental: no run lines in either pane');
-        A('inc-still-shows-the-answer', !!document.querySelector('#lv-rail .lv-node.resp')
+        A('inc-still-shows-the-answer', !!document.querySelector('#lv-rail .lv-node.resph')
           && !!document.querySelector(`#lv-t-${rid2} .lv-sec.out, #lv-a-${rid2}`),
           'the response section and rail row survive incremental');
         // The rail rows for a turn are the messages it ADDED — no REQ count
         // row, and no re-sent rows under a later request while incremental.
-        const rows2 = [...document.querySelectorAll(`#lv-rail .lv-node.msg[data-rid="${rid2}"]`)];
+        const rows2 = [...document.querySelectorAll(`#lv-rail .lv-node.sub[data-rid="${rid2}"]`)];
         A('tree-rows-are-new-only', rows2.length > 0 && rows2.every(n => +n.dataset.idx >= hid)
           && ![...document.querySelectorAll(`#lv-rail .lv-node[data-rid="${rid2}"]`)].some(n => /\bheld\b/.test(n.textContent)),
           `${rows2.length} rows for request 2, every idx >= ${hid}`);
@@ -203,7 +241,7 @@ addEventListener('load', () => {
         await wait(700);
         const heldRows = document.querySelectorAll(`#lv-t-${rid2} .msg.m-held`).length;
         A('show-incremental-full-prompt', inc() === n0 + hid && heldRows === hid
-          && document.querySelectorAll(`#lv-rail .lv-node.msg[data-rid="${rid2}"]`).length > rows2.length,
+          && document.querySelectorAll(`#lv-rail .lv-node.sub[data-rid="${rid2}"]`).length > rows2.length,
           `request 2 body ${n0} \u2192 ${inc()} messages (+${hid} held, dimmed)`);
         // The whole-prompt view gets the run grouping back: the group lines
         // appear in both panes.
@@ -561,7 +599,20 @@ addEventListener('load', () => setTimeout(() => {
     const orph = [...document.querySelectorAll('#ov-timeline .tl-lab')].filter(l => /unlinked/.test(l.textContent));
     A4('unlinked-compaction-says-so', orph.length >= 1, orph.map(l => l.textContent.trim()).join(' | ') || 'none');
     A4('legend-explains-the-mark',
-      [...document.querySelectorAll('#ov-timeline .tl-legend .sw.c')].length === 1, 'striped swatch in the legend');
+      [...document.querySelectorAll('#ov-timeline .legend .sw.c')].length === 1, 'striped swatch in the legend');
+    // One legend component, split by section: the stage key lives with the graph
+    // that draws the stages, the identity key with the bar that colours by them.
+    A4('activity-carries-the-stage-key',
+      [...document.querySelectorAll('#ov-timeline .legend .sw')].map(s => s.className.replace('sw ', '')).join(',')
+        === 'w,p,g,e,c', [...document.querySelectorAll('#ov-timeline .legend .sw')].map(s => s.className).join(','));
+    A4('capacity-carries-the-identity-key',
+      document.querySelectorAll('#ov-capacity .legend .sw.free').length === 1
+        && !document.querySelector('#ov-capacity .legend .sw.g'),
+      `${document.querySelectorAll('#ov-capacity .legend .sw').length} swatches under Capacity`);
+    A4('one-legend-shape-both-panels',
+      document.querySelectorAll('.tl-legend').length === 0
+        && document.querySelectorAll('#ov-capacity .legend, #ov-timeline .legend').length === 2,
+      'the old .tl-legend component is gone');
     // The window counter counts conversations, not summarization requests.
     const cmp = document.querySelector('#stats .stat.cmp');
     A4('window-counter-counts-conversations', !!cmp && /\b2\b/.test(cmp.textContent),
@@ -640,3 +691,125 @@ addEventListener('load', () => setTimeout(() => {
       `${document.querySelectorAll('#dlg-log .audit .a-row').length} verdict lines`);
   }, 2600);
 }, 9800));
+
+// The Overview filters reach the Logs list: the same window, the same
+// client/model/backend scope, the same top-bar button — and the list says which
+// scope is holding its rows back. Runs last: it edits S.filters and restores it.
+addEventListener('load', () => setTimeout(() => {
+  const A7 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  setTimeout(() => { location.hash = '#logs'; }, 300);
+  setTimeout(() => {
+    const grouped = document.querySelector('#log-group input[value="session"]');
+    if (grouped && !grouped.checked) { grouped.checked = true; grouped.dispatchEvent(new Event('change')); }
+    const rows = () => [...document.querySelectorAll('#logs tbody tr[data-action="conv-open"]')];
+    const before = rows().length;
+    const users = [...new Set(logRounds(S.logs).map(r => (r.in || r.out || r.solo)?.user).filter(Boolean))];
+    const one = users[0];
+    A7('log-scope-has-two-clients-to-choose', users.length >= 2, users.join(','));
+    S.filters = { ...S.filters, win: '48h', clients: [one], models: [], backends: [], priority: [] };
+    renderFiltersBtn(); renderLogs();
+    const left = rows();
+    A7('client-scope-narrows-list', left.length > 0 && left.length < before
+      && left.every(r => r.querySelector('.mono')?.textContent.trim() === one),
+      `${before} → ${left.length} rows, client ${one}`);
+    A7('scope-chip-names-the-scope', !$('#log-scope').hidden
+      && $('#log-scope').textContent.includes('1 clients'), $('#log-scope').textContent);
+    A7('filters-button-shows-on-logs', getComputedStyle($('#ov-filters')).display !== 'none',
+      $('#ov-filters').title);
+    const wide = left.length;
+    S.filters = { ...S.filters, win: '5m' };
+    renderLogs();
+    A7('window-applies-to-the-list', rows().length <= wide, `${wide} rows in 48 h → ${rows().length} in 5 min`);
+    S.filters = { ...S.filters, clients: [FNONE] };
+    renderLogs();
+    A7('empty-scope-explains-itself', /No row matches the filters/.test($('#logs').textContent),
+      $('#logs').textContent.replace(/\s+/g, ' ').trim().slice(0, 70));
+    S.filters = { ...S.filters, win: '15m', clients: [] };
+    renderFiltersBtn(); renderLogs();
+    A7('scope-restored', rows().length === before && $('#log-scope').hidden, `${rows().length} rows`);
+    // Two axes a captured row cannot answer for. A `client+label` selection still
+    // scopes this list by its client name (the keys of one client are one actor
+    // here), while priority has nothing to bite on — and the chip says exactly
+    // that: no phantom scope, no empty list blamed on a filter that did nothing.
+    S.filters = { ...S.filters, mode: 'key', clients: [`${one}\tany-key`] };
+    renderFiltersBtn(); renderLogs();
+    A7('key-selection-scopes-by-client-name', rows().length > 0
+      && !$('#log-scope').hidden && !/client\+label/.test($('#log-scope').textContent),
+      `${rows().length} rows kept, chip: ${$('#log-scope').textContent}`);
+    S.filters = { ...S.filters, mode: 'client', clients: [], priority: ['top'] };
+    renderFiltersBtn(); renderLogs();
+    A7('priority-leaves-the-list-alone-and-says-so', rows().length === before && $('#log-scope').hidden,
+      `${rows().length} rows, chip ${$('#log-scope').hidden ? 'hidden' : $('#log-scope').textContent}`);
+    S.filters = { ...S.filters, priority: [] };
+    renderFiltersBtn(); renderLogs();
+  }, 1100);
+}, 44000));
+
+// The Activity pair: a conversation's lane in the graph and its header in the
+// list below are the same thing, so the pointer lights both ends (and the mark
+// survives the 1 s rebuild under a still mouse). Also checks the jump rail's
+// child rows answer to the pointer again — the rule that flattened them used to
+// cancel the shared hover tint along the way. Runs last: it hovers live rows.
+addEventListener('load', () => setTimeout(() => {
+  const A8 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  const hover = el => el.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }));
+  const q = k => `.tl-row[data-key="${CSS.escape(k)}"], .det-h[data-key="${CSS.escape(k)}"]`;
+  location.hash = '#overview';
+  setTimeout(() => {
+    const lane = document.querySelector('#ov-timeline .tl-row');
+    if (!lane) { A8('activity-rows-present', false, 'no lane to hover'); return; }
+    hover(lane);
+    const mate = [...document.querySelectorAll('#ov-now .det-h')].find(h => h.dataset.key === lane.dataset.key);
+    A8('lane-hover-lights-both-ends', lane.classList.contains('x-hi')
+      && (!mate || mate.classList.contains('x-hi')),
+      mate ? `${lane.dataset.key}: lane + its header` : `${lane.dataset.key}: lane only (header outside Show)`);
+    const heads = [...document.querySelectorAll('#ov-now .det-h')];
+    const head = heads.find(h => document.querySelector(`#ov-timeline ${q(h.dataset.key).split(',')[0].trim()}`));
+    if (head) {
+      hover(head);
+      const lane2 = document.querySelector(`#ov-timeline .tl-row[data-key="${CSS.escape(head.dataset.key)}"]`);
+      A8('header-hover-lights-its-lane', head.classList.contains('x-hi') && !!lane2
+        && lane2.classList.contains('x-hi'), head.dataset.key);
+    }
+    document.querySelector('#ov-now').dispatchEvent(new PointerEvent('pointerleave'));
+    A8('hover-mark-clears-when-the-pointer-leaves',
+      document.querySelectorAll('.x-hi').length === 0, `${S.hoverKey}`);
+  }, 1400);
+  setTimeout(() => {
+    // The point of S.hoverKey: the poll rebuilt both panels under a mouse that
+    // never moved, so the mark has to come back on the same conversation.
+    const key = document.querySelector('#ov-timeline .tl-row').dataset.key;
+    hover(document.querySelector(`#ov-timeline .tl-row[data-key="${CSS.escape(key)}"]`));
+    setTimeout(() => {
+      // One conversation can hold two lanes (a request on one backend, a second
+      // waiting for another), so "exactly one" is the wrong shape: every lit lane
+      // must be that conversation, and it must still be lit after the rebuild.
+      const lit = [...document.querySelectorAll('#ov-timeline .tl-row.x-hi')];
+      A8('hover-mark-survives-the-poll', lit.length >= 1
+        && lit.every(r => r.dataset.key === key),
+        `${lit.length} lane(s) of ${key} still lit after a rebuild`);
+    }, 2600);
+  }, 4200);
+  setTimeout(() => {
+    // The rail's hover rule, read out of the stylesheet: CSSOM and fetch are both
+    // closed to a file:// page, so the check only speaks when served over http.
+    const flat = [...document.styleSheets].flatMap(s => {
+      try { return [...s.cssRules]; } catch { return []; }
+    }).find(r => r.selectorText === '.lv-node.sub');
+    const rule = [...document.styleSheets].flatMap(s => {
+      try { return [...s.cssRules]; } catch { return []; }
+    }).find(r => r.selectorText === '.lv-node.sub:not(.on):hover');
+    if (rule) {
+      const bg = `${rule.style.background} ${rule.style.backgroundColor}`;
+      // The wash has to be ink (7% of --text): "transparent" is colour-mix's far
+      // end, so testing for its absence would only ever fail.
+      A8('rail-child-hover-rule', /--text/.test(bg) && /none/.test(`${flat.style.background} ${flat.style.backgroundColor}`),
+        `rest ${flat.style.background || flat.style.backgroundColor} → hover ${bg.trim()}`);
+    } else {
+      fetch('app.css').then(css => {
+        A8('rail-child-hover-rule', /\.lv-node\.sub:not\(\.on\):hover\s*\{[^}]*--text/.test(css),
+          'the hover rule paints an ink wash on child rows');
+      }).catch(() => console.log('ASSERT SKIP rail-child-hover-rule — file:// hides both CSSOM and app.css; run the harness over http'));
+    }
+  }, 7600);
+}, 54000));

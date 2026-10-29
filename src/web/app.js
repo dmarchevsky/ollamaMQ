@@ -30,6 +30,7 @@ const S = {
   overview: null,            // api/overview for the chosen window and filters
   filters: storedFilters(),  // the filter modal's selection (time, identity, lists)
   reqShow: storedReqShow(),  // the Activity list: active rows only, or the window too
+  hoverKey: null,            // Activity: the conversation the pointer is on (graph ⇄ list)
   collapsed: storedCollapsed(),// conversation headers the operator folded shut
   pins: {},                // session tag -> operator-pinned priority level
   colorOf: new Map(),        // client id -> colour slot 1..4
@@ -378,6 +379,28 @@ const fmtWho = o => (S.filters.mode === 'key' && o.key && o.key !== 'none') ? `$
 /** A session as a person reads it: the label the client sent, else the tag. */
 const sessName = o => o.session_label || o.session || null;
 const prioSel = p => !S.filters.priority.length || S.filters.priority.includes(p || 'normal');
+/** The filter window in milliseconds — the Logs list applies the same window
+ *  the Overview panels send to the server, so one control scopes both. */
+const winMs = w => { const m = /^(\d+)(m|h)$/.exec(w || ''); return m ? +m[1] * (m[2] === 'm' ? 6e4 : 36e5) : 9e5; };
+/** Does this log round sit inside the Overview scope? A round's identity is the
+ *  side that carries it (IN wins). A captured row knows no API-key label and no
+ *  priority, so the two axes a log cannot answer for are not applied here: a
+ *  `client\tkey` selection scopes by its client name (the keys of one client are
+ *  one actor in this list), and priority simply has nothing to bite on. */
+const logScoped = r => {
+  const e = r.in || r.out || r.solo || {};
+  const cl = S.filters.clients;
+  const who = !cl.length || cl.includes(e.user) || cl.some(v => v.split('\t')[0] === e.user);
+  return who && modelSel(e.model) && backendSel(e.backend);
+};
+/** The scope in words, narrowed to the axes a log row can answer for (no key,
+ *  no priority) — and empty when nothing the list honours is actually scoped, so
+ *  the chip never advertises a filter that has no effect on this page. */
+const logBits = () => {
+  const f = S.filters;
+  if (f.win === '15m' && !f.clients.length && !f.models.length && !f.backends.length) return [];
+  return filterBits().filter(b => b !== 'client+label' && !/\bpriority\b/.test(b));
+};
 /** Priority in the tight places (graph lane, phone card): a glyph in the one
  *  hue that already means "priority", so no new status colour is invented. */
 /** The priority mark: one glyph whose colour carries the level, and the thing
@@ -515,11 +538,17 @@ function renderFiltersBtn() {
   const on = filtersActive();
   $('#ov-filters').classList.toggle('on', on);
   $('#f-dot').hidden = !on;
+  $('#ov-filters').title = on ? `Filters: ${filterBits().join(' · ')}` : 'Time, clients, backends and models';
+}
+
+/** What the scope says in words. The button's tooltip and the Logs page's chip
+ *  both read it, so the scope never reads two different ways. */
+function filterBits() {
   const f = S.filters;
   const bit = (sel, word) => !sel.length ? null : sel[0] === FNONE ? `no ${word}` : `${sel.length} ${word}`;
-  const bits = [winLabel(f.win), f.mode === 'key' ? 'client+label' : null,
-    bit(f.clients, 'clients'), bit(f.backends, 'backends'), bit(f.models, 'models'), bit(f.priority, 'priority')];
-  $('#ov-filters').title = on ? `Filters: ${bits.filter(Boolean).join(' · ')}` : 'Time, clients, backends and models';
+  return [winLabel(f.win), f.mode === 'key' ? 'client+label' : null,
+    bit(f.clients, 'clients'), bit(f.backends, 'backends'), bit(f.models, 'models'), bit(f.priority, 'priority')]
+    .filter(Boolean);
 }
 
 function renderNav(st) {
@@ -629,6 +658,9 @@ function renderOverview(st) {
   renderRequests(vis, ov);
   renderBackendStats(ov);
   renderClientStats(vis, ov);
+  // The poll rebuilds both Activity panels, so the row the pointer sits on is
+  // new DOM every second — the mark is re-stamped rather than lost.
+  if (S.hoverKey) tlMarkPair();
 }
 
 /**
@@ -692,13 +724,14 @@ function renderCapacity(st, ov) {
     `<div class="q2-bar"><div class="q-track">${shared.map(w => waitSeg(w, 'flex:1 1 26px')).join('')}</div></div>`, '') : '';
   // Legend of the board: the conversations on it right now, not the window
   // history — same identity (client, or client+label) the rows are coloured by.
-  const legend = [...new Set([...(st.runs || []).map(fmtWho), ...ov.queue.map(fmtWho)])]
-    .map(id => `<span>${swatch(id)}${esc(id)}</span>`).join('')
-    + '<span><i class="sw free"></i>free</span>'
-    + '<span><i class="sw loading"></i>loading a model</span>'
-    + '<span class="dim">waiting rows share the bar’s token scale</span>';
+  // Capacity names only what Capacity draws; the stage chips are keyed under
+  // Activity, where they are drawn.
+  const ids = [...new Set([...(st.runs || []).map(fmtWho), ...ov.queue.map(fmtWho)])]
+    .map(id => `<span>${swatch(id)}${esc(id)}</span>`);
+  const legend = legendRow([...ids, swItem('free', 'free'), swItem('loading', 'loading a model'),
+    '<span class="dim">waiting rows share the bar’s token scale</span>']);
   setHTML($('#ov-capacity'), ov.backends.length
-    ? `<div class="caps">${rows}${sharedRow}</div><div class="legend">${legend}</div>`
+    ? `<div class="caps">${rows}${sharedRow}</div>${legend}`
     : '<div class="empty">No backends configured</div>');
 }
 
@@ -712,10 +745,14 @@ function renderCapacity(st, ov) {
  */
 const TL_ROWS = 12;          // sessions per backend before the oldest fold away
 const STAGE = { w: 'waiting', p: 'prefill', g: 'decode', e: 'error', c: 'compaction' };
-const TL_LEGEND = '<div class="tl-legend"><span><i class="sw w"></i>waiting</span>'
-  + '<span><i class="sw p"></i>prefill</span><span><i class="sw g"></i>decode</span>'
-  + '<span><i class="sw e"></i>error</span>'
-  + '<span><i class="sw c"></i>compaction</span></div>';
+/** One legend component, used by both Overview panels: the same markup and the
+ *  same swatch shape, one vocabulary per panel — Capacity keys its identity
+ *  hues and the two bar states, Activity keys the stage chips it draws. They
+ *  used to be two components with two shapes for one board. */
+const legendRow = items => `<div class="legend">${items.join('')}</div>`;
+const swItem = (cls, label) => `<span><i class="sw ${cls}"></i>${label}</span>`;
+/** The stage key, derived from the same table the chips are drawn from. */
+const stageLegend = () => legendRow(Object.entries(STAGE).map(([k, label]) => swItem(k, label)));
 
 /** What a compaction's own segment says: what it read, what it left behind. */
 const compactionLine = o => `${fmtTok(o.prompt_tokens)} tok → ${fmtTok(o.completion_tokens)} tok`
@@ -777,7 +814,7 @@ function renderTimeline(st, ov) {
         + shown.map(s => tlRow(s.rs, pctOf, span)).join('');
     }).join('');
   const foot = hidden ? `+${hidden} older session${hidden === 1 ? '' : 's'} hidden` : '';
-  setHTML(el, `<div class="tl">${axis}${body}${TL_LEGEND}${foot ? `<div class="tl-foot">${foot}</div>` : ''}</div>`);
+  setHTML(el, `<div class="tl">${axis}${body}${stageLegend()}${foot ? `<div class="tl-foot">${foot}</div>` : ''}</div>`);
   wireTimeline();
 }
 
@@ -819,6 +856,28 @@ function tlRow(rows, pctOf, span) {
 
 /** A chip's own tooltip: when the stage began and what it is worth. */
 const stageTip = e => `${fmtTime(e.at)} · ${STAGE[e.k]} ${stripTags(e.line)}`;
+
+/**
+ * The two ends of one conversation light together. Its lane in the graph and its
+ * header in the list carry the same `data-key` (a click already travels between
+ * them), so pointing at either marks both — the mouse says what the click does,
+ * before you commit to it. Delegation rather than per-row handlers: both panels
+ * are rebuilt by the 1 s poll, and the key lives in `S.hoverKey` so the mark
+ * survives a rebuild under a still pointer instead of blinking out. Hover moves
+ * nothing and changes no filter — a header off-screen, or hidden behind
+ * "Active", simply stays dark, and the click still scrolls and flashes.
+ */
+function tlHover(key) {
+  if (key === S.hoverKey) return;
+  S.hoverKey = key;
+  tlMarkPair();
+}
+
+/** Stamp the mark on every row of the conversation under the pointer (of none). */
+function tlMarkPair() {
+  $$('#ov-timeline .tl-row, #ov-now .det-h').forEach(el =>
+    el.classList.toggle('x-hi', !!S.hoverKey && el.dataset.key === S.hoverKey));
+}
 
 /**
  * Which group a row belongs to: its backend, or a named bucket when it has
@@ -1852,16 +1911,39 @@ function renderLogs() {
   segCount('#log-flag', 1, flagged);
   $('#nav-logs').textContent = flagged || '';
   const rounds = all.filter(r =>
+    // The same scope the top-bar Filters button owns: window, client, model,
+    // backend. The Overview selection is already persisted per browser, so one
+    // choice now reads the same on both pages and after a reload. The window is
+    // measured on the server's clock (`nowish`), because that is the clock the
+    // rows' own timestamps came from and the clock Overview cuts its window by.
+    ((r.in || r.out || r.solo)?.at_ms ?? 0) >= nowish() - winMs(S.filters.win) &&
+    logScoped(r) &&
     (dir === '' || (dir === 'awaiting' ? r.in && !r.out : r.ctl)) &&
     (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.in?.session_label, r.out?.user, r.out?.model,
       r.out?.backend, r.out?.session, r.out?.session_label,
       r.in?.info, r.out?.info, r.solo?.user, r.solo?.model, r.solo?.backend, r.solo?.session, r.solo?.info]
       .some(v => v && String(v).toLowerCase().includes(q))) &&
     (!logFlagOnly || roundFlags(r).length));
+  // The scope prints where it bites: an Overview panel visibly shrinks, a log
+  // list just stops showing rows, so say what is holding them back.
+  const chip = $('#log-scope');
+  const bits = logBits();
+  chip.hidden = !bits.length;
+  chip.textContent = bits.join(' · ');
+  // Priority alone leaves this list untouched, so it neither fills the chip nor
+  // explains an empty one: only the axes that bite get said out loud.
   const warn = captureOff()
     ? `<div class="capnote">Body capture is <b>off</b> — these requests are listed from memory, but their conversations are not written to disk, so a row has nothing to open. Set a writable <b>Request log path</b> in Settings and restart to capture them${S.capture.path ? ` (current path: <code>${esc(S.capture.path)}</code>)` : ''}.</div>`
     : '';
-  setHTML($('#logs'), warn + (S.logGroup === 'request' ? logTable(rounds) : convTable(rounds)));
+  const empty = bits.length && !rounds.length && all.length
+    ? `<div class="empty">No row matches the filters (${esc(bits.join(' · '))}) — open Filters to widen them.</div>`
+    : (S.logGroup === 'request' ? logTable(rounds) : convTable(rounds));
+  // A window wider than what the ring holds must not read as “nothing happened”.
+  const oldest = all.length ? Math.min(...all.map(r => (r.in || r.out || r.solo)?.at_ms ?? Infinity)) : Infinity;
+  const reach = all.length && oldest > nowish() - winMs(S.filters.win)
+    ? `<p class="hint">The list holds the newest ${LOG_LIMIT} events — that reaches back to ${fmtTime(oldest)}, `
+      + `short of ${winLabel(S.filters.win)}.</p>` : '';
+  setHTML($('#logs'), warn + empty + reach);
 }
 
 // --- Conversation viewer
@@ -2471,8 +2553,8 @@ function lvTrackRail() {
     else if (el.matches('section.turn')) sel = `.lv-node.turn[data-rid="${el.dataset.rid}"]`;
     else if (el.classList.contains('msg')) {
       const m = /^lv-m-(\d+)-(\d+)$/.exec(el.id);
-      if (m) sel = `.lv-node.msg.sub[data-rid="${m[1]}"][data-idx="${m[2]}"]`;
-    } else sel = `.lv-node.resp.sub[data-rid="${el.id.slice(5)}"]`;
+      if (m) sel = `.lv-node.sub[data-rid="${m[1]}"][data-idx="${m[2]}"]`;
+    } else sel = `.lv-node.resph[data-rid="${el.id.slice(5)}"]`;
     const found = sel && rail.querySelector(sel);
     if (!found) continue;
     last = found;
@@ -2692,16 +2774,24 @@ function lvSave(text, name, type) {
 
 // --- Jump tree ---
 //
-// The rail mirrors the conversation as a tree: request → request/response →
-// message → tool call. Each node is expandable on its own and every node
-// carries the timestamp it was measured at, so the outline reads as the
-// timeline it is.
+// The rail mirrors the conversation as a tree: a request folds to one line, and
+// opened it groups its rows under a REQ head (the messages it sent) and a RESP
+// head (the answer it got). Each node carries the moment or the length it was
+// measured at, so the outline reads as the timeline it is.
 
 function lvNode({ level, rid, idx, when, tip, tag, snip, pv, tb, caret, cls = '', action = 'lv-jump', on = false, run }) {
+  // A turn, a run and an idle gap always carry their moment, so they open with
+  // the clock column the whole tree aligns on. A REQ/RESP head or a message row
+  // owns no leading clock column: the length it may have rides after its label,
+  // and a row without one renders no clock cell (an empty column of it is pure
+  // stolen snippet width).
+  const inline = /(^|\s)(head|sub)(\s|$)/.test(cls);
+  const clock = `<span class="when">${when ?? ''}</span>`;
+  const label = `<span class="tag">${esc(tag)}</span>`;
   return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}${run != null ? ` data-run="${run}"` : ''}
     ${tip ? `title="${esc(tip)}"` : ''}>
     <span class="car"${caret ? ` data-action="${action === 'lv-run' ? 'lv-run' : 'lv-tree'}"` : ''} data-rid="${rid}">${caret ?? ''}</span>
-    <span class="when">${when ?? ''}</span><span class="tag">${esc(tag)}</span>
+    ${inline ? label + clock : clock + label}
     <span class="snip">${pv || esc(snip ?? '')}</span>${tb ?? ''}</div>`;
 }
 
@@ -2799,32 +2889,45 @@ function lvDrawRail() {
     // mode is on — they are drawn under the request that first sent them.
     const hid = lvHidden(i);
     // The answer this turn gave re-enters the next request as a message —
-    // the answer row under its own turn already speaks it, so the increment
+    // the RESP head under its own turn already speaks it, so the increment
     // below does not repeat it (it read as a duplicated assistant).
     const prevAns = i ? lvAnswerSig(turns[i - 1]) : '';
+    const msgs = [];
     for (const [mi, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
       if (S.lv.inc && mi < hid) continue;
       if (S.lv.inc && m.role === 'assistant' && prevAns
         && lvWords(msgText(m.content, m.images)) === prevAns) continue;
       const w = lvMsgWhen(lvIdxOf(t.rid), mi)
         || { when: '', tip: 'older than this log \u2014 the request that produced it was never captured' };
-      items.push(lvNode({ level: subLevel, rid: t.rid, idx: mi, when: w.when, tip: w.tip,
+      msgs.push(lvNode({ level: subLevel + 1, rid: t.rid, idx: mi, when: w.when, tip: w.tip,
         tag: ROLE_LABEL[m.role] || 'MSG', snip: lvSnip(m),
-        cls: `msg sub ${ROLE_CLS[m.role] || 'user'}`,
+        cls: `sub ${ROLE_CLS[m.role] || 'user'}`,
         action: 'lv-msg', on: !!LV.focusMsg && LV.focusMsg[0] === t.rid && LV.focusMsg[1] === mi }));
     }
-    // The assistant's own answer row. It carries the reply's opening words
-    // (the operator reads the rail as SYS / USER / ASST messages — a meta
-    // "resp" row did not read as the assistant), and clicking it lands on the
-    // Response section in the body. The duration is a length, not a moment.
-    const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
+    // An open request groups its rows under two heads: what it SENT (the
+    // messages, in a nested group) and what it GOT (the answer, which IS the
+    // RESP row — the response body has no per-part anchors, so nothing hangs
+    // under it). The tint of a head is what groups its rows, never a border:
+    // a border is what a body transcript block wears.
+    items.push('<div class="lv-grp">');
     const fin = f.finish;
-    items.push(lvNode({ level: subLevel, rid: t.rid, cls: 'resp sub asst', tag: 'ASST', action: 'lv-resp',
+    const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
+    items.push(lvNode({
+      level: subLevel, rid: t.rid, cls: 'head reqh', tag: 'REQ', action: 'lv-req', caret: '',
+      snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ${msgs.length} ${S.lv.inc ? 'new' : 'msgs'}`,
+      tip: `${[t.method, t.path].filter(Boolean).join(' ') || 'the request'} · `
+        + `${msgs.length} message${msgs.length === 1 ? '' : 's'} ${S.lv.inc ? 'added by' : 'sent with'} this request`
+        + ' — click to jump to the Request section' }));
+    if (msgs.length) items.push('<div class="lv-grp">', ...msgs, '</div>');
+    // The reply's own length, not a moment: it is a duration of the answer.
+    items.push(lvNode({
+      level: subLevel, rid: t.rid, cls: 'head resph', tag: 'RESP', action: 'lv-resp', caret: '',
       when: dur == null ? '' : fmtDur(dur / 1000),
       tip: t.tl?.end != null
         ? `the assistant's answer — how long it took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)})${fin ? ` — ${fin}` : ''} — click to jump to it`
         : 'no response recorded yet',
-      snip: (f.words || fin || lvFinish(t)) + (c && c.resp == null ? (t.redacted ? ' · redacted' : ' · no text') : ''), caret: '' }));
+      snip: `← ${(f.words || fin || lvFinish(t)) + (c && c.resp == null ? (t.redacted ? ' · redacted' : ' · no text') : '')}` }));
+    items.push('</div>');
   });
   if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');
   setHTML(rail, items.join(''));
@@ -3665,7 +3768,8 @@ const actions = {
     else LV.closedRuns.add(k);
     return lvDraw({ scroll: false });
   },
-  // The tree's RESP row: land on the Response section, not the turn top.
+  // The tree's two heads: land on the Request / Response section, not the top.
+  'lv-req': el => lvFocusSec(+el.dataset.rid, 'q'),
   'lv-resp': el => lvFocusSec(+el.dataset.rid, 'a'),
   // One switch decides increment-vs-full-prompt for every request at once.
   'lv-inc': async el => {
@@ -3860,12 +3964,16 @@ function route() {
   if (page === 'users') page = 'clients';  // Users merged into Clients
   const was = S.page;
   S.page = $(`#page-${page}`) ? page : 'overview';
+  // A conversation left under the pointer keeps no mark behind: the next Overview
+  // draw would otherwise light it with nothing under the mouse.
+  if (was !== S.page) S.hoverKey = null;
   // Coming back to Settings draws the form again (from the draft, if any).
   if (S.page === 'settings' && was !== 'settings') S.formShown = false;
   $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${S.page}`));
   $$('.nav nav a').forEach(a => a.classList.toggle('active', a.dataset.page === S.page));
-  // The Filters button scopes the whole Overview page; other pages hide it.
-  $('#ov-filters').style.display = S.page === 'overview' ? '' : 'none';
+  // The Filters scope covers the Overview panels and the Logs list, so the
+  // button is on the top bar wherever the scope it carries applies.
+  $('#ov-filters').style.display = S.page === 'overview' || S.page === 'logs' ? '' : 'none';
   // The link's own text, without its icon and counter spans.
   $('#top-title').textContent = [...$(`.nav nav a[data-page="${S.page}"]`).childNodes]
     .filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent).join('').trim();
@@ -3878,8 +3986,25 @@ function start() {
   if (!DEMO) {
     api('GET', 'me').then(d => { $('#whoami').textContent = d.user ? `Signed in as ${d.user}` : ''; }).catch(() => {});
   }
+  wireTimelineHover();
   route();
   setInterval(poll, POLL_MS);
+}
+
+/**
+ * The pointer carries the mark between a lane and its header (see tlHover).
+ * Delegated on the two panels, not on their rows: the poll replaces the rows
+ * every second, so a per-row handler would be bound and thrown away each tick.
+ */
+function wireTimelineHover() {
+  ['#ov-timeline', '#ov-now'].forEach(sel => {
+    const panel = $(sel);
+    panel.addEventListener('pointerover', e => {
+      const row = e.target.closest('#ov-timeline .tl-row, #ov-now .det-h');
+      tlHover(row ? row.dataset.key : null);
+    });
+    panel.addEventListener('pointerleave', () => tlHover(null));
+  });
 }
 
 if (DEMO) {
