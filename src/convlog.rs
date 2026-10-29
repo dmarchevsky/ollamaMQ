@@ -1359,7 +1359,7 @@ impl DiskIndex {
     /// entry rather than returning a stranger's conversation.
     fn read(&self, entry: &DiskEntry) -> Option<Conv> {
         use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(&self.slots.get(entry.slot)?).ok()?;
+        let mut f = std::fs::File::open(self.slots.get(entry.slot)?).ok()?;
         f.seek(SeekFrom::Start(entry.offset)).ok()?;
         let mut buf = vec![0u8; entry.len as usize];
         f.read_exact(&mut buf).ok()?;
