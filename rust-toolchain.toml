@@ -1,0 +1,8 @@
+# Pinned so local and CI clippy agree — with `-D warnings` in CI, an unpinned
+# toolchain means every new stable release can turn fresh-green code red
+# overnight (see v0.22.0..v0.24.0). Bump deliberately, together with any lint
+# fallout it brings. CI installs the clippy component itself (rustup component
+# add clippy); no `components` here because local cargo runs in a throwaway
+# container where a component list would re-download clippy on every call.
+[toolchain]
+channel = "1.99.0"
