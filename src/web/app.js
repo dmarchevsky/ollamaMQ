@@ -692,13 +692,14 @@ function renderCapacity(st, ov) {
     `<div class="q2-bar"><div class="q-track">${shared.map(w => waitSeg(w, 'flex:1 1 26px')).join('')}</div></div>`, '') : '';
   // Legend of the board: the conversations on it right now, not the window
   // history — same identity (client, or client+label) the rows are coloured by.
-  const legend = [...new Set([...(st.runs || []).map(fmtWho), ...ov.queue.map(fmtWho)])]
-    .map(id => `<span>${swatch(id)}${esc(id)}</span>`).join('')
-    + '<span><i class="sw free"></i>free</span>'
-    + '<span><i class="sw loading"></i>loading a model</span>'
-    + '<span class="dim">waiting rows share the bar’s token scale</span>';
+  // Capacity names only what Capacity draws; the stage chips are keyed under
+  // Activity, where they are drawn.
+  const ids = [...new Set([...(st.runs || []).map(fmtWho), ...ov.queue.map(fmtWho)])]
+    .map(id => `<span>${swatch(id)}${esc(id)}</span>`);
+  const legend = legendRow([...ids, swItem('free', 'free'), swItem('loading', 'loading a model'),
+    '<span class="dim">waiting rows share the bar’s token scale</span>']);
   setHTML($('#ov-capacity'), ov.backends.length
-    ? `<div class="caps">${rows}${sharedRow}</div><div class="legend">${legend}</div>`
+    ? `<div class="caps">${rows}${sharedRow}</div>${legend}`
     : '<div class="empty">No backends configured</div>');
 }
 
@@ -712,10 +713,14 @@ function renderCapacity(st, ov) {
  */
 const TL_ROWS = 12;          // sessions per backend before the oldest fold away
 const STAGE = { w: 'waiting', p: 'prefill', g: 'decode', e: 'error', c: 'compaction' };
-const TL_LEGEND = '<div class="tl-legend"><span><i class="sw w"></i>waiting</span>'
-  + '<span><i class="sw p"></i>prefill</span><span><i class="sw g"></i>decode</span>'
-  + '<span><i class="sw e"></i>error</span>'
-  + '<span><i class="sw c"></i>compaction</span></div>';
+/** One legend component, used by both Overview panels: the same markup and the
+ *  same swatch shape, one vocabulary per panel — Capacity keys its identity
+ *  hues and the two bar states, Activity keys the stage chips it draws. They
+ *  used to be two components with two shapes for one board. */
+const legendRow = items => `<div class="legend">${items.join('')}</div>`;
+const swItem = (cls, label) => `<span><i class="sw ${cls}"></i>${label}</span>`;
+/** The stage key, derived from the same table the chips are drawn from. */
+const stageLegend = () => legendRow(Object.entries(STAGE).map(([k, label]) => swItem(k, label)));
 
 /** What a compaction's own segment says: what it read, what it left behind. */
 const compactionLine = o => `${fmtTok(o.prompt_tokens)} tok → ${fmtTok(o.completion_tokens)} tok`
@@ -777,7 +782,7 @@ function renderTimeline(st, ov) {
         + shown.map(s => tlRow(s.rs, pctOf, span)).join('');
     }).join('');
   const foot = hidden ? `+${hidden} older session${hidden === 1 ? '' : 's'} hidden` : '';
-  setHTML(el, `<div class="tl">${axis}${body}${TL_LEGEND}${foot ? `<div class="tl-foot">${foot}</div>` : ''}</div>`);
+  setHTML(el, `<div class="tl">${axis}${body}${stageLegend()}${foot ? `<div class="tl-foot">${foot}</div>` : ''}</div>`);
   wireTimeline();
 }
 

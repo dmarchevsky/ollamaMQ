@@ -638,8 +638,19 @@ tr.is-hidden td .mono { color: var(--faint); text-decoration: line-through; }
 .q-track .seg { border-radius: 4px; min-width: 10px; }
 .q-track .seg.q { background: color-mix(in srgb, var(--c) 42%, transparent); border: 2px dashed var(--c); }
 .bar-gap { width: 1px; align-self: stretch; background: var(--border); margin: 0 4px; }
-.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 12px; font-size: 12px; color: var(--muted); }
 .legend span { display: inline-flex; align-items: center; }
+.legend .sw { margin-right: 5px; }
+/* The stage key squares: a stage chip is square on purpose (a rounded end blurs
+   where a stage stops), so its swatch is square too — identity swatches keep
+   the round shape that means “this is a client”. */
+.legend .sw.w, .legend .sw.p, .legend .sw.g, .legend .sw.e, .legend .sw.c { border-radius: 0; }
+.legend .sw.w { background: var(--accent-soft); border: 1px solid var(--accent); }
+.legend .sw.p { background: var(--warn); }
+.legend .sw.g { background: var(--decode); }
+.legend .sw.e { background: var(--bad); }
+.legend .sw.c { background: repeating-linear-gradient(135deg, var(--compact) 0 3px,
+    color-mix(in srgb, var(--compact) 40%, transparent) 3px 6px); }
 
 .free-chip {
   font-size: 11.5px; font-weight: 650; padding: 2px 9px; border-radius: 9px;
@@ -773,16 +784,6 @@ tr.is-off td { color: var(--muted); }
 .tl-track .now { position: absolute; right: 0; top: -1px; bottom: -1px;
   border-left: 1px solid var(--muted); }
 .tl-foot { padding: 7px 0 0; font-size: 11.5px; color: var(--faint); }
-.tl-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 8px 0 0;
-  font-size: 11.5px; color: var(--muted); }
-.tl-legend .sw { margin-right: 4px; }
-.tl-legend .sw { border-radius: 0; }
-.tl-legend .sw.w { background: var(--accent-soft); border: 1px solid var(--accent); }
-.tl-legend .sw.p { background: var(--warn); }
-.tl-legend .sw.g { background: var(--decode); }
-.tl-legend .sw.e { background: var(--bad); }
-.tl-legend .sw.c { background: repeating-linear-gradient(135deg, var(--compact) 0 3px,
-    color-mix(in srgb, var(--compact) 40%, transparent) 3px 6px); }
 /* Details: one collapsible block per session. */
 .det-h { display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left;
   background: color-mix(in srgb, var(--c, var(--accent)) 7%, var(--surface));
