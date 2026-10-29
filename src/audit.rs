@@ -657,21 +657,19 @@ fn clamp(s: &str, limit: usize) -> String {
 /// Tool-call arguments count too — that is where a `curl -X PUT …` lives.
 pub fn reply_text(stored: &str) -> String {
     let trimmed = stored.trim_start();
-    if trimmed.starts_with('{') {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(stored) {
-            if let Some(choice) = v
-                .get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|a| a.first())
-            {
-                let mut out = String::new();
-                if let Some(msg) = choice.get("message") {
-                    out.push_str(&message_text(msg));
-                    push_tool_calls(msg.get("tool_calls"), &mut out);
-                }
-                return out;
-            }
+    if trimmed.starts_with('{')
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(stored)
+        && let Some(choice) = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+    {
+        let mut out = String::new();
+        if let Some(msg) = choice.get("message") {
+            out.push_str(&message_text(msg));
+            push_tool_calls(msg.get("tool_calls"), &mut out);
         }
+        return out;
     }
     let mut out = String::new();
     for line in stored.lines() {
@@ -792,10 +790,10 @@ fn best_category(item: &serde_json::Value) -> Option<(String, f64)> {
     let mut keep = |node: &serde_json::Value| match node {
         serde_json::Value::Object(map) => {
             for (k, val) in map {
-                if let Some(s) = score_of(val) {
-                    if best.as_ref().is_none_or(|(_, bs)| s > *bs) {
-                        best = Some((k.clone(), s));
-                    }
+                if let Some(s) = score_of(val)
+                    && best.as_ref().is_none_or(|(_, bs)| s > *bs)
+                {
+                    best = Some((k.clone(), s));
                 }
             }
         }
@@ -821,10 +819,10 @@ fn best_category(item: &serde_json::Value) -> Option<(String, f64)> {
                     .filter_map(|k| entry.get(*k).and_then(|s| s.as_f64()))
                     .next()
                     .unwrap_or(1.0);
-                if let Some(name) = name.filter(|n| !n.is_empty()) {
-                    if best.as_ref().is_none_or(|(_, bs)| score > *bs) {
-                        best = Some((name, score));
-                    }
+                if let Some(name) = name.filter(|n| !n.is_empty())
+                    && best.as_ref().is_none_or(|(_, bs)| score > *bs)
+                {
+                    best = Some((name, score));
                 }
             }
         }

@@ -368,10 +368,10 @@ impl Stats {
             q.pop_front();
         }
         q.push_back(f);
-        if let Some(line) = line {
-            if let Some(tx) = self.journal.lock_or_recover().as_ref() {
-                let _ = tx.send(line);
-            }
+        if let Some(line) = line
+            && let Some(tx) = self.journal.lock_or_recover().as_ref()
+        {
+            let _ = tx.send(line);
         }
     }
 
@@ -465,10 +465,10 @@ fn journal_writer(path: &str, rx: Receiver<JournalLine>) {
     };
     let mut file = open(path);
     let mut size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    loop {
-        // Block for the next record, then drain everything queued behind it:
-        // one wake and one flush per burst, not one per record.
-        let Ok(first) = rx.recv() else { break };
+    // Block for the next record, then drain everything queued behind it:
+    // one wake and one flush per burst, not one per record. The loop ends when
+    // the sender is dropped (recv error) — the same exit as the old `break`.
+    while let Ok(first) = rx.recv() {
         let mut burst = vec![first];
         burst.extend(rx.try_iter());
         if file.is_none() {
