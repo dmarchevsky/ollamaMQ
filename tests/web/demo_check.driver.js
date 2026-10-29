@@ -729,3 +729,72 @@ addEventListener('load', () => setTimeout(() => {
     A7('scope-restored', rows().length === before && $('#log-scope').hidden, `${rows().length} rows`);
   }, 1100);
 }, 44000));
+
+// The Activity pair: a conversation's lane in the graph and its header in the
+// list below are the same thing, so the pointer lights both ends (and the mark
+// survives the 1 s rebuild under a still mouse). Also checks the jump rail's
+// child rows answer to the pointer again — the rule that flattened them used to
+// cancel the shared hover tint along the way. Runs last: it hovers live rows.
+addEventListener('load', () => setTimeout(() => {
+  const A8 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  const hover = el => el.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }));
+  const q = k => `.tl-row[data-key="${CSS.escape(k)}"], .det-h[data-key="${CSS.escape(k)}"]`;
+  location.hash = '#overview';
+  setTimeout(() => {
+    const lane = document.querySelector('#ov-timeline .tl-row');
+    if (!lane) { A8('activity-rows-present', false, 'no lane to hover'); return; }
+    hover(lane);
+    const mate = [...document.querySelectorAll('#ov-now .det-h')].find(h => h.dataset.key === lane.dataset.key);
+    A8('lane-hover-lights-both-ends', lane.classList.contains('x-hi')
+      && (!mate || mate.classList.contains('x-hi')),
+      mate ? `${lane.dataset.key}: lane + its header` : `${lane.dataset.key}: lane only (header outside Show)`);
+    const heads = [...document.querySelectorAll('#ov-now .det-h')];
+    const head = heads.find(h => document.querySelector(`#ov-timeline ${q(h.dataset.key).split(',')[0].trim()}`));
+    if (head) {
+      hover(head);
+      const lane2 = document.querySelector(`#ov-timeline .tl-row[data-key="${CSS.escape(head.dataset.key)}"]`);
+      A8('header-hover-lights-its-lane', head.classList.contains('x-hi') && !!lane2
+        && lane2.classList.contains('x-hi'), head.dataset.key);
+    }
+    document.querySelector('#ov-now').dispatchEvent(new PointerEvent('pointerleave'));
+    A8('hover-mark-clears-when-the-pointer-leaves',
+      document.querySelectorAll('.x-hi').length === 0, `${S.hoverKey}`);
+  }, 1400);
+  setTimeout(() => {
+    // The point of S.hoverKey: the poll rebuilt both panels under a mouse that
+    // never moved, so the mark has to come back on the same conversation.
+    const key = document.querySelector('#ov-timeline .tl-row').dataset.key;
+    hover(document.querySelector(`#ov-timeline .tl-row[data-key="${CSS.escape(key)}"]`));
+    setTimeout(() => {
+      // One conversation can hold two lanes (a request on one backend, a second
+      // waiting for another), so "exactly one" is the wrong shape: every lit lane
+      // must be that conversation, and it must still be lit after the rebuild.
+      const lit = [...document.querySelectorAll('#ov-timeline .tl-row.x-hi')];
+      A8('hover-mark-survives-the-poll', lit.length >= 1
+        && lit.every(r => r.dataset.key === key),
+        `${lit.length} lane(s) of ${key} still lit after a rebuild`);
+    }, 2600);
+  }, 4200);
+  setTimeout(() => {
+    // The rail's hover rule, read out of the stylesheet: CSSOM and fetch are both
+    // closed to a file:// page, so the check only speaks when served over http.
+    const flat = [...document.styleSheets].flatMap(s => {
+      try { return [...s.cssRules]; } catch { return []; }
+    }).find(r => r.selectorText === '.lv-node.sub');
+    const rule = [...document.styleSheets].flatMap(s => {
+      try { return [...s.cssRules]; } catch { return []; }
+    }).find(r => r.selectorText === '.lv-node.sub:not(.on):hover');
+    if (rule) {
+      const bg = `${rule.style.background} ${rule.style.backgroundColor}`;
+      // The wash has to be ink (7% of --text): "transparent" is colour-mix's far
+      // end, so testing for its absence would only ever fail.
+      A8('rail-child-hover-rule', /--text/.test(bg) && /none/.test(`${flat.style.background} ${flat.style.backgroundColor}`),
+        `rest ${flat.style.background || flat.style.backgroundColor} → hover ${bg.trim()}`);
+    } else {
+      fetch('app.css').then(css => {
+        A8('rail-child-hover-rule', /\.lv-node\.sub:not\(\.on\):hover\s*\{[^}]*--text/.test(css),
+          'the hover rule paints an ink wash on child rows');
+      }).catch(() => console.log('ASSERT SKIP rail-child-hover-rule — file:// hides both CSSOM and app.css; run the harness over http'));
+    }
+  }, 7600);
+}, 54000));

@@ -30,6 +30,7 @@ const S = {
   overview: null,            // api/overview for the chosen window and filters
   filters: storedFilters(),  // the filter modal's selection (time, identity, lists)
   reqShow: storedReqShow(),  // the Activity list: active rows only, or the window too
+  hoverKey: null,            // Activity: the conversation the pointer is on (graph ⇄ list)
   collapsed: storedCollapsed(),// conversation headers the operator folded shut
   pins: {},                // session tag -> operator-pinned priority level
   colorOf: new Map(),        // client id -> colour slot 1..4
@@ -643,6 +644,9 @@ function renderOverview(st) {
   renderRequests(vis, ov);
   renderBackendStats(ov);
   renderClientStats(vis, ov);
+  // The poll rebuilds both Activity panels, so the row the pointer sits on is
+  // new DOM every second — the mark is re-stamped rather than lost.
+  if (S.hoverKey) tlMarkPair();
 }
 
 /**
@@ -838,6 +842,28 @@ function tlRow(rows, pctOf, span) {
 
 /** A chip's own tooltip: when the stage began and what it is worth. */
 const stageTip = e => `${fmtTime(e.at)} · ${STAGE[e.k]} ${stripTags(e.line)}`;
+
+/**
+ * The two ends of one conversation light together. Its lane in the graph and its
+ * header in the list carry the same `data-key` (a click already travels between
+ * them), so pointing at either marks both — the mouse says what the click does,
+ * before you commit to it. Delegation rather than per-row handlers: both panels
+ * are rebuilt by the 1 s poll, and the key lives in `S.hoverKey` so the mark
+ * survives a rebuild under a still pointer instead of blinking out. Hover moves
+ * nothing and changes no filter — a header off-screen, or hidden behind
+ * "Active", simply stays dark, and the click still scrolls and flashes.
+ */
+function tlHover(key) {
+  if (key === S.hoverKey) return;
+  S.hoverKey = key;
+  tlMarkPair();
+}
+
+/** Stamp the mark on every row of the conversation under the pointer (of none). */
+function tlMarkPair() {
+  $$('#ov-timeline .tl-row, #ov-now .det-h').forEach(el =>
+    el.classList.toggle('x-hi', !!S.hoverKey && el.dataset.key === S.hoverKey));
+}
 
 /**
  * Which group a row belongs to: its backend, or a named bucket when it has
@@ -3920,6 +3946,9 @@ function route() {
   if (page === 'users') page = 'clients';  // Users merged into Clients
   const was = S.page;
   S.page = $(`#page-${page}`) ? page : 'overview';
+  // A conversation left under the pointer keeps no mark behind: the next Overview
+  // draw would otherwise light it with nothing under the mouse.
+  if (was !== S.page) S.hoverKey = null;
   // Coming back to Settings draws the form again (from the draft, if any).
   if (S.page === 'settings' && was !== 'settings') S.formShown = false;
   $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${S.page}`));
@@ -3939,8 +3968,25 @@ function start() {
   if (!DEMO) {
     api('GET', 'me').then(d => { $('#whoami').textContent = d.user ? `Signed in as ${d.user}` : ''; }).catch(() => {});
   }
+  wireTimelineHover();
   route();
   setInterval(poll, POLL_MS);
+}
+
+/**
+ * The pointer carries the mark between a lane and its header (see tlHover).
+ * Delegated on the two panels, not on their rows: the poll replaces the rows
+ * every second, so a per-row handler would be bound and thrown away each tick.
+ */
+function wireTimelineHover() {
+  ['#ov-timeline', '#ov-now'].forEach(sel => {
+    const panel = $(sel);
+    panel.addEventListener('pointerover', e => {
+      const row = e.target.closest('#ov-timeline .tl-row, #ov-now .det-h');
+      tlHover(row ? row.dataset.key : null);
+    });
+    panel.addEventListener('pointerleave', () => tlHover(null));
+  });
 }
 
 if (DEMO) {

@@ -859,6 +859,19 @@ tr.is-off td { color: var(--muted); }
 .tl-row:hover { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent);
   outline: 1px dashed color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
   outline-offset: -1px; border-radius: 6px; }
+/* A conversation is drawn twice — a lane in the graph, a header in the list —
+   and both ends carry its data-key, so pointing at either lights both in that
+   conversation's own colour. It is the lane's own hover cue (same 12% wash, same
+   dashed outline) mirrored onto the header, which is what makes the two ends
+   read as one thing. Hover never scrolls and never changes the Show filter: a
+   header that is off-screen, or hidden behind "Active", simply stays dark. */
+.tl-row.x-hi { background: color-mix(in srgb, var(--c, var(--accent)) 12%, transparent);
+  outline: 1px dashed color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
+  outline-offset: -1px; border-radius: 6px; }
+.tl-row.x-hi .tl-lab { color: var(--text); }
+.det-h.x-hi { background: color-mix(in srgb, var(--c, var(--accent)) 12%, var(--surface));
+  outline: 1px dashed color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
+  outline-offset: -1px; }
 .det-h.flash { animation: detflash 1.2s ease-out; }
 @keyframes detflash {
   from { box-shadow: 0 0 0 2px var(--c, var(--accent)); }
@@ -987,6 +1000,12 @@ body.lv-resizing, body.lv-resizing * { cursor: col-resize !important; user-selec
 /* Message rows are rows of the tree, not transcript blocks: they dropped the
    body `.msg` chip (same class name used to buy it) so only their head tints. */
 .lv-node.sub { border: 0; background: none; margin: 0; border-radius: 0; }
+/* That flatten also cancelled the shared `.lv-node:hover` tint, so a message row
+   never answered to the pointer. It now wears 7% ink — neutral on purpose: the
+   accent/ok tints already say which end of a request a row is, and `--accent-soft`
+   already means "this is where I jumped". A selected row keeps its mark: hovering
+   the row you jumped to must not erase the reason you are looking at it. */
+.lv-node.sub:not(.on):hover { background: color-mix(in srgb, var(--text) 7%, transparent); }
 .lv-node .tb { flex: none; margin-left: 6px; }
 .lv-node .snip .u { color: var(--accent); } .lv-node .snip .t { color: var(--ok); }
 /* The viewer header carries the Show-incremental switch beside Raw/Formatted;
