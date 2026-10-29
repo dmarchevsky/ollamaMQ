@@ -378,6 +378,14 @@ const fmtWho = o => (S.filters.mode === 'key' && o.key && o.key !== 'none') ? `$
 /** A session as a person reads it: the label the client sent, else the tag. */
 const sessName = o => o.session_label || o.session || null;
 const prioSel = p => !S.filters.priority.length || S.filters.priority.includes(p || 'normal');
+/** The filter window in milliseconds — the Logs list applies the same window
+ *  the Overview panels send to the server, so one control scopes both. */
+const winMs = w => { const m = /^(\d+)(m|h)$/.exec(w || ''); return m ? +m[1] * (m[2] === 'm' ? 6e4 : 36e5) : 9e5; };
+/** Does this log round sit inside the Overview scope? A round's identity is the
+ *  side that carries it (IN wins), and a captured row knows no API-key label
+ *  and no priority: a `client\tkey` selection therefore matches its client name
+ *  on this page, and the priority axis has nothing to bite on. */
+const logScoped = r => { const e = r.in || r.out || r.solo || {}; return clientSel(e.user) && modelSel(e.model) && backendSel(e.backend); };
 /** Priority in the tight places (graph lane, phone card): a glyph in the one
  *  hue that already means "priority", so no new status colour is invented. */
 /** The priority mark: one glyph whose colour carries the level, and the thing
@@ -515,11 +523,17 @@ function renderFiltersBtn() {
   const on = filtersActive();
   $('#ov-filters').classList.toggle('on', on);
   $('#f-dot').hidden = !on;
+  $('#ov-filters').title = on ? `Filters: ${filterBits().join(' · ')}` : 'Time, clients, backends and models';
+}
+
+/** What the scope says in words. The button's tooltip and the Logs page's chip
+ *  both read it, so the scope never reads two different ways. */
+function filterBits() {
   const f = S.filters;
   const bit = (sel, word) => !sel.length ? null : sel[0] === FNONE ? `no ${word}` : `${sel.length} ${word}`;
-  const bits = [winLabel(f.win), f.mode === 'key' ? 'client+label' : null,
-    bit(f.clients, 'clients'), bit(f.backends, 'backends'), bit(f.models, 'models'), bit(f.priority, 'priority')];
-  $('#ov-filters').title = on ? `Filters: ${bits.filter(Boolean).join(' · ')}` : 'Time, clients, backends and models';
+  return [winLabel(f.win), f.mode === 'key' ? 'client+label' : null,
+    bit(f.clients, 'clients'), bit(f.backends, 'backends'), bit(f.models, 'models'), bit(f.priority, 'priority')]
+    .filter(Boolean);
 }
 
 function renderNav(st) {
@@ -1857,16 +1871,35 @@ function renderLogs() {
   segCount('#log-flag', 1, flagged);
   $('#nav-logs').textContent = flagged || '';
   const rounds = all.filter(r =>
+    // The same scope the top-bar Filters button owns: window, client, model,
+    // backend. The Overview selection is already persisted per browser, so one
+    // choice now reads the same on both pages and after a reload.
+    ((r.in || r.out || r.solo)?.at_ms ?? 0) >= Date.now() - winMs(S.filters.win) &&
+    logScoped(r) &&
     (dir === '' || (dir === 'awaiting' ? r.in && !r.out : r.ctl)) &&
     (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.in?.session_label, r.out?.user, r.out?.model,
       r.out?.backend, r.out?.session, r.out?.session_label,
       r.in?.info, r.out?.info, r.solo?.user, r.solo?.model, r.solo?.backend, r.solo?.session, r.solo?.info]
       .some(v => v && String(v).toLowerCase().includes(q))) &&
     (!logFlagOnly || roundFlags(r).length));
+  // The scope prints where it bites: an Overview panel visibly shrinks, a log
+  // list just stops showing rows, so say what is holding them back.
+  const chip = $('#log-scope');
+  const scoped = filtersActive();
+  chip.hidden = !scoped;
+  chip.textContent = scoped ? filterBits().join(' · ') : '';
   const warn = captureOff()
     ? `<div class="capnote">Body capture is <b>off</b> — these requests are listed from memory, but their conversations are not written to disk, so a row has nothing to open. Set a writable <b>Request log path</b> in Settings and restart to capture them${S.capture.path ? ` (current path: <code>${esc(S.capture.path)}</code>)` : ''}.</div>`
     : '';
-  setHTML($('#logs'), warn + (S.logGroup === 'request' ? logTable(rounds) : convTable(rounds)));
+  const empty = scoped && !rounds.length && all.length
+    ? `<div class="empty">No row matches the filters (${esc(filterBits().join(' · '))}) — open Filters to widen them.</div>`
+    : (S.logGroup === 'request' ? logTable(rounds) : convTable(rounds));
+  // A window wider than what the ring holds must not read as “nothing happened”.
+  const oldest = all.length ? Math.min(...all.map(r => (r.in || r.out || r.solo)?.at_ms ?? Infinity)) : Infinity;
+  const reach = all.length && oldest > Date.now() - winMs(S.filters.win)
+    ? `<p class="hint">The list holds the newest ${LOG_LIMIT} events — that reaches back to ${fmtTime(oldest)}, `
+      + `short of ${winLabel(S.filters.win)}.</p>` : '';
+  setHTML($('#logs'), warn + empty + reach);
 }
 
 // --- Conversation viewer
@@ -3891,8 +3924,9 @@ function route() {
   if (S.page === 'settings' && was !== 'settings') S.formShown = false;
   $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${S.page}`));
   $$('.nav nav a').forEach(a => a.classList.toggle('active', a.dataset.page === S.page));
-  // The Filters button scopes the whole Overview page; other pages hide it.
-  $('#ov-filters').style.display = S.page === 'overview' ? '' : 'none';
+  // The Filters scope covers the Overview panels and the Logs list, so the
+  // button is on the top bar wherever the scope it carries applies.
+  $('#ov-filters').style.display = S.page === 'overview' || S.page === 'logs' ? '' : 'none';
   // The link's own text, without its icon and counter spans.
   $('#top-title').textContent = [...$(`.nav nav a[data-page="${S.page}"]`).childNodes]
     .filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent).join('').trim();
