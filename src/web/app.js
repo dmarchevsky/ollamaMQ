@@ -2471,8 +2471,8 @@ function lvTrackRail() {
     else if (el.matches('section.turn')) sel = `.lv-node.turn[data-rid="${el.dataset.rid}"]`;
     else if (el.classList.contains('msg')) {
       const m = /^lv-m-(\d+)-(\d+)$/.exec(el.id);
-      if (m) sel = `.lv-node.msg.sub[data-rid="${m[1]}"][data-idx="${m[2]}"]`;
-    } else sel = `.lv-node.resp.sub[data-rid="${el.id.slice(5)}"]`;
+      if (m) sel = `.lv-node.sub[data-rid="${m[1]}"][data-idx="${m[2]}"]`;
+    } else sel = `.lv-node.resph[data-rid="${el.id.slice(5)}"]`;
     const found = sel && rail.querySelector(sel);
     if (!found) continue;
     last = found;
@@ -2692,16 +2692,24 @@ function lvSave(text, name, type) {
 
 // --- Jump tree ---
 //
-// The rail mirrors the conversation as a tree: request → request/response →
-// message → tool call. Each node is expandable on its own and every node
-// carries the timestamp it was measured at, so the outline reads as the
-// timeline it is.
+// The rail mirrors the conversation as a tree: a request folds to one line, and
+// opened it groups its rows under a REQ head (the messages it sent) and a RESP
+// head (the answer it got). Each node carries the moment or the length it was
+// measured at, so the outline reads as the timeline it is.
 
 function lvNode({ level, rid, idx, when, tip, tag, snip, pv, tb, caret, cls = '', action = 'lv-jump', on = false, run }) {
+  // A turn, a run and an idle gap always carry their moment, so they open with
+  // the clock column the whole tree aligns on. A REQ/RESP head or a message row
+  // owns no leading clock column: the length it may have rides after its label,
+  // and a row without one renders no clock cell (an empty column of it is pure
+  // stolen snippet width).
+  const inline = /(^|\s)(head|sub)(\s|$)/.test(cls);
+  const clock = `<span class="when">${when ?? ''}</span>`;
+  const label = `<span class="tag">${esc(tag)}</span>`;
   return `<div class="lv-node ${cls} l${level}${on ? ' on' : ''}" data-action="${action}" data-rid="${rid ?? ''}"${idx != null ? ` data-idx="${idx}"` : ''}${run != null ? ` data-run="${run}"` : ''}
     ${tip ? `title="${esc(tip)}"` : ''}>
     <span class="car"${caret ? ` data-action="${action === 'lv-run' ? 'lv-run' : 'lv-tree'}"` : ''} data-rid="${rid}">${caret ?? ''}</span>
-    <span class="when">${when ?? ''}</span><span class="tag">${esc(tag)}</span>
+    ${inline ? label + clock : clock + label}
     <span class="snip">${pv || esc(snip ?? '')}</span>${tb ?? ''}</div>`;
 }
 
@@ -2799,32 +2807,45 @@ function lvDrawRail() {
     // mode is on — they are drawn under the request that first sent them.
     const hid = lvHidden(i);
     // The answer this turn gave re-enters the next request as a message —
-    // the answer row under its own turn already speaks it, so the increment
+    // the RESP head under its own turn already speaks it, so the increment
     // below does not repeat it (it read as a duplicated assistant).
     const prevAns = i ? lvAnswerSig(turns[i - 1]) : '';
+    const msgs = [];
     for (const [mi, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
       if (S.lv.inc && mi < hid) continue;
       if (S.lv.inc && m.role === 'assistant' && prevAns
         && lvWords(msgText(m.content, m.images)) === prevAns) continue;
       const w = lvMsgWhen(lvIdxOf(t.rid), mi)
         || { when: '', tip: 'older than this log \u2014 the request that produced it was never captured' };
-      items.push(lvNode({ level: subLevel, rid: t.rid, idx: mi, when: w.when, tip: w.tip,
+      msgs.push(lvNode({ level: subLevel + 1, rid: t.rid, idx: mi, when: w.when, tip: w.tip,
         tag: ROLE_LABEL[m.role] || 'MSG', snip: lvSnip(m),
-        cls: `msg sub ${ROLE_CLS[m.role] || 'user'}`,
+        cls: `sub ${ROLE_CLS[m.role] || 'user'}`,
         action: 'lv-msg', on: !!LV.focusMsg && LV.focusMsg[0] === t.rid && LV.focusMsg[1] === mi }));
     }
-    // The assistant's own answer row. It carries the reply's opening words
-    // (the operator reads the rail as SYS / USER / ASST messages — a meta
-    // "resp" row did not read as the assistant), and clicking it lands on the
-    // Response section in the body. The duration is a length, not a moment.
-    const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
+    // An open request groups its rows under two heads: what it SENT (the
+    // messages, in a nested group) and what it GOT (the answer, which IS the
+    // RESP row — the response body has no per-part anchors, so nothing hangs
+    // under it). The tint of a head is what groups its rows, never a border:
+    // a border is what a body transcript block wears.
+    items.push('<div class="lv-grp">');
     const fin = f.finish;
-    items.push(lvNode({ level: subLevel, rid: t.rid, cls: 'resp sub asst', tag: 'ASST', action: 'lv-resp',
+    const dur = t.tl?.end != null ? t.tl.end - t.at_ms : null;
+    items.push(lvNode({
+      level: subLevel, rid: t.rid, cls: 'head reqh', tag: 'REQ', action: 'lv-req', caret: '',
+      snip: `→ ${t.req?.bytes != null ? fmtBytes(t.req.bytes) : '…'} · ${msgs.length} ${S.lv.inc ? 'new' : 'msgs'}`,
+      tip: `${[t.method, t.path].filter(Boolean).join(' ') || 'the request'} · `
+        + `${msgs.length} message${msgs.length === 1 ? '' : 's'} ${S.lv.inc ? 'added by' : 'sent with'} this request`
+        + ' — click to jump to the Request section' }));
+    if (msgs.length) items.push('<div class="lv-grp">', ...msgs, '</div>');
+    // The reply's own length, not a moment: it is a duration of the answer.
+    items.push(lvNode({
+      level: subLevel, rid: t.rid, cls: 'head resph', tag: 'RESP', action: 'lv-resp', caret: '',
       when: dur == null ? '' : fmtDur(dur / 1000),
       tip: t.tl?.end != null
         ? `the assistant's answer — how long it took: ${fmtDur(dur / 1000)} (arrived ${fmtTime(t.at_ms)}, finished ${fmtTime(t.tl.end)})${fin ? ` — ${fin}` : ''} — click to jump to it`
         : 'no response recorded yet',
-      snip: (f.words || fin || lvFinish(t)) + (c && c.resp == null ? (t.redacted ? ' · redacted' : ' · no text') : ''), caret: '' }));
+      snip: `← ${(f.words || fin || lvFinish(t)) + (c && c.resp == null ? (t.redacted ? ' · redacted' : ' · no text') : '')}` }));
+    items.push('</div>');
   });
   if (!turns.length) items.push('<div class="lv-foot">Nothing to jump to in this view.</div>');
   setHTML(rail, items.join(''));
@@ -3665,7 +3686,8 @@ const actions = {
     else LV.closedRuns.add(k);
     return lvDraw({ scroll: false });
   },
-  // The tree's RESP row: land on the Response section, not the turn top.
+  // The tree's two heads: land on the Request / Response section, not the top.
+  'lv-req': el => lvFocusSec(+el.dataset.rid, 'q'),
   'lv-resp': el => lvFocusSec(+el.dataset.rid, 'a'),
   // One switch decides increment-vs-full-prompt for every request at once.
   'lv-inc': async el => {
