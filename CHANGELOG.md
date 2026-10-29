@@ -3,6 +3,22 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.24.1 — 2026-10-29
+
+### Changed
+
+- No behavior changes — this release makes the checks honest instead of noisy.
+  Every release since v0.22.0 had its CI red on the `clippy -D warnings` step
+  while the image still published from the tag, so failure arrived only as an
+  email after the fact. Three things close the gap: the seven outstanding lints
+  are fixed (collapsible `if`s in the audit paths, a needless borrow in the
+  conversation index, the journal writer's `loop` becomes the equivalent
+  `while let`); `rust-toolchain.toml` pins the toolchain so local and CI clippy
+  can never drift; and the contributor playbook now runs the same
+  `cargo clippy --all-targets -- -D warnings` locally as its test gate and
+  refuses to tag a release until the `test` workflow is green on the merge
+  commit.
+
 ## v0.24.0 — 2026-10-28
 
 ### Added
