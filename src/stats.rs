@@ -333,6 +333,17 @@ impl Stats {
         self.replayed_rid_max.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Cheap change-tag for the Logs window: `(count of finished records at
+    /// or after `from_ms`, newest `at_ms`) without cloning a single record —
+    /// `/api/logs` answers `If-None-Match` from this plus the ring's own
+    /// numbers, so an unchanged 1 s poll costs nothing. The queue is
+    /// append-ordered (replay included), hence the partition point.
+    pub fn window_tag(&self, from_ms: u64) -> (usize, u64) {
+        let q = self.finished.lock_or_recover();
+        let start = q.partition_point(|f| f.at_ms < from_ms);
+        (q.len() - start, q.back().map(|f| f.at_ms).unwrap_or(0))
+    }
+
     /// The newest `need` finished records, newest first — the Logs page's
     /// file-backed tail under the live ring.
     pub fn finished_tail(&self, need: usize) -> Vec<Finished> {
