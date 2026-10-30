@@ -3,6 +3,43 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## Unreleased
+
+### Changed
+
+- **The Logs page is now shareable, complete, and honest about what it can
+  open** — four changes on one complaint: a log you cannot hand to someone is
+  not evidence.
+  - **The address bar is the link.** Opening a conversation writes it into the
+    URL (`#logs?rid=904&conv=codex-laptop%23a3f19c`) and stepping `⏮ ‹ › ⏭`
+    keeps it current. Copy it from the browser, paste it into another machine
+    that already has a session, and the same conversation opens on the same
+    request; closing the viewer hands the address back. A link whose
+    conversation aged out says so in a toast instead of opening an empty modal.
+    There is no copy button — the bar is the copy.
+  - **One way to read a log.** The Raw/Formatted switch is gone: the viewer
+    shows the transcript (a streamed answer reassembled into the message it
+    produced, thinking collapsed, tool calls rebuilt) and nothing else. The
+    wire is what the download is for.
+  - **`⤓ Raw log` is the capture.** One click, one file: `jsonl`, one line,
+    every turn's `content.req` / `content.resp` exactly as the log holds them —
+    SSE frames, `[DONE]`, redactions and all. The markdown transcript is gone;
+    nothing rendered is worth filing a bug with.
+  - **The list is the window, not a count.** `/api/logs` answers every event in
+    the selected window — live ring plus the whole replayed Activity journal,
+    with no row limit (both the server's 1000-event cap and the client's
+    300-row slice are retired). The only boundary left is the request log's own
+    retention, and that boundary is told honestly: a journalled row whose
+    conversation rotated out of the chain is greyed history carrying the reason
+    instead of a click that answered `no log for this conversation`; the boot
+    log warns when the size caps cannot span `history_hours`; a cold start says
+    `indexing` while the disk index is still being built. The 1 s poll carries
+    `If-None-Match`, so a wide window costs a `304` while nothing is new.
+
+  Nothing here needs a new setting: retention stays `request_log_max_bytes ×
+  (1 + request_log_max_files)`, and every width `history_hours` offers is now
+  actually reachable.
+
 ## v0.25.0 — 2026-10-29
 
 ### Added

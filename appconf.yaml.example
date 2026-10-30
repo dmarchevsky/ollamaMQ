@@ -102,6 +102,12 @@ settings:
                               # (a docker-compose layout beside config/ uses ../logs/ollamamq-requests.jsonl).
   request_log_max_bytes: 10485760             # rotate when file exceeds this (default 10 MiB)
   request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
+                              # Together these two ARE the Logs page's memory: the list shows every
+                              # event in the window you pick and the viewer opens any conversation the
+                              # chain still holds — so `max_bytes × (1 + max_files)` divided by your
+                              # traffic is how far back a click works. 5 × 10 MiB is a couple of hours
+                              # on a busy box; raise both to make `history_hours` honest. The boot log
+                              # warns when the chain cannot span `history_hours` at the current caps.
   request_log_flush_secs: 5                     # write a conversation out after this much quiet (default 5 s)
   log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
   history_hours: 24                          # Activity (Overview) history depth, and the age its journaled
