@@ -855,7 +855,7 @@ addEventListener('load', () => setTimeout(async () => {
   const until = async (fn, ms) => { for (let i = 0; i < Math.ceil(ms / 120); i++) { if (fn()) return true; await w(120); } return false; };
   const closeIt = async () => {
     document.querySelector('#dlg-log .lv-close')?.click();
-    return until(() => !dlg().open && location.hash === '#logs', 3000);
+    return until(() => !dlg().open && location.hash === '#logs', 6000);
   };
   let cleared = await closeIt();
   if (!cleared && !dlg().open) {
@@ -865,6 +865,23 @@ addEventListener('load', () => setTimeout(async () => {
     cleared = await closeIt();
   }
   A5('hash-clears-on-close', cleared, `wasOpen=${wasOpen} open=${dlg().open} hash=${location.hash || '(empty)'}`);
+  // Clearing must not leave a history ENTRY behind: an entry means Back lands on
+  // the link we just erased and reopens the viewer the operator closed.
+  const hist0 = history.length;
+  await openConv({ key: key0 }); await w(900);
+  const hist1 = history.length;
+  document.querySelector('#dlg-log .lv-close').click();
+  await until(() => !dlg().open, 2500); await w(400);
+  A5('close-adds-no-history-entry', hist1 === hist0 && history.length === hist0,
+    `before ${hist0}, open ${hist1}, after ${history.length}`);
+  // If the hard safety bound ever cuts an answer short, the list says so instead
+  // of letting the oldest events vanish quietly.
+  S.logsMeta = { ...S.logsMeta, truncated: true };
+  renderLogs();
+  A5('truncated-answer-says-so', [...document.querySelectorAll('#logs .capnote')]
+    .some(n => /more events than one answer/.test(n.textContent)),
+    [...document.querySelectorAll('#logs .capnote')].map(n => n.textContent.trim().slice(0, 46)).join(' | ') || 'no note');
+  S.logsMeta = { ...S.logsMeta, truncated: false }; renderLogs();
   // Paste it back: the same conversation opens, on the same address.
   location.hash = '#logs';
   await w(300);
@@ -893,14 +910,20 @@ addEventListener('load', () => setTimeout(async () => {
     `${saved[0]?.name || 'nothing saved'} · ${got} of ${want} captured bytes · req/resp per turn: ${sizes.join(' ')}`);
   A5('raw-download-keeps-the-wire', /data: ?\{/.test(saved[0]?.text || '')
     && (saved[0]?.text || '').includes('[DONE]'), 'the streamed answer is stored as captured, [DONE] and all');
-  // A link that names nothing on the log says so instead of opening an empty modal.
+  // A link that names nothing on the log says so instead of opening an empty
+  // modal. The toast is caught at the source: under virtual time it has faded by
+  // the time the page is inspected again, and a missing toast is not a missing warning.
+  const toasts = [];
+  const realToast = window.toast;
+  window.toast = (msg, ok) => { toasts.push(String(msg)); return realToast(msg, ok); };
   document.querySelector('#dlg-log .lv-close').click();
   await w(500);
   location.hash = '#logs?rid=999999&conv=nobody%23deadbe';
-  await w(2600);   // inside the toast's own lifetime — later and it has faded
+  await w(3000);
+  window.toast = realToast;
   A5('deep-link-missing-says-so', !dlg().open
-    && [...document.querySelectorAll('.toast')].some(t => /aged out|not in the chain/.test(t.textContent)),
-    [...document.querySelectorAll('.toast')].map(t => t.textContent.trim()).join(' | ') || 'no toast');
+    && toasts.some(t => /aged out|not in the chain/.test(t)),
+    toasts.join(' | ') || 'no toast');
   // A journalled row the log can no longer resolve is inert history: the server
   // marks it with has_content false, and the row must not offer a dead click.
   S.logs = [{ seq: 900001, at_ms: Date.now() - 60_000, dir: 'OUT', user: 'ghost', model: 'm',

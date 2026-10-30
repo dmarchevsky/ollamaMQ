@@ -793,6 +793,12 @@ struct LogQuery {
     /// the old count shape (`limit` alone) keeps working for old callers and
     /// defaults to 300 events when neither parameter is given.
     since: Option<u64>,
+    /// How wide the caller's window is (ms), sent alongside `since`. `since`
+    /// slides forward with every poll, so it cannot identify the ANSWER — two
+    /// polls one second apart ask the same question in every way that matters.
+    /// The change-tag hashes this instead, which is what makes the 304 path
+    /// reachable from a live 1 s poll at all.
+    win: Option<u64>,
 }
 
 /// One `/api/logs` answer: the window itself, plus an honest account of its
@@ -877,7 +883,15 @@ async fn list_logs(
         (base + logs.len() as u64, in_window as u64)
     };
     let tag = logs_tag([
-        since.unwrap_or(u64::MAX),
+        // The window's IDENTITY, not its moving start: asked one second later
+        // the question is the same question, so hashing `since` alone would
+        // make a 304 impossible on a live poll. Callers that send no `win`
+        // (old count-shaped ones) keep the previous behaviour.
+        match (q.win, since) {
+            (Some(w), _) => w,
+            (None, Some(s)) => s,
+            (None, None) => u64::MAX,
+        },
         limit as u64,
         ring_tag.0,
         ring_tag.1,
@@ -2179,6 +2193,66 @@ mod tests {
             tag,
             "a changed window carries a new tag"
         );
+    }
+
+    /// The poll that matters: the Logs page asks for its window every second,
+    /// and each ask starts a second later than the last. Sliding `since` must
+    /// not count as a change — if it did, the 304 path existed only in tests
+    /// and a 48 h window was re-sent whole once a second in production.
+    #[tokio::test]
+    async fn logs_etag_survives_the_window_sliding_forward() {
+        let state = test_state();
+        let ev = LogEvent {
+            at: std::time::SystemTime::now(),
+            dir: "IN",
+            user: "u".into(),
+            model: None,
+            backend: None,
+            info: "e1".into(),
+            content: None,
+            rid: None,
+            session: None,
+            redacted: false,
+        };
+        state.log_event(ev);
+        let base = serve(state.clone()).await;
+        let c = http();
+        let first = c
+            .get(format!("{base}/ui/api/logs?since=1000&win=86400000"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap();
+        let tag = first
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        drop(first);
+        // One second later, same width, nothing new: the answer is "nothing".
+        let again = c
+            .get(format!("{base}/ui/api/logs?since=1001&win=86400000"))
+            .basic_auth("admin", Some("pw"))
+            .header(header::IF_NONE_MATCH, &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            again.status(),
+            StatusCode::NOT_MODIFIED,
+            "a poll one second later must not re-fetch the window"
+        );
+        // A different width is a different question, unchanged data or not.
+        let wider = c
+            .get(format!("{base}/ui/api/logs?since=1&win=90000000"))
+            .basic_auth("admin", Some("pw"))
+            .header(header::IF_NONE_MATCH, &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wider.status(), StatusCode::OK, "48 h is not 25 h");
     }
 
     /// A journalled row the conversation chain cannot open renders as inert

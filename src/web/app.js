@@ -226,13 +226,20 @@ async function api(method, path, body) {
  *  only limit. The change-tag dance rides along: a poll that changed nothing
  *  is a 304 and returns null, and the caller keeps the list it already has.
  *  (Not routed through api(): a 304 has no body, and api() reads bodies.) */
-let logsTag = null, logsTagSince = null;
+let logsTag = null, logsTagWin = null;
 async function fetchLogs() {
-  const since = Math.floor(nowish() - winMs(S.filters.win));
-  if (DEMO) return window.DemoApi.handle('GET', 'logs?since=' + since);
+  const win = S.filters.win || '';
+  const winMs_ = winMs(win);
+  const since = Math.floor(nowish() - winMs_);
+  if (DEMO) return window.DemoApi.handle('GET', `logs?since=${since}&win=${winMs_}`);
   const headers = { 'X-OllamaMQ-UI': '1' };
-  if (logsTag && logsTagSince === since) headers['If-None-Match'] = logsTag;
-  const res = await fetch('api/logs?since=' + since, { headers });
+  // Keyed on the window, not on `since`: `since` slides forward every poll, and
+  // a tag that has to be re-fetched because it was asked one second later is
+  // worthless. The server's tag describes the window's content (rows in it and
+  // their newest stamp), so "unchanged since you last asked for THIS window" is
+  // exactly what a 304 means here. Any other window re-asks from scratch.
+  if (logsTag && logsTagWin === win) headers['If-None-Match'] = logsTag;
+  const res = await fetch(`api/logs?since=${since}&win=${winMs_}`, { headers });
   if (res.status === 401) {
     location.href = 'login?next=' + encodeURIComponent(location.pathname + location.hash);
     throw new Error('sign in required');
@@ -243,7 +250,7 @@ async function fetchLogs() {
   try { data = text ? JSON.parse(text) : null; } catch { data = null; }
   if (!res.ok) throw new Error((data && data.error) || text || `${res.status} ${res.statusText}`);
   logsTag = res.headers.get('ETag');
-  logsTagSince = since;
+  logsTagWin = win;
   return data;
 }
 
@@ -1799,15 +1806,15 @@ function logTable(rounds) {
     <tr><th>Time</th><th>Client</th><th>Model</th><th>Backend</th><th>Round</th></tr>
     ${rounds.map(r => { const e = ev(r); const rid = r.in?.rid ?? r.out?.rid;
       // A journal-restored row opens through the conversation log, and the
-      // server's has_content says whether the log can still resolve it: a
-      // request whose conversation rotated out of the chain is inert history,
-      // never a click that 404s. A journalled row with no rid and no session is
-      // information only either way: seq addresses the live ring.
+      // server's has_content says whether the log can still resolve it: only a
+      // row whose own request id the log can find is clickable, so a request
+      // whose conversation rotated out of the chain is inert history, never a
+      // click that 404s. A journalled row with no rid is information either way
+      // (seq addresses the live ring, which this window no longer holds).
       const dead = !!e.hist && !e.has_content;
       const open = dead ? '' : rid ? `data-action="log-round" data-rid="${rid}"`
-        : e.hist ? (e.session ? `data-action="conv-open" data-user="${esc(e.user)}" data-session="${esc(e.session)}"` : '')
         : `data-action="log-detail" data-seq="${e.seq}"`;
-      const inert = dead || (e.hist && !rid && !e.session);
+      const inert = dead || (e.hist && !rid);
       return `<tr class="${inert ? '' : 'clickable'}" ${open}${dead ? ' title="this conversation has aged out of the log files — the row is all that is left"' : ''}>
       <td class="time">${fmtTime(e.at_ms)}</td>
       <td class="mono">${esc(e.user)}</td>
@@ -1987,7 +1994,15 @@ function renderLogs() {
     : '';
   const indexingNote = meta && meta.indexing
     ? '<p class="hint">indexing the log…</p>' : '';
-  setHTML($('#logs'), warn + chainShort + indexingNote + empty);
+  // The one case where the window is NOT all there: the hard safety bound on a
+  // single answer stopped short. It should never be reached (retention runs out
+  // long before 200 000 events in one window), so when it does, it says so
+  // instead of letting rows vanish quietly.
+  const cutShort = meta && meta.truncated
+    ? '<div class="capnote">This window holds more events than one answer carries — the oldest are '
+      + 'left out. Narrow the window or keep fewer hours.</div>'
+    : '';
+  setHTML($('#logs'), warn + chainShort + cutShort + indexingNote + empty);
 }
 
 // --- Conversation viewer
@@ -2101,7 +2116,10 @@ const lvHashWrite = () => {
 const lvHashClear = () => {
   deepSeen = null;
   deepPending = null;
-  if (location.hash.startsWith('#logs?')) location.hash = '#logs';
+  // Replace, never assign: an assigned `#logs` is a history ENTRY, and Back
+  // would land on the deep link we just cleared and reopen the viewer the
+  // operator closed. Same reason the open itself uses replaceState.
+  if (location.hash.startsWith('#logs?')) history.replaceState(null, '', '#logs');
 };
 /** Open what the address names: rid -> conv -> seq, each form falling through
  *  when the server cannot resolve it. openConv reports its own success. */
@@ -3120,7 +3138,8 @@ function transcriptView(body, rid) {
 /** Parse a streamed capture into its parts — reconstructed text, thinking,
  *  tool calls, finish reason, usage — or null when it is not a stream. OpenAI
  *  SSE (`data: {…}` lines + `[DONE]`) or Ollama-native line-delimited JSON.
- *  The viewer renders this to HTML; the markdown download writes it as text. */
+ *  The viewer renders this to HTML; the raw download hands out the bytes as they
+ *  were captured, so this parser is the only place a stream is reassembled. */
 function streamState(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   if (!lines.length) return null;
