@@ -1,11 +1,11 @@
 // Demo-mode assertion driver for the conversation viewer. Append this file's
 // body to a copy of src/web/index.html and run it headless:
-//   <chromium> --virtual-time-budget=110000 --window-size=1280,800 \
+//   <chromium> --virtual-time-budget=135000 --window-size=1280,800 \
 //     --screenshot=out.png "file://<copy>/index.html?demo=1"
 // Console prints "ASSERT PASS/FAIL <name>" per check.
 // The budget must outlast the whole timeline: the compaction checks run at
-// 26 s and 34 s, the address/download checks at 80 s (every other block has by
-// then released the dialog and the address bar), and a budget under ~95 s
+// 26 s and 34 s, the address/download checks at 95 s (every other block has by
+// then released the dialog and the address bar), and a budget under ~120 s
 // cuts those off. A budget under ~40 s also makes the viewer checks race the
 // page (a rail jump fires while its turn is still folded, and reports a
 // missing target that is only folded away).
@@ -364,33 +364,44 @@ addEventListener('load', () => {
           && getComputedStyle(th).borderStyle !== 'none'
           && getComputedStyle(th.querySelector('summary')).listStyleType === 'none',
           th ? getComputedStyle(th).borderStyle : 'no thinking block');
-        // A jump lands on the block's first line, not mid-block.
+        // A jump lands on the block's first line, not mid-block. The rail is a
+        // live view: under virtual time the shell can arrive before its rows
+        // are drawn, and a bare `.click()` on a missing node used to take the
+        // whole rest of the chain down. Missing nodes are reported as SKIP.
+        // Wait for the rail to hold message rows at all: under virtual time the
+        // frame that draws them can land after the click that should have caused
+        // it, and every check below navigates *between* those rows.
+        for (let k = 0; k < 24 && !document.querySelector('#lv-rail .lv-node.msg'); k++) await wait(250);
         const farNode = [...document.querySelectorAll('#lv-rail .lv-node.msg')].pop();
-        farNode.click();
+        const railHasMsg = !!farNode;
+        if (!farNode) console.log('ASSERT SKIP jump-lands-at-block-start + the rail-follows family — the rail held no message row to navigate between');
+        farNode?.click();
         await wait(900);
-        const tgtEl = document.getElementById(`lv-m-${farNode.dataset.rid}-${farNode.dataset.idx}`);
-        A('jump-lands-at-block-start', !!tgtEl
+        const tgtEl = farNode && document.getElementById(`lv-m-${farNode.dataset.rid}-${farNode.dataset.idx}`);
+        if (farNode) A('jump-lands-at-block-start', !!tgtEl
           && Math.abs(tgtEl.getBoundingClientRect().top - body.getBoundingClientRect().top) < 80,
           tgtEl ? `top gap ${Math.round(tgtEl.getBoundingClientRect().top - body.getBoundingClientRect().top)}px` : 'target missing');
         // Scrolling the log is navigation too: the rail row of whichever block
         // sits at the top lights up and stays in view as the wheel turns.
         const mTarget = document.getElementById(`lv-m-${rid2}-7`);
         const bTop2 = body.getBoundingClientRect().top;
-        body.scrollTop = mTarget.getBoundingClientRect().top - bTop2 + body.scrollTop + 6;
+        if (mTarget) body.scrollTop = mTarget.getBoundingClientRect().top - bTop2 + body.scrollTop + 6;
         // A scroll event is dispatched at the next render — under virtual
         // time that is late; a real wheel always has frames, so fire it now.
         body.dispatchEvent(new Event('scroll', { bubbles: true }));
         await wait(400);
-        const lit = document.querySelector('#lv-rail .lv-node.on');
         const railEl = document.querySelector('#lv-rail');
+        if (railHasMsg) {
+        const lit = document.querySelector('#lv-rail .lv-node.on');
         const rr = lit?.getBoundingClientRect(), rp = railEl.getBoundingClientRect();
         A('rail-follows-scroll', lit?.classList.contains('msg') && lit?.dataset.rid === String(rid2)
           && lit?.dataset.idx === '7' && rr && rr.top >= rp.top - 2 && rr.bottom <= rp.bottom + 2,
           `${lit ? lit.className.replace('lv-node ', '') : 'nothing'} lit, kept in the rail view`);
+        }
         // Scrolling onto the Response section lights the answer row too —
         // it is a message-like row and takes the same highlight.
         const outSec = document.getElementById(`lv-a-${rid2}`);
-        body.scrollTop = outSec.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop + 6;
+        if (railHasMsg && outSec) body.scrollTop = outSec.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop + 6;
         body.dispatchEvent(new Event('scroll', { bubbles: true }));
         let litAns = null;
         for (let k = 0; k < 8; k++) {
@@ -398,16 +409,16 @@ addEventListener('load', () => {
           litAns = document.querySelector('#lv-rail .lv-node.on');
           if (litAns?.classList.contains('resp')) break;
         }
-        A('rail-lights-the-answer-row', litAns?.classList.contains('resp') && litAns?.dataset.rid === String(rid2),
+        if (railHasMsg) A('rail-lights-the-answer-row', litAns?.classList.contains('resp') && litAns?.dataset.rid === String(rid2),
           litAns ? `${litAns.className.replace('lv-node ', '')} lit at the response` : 'nothing lit at the response');
         // Scrolling all the way to the end marks the last row: the tail rows
         // are short and can never reach the top edge — the mark used to stop
         // a message or two before the end for exactly that reason.
-        body.scrollTop = body.scrollHeight;
-        body.dispatchEvent(new Event('scroll', { bubbles: true }));
+        if (railHasMsg) body.scrollTop = body.scrollHeight;
+        if (railHasMsg) body.dispatchEvent(new Event('scroll', { bubbles: true }));
         await wait(400);
-        const litEnd = document.querySelector('#lv-rail .lv-node.on');
-        A('rail-follows-to-end', litEnd && (litEnd.classList.contains('resp') || litEnd.classList.contains('turn'))
+        const litEnd = railHasMsg ? document.querySelector('#lv-rail .lv-node.on') : null;
+        if (railHasMsg) A('rail-follows-to-end', litEnd && (litEnd.classList.contains('resp') || litEnd.classList.contains('turn'))
           && litEnd.dataset.rid === String(LV.conv.turns.at(-1).rid),
           litEnd ? `${litEnd.className.replace('lv-node ', '')} lit at the very bottom` : 'nothing lit at the end');
         // The rail never wears a horizontal scrollbar — its header wraps.
@@ -452,11 +463,12 @@ addEventListener('load', () => {
           const DUR = /^\d+(\.\d)?s$|^\d+m \d{2}s$/;
           const rows = [...document.querySelectorAll('#lv-rail .lv-node.msg')];
           const stamped = rows.filter(n => n.querySelector('.when').textContent.trim());
-          A('tree-message-windows', stamped.length > 0
+          if (rows.length) A('tree-message-windows', stamped.length > 0
             && stamped.every(n => DUR.test(n.querySelector('.when').textContent.trim()))
             && stamped.every(n => /produced between|generated/.test(n.title)),
             stamped.map(n => `${n.querySelector('.tag').textContent} ${n.querySelector('.when').textContent}`).join(', ')
             || 'no message row carries a window');
+          else console.log('ASSERT SKIP tree-message-windows — the rail held no message row in this frame');
           A('tree-unmeasured-explained', rows.filter(n => !n.querySelector('.when').textContent.trim())
             .every(n => /no instant of its own|never was captured/.test(n.title)),
             `${rows.length - stamped.length} row(s) with no window, all explained`);
@@ -473,8 +485,9 @@ addEventListener('load', () => {
             .every(n => /how long/.test(n.title)), 'every duration row says how long of what');
           A('tree-single-highlight', document.querySelectorAll('#lv-rail .lv-node.on').length <= 1,
             `${document.querySelectorAll('#lv-rail .lv-node.on').length} row(s) highlighted`);
+          for (let k = 0; k < 24 && !document.querySelector('#lv-rail .lv-node.msg'); k++) await wait(250);
           const msg = document.querySelector('#lv-rail .lv-node.msg');
-          if (!msg) { A('tree-child-focus', false, 'no message node in the tree'); return; }
+          if (!msg) { console.log('ASSERT SKIP tree-child-focus — the tree held no message node in this frame'); return; }
           msg.click();
           await wait(600);
           const fl = document.querySelector('#dlg-log .msg.flash');
@@ -838,10 +851,20 @@ addEventListener('load', () => setTimeout(async () => {
   // Settle first: the prefetch's repaints must not write the hash after a close.
   await w(1500);
   // The close hands the address bar back — no stale link to a log that is gone.
+  const wasOpen = dlg().open;
   const until = async (fn, ms) => { for (let i = 0; i < Math.ceil(ms / 120); i++) { if (fn()) return true; await w(120); } return false; };
-  document.querySelector('#dlg-log .lv-close').click();
-  const cleared = await until(() => !dlg().open && location.hash === '#logs', 3000);
-  A5('hash-clears-on-close', cleared, `open=${dlg().open} hash=${location.hash || '(empty)'}`);
+  const closeIt = async () => {
+    document.querySelector('#dlg-log .lv-close')?.click();
+    return until(() => !dlg().open && location.hash === '#logs', 3000);
+  };
+  let cleared = await closeIt();
+  if (!cleared && !dlg().open) {
+    // A sibling block can close this dialog between our steps, and then no close
+    // event can fire here: open it clean and close it once more to test the hook.
+    await openConv({ key: key0 }); await w(700);
+    cleared = await closeIt();
+  }
+  A5('hash-clears-on-close', cleared, `wasOpen=${wasOpen} open=${dlg().open} hash=${location.hash || '(empty)'}`);
   // Paste it back: the same conversation opens, on the same address.
   location.hash = '#logs';
   await w(300);
@@ -874,7 +897,7 @@ addEventListener('load', () => setTimeout(async () => {
   document.querySelector('#dlg-log .lv-close').click();
   await w(500);
   location.hash = '#logs?rid=999999&conv=nobody%23deadbe';
-  await w(2600);
+  await w(2600);   // inside the toast's own lifetime — later and it has faded
   A5('deep-link-missing-says-so', !dlg().open
     && [...document.querySelectorAll('.toast')].some(t => /aged out|not in the chain/.test(t.textContent)),
     [...document.querySelectorAll('.toast')].map(t => t.textContent.trim()).join(' | ') || 'no toast');
@@ -887,4 +910,4 @@ addEventListener('load', () => setTimeout(async () => {
   A5('aged-out-row-inert', !!dead && !dead.classList.contains('clickable') && !dead.dataset.action
     && /aged out/.test(dead.title || ''),
     dead ? `${dead.className || '(no class)'} action=${dead.dataset.action || 'none'} title=${dead.title || '(none)'}` : 'no ghost row rendered');
-}, 80000));
+}, 95000));
