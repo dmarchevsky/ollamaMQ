@@ -276,7 +276,7 @@ function overviewPath() {
 
 async function poll() {
   try {
-    const needLogs = S.page === 'logs';
+    const needLogs = S.page === 'logs' || !!deepPending;
     const needClients = S.page === 'clients' || !S.clients.length;
     const needModels = S.page === 'models' || !S.modelPolicy;
     const needOverview = S.page === 'overview';
@@ -1798,14 +1798,17 @@ function logTable(rounds) {
   return `<table class="logs">
     <tr><th>Time</th><th>Client</th><th>Model</th><th>Backend</th><th>Round</th></tr>
     ${rounds.map(r => { const e = ev(r); const rid = r.in?.rid ?? r.out?.rid;
-      // A journal-restored row without a rid (refused traffic, control records)
-      // is information only: seq addresses the live ring, so clicking it could
-      // open nothing. Rows that name a conversation still open it.
-      const open = rid ? `data-action="log-round" data-rid="${rid}"`
+      // A journal-restored row opens through the conversation log, and the
+      // server's has_content says whether the log can still resolve it: a
+      // request whose conversation rotated out of the chain is inert history,
+      // never a click that 404s. A journalled row with no rid and no session is
+      // information only either way: seq addresses the live ring.
+      const dead = !!e.hist && !e.has_content;
+      const open = dead ? '' : rid ? `data-action="log-round" data-rid="${rid}"`
         : e.hist ? (e.session ? `data-action="conv-open" data-user="${esc(e.user)}" data-session="${esc(e.session)}"` : '')
         : `data-action="log-detail" data-seq="${e.seq}"`;
-      const inert = e.hist && !rid && !e.session;
-      return `<tr class="${inert ? '' : 'clickable'}" ${open}>
+      const inert = dead || (e.hist && !rid && !e.session);
+      return `<tr class="${inert ? '' : 'clickable'}" ${open}${dead ? ' title="this conversation has aged out of the log files — the row is all that is left"' : ''}>
       <td class="time">${fmtTime(e.at_ms)}</td>
       <td class="mono">${esc(e.user)}</td>
       <td class="trunc ${e.model ? '' : 'none'}">${esc(e.model ?? '—')}</td>
@@ -1841,10 +1844,15 @@ function logConvs(rounds) {
       g = { kind: 'conv', key, user: e.user, session: e.session, label: e.session_label || null,
         models: new Set(), backends: new Set(), reqs: 0, inBytes: 0, outBytes: 0, errors: 0,
         first: e.at_ms, at: e.at_ms, rid: e.rid ?? null, lastStatus: null, lastOutcome: null,
-        statusAt: 0, redacted: false, waiting: false, cmp: 0, flagList: [] };
+        statusAt: 0, redacted: false, waiting: false, cmp: 0, flagList: [],
+        // Whether the row may be clicked at all: a live row always opens (its
+        // text may be missing, the conversation is there), a journalled one only
+        // when the log can still resolve it.
+        open: !e.hist || !!e.has_content };
       byKey.set(key, g);
       items.push(g);
     }
+    if (!e.hist || e.has_content) g.open = true;
     g.first = Math.min(g.first, e.at_ms);
     if (e.at_ms >= g.at) { g.at = e.at_ms; if (e.rid != null) g.rid = e.rid; }
     if (e.model) g.models.add(e.model);
@@ -1909,8 +1917,10 @@ function convTable(rounds) {
         <td class="round"><div class="rline">${roundSegs(it.r)}${roundFlags(it.r).length ? ' ' + flagBadges(roundFlags(it.r)) : ''}</div></td></tr>`;
     }
     const g = it, model = listSome(g.models), bk = listSome(g.backends);
-    return `<tr class="clickable" data-action="conv-open" data-session="${esc(g.session)}" data-user="${esc(g.user)}"${g.rid != null ? ` data-rid="${g.rid}"` : ''}
-      title="${esc(g.user)} \u00b7 ${fmtTime(g.first)} \u2192 ${fmtTime(g.at)} \u00b7 ${g.reqs} requests">
+    const span = `${esc(g.user)} \u00b7 ${fmtTime(g.first)} \u2192 ${fmtTime(g.at)} \u00b7 ${g.reqs} requests`;
+    return `<tr class="${g.open ? 'clickable' : ''}" ${g.open
+        ? `data-action="conv-open" data-session="${esc(g.session)}" data-user="${esc(g.user)}"${g.rid != null ? ` data-rid="${g.rid}"` : ''} title="${esc(span)}"`
+        : 'title="this conversation has aged out of the log files — the row is all that is left"'}>
       <td class="time">${fmtTime(g.at)}</td>
       <td><span class="mono">${esc(g.user)}</span>${sessTag(g)}</td>
       <td class="trunc ${model ? '' : 'none'}">${model ?? '—'}</td>
@@ -1985,7 +1995,7 @@ function renderLogs() {
 // Full-screen dialog over one conversation. Every turn is a block on one
 // timeline carrying the timestamps the proxy measured (queue, dispatch, first
 // token, end), the quiet stretch between two turns is named by the tools that
-// ran in it, and Raw/Formatted, download, reload and request navigation
+// ran in it, and download, reload and request navigation
 // (⏮ ‹ › ⏭) work over the whole conversation instead of one request round.
 // The index arrives without body text — a conversation resends its whole
 // history every turn, so sending text with it would refetch hundreds of
@@ -2056,6 +2066,70 @@ function lvHidden(i) {
   return prev > 0 && prev < lvMsgCount(turns[i]) ? prev : 0;
 }
 
+/** --- The log's address ---------------------------------------------------
+ *
+ * While a log is open the address bar names it, so sharing a log is copying the
+ * URL — there is no copy button and no clipboard code. `#logs?rid=<focus>&conv=<key>`
+ * for a request's conversation, `#logs?seq=<seq>` for a control event. Steps
+ * rewrite it with replaceState so Back leaves the viewer instead of walking
+ * every request, and closing restores the plain `#logs` — a bar copied after
+ * the close cannot name a log that is no longer on screen. A pasted link is
+ * read in priority order rid -> conv -> seq, each form falling through when the
+ * server cannot resolve it (a conversation whose key aged out may still hold
+ * the request the link names, and the other way round). */
+let deepPending = null, deepSeen = null, deepBusy = false;
+const deepArgs = () => {
+  const h = location.hash.slice(1);
+  if (!h.startsWith('logs?')) return null;
+  const q = new URLSearchParams(h.slice('logs?'.length));
+  const out = {};
+  for (const k of ['rid', 'conv', 'seq']) if (q.get(k)) out[k] = q.get(k);
+  return Object.keys(out).length ? out : null;
+};
+/** Write the open log into the address bar. replaceState, so stepping through a
+ *  conversation never stacks a history entry per request. */
+const lvHashWrite = () => {
+  if (!LV.conv) return;
+  const ctl = String(LV.conv.key || '').startsWith('ctl:');
+  const key = LV.conv.key && !ctl ? `&conv=${encodeURIComponent(LV.conv.key)}` : '';
+  const h = `#logs?${ctl ? 'seq' : 'rid'}=${LV.rid ?? ''}${key}`;
+  deepSeen = h;              // our own write is not a link to follow
+  history.replaceState(null, '', h);
+};
+const lvHashClear = () => {
+  deepSeen = null;
+  deepPending = null;
+  if (location.hash.startsWith('#logs?')) location.hash = '#logs';
+};
+/** Open what the address names: rid -> conv -> seq, each form falling through
+ *  when the server cannot resolve it. openConv reports its own success. */
+async function openDeep(p) {
+  const tries = [
+    p.rid && (() => openConv({ rid: +p.rid }, { silent: true })),
+    p.conv && (() => openConv({ key: p.conv }, { silent: true })),
+    p.seq && (async () => { await openSeq(+p.seq); return true; }),
+  ].filter(Boolean);
+  for (const t of tries) {
+    try { if (await t()) return true; }
+    catch { /* next form */ }
+  }
+  return false;
+}
+/** Called at the end of every poll: an address that names a log opens once, and
+ *  once per address — a link already on screen is not reopened by the next poll. */
+async function maybeOpenDeepLink() {
+  const p = deepPending;
+  if (!p || deepBusy) return;
+  deepPending = null;
+  const h = location.hash;
+  if (h === deepSeen) return;
+  deepBusy = true;
+  try {
+    if (await openDeep(p)) deepSeen = h;
+    else toast('that log is not in the chain any more — it aged out of the log files', false);
+  } finally { deepBusy = false; }
+}
+
 /** Open the viewer on a conversation: by request id (a row) or by the client
  *  and conversation tag (a conversation header). Either way the server picks
  *  the conversation, because it owns the keys. */
@@ -2076,6 +2150,10 @@ async function openConv({ rid, session, user, key } = {}, { silent = false } = {
     return;
   }
   const resuming = LV.conv && LV.conv.key === conv.key;
+  // A log opened from the Overview shows up where it belongs: the Logs page.
+  // (replaceState, not a jump, when the viewer is already open — a step must
+  // not add a history entry per request.)
+  if (S.page !== 'logs' && !resuming) location.hash = '#logs';
   LV.conv = conv;
   LV.rid = rid || (resuming && LV.rid) || conv.turns.at(-1)?.rid || null;
   LV.open = new Set(LV.rid != null ? [LV.rid] : []);
@@ -2094,6 +2172,7 @@ async function openConv({ rid, session, user, key } = {}, { silent = false } = {
   lvPrefetch();
   lvAutoStart();
   lvHashWrite();
+  return true;
 }
 
 /** The viewer header's second line: conversation id, its name when it has
@@ -2155,6 +2234,7 @@ async function openSeq(seq) {
   const dlg = $('#dlg-log');
   if (!dlg.open) dlg.showModal();
   await lvDraw({ scroll: true });
+  lvHashWrite();
 }
 
 /** Captured text of one turn, fetched once and kept for the session. */
@@ -2721,64 +2801,6 @@ async function lvDownload() {
   lvSave(line + '\n', base + '.jsonl', 'application/x-ndjson');
 }
 
-/**
- * The conversation as a transcript: what the viewer shows, in a file. One
- * section per request with its measured timeline, the messages the request
- * actually added (the history it resent is named, not repeated), and the
- * response reconstructed to text — thinking, answer, tool calls, usage.
- */
-function lvMarkdown(conv, content, turns) {
-  const out = [`# ${conv.user}${conv.session ? ` · #${sessName(conv)}` : ''}`, ''];
-  if (conv.session_label) out.push(conv.session_label, '');
-  if (conv.redacted) out.push('_Body capture was switched off for part of this conversation; the timeline, sizes and roles below are complete._', '');
-  out.push(`_${turns.length} ${turns.length === 1 ? 'request' : 'requests'} · ${fmtTime(conv.start_ms)} → ${fmtTime(conv.end_ms)}${conv.model ? ` · ${conv.model}` : ''}${conv.backend ? ` → ${conv.backend}` : ''}_`, '');
-  turns.forEach((t, i) => {
-    const c = content.get(t.rid) || {};
-    out.push(`## Request ${i + 1} — ${fmtTime(t.at_ms)}${t.tl?.end != null ? ` → ${fmtTime(t.tl.end)}` : ' (running)'}`, '',
-      `> ${lvStages(t).replace(/<[^>]*>/g, '')}${t.status != null ? ` · HTTP ${t.status}` : ''}${t.outcome && t.outcome !== 'ok' ? ` · ${t.outcome}` : ''}`, '');
-    const prev = i > 0 ? lvMsgCount(turns[i - 1]) : 0;
-    const msgs = c.reqObj?.messages || [];
-    // What an earlier turn already sent is not repeated here; the count says so.
-    const cut = prev > 0 && prev < msgs.length ? prev : 0;
-    out.push(`**Request** ${[t.method, t.path, t.req?.bytes != null ? fmtBytes(t.req.bytes) : null,
-      msgs.length ? `${msgs.length} messages${cut ? `, ${msgs.length - cut} new` : ''}` : null]
-      .filter(Boolean).join(' ')}`, '');
-    if (c.req == null) out.push(t.redacted ? '_text redacted — X-Redact-Log header or client/key/backend setting_' : '_no request text stored_', '');
-    else if (msgs.length) for (const m of msgs.slice(cut)) out.push(...lvMsgMd(m));
-    else out.push('```', c.req, '```', '');
-    out.push(`**Response**${t.resp?.bytes != null ? ` · ${fmtBytes(t.resp.bytes)}` : ''}`, '');
-    if (c.resp == null) out.push(t.redacted ? '_text redacted_' : '_no response text stored_', '');
-    else {
-      const st = streamState(c.resp) || lvPlainResp(c.resp);
-      if (!st) out.push('```', c.resp, '```', '');
-      else {
-        if (st.think) out.push('_thinking_', '', `> ${st.think.replace(/\n/g, '\n> ')}`, '');
-        if (st.text) out.push(st.text.trimEnd(), '');
-        for (const tc of st.tools || [])
-          out.push(`_tool call_ **${tc.name || '?'}**`, '', '```json', lvArgsText(tc.args), '```', '');
-        if (st.usage?.c != null)
-          out.push(`_${fmtNum(st.usage.c)} tokens generated${st.finish ? `, finished \`${st.finish}\`` : ''}${st.cutTail ? ', capture truncated' : ''}_`, '');
-      }
-    }
-  });
-  return out.join('\n');
-}
-
-/** One request message as markdown: role, text, then the calls it issues. */
-function lvMsgMd(m) {
-  const role = String(m.role || 'message').toLowerCase();
-  const label = ROLE_LABEL[role] || role.toUpperCase();
-  const who = role === 'tool' ? (m.name || m.tool_name || m.tool_call_id || '') : '';
-  const think = m.reasoning_content || m.reasoning || '';
-  const text = msgText(m.content, m.images);
-  const out = [`**${label}${who ? ` · ${who}` : ''}**`, ''];
-  if (think) out.push('_thinking_', `> ${String(think).replace(/\n/g, '\n> ')}`, '');
-  if (text) out.push(String(text).trimEnd(), '');
-  for (const tc of m.tool_calls || [])
-    out.push(`_tool call_ **${tc.function?.name ?? tc.name ?? '?'}**`, '', '```json', lvArgsText(tc.function?.arguments), '```', '');
-  return out;
-}
-
 /** A non-stream response has no SSE to rebuild, but reads out the same way. */
 function lvPlainResp(text) {
   const o = tryJson(text);
@@ -2790,17 +2812,6 @@ function lvPlainResp(text) {
     usage: o.usage ? { p: o.usage.prompt_tokens, c: o.usage.completion_tokens } : null,
     finish: o.choices?.[0]?.finish_reason,
   };
-}
-
-/** Tool-call arguments arrive as a JSON string (sometimes mid-stream, so
- *  sometimes not yet valid); pretty-print what parses, pass through the rest. */
-function lvArgsText(args) {
-  if (args == null) return '';
-  if (typeof args === 'string') {
-    const o = tryJson(args);
-    return o === undefined ? args : JSON.stringify(o, null, 2);
-  }
-  return JSON.stringify(args, null, 2);
 }
 
 function lvSave(text, name, type) {
@@ -3868,7 +3879,7 @@ document.addEventListener('keydown', e => {
 // Click on a dialog's backdrop closes it.
 $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close('cancel'); }));
 // A closed viewer must leave no poller behind.
-$('#dlg-log').addEventListener('close', lvAutoStop);
+$('#dlg-log').addEventListener('close', () => { lvAutoStop(); lvHashClear(); });
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
 $$('#log-flag input').forEach(r => r.addEventListener('change', () => {
@@ -3937,7 +3948,6 @@ $('#lv-next').addEventListener('click', () => lvStep(1));
 $('#lv-last').addEventListener('click', () => lvFocus(lvTurns().at(-1)?.rid));
 $('#lv-reload').addEventListener('click', () => lvReload().catch(e => toast(e.message, false)));
 $('#lv-dl').addEventListener('click', () => lvDownload().catch(e => toast(e.message, false)));
-$$('input[name="lv-fmt"]').forEach(r => r.addEventListener('change', () => { S.lv.fmt = r.value; saveLv(); lvDraw({ scroll: true }); }));
 $('#client-filter').addEventListener('change', e => { S.clientFilter = e.target.value; render(); });
 $('#model-search').addEventListener('input', e => { S.modelQuery = e.target.value.trim().toLowerCase(); render(); });
 $('#model-show').addEventListener('change', e => { S.modelShow = e.target.value; render(); });
@@ -4002,6 +4012,9 @@ $('#model-list').addEventListener('change', e => {
 function route() {
   let page = (location.hash.slice(1) || 'overview').split('?')[0];
   if (page === 'users') page = 'clients';  // Users merged into Clients
+  // A pasted or edited `#logs?…` address is a log to open, once the page's own
+  // data has arrived (maybeOpenDeepLink runs at the end of every poll).
+  deepPending = deepArgs();
   const was = S.page;
   S.page = $(`#page-${page}`) ? page : 'overview';
   // A conversation left under the pointer keeps no mark behind: the next Overview

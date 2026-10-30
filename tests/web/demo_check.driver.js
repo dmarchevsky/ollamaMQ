@@ -296,12 +296,25 @@ addEventListener('load', () => {
         const fmt = out();
         A('formatted-stream-is-text', !/data: ?\{|keepalive/.test(fmt)
           && /rotate\(\) loop shifts files/.test(fmt), fmt.replace(/\s+/g, ' ').trim().slice(0, 96));
-        document.querySelector('#lv-fmt label:has(input[value="raw"])').click();
-        await wait(700);
-        const raw = out();
-        A('raw-keeps-the-wire', /data: ?\{/.test(raw) && raw.includes('[DONE]'), `${raw.length} chars of captured bytes`);
-        document.querySelector('#lv-fmt label:has(input[value="fmt"])').click();
-        await wait(500);
+        // There is no Raw/Formatted switch any more: the transcript IS the view,
+        // and the raw capture is what the download hands the browser.
+        A('no-fmt-control', !document.querySelector('#lv-fmt')
+          && !document.querySelector('input[name="lv-fmt"]')
+          && /rotate\(\) loop shifts files/.test(fmt), 'no format control in the header');
+        const saved = [];
+        const realSave = window.lvSave;
+        window.lvSave = (text, name, type) => saved.push({ text, name, type });
+        document.querySelector('#lv-dl').click();
+        await wait(1200);
+        window.lvSave = realSave;
+        const dl = saved[0] || {};
+        let raw1 = null;
+        try { raw1 = JSON.parse(String(dl.text || '').trim()); } catch { /* not JSONL */ }
+        A('download-always-raw', !!raw1 && saved.length === 1 && /\.jsonl$/.test(dl.name || '')
+          && dl.type === 'application/x-ndjson'
+          && (raw1.turns || []).length === lvTurns().length
+          && raw1.turns.some(t => /data: ?\{/.test(t.content?.resp || '') && (t.content?.resp || '').includes('[DONE]')),
+          `${dl.name || 'nothing saved'}: ${(dl.text || '').length} chars, stream bytes as captured`);
         // With its held history on screen, that request's own copy of a
         // re-sent message is what a jump lands on \u2014 not the earlier turn.
         await lvFocusMsg(rid2, 0);
@@ -483,20 +496,41 @@ addEventListener('load', () => {
           A('idle-gap-named', !!document.querySelector('#dlg-log .lv-gap')
             && !!document.querySelector('#lv-rail .lv-node.gapnode'),
             document.querySelector('#dlg-log .lv-gap')?.textContent.trim().slice(0, 64));
-          // The download is a shipped artefact and nothing else looks at it: the
-          // transcript gets exactly one Request and one Response heading per
-          // turn, written as prose rather than as the wire.
+          // The address names the log while it is open: copy the URL now, paste
+          // it in another browser, and the same conversation opens there. Steps
+          // rewrite it, the close clears it, and nothing else does.
+          const key0 = LV.conv.key, hash0 = location.hash;
+          A('hash-names-the-log', /^#logs\?rid=\d+&conv=/.test(hash0), hash0);
+          document.querySelector('#dlg-log .lv-close').click();
+          await wait(400);
+          A('hash-clears-on-close', !$('#dlg-log').open && location.hash === '#logs', location.hash || '(empty)');
+          location.hash = hash0;
+          await wait(1400);
+          A('deep-link-reopens', $('#dlg-log').open && LV.conv && LV.conv.key === key0
+            && location.hash === hash0,
+            `${LV.conv ? LV.conv.key : 'still closed'} @ ${location.hash}`);
+          document.querySelector('#dlg-log .lv-close').click();
+          await wait(300);
+          await openConv({ rid: t2.rid });
+          await wait(600);
+          // And the download carries EVERY turn's captured text — the raw log is
+          // the artefact now, so a two-turn conversation must arrive complete.
           for (const t of lvTurns()) await lvLoad(t.rid);
-          const md = lvMarkdown(LV.conv, LV.content, lvTurns());
-          const lines = md.split('\n');
-          const reqL = lines.filter(l => l.startsWith('**Request**'));
-          A('transcript-headings', reqL.length === lvTurns().length
-            && lines.filter(l => l.startsWith('**Response**')).length === lvTurns().length,
-            `${reqL.length} request headings for ${lvTurns().length} turns: ${reqL.join(' / ').slice(0, 72)}`);
-          A('transcript-is-prose', !/data: ?\{|\[DONE\]/.test(md)
-            && /rotate\(\) loop shifts files/.test(md)
-            && /messages, \d+ new/.test(md),
-            `${md.length} chars, stream read back as text, the held history named as a count`);
+          const saved2 = [];
+          const real2 = window.lvSave;
+          window.lvSave = (text, name, type) => saved2.push({ text, name, type });
+          document.querySelector('#lv-dl').click();
+          await wait(1400);
+          window.lvSave = real2;
+          const dl2 = saved2[0] || {};
+          let raw2 = null;
+          try { raw2 = JSON.parse(String(dl2.text || '').trim()); } catch { /* not JSONL */ }
+          const perTurn = (raw2?.turns || []).map(t => [t.rid, String(t.content?.req ?? '').length, String(t.content?.resp ?? '').length]);
+          A('raw-download-complete', !!raw2 && (raw2.turns || []).length === lvTurns().length
+            && (raw2.turns || []).every(t => String(t.content?.req ?? '').length > 40
+              && String(t.content?.resp ?? '').length > 40)
+            && raw2.user === LV.conv.user && raw2.key === LV.conv.key,
+            perTurn.map(x => `rid ${x[0]}: ${x[1]}B req / ${x[2]}B resp`).join(' | ') || 'no download');
           // The tree's width is yours: drag, keys, double-click to reset, and it
           // is remembered like the other viewer choices.
           const grip = document.querySelector('#lv-grip');
