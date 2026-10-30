@@ -948,7 +948,7 @@ impl ConvLogger {
     }
 
     /// Every turn `rid` the conversation log can resolve right now (hot store
-    /// + disk index) as ONE pass — the Logs page marks its rows clickable
+    /// and disk index) as ONE pass: the Logs page marks its rows clickable
     /// from membership in this set instead of probing the log per row (same
     /// single-pass shape as [`Self::max_rid`], which is its boot-only sibling).
     pub fn resolvable_rids(&self) -> std::collections::HashSet<u64> {

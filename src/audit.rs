@@ -1229,6 +1229,13 @@ impl Audit {
         }
     }
 
+    /// How many verdict records the live view holds. Rides the Logs
+    /// change-tag so a flag landing after its row was served still changes
+    /// the answer instead of hiding behind an unconditional 304.
+    pub fn live_flags(&self) -> u64 {
+        self.live.lock_or_recover().len() as u64
+    }
+
     /// Verdicts of one request; the newest answer wins.
     pub fn flags_for(&self, rid: u64) -> Option<Vec<Flag>> {
         let live = self.live.lock_or_recover();
