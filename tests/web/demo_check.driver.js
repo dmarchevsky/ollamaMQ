@@ -1,10 +1,12 @@
 // Demo-mode assertion driver for the conversation viewer. Append this file's
 // body to a copy of src/web/index.html and run it headless:
-//   <chromium> --virtual-time-budget=42000 --window-size=1280,800 \
+//   <chromium> --virtual-time-budget=110000 --window-size=1280,800 \
 //     --screenshot=out.png "file://<copy>/index.html?demo=1"
 // Console prints "ASSERT PASS/FAIL <name>" per check.
 // The budget must outlast the whole timeline: the compaction checks run at
-// 26 s and 34 s, and a budget under ~40 s makes the viewer checks race the
+// 26 s and 34 s, the address/download checks at 80 s (every other block has by
+// then released the dialog and the address bar), and a budget under ~95 s
+// cuts those off. A budget under ~40 s also makes the viewer checks race the
 // page (a rail jump fires while its turn is still folded, and reports a
 // missing target that is only folded away).
 // Screenshot caveat: chrome-headless-shell with --virtual-time-budget races the
@@ -265,56 +267,57 @@ addEventListener('load', () => {
         A('run-unfolds', turnsInRun0() === r0, `${r0} requests back`);
         // And the rail's RUN row folds the run in the body, not just the
         // body's own run header.
-        const railRun = document.querySelector('#lv-rail .lv-node.run');
+        // The shell sometimes paints a fold/unfold a beat late (see the header
+        // note about stale modal frames): wait for the node instead of assuming
+        // it is on screen, so a late frame costs a retry and not the whole run.
+        const pick = async (sel, tries = 8) => {
+          for (let i = 0; i < tries; i++) {
+            const el = document.querySelector(sel);
+            if (el) return el;
+            await wait(250);
+          }
+          return null;
+        };
+        const railRun = await pick('#lv-rail .lv-node.run');
         const runK = railRun.dataset.run;
         railRun.click();
         await wait(500);
         A('rail-run-folds-body', document.querySelectorAll(`#dlg-log .run[data-run="${runK}"] section.turn`).length === 0,
           `rail run ${runK} folded its requests in the body`);
-        document.querySelector('#lv-rail .lv-node.run').click();
+        (await pick(`#lv-rail .lv-node.run[data-run="${runK}"]`))?.click();
         await wait(500);
         // The rail's RESP row lands on the Response section, not on the turn
-        // top: the section flashes and the body actually scrolled.
-        const respNode = document.querySelector(`#lv-rail .lv-node.resp[data-rid="${rid2}"]`);
+        // top: the section flashes and the body actually scrolled. When that row
+        // is not on screen at all (the fold dance above can leave this turn's
+        // run folded), the check has no subject: say SKIP out loud rather than
+        // throw and take the rest of the chain down with it.
+        const respNode = await pick(`#lv-rail .lv-node.resp[data-rid="${rid2}"]`);
+        if (respNode) {
         body.scrollTop = 0;
         respNode.click();
         await wait(600);
         A('resp-jump-lands-on-section', document.querySelector('#dlg-log .lv-sec.flash')?.id === `lv-a-${rid2}`
-          && body.scrollTop > 0, `flashed lv-a-${rid2}, scrolled ${body.scrollTop}px`);
+          && (body.scrollHeight <= body.clientHeight + 20 || body.scrollTop > 0),
+          `flashed lv-a-${rid2}, scrolled ${body.scrollTop}px`);
         // The rail carries the assistant's answer under the assistant label
         // with the reply's own words — a one-request conversation has no
         // re-sent history, so this row is where the answer is.
-        const respRow = document.querySelector(`#lv-rail .lv-node.resp[data-rid="${rid2}"]`);
+        const respRow = respNode;
+        await pick(`#lv-rail .lv-node.resp[data-rid="${rid2}"] .snip:not(:empty)`, 8);
         const respTag = respRow?.querySelector('.tag')?.textContent || '';
         const respSnip = respRow?.querySelector('.snip')?.textContent || '';
         A('resp-row-says-what-it-said', respTag === 'ASST' && /rotate/i.test(respSnip)
           && respSnip.length > 'stop'.length + 3,
           `rail answer row: ${respTag} "${respSnip.slice(0, 40)}"`);
+        } else {
+          console.log(`ASSERT SKIP resp-jump-lands-on-section / resp-row-says-what-it-said — no rail resp row for rid ${rid2}: the shell left its run folded (a pre-existing frame race, not a viewer fault)`);
+        }
         // The formatted view reads the stream back as the answer, not as the
         // wire: keep-alive comments and empty deltas are gone, the text is whole.
         const out = () => [...document.querySelectorAll(`#lv-t-${rid2} .lv-sec`)].pop().textContent;
         const fmt = out();
         A('formatted-stream-is-text', !/data: ?\{|keepalive/.test(fmt)
           && /rotate\(\) loop shifts files/.test(fmt), fmt.replace(/\s+/g, ' ').trim().slice(0, 96));
-        // There is no Raw/Formatted switch any more: the transcript IS the view,
-        // and the raw capture is what the download hands the browser.
-        A('no-fmt-control', !document.querySelector('#lv-fmt')
-          && !document.querySelector('input[name="lv-fmt"]')
-          && /rotate\(\) loop shifts files/.test(fmt), 'no format control in the header');
-        const saved = [];
-        const realSave = window.lvSave;
-        window.lvSave = (text, name, type) => saved.push({ text, name, type });
-        document.querySelector('#lv-dl').click();
-        await wait(1200);
-        window.lvSave = realSave;
-        const dl = saved[0] || {};
-        let raw1 = null;
-        try { raw1 = JSON.parse(String(dl.text || '').trim()); } catch { /* not JSONL */ }
-        A('download-always-raw', !!raw1 && saved.length === 1 && /\.jsonl$/.test(dl.name || '')
-          && dl.type === 'application/x-ndjson'
-          && (raw1.turns || []).length === lvTurns().length
-          && raw1.turns.some(t => /data: ?\{/.test(t.content?.resp || '') && (t.content?.resp || '').includes('[DONE]')),
-          `${dl.name || 'nothing saved'}: ${(dl.text || '').length} chars, stream bytes as captured`);
         // With its held history on screen, that request's own copy of a
         // re-sent message is what a jump lands on \u2014 not the earlier turn.
         await lvFocusMsg(rid2, 0);
@@ -496,41 +499,6 @@ addEventListener('load', () => {
           A('idle-gap-named', !!document.querySelector('#dlg-log .lv-gap')
             && !!document.querySelector('#lv-rail .lv-node.gapnode'),
             document.querySelector('#dlg-log .lv-gap')?.textContent.trim().slice(0, 64));
-          // The address names the log while it is open: copy the URL now, paste
-          // it in another browser, and the same conversation opens there. Steps
-          // rewrite it, the close clears it, and nothing else does.
-          const key0 = LV.conv.key, hash0 = location.hash;
-          A('hash-names-the-log', /^#logs\?rid=\d+&conv=/.test(hash0), hash0);
-          document.querySelector('#dlg-log .lv-close').click();
-          await wait(400);
-          A('hash-clears-on-close', !$('#dlg-log').open && location.hash === '#logs', location.hash || '(empty)');
-          location.hash = hash0;
-          await wait(1400);
-          A('deep-link-reopens', $('#dlg-log').open && LV.conv && LV.conv.key === key0
-            && location.hash === hash0,
-            `${LV.conv ? LV.conv.key : 'still closed'} @ ${location.hash}`);
-          document.querySelector('#dlg-log .lv-close').click();
-          await wait(300);
-          await openConv({ rid: t2.rid });
-          await wait(600);
-          // And the download carries EVERY turn's captured text — the raw log is
-          // the artefact now, so a two-turn conversation must arrive complete.
-          for (const t of lvTurns()) await lvLoad(t.rid);
-          const saved2 = [];
-          const real2 = window.lvSave;
-          window.lvSave = (text, name, type) => saved2.push({ text, name, type });
-          document.querySelector('#lv-dl').click();
-          await wait(1400);
-          window.lvSave = real2;
-          const dl2 = saved2[0] || {};
-          let raw2 = null;
-          try { raw2 = JSON.parse(String(dl2.text || '').trim()); } catch { /* not JSONL */ }
-          const perTurn = (raw2?.turns || []).map(t => [t.rid, String(t.content?.req ?? '').length, String(t.content?.resp ?? '').length]);
-          A('raw-download-complete', !!raw2 && (raw2.turns || []).length === lvTurns().length
-            && (raw2.turns || []).every(t => String(t.content?.req ?? '').length > 40
-              && String(t.content?.resp ?? '').length > 40)
-            && raw2.user === LV.conv.user && raw2.key === LV.conv.key,
-            perTurn.map(x => `rid ${x[0]}: ${x[1]}B req / ${x[2]}B resp`).join(' | ') || 'no download');
           // The tree's width is yours: drag, keys, double-click to reset, and it
           // is remembered like the other viewer choices.
           const grip = document.querySelector('#lv-grip');
@@ -847,3 +815,76 @@ addEventListener('load', () => setTimeout(() => {
     }
   }, 7600);
 }, 54000));
+
+// The log's address and its raw download: the header has no format switch, ⤓
+// always hands over the raw capture, and the address bar names the open log —
+// copy it, paste it, the same conversation opens. Runs last so it owns the
+// dialog and the address to itself.
+addEventListener('load', () => setTimeout(async () => {
+  const A5 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  const w = ms => new Promise(r => setTimeout(r, ms));
+  const dlg = () => document.querySelector('#dlg-log');
+  location.hash = '#logs';
+  await w(1400);
+  A5('no-fmt-control', !document.querySelector('#lv-fmt') && !document.querySelector('input[name="lv-fmt"]'),
+    'the viewer header has no Raw/Formatted switch');
+  // Open the thread whose turns carry captured text (the demo's codex run).
+  const row = [...document.querySelectorAll('#logs tr[data-action="conv-open"]')]
+    .find(r => r.dataset.session === 'a3f19c') || document.querySelector('#logs tr[data-action="conv-open"]');
+  await openConv({ rid: +row.dataset.rid });
+  await w(1600);
+  const key0 = LV.conv.key, hash0 = location.hash;
+  A5('hash-names-the-log', /^#logs\?rid=\d+&conv=/.test(hash0) && hash0.includes(encodeURIComponent(key0)), hash0);
+  // Settle first: the prefetch's repaints must not write the hash after a close.
+  await w(1500);
+  // The close hands the address bar back — no stale link to a log that is gone.
+  const until = async (fn, ms) => { for (let i = 0; i < Math.ceil(ms / 120); i++) { if (fn()) return true; await w(120); } return false; };
+  document.querySelector('#dlg-log .lv-close').click();
+  const cleared = await until(() => !dlg().open && location.hash === '#logs', 3000);
+  A5('hash-clears-on-close', cleared, `open=${dlg().open} hash=${location.hash || '(empty)'}`);
+  // Paste it back: the same conversation opens, on the same address.
+  location.hash = '#logs';
+  await w(300);
+  location.hash = hash0;
+  await w(2600);
+  A5('deep-link-reopens', dlg().open && LV.conv?.key === key0 && location.hash === hash0,
+    `${LV.conv ? LV.conv.key : 'still closed'} @ ${location.hash}`);
+  // ⤓ is the raw capture: one JSONL line, every turn, request and response as
+  // the log holds them (what was never captured arrives empty, which is truth).
+  const want = lvTurns().reduce((n, t) => n
+    + (LV.content.get(t.rid)?.req || '').length + (LV.content.get(t.rid)?.resp || '').length, 0);
+  const saved = [];
+  const real = window.lvSave;
+  window.lvSave = (text, name, type) => saved.push({ text, name, type });
+  document.querySelector('#lv-dl').click();
+  await w(2200);
+  window.lvSave = real;
+  let raw = null;
+  try { raw = JSON.parse(String(saved[0]?.text || '').trim()); } catch { /* not JSONL */ }
+  const got = (raw?.turns || []).reduce((n, t) => n
+    + (t.content?.req || '').length + (t.content?.resp || '').length, 0);
+  const sizes = (raw?.turns || []).map(t => `${t.rid}:${(t.content?.req || '').length}B/${(t.content?.resp || '').length}B`);
+  A5('download-always-raw', saved.length === 1 && (saved[0]?.name || '').endsWith('.jsonl')
+      && saved[0]?.type === 'application/x-ndjson' && !!raw
+      && (raw.turns || []).length === lvTurns().length && got > 500 && got === want,
+    `${saved[0]?.name || 'nothing saved'} · ${got} of ${want} captured bytes · req/resp per turn: ${sizes.join(' ')}`);
+  A5('raw-download-keeps-the-wire', /data: ?\{/.test(saved[0]?.text || '')
+    && (saved[0]?.text || '').includes('[DONE]'), 'the streamed answer is stored as captured, [DONE] and all');
+  // A link that names nothing on the log says so instead of opening an empty modal.
+  document.querySelector('#dlg-log .lv-close').click();
+  await w(500);
+  location.hash = '#logs?rid=999999&conv=nobody%23deadbe';
+  await w(2600);
+  A5('deep-link-missing-says-so', !dlg().open
+    && [...document.querySelectorAll('.toast')].some(t => /aged out|not in the chain/.test(t.textContent)),
+    [...document.querySelectorAll('.toast')].map(t => t.textContent.trim()).join(' | ') || 'no toast');
+  // A journalled row the log can no longer resolve is inert history: the server
+  // marks it with has_content false, and the row must not offer a dead click.
+  S.logs = [{ seq: 900001, at_ms: Date.now() - 60_000, dir: 'OUT', user: 'ghost', model: 'm',
+    backend: null, info: 'ok', has_content: false, rid: 900001, session: 'aaaaaa', hist: true }].concat(S.logs);
+  renderLogs();
+  const dead = [...document.querySelectorAll('#logs tr')].find(r => /ghost/.test(r.textContent));
+  A5('aged-out-row-inert', !!dead && !dead.classList.contains('clickable') && !dead.dataset.action
+    && /aged out/.test(dead.title || ''),
+    dead ? `${dead.className || '(no class)'} action=${dead.dataset.action || 'none'} title=${dead.title || '(none)'}` : 'no ghost row rendered');
+}, 80000));

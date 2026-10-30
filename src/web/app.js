@@ -2087,9 +2087,11 @@ const deepArgs = () => {
   return Object.keys(out).length ? out : null;
 };
 /** Write the open log into the address bar. replaceState, so stepping through a
- *  conversation never stacks a history entry per request. */
+ *  conversation never stacks a history entry per request. Only while the viewer
+ *  is actually on screen: a scroll-spy or a late prefetch landing after the
+ *  close must not resurrect the link the close just cleared. */
 const lvHashWrite = () => {
-  if (!LV.conv) return;
+  if (!LV.conv || !$('#dlg-log').open) return;
   const ctl = String(LV.conv.key || '').startsWith('ctl:');
   const key = LV.conv.key && !ctl ? `&conv=${encodeURIComponent(LV.conv.key)}` : '';
   const h = `#logs?${ctl ? 'seq' : 'rid'}=${LV.rid ?? ''}${key}`;
