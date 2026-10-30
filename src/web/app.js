@@ -9,13 +9,13 @@
 
 const POLL_MS = 1000;
 const MODEL_LIMIT = 12;      // models shown per expanded backend before "show all"
-const LOG_LIMIT = 300;
 
 const S = {
   page: 'overview',
   state: null,
   logs: [],
-  capture: null,             // { log, path } from api/capture: is body capture running
+  logsMeta: null,            // the /api/logs envelope around S.logs (chain reach, indexing)
+  capture: null,             // { log, path, indexing, chain_back_ms } from api/capture
   logGroup: 'session',       // Logs page: one row per conversation, or per request
   clients: [],
   expanded: new Set(),       // backend URLs with their model list open
@@ -221,6 +221,32 @@ async function api(method, path, body) {
   return data;
 }
 
+/** The Logs window in its `since` form: everything the filter window covers,
+ *  at whatever length that takes — the list is the window, retention is the
+ *  only limit. The change-tag dance rides along: a poll that changed nothing
+ *  is a 304 and returns null, and the caller keeps the list it already has.
+ *  (Not routed through api(): a 304 has no body, and api() reads bodies.) */
+let logsTag = null, logsTagSince = null;
+async function fetchLogs() {
+  const since = Math.floor(nowish() - winMs(S.filters.win));
+  if (DEMO) return window.DemoApi.handle('GET', 'logs?since=' + since);
+  const headers = { 'X-OllamaMQ-UI': '1' };
+  if (logsTag && logsTagSince === since) headers['If-None-Match'] = logsTag;
+  const res = await fetch('api/logs?since=' + since, { headers });
+  if (res.status === 401) {
+    location.href = 'login?next=' + encodeURIComponent(location.pathname + location.hash);
+    throw new Error('sign in required');
+  }
+  if (res.status === 304) return null;
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+  if (!res.ok) throw new Error((data && data.error) || text || `${res.status} ${res.statusText}`);
+  logsTag = res.headers.get('ETag');
+  logsTagSince = since;
+  return data;
+}
+
 /** Run a mutating call, toast the outcome, refresh right away. */
 async function act(method, path, body, okText) {
   try {
@@ -259,7 +285,7 @@ async function poll() {
     // so ask once and keep the answer.
     const [state, logs, clients, models, overview, settings, me, capture] = await Promise.all([
       api('GET', 'state'),
-      needLogs && !$('#log-pause').checked ? api('GET', `logs?limit=${LOG_LIMIT}`) : null,
+      needLogs && !$('#log-pause').checked ? fetchLogs() : null,
       needClients ? api('GET', 'clients') : null,
       needModels ? api('GET', 'models') : null,
       needOverview ? api('GET', overviewPath()) : null,
@@ -268,7 +294,7 @@ async function poll() {
       needLogs && !S.capture ? api('GET', 'capture') : null,
     ]);
     S.state = state;
-    if (logs) S.logs = logs;
+    if (logs) { S.logs = logs.events; S.logsMeta = logs; }
     if (clients) S.clients = clients;
     if (models) S.modelPolicy = models;
     if (overview) {
@@ -286,6 +312,7 @@ async function poll() {
     S.online = false;
   }
   render();
+  maybeOpenDeepLink();
 }
 
 // ------------------------------------------------------------------- render
@@ -1911,12 +1938,11 @@ function renderLogs() {
   segCount('#log-flag', 1, flagged);
   $('#nav-logs').textContent = flagged || '';
   const rounds = all.filter(r =>
-    // The same scope the top-bar Filters button owns: window, client, model,
-    // backend. The Overview selection is already persisted per browser, so one
-    // choice now reads the same on both pages and after a reload. The window is
-    // measured on the server's clock (`nowish`), because that is the clock the
-    // rows' own timestamps came from and the clock Overview cuts its window by.
-    ((r.in || r.out || r.solo)?.at_ms ?? 0) >= nowish() - winMs(S.filters.win) &&
+    // The same scope the top-bar Filters button owns: client, model, backend.
+    // The time window is NOT re-filtered here — it was the `since` of this
+    // list's own request, so the server's window is the single truth. (The
+    // old client-side cut over a count-capped list is what let one chatty
+    // conversation look like the whole window.)
     logScoped(r) &&
     (dir === '' || (dir === 'awaiting' ? r.in && !r.out : r.ctl)) &&
     (!q || [r.in?.user, r.in?.model, r.in?.backend, r.in?.session, r.in?.session_label, r.out?.user, r.out?.model,
@@ -1938,12 +1964,20 @@ function renderLogs() {
   const empty = bits.length && !rounds.length && all.length
     ? `<div class="empty">No row matches the filters (${esc(bits.join(' · '))}) — open Filters to widen them.</div>`
     : (S.logGroup === 'request' ? logTable(rounds) : convTable(rounds));
-  // A window wider than what the ring holds must not read as “nothing happened”.
-  const oldest = all.length ? Math.min(...all.map(r => (r.in || r.out || r.solo)?.at_ms ?? Infinity)) : Infinity;
-  const reach = all.length && oldest > nowish() - winMs(S.filters.win)
-    ? `<p class="hint">The list holds the newest ${LOG_LIMIT} events — that reaches back to ${fmtTime(oldest)}, `
-      + `short of ${winLabel(S.filters.win)}.</p>` : '';
-  setHTML($('#logs'), warn + empty + reach);
+  // The only reach note a complete list may carry: the window asks for more
+  // than the log chain can still answer. What is listed is everything on disk
+  // and every row of it opens; retention is the only limit, and this says so.
+  // An event-count note must never appear again — the list is the window.
+  const meta = S.logsMeta;
+  const chainShort = meta && all.length && meta.chain_start_ms != null
+    && meta.chain_start_ms > nowish() - winMs(S.filters.win)
+    ? `<div class="capnote">The window asks for ${winLabel(S.filters.win)}; the log chain reaches back to `
+      + `${fmtTime(meta.chain_start_ms)} — that is everything still on disk, and every row above opens. `
+      + `Retention is the only limit: raise <code>request_log_max_files</code> to keep more slots.</div>`
+    : '';
+  const indexingNote = meta && meta.indexing
+    ? '<p class="hint">indexing the log…</p>' : '';
+  setHTML($('#logs'), warn + chainShort + indexingNote + empty);
 }
 
 // --- Conversation viewer
@@ -1960,10 +1994,10 @@ function renderLogs() {
 const storedLv = () => {
   try {
     const v = JSON.parse(localStorage.getItem('omq.lv') || '{}');
-    return { fmt: v.fmt === 'raw' ? 'raw' : 'fmt', rail: !!v.rail,
-      inc: v.inc !== false, railW: lvRailClamp(v.railW), auto: !!v.auto };
+    // A stored `fmt` key from the Raw/Formatted toggle is ignored, not fatal.
+    return { rail: !!v.rail, inc: v.inc !== false, railW: lvRailClamp(v.railW), auto: !!v.auto };
   } catch { /* storage blocked */ }
-  return { fmt: 'fmt', rail: false, inc: true, railW: LV_RAIL_DEF, auto: false };
+  return { rail: false, inc: true, railW: LV_RAIL_DEF, auto: false };
 };
 const saveLv = () => { try { localStorage.setItem('omq.lv', JSON.stringify(S.lv)); } catch { /* storage blocked */ } };
 /* The jump tree is a side column you may want wide (tool names, message text) or
@@ -2025,14 +2059,22 @@ function lvHidden(i) {
 /** Open the viewer on a conversation: by request id (a row) or by the client
  *  and conversation tag (a conversation header). Either way the server picks
  *  the conversation, because it owns the keys. */
-async function openConv({ rid, session, user } = {}) {
+async function openConv({ rid, session, user, key } = {}, { silent = false } = {}) {
   const q = new URLSearchParams();
   if (rid) q.set('rid', rid);
+  if (key) q.set('key', key);
   if (session) q.set('session', session);
   if (user) q.set('user', user);
   let conv;
-  try { conv = await api('GET', 'conv?' + q.toString()); }
-  catch (e) { return toast(e.message, false); }
+  try {
+    conv = await api('GET', 'conv?' + q.toString());
+  } catch (e) {
+    // `silent` is the deep link falling through rid -> conv -> seq: a miss
+    // there is a next try, not an error to announce.
+    if (!silent) toast(e.message, false);
+    if (silent) throw e;
+    return;
+  }
   const resuming = LV.conv && LV.conv.key === conv.key;
   LV.conv = conv;
   LV.rid = rid || (resuming && LV.rid) || conv.turns.at(-1)?.rid || null;
@@ -2044,7 +2086,6 @@ async function openConv({ rid, session, user } = {}) {
   $('#dlg-log [data-title]').textContent =
     `${conv.model || 'traffic'} · ${conv.user}${conv.backend ? ` → ${bkName(conv.backend)}` : ''}`;
   $('#dlg-log [data-sub]').textContent = lvSubline(conv);
-  $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
   $('#lv-inc').checked = S.lv.inc;
   $('#lv-auto').checked = S.lv.auto;
   const dlg = $('#dlg-log');
@@ -2052,6 +2093,7 @@ async function openConv({ rid, session, user } = {}) {
   await lvDraw({ scroll: true });
   lvPrefetch();
   lvAutoStart();
+  lvHashWrite();
 }
 
 /** The viewer header's second line: conversation id, its name when it has
@@ -2110,7 +2152,6 @@ async function openSeq(seq) {
   LV.content = new Map([[seq, { req: null, resp: ev.content ?? null, reqObj: null }]]);
   $('#dlg-log [data-title]').textContent = `control \u00b7 ${ev.user}`;
   $('#dlg-log [data-sub]').textContent = `${fmtTime(ev.at_ms)} \u00b7 ${ev.info}`;
-  $$('input[name="lv-fmt"]').forEach(r => { r.checked = S.lv.fmt === r.value; });
   const dlg = $('#dlg-log');
   if (!dlg.open) dlg.showModal();
   await lvDraw({ scroll: true });
@@ -2335,19 +2376,19 @@ function lvMsgsHtml(obj, i, rid) {
 
 function lvReqHtml(t, c, i) {
   if (c.req == null) return (t.redacted ? lvOff() : '<div class="lv-note">No request text was stored for this request.</div>') + lvMsgChips(t);
-  if (S.lv.fmt === 'raw')
-    return (c.req.includes('[truncated:') ? '<div class="lv-note">Captured text was truncated by the content limit — Raw shows what was kept.</div>' : '') + rawView(c.req);
-  if (!c.reqObj) return rawView(c.req);
+  const cut = c.req.includes('[truncated:')
+    ? '<div class="lv-note">Captured text was truncated by the content limit.</div>' : '';
+  if (!c.reqObj) return cut + rawView(c.req); // not JSON — the bytes are the transcript
   // No meta line: the section header carries method, path and size, and its
   // tooltip carries the parameters and the new/held split.
-  return lvMsgsHtml(c.reqObj, i, t.rid);
+  return cut + lvMsgsHtml(c.reqObj, i, t.rid);
 }
 
 function lvRespHtml(t, c) {
   if (c.resp == null)
     return (t.redacted ? lvOff() : `<div class="lv-note">${t.tl?.end != null ? 'No response text was stored for this request.' : 'No response recorded yet — still queued, running, or disconnected.'}</div>`)
       + lvRespChips(t);
-  return S.lv.fmt === 'raw' ? rawView(c.resp) : formatContent(c.resp, t.rid);
+  return formatContent(c.resp, t.rid);
 }
 
 /** Without text the turn still lists what it held: one chip per message. */
@@ -2506,6 +2547,7 @@ async function lvFocus(rid) {
   LV.open.add(rid);
   LV.closedRuns.delete(lvRunOf(lvRuns(), lvIdxOf(rid)));
   await lvDraw({ scroll: true });
+  lvHashWrite();
 }
 
 /** A deep target inside a turn (the rail's RESP row): focus the turn, then
@@ -2664,21 +2706,19 @@ function lvAutoStop() {
   if (lvAutoTimer) { clearInterval(lvAutoTimer); lvAutoTimer = null; }
 }
 
-/** Refetch everything and hand the browser a file: raw is the log line as the
- *  file holds it, formatted is the conversation as a transcript. */
+/** Refetch everything and hand the browser a file: the raw log, always —
+ *  one JSONL line, the conversation index plus every turn's captured request
+ *  and response verbatim. What `log_content_limit` did not capture was never
+ *  stored, and the truncated-capture note says so. */
 async function lvDownload() {
   if (!LV.conv) return;
-  toast(`preparing ${S.lv.fmt === 'raw' ? 'raw log' : 'transcript'}…`, true);
+  toast('preparing raw log…', true);
   const turns = lvTurns();
   for (const t of turns) await lvLoad(t.rid);
   const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '').slice(0, 11);
   const base = `ollamamq-${(LV.conv.user || 'client').replace(/[^\w.-]/g, '_')}-${(LV.conv.session || 'one-shot')}-${stamp}`;
-  if (S.lv.fmt === 'raw') {
-    const line = JSON.stringify({ ...LV.conv, turns: turns.map(t => ({ ...t, content: { req: LV.content.get(t.rid)?.req ?? null, resp: LV.content.get(t.rid)?.resp ?? null } })) });
-    lvSave(line + '\n', base + '.jsonl', 'application/x-ndjson');
-    return;
-  }
-  lvSave(lvMarkdown(LV.conv, LV.content, turns), base + '.md', 'text/markdown');
+  const line = JSON.stringify({ ...LV.conv, turns: turns.map(t => ({ ...t, content: { req: LV.content.get(t.rid)?.req ?? null, resp: LV.content.get(t.rid)?.resp ?? null } })) });
+  lvSave(line + '\n', base + '.jsonl', 'application/x-ndjson');
 }
 
 /**
