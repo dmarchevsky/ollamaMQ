@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -915,6 +915,68 @@ impl ConvLogger {
         self.store.lock_or_recover().dropped_count()
     }
 
+    /// True while the boot scan of the rotation chain is still filling the
+    /// disk index. The hot store already answers for what is live, but the
+    /// retained older half is not fully listable yet — the UI says "indexing
+    /// the log…" instead of letting a row 404 for a conversation that is on
+    /// disk and simply not indexed yet.
+    pub fn indexing(&self) -> bool {
+        self.disk
+            .as_ref()
+            .is_some_and(|d| !d.scan_done.load(Ordering::Relaxed))
+    }
+
+    /// The oldest moment the conversation chain can still resolve: the
+    /// smallest `end_ms` over everything the hot store and the disk index
+    /// know. `None` when capture is off or nothing is retained (or indexed)
+    /// yet. A Logs row older than this is inert history — clicking it cannot
+    /// open, because the line it names has rotated out of the chain.
+    pub fn chain_start_ms(&self) -> Option<u64> {
+        let mut out: Option<u64> = None;
+        {
+            let store = self.store.lock_or_recover();
+            for e in store.entries.values() {
+                out = Some(out.map_or(e.conv.end_ms, |m| m.min(e.conv.end_ms)));
+            }
+        }
+        if let Some(disk) = &self.disk {
+            for e in disk.entries.lock_or_recover().values() {
+                out = Some(out.map_or(e.summary.end_ms, |m| m.min(e.summary.end_ms)));
+            }
+        }
+        out
+    }
+
+    /// Every turn `rid` the conversation log can resolve right now (hot store
+    /// and disk index) as ONE pass: the Logs page marks its rows clickable
+    /// from membership in this set instead of probing the log per row (same
+    /// single-pass shape as [`Self::max_rid`], which is its boot-only sibling).
+    pub fn resolvable_rids(&self) -> std::collections::HashSet<u64> {
+        let mut out = std::collections::HashSet::new();
+        {
+            let store = self.store.lock_or_recover();
+            for e in store.entries.values() {
+                for t in &e.conv.turns {
+                    out.insert(t.rid);
+                }
+            }
+        }
+        if let Some(disk) = &self.disk {
+            for e in disk.entries.lock_or_recover().values() {
+                out.extend(e.rids.iter().copied());
+            }
+        }
+        out
+    }
+
+    /// What the rotation chain physically holds: `(bytes on disk across all
+    /// slots, unix ms of the oldest slot's last write)`, `None` when capture
+    /// is off or no slot file exists yet. The boot retention warning weighs
+    /// this against `history_hours` (see [`retention_shortfall`]).
+    pub fn chain_disk_stats(&self) -> Option<(u64, u64)> {
+        self.disk.as_ref().and_then(|d| d.disk_stats())
+    }
+
     /// Apply one change. The work under the lock is a handful of moves and a
     /// size update — no parsing and no I/O — so this is safe on the request path.
     pub fn note(&self, note: Note) {
@@ -1139,6 +1201,31 @@ impl ConvLogger {
     }
 }
 
+/// Whether the conversation log's size caps (`cap_bytes` — the operator's
+/// `request_log_max_bytes` × the slots `request_log_max_files` keeps) can
+/// span `history_hours` of traffic at the write rate the chain has actually
+/// been seeing. `used_bytes` is the chain's current size and `oldest_ms` the
+/// age of its oldest slot: while the chain is still growing, the rate is
+/// measured from its own history; once rotation bites, the surviving age IS
+/// the coverage, and the ratio says so either way. A chain younger than a
+/// minute is read as one minute old so the first flush cannot read as
+/// infinite throughput. Pure so the boot warning's rule is testable without
+/// a disk.
+pub fn retention_shortfall(
+    cap_bytes: u64,
+    used_bytes: u64,
+    oldest_ms: u64,
+    now_ms: u64,
+    history_hours: u64,
+) -> bool {
+    if used_bytes == 0 || cap_bytes == 0 {
+        return false;
+    }
+    let age_hours = (now_ms.saturating_sub(oldest_ms) as f64 / 3_600_000.0).max(1.0 / 60.0);
+    let rate = used_bytes as f64 / age_hours;
+    rate * history_hours.max(1) as f64 > cap_bytes as f64
+}
+
 /// True when `candidate` outranks the conversation's recorded priority.
 fn priority_above(current: Option<&str>, candidate: &str) -> bool {
     let rank = |p: &str| match p {
@@ -1254,6 +1341,10 @@ struct DiskIndex {
     /// Slot table, newest first: `[live, .0, .1, …]`.
     slots: Vec<String>,
     entries: Mutex<HashMap<String, DiskEntry>>,
+    /// Set once the boot scan of the rotation chain has run: until then the
+    /// views answer from the hot seed only, and the API says so
+    /// ([`ConvLogger::indexing`]) rather than 404-ing on lines that are on disk.
+    scan_done: AtomicBool,
 }
 
 /// Index entries held for at most this many conversations; past it a new key
@@ -1268,7 +1359,32 @@ impl DiskIndex {
         Self {
             slots,
             entries: Mutex::new(HashMap::new()),
+            scan_done: AtomicBool::new(false),
         }
+    }
+
+    /// Total bytes across the slot files and the last-write time of the
+    /// oldest existing slot — the chain's honest reach on disk. Slot mtimes
+    /// are cheap and never wrong by more than a rotation interval.
+    fn disk_stats(&self) -> Option<(u64, u64)> {
+        let mut bytes = 0u64;
+        let mut oldest_ms: Option<u64> = None;
+        for slot in self.slots.iter().rev() {
+            // Oldest slot first: its mtime is the age of the oldest retained
+            // data (its last write before it stopped being the live file).
+            let Ok(m) = std::fs::metadata(slot) else {
+                continue; // a missing slot is just a shorter chain
+            };
+            bytes += m.len();
+            if oldest_ms.is_none() {
+                oldest_ms = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64);
+            }
+        }
+        Some((bytes, oldest_ms?))
     }
 
     /// Scan the rotation chain oldest-first, so the last (newest, longest) line
@@ -1418,6 +1534,7 @@ async fn writer_loop(
     // boot: the hot store answers from its seed tail meanwhile, so a large
     // chain costs early entries of the oldest hour, never a slow start.
     disk.scan();
+    disk.scan_done.store(true, Ordering::Relaxed);
     // Continue sizing from the existing file so restarts keep rotation honest.
     let mut current_size = tokio::fs::metadata(&file.path)
         .await
@@ -1588,6 +1705,38 @@ async fn rotate(path: &str, max_files: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The boot retention warning's rule, without a disk: the chain's own
+    /// write rate decides whether its size caps can span `history_hours`.
+    #[test]
+    fn retention_shortfall_names_a_chain_too_small_for_the_window() {
+        let hour = 3_600_000u64;
+        let now = 100 * hour;
+        // 10 MiB x 6 slots = 60 MiB of chain, 40 MiB written in the last
+        // hour: a 24 h window needs ~960 MiB — the caps cannot cover it.
+        assert!(retention_shortfall(60 << 20, 40 << 20, now - hour, now, 24));
+        // The same caps at a quiet rate cover the window easily.
+        assert!(!retention_shortfall(60 << 20, 1 << 20, now - hour, now, 24));
+        // A brand-new chain that barely wrote says nothing yet (the one-minute
+        // floor keeps the first flush from reading as infinite throughput).
+        assert!(!retention_shortfall(60 << 20, 16 << 10, now, now, 24));
+        // A full chain that survived only 6 of the 24 requested hours is a
+        // shortfall — rotation is eating history faster than the window drains.
+        assert!(retention_shortfall(60 << 20, 60 << 20, now - 6 * hour, now, 24));
+        // ...and one that survived the whole window does not warn.
+        assert!(!retention_shortfall(60 << 20, 60 << 20, now - 25 * hour, now, 24));
+    }
+
+    /// A logger without a boot scan (the disabled one) is never "indexing":
+    /// there is no chain to scan, and the UI must not wait for nothing.
+    #[test]
+    fn disabled_logger_is_never_indexing_and_has_no_chain() {
+        let log = ConvLogger::disabled();
+        assert!(!log.indexing());
+        assert_eq!(log.chain_start_ms(), None);
+        assert!(log.resolvable_rids().is_empty());
+        assert_eq!(log.chain_disk_stats(), None);
+    }
     use super::*;
 
     fn tmp(name: &str) -> String {

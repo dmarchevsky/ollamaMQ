@@ -1090,6 +1090,8 @@ pub struct Audit {
     down_since_ms: AtomicU64,
     /// rid -> verdicts, newest last: what lets a flag appear the moment it lands.
     live: Mutex<std::collections::VecDeque<(u64, Vec<Flag>)>>,
+    /// Every verdict ever remembered, counted: see [`Audit::live_flags`].
+    live_seen: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Audit {
@@ -1111,6 +1113,7 @@ impl Audit {
             dropped: AtomicU64::new(0),
             down_since_ms: AtomicU64::new(0),
             live: Mutex::new(std::collections::VecDeque::new()),
+            live_seen: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1227,6 +1230,16 @@ impl Audit {
         while live.len() > LIVE_FLAGS {
             live.pop_front();
         }
+        self.live_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many verdicts the audit has ever remembered — a monotonic witness,
+    /// not the live window's size. The Logs change-tag rides this: a verdict
+    /// that arrives after the live window is full (`LIVE_FLAGS`) still changes
+    /// the tag, so a flagged request appears instead of waiting behind a
+    /// `not modified` because the window happened to be saturated.
+    pub fn live_flags(&self) -> u64 {
+        self.live_seen.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Verdicts of one request; the newest answer wins.
@@ -1378,6 +1391,26 @@ pub async fn judge(state: &Arc<AppState>, job: Job) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Logs change-tag rides this counter, so it must keep moving after the
+    /// live window fills: a verdict that changes nothing visible is a verdict
+    /// that leaves a flagged request hidden behind a `not modified`.
+    #[test]
+    fn live_flags_keep_counting_past_the_live_window() {
+        let audit = Audit::new();
+        let flag = || Flag::rule(Kind::Exfil, Src::Tool, "metadata-ip", "cloud metadata endpoint", true);
+        for i in 0..(LIVE_FLAGS + 40) {
+            audit.remember(i as u64, &[flag()]);
+        }
+        assert_eq!(audit.live_flags(), (LIVE_FLAGS + 40) as u64);
+        let before = audit.live_flags();
+        audit.remember(9000, &[flag()]);
+        assert!(audit.live_flags() > before, "a late verdict still moves the tag");
+        // A clean verdict is not a verdict: nothing changed, nothing to say.
+        let same = audit.live_flags();
+        audit.remember(9001, &[]);
+        assert_eq!(audit.live_flags(), same);
+    }
 
     fn scan(text: &str) -> Vec<Flag> {
         scan_turn(&[Scan { text, at: 0, src: Src::Tool }], &[])

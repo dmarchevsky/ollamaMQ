@@ -509,6 +509,27 @@ async fn main() {
     if rid_floor > 0 {
         state.seed_rid_floor(rid_floor);
     }
+    // Honest retention (log-viewer-share): the Logs window can ask for
+    // `history_hours` of rows, but clicks are answered by the conversation
+    // chain alone, and its size caps decide how far back it reaches. When the
+    // write rate the chain itself has seen says it cannot span the window,
+    // name both knobs at boot: rows listed from the journal that 404 in the
+    // viewer otherwise read as a broken viewer, not as retention.
+    if let Some((used_bytes, oldest_ms)) = state.convlog.chain_disk_stats() {
+        let hours = state.stats.history_hours();
+        // The live file plus the `request_log_max_files` rotated slots.
+        let cap = request_log_max_bytes.saturating_mul(request_log_max_files.max(1) as u64 + 1);
+        if crate::convlog::retention_shortfall(cap, used_bytes, oldest_ms, crate::stats::now_ms(), hours) {
+            tracing::warn!(
+                "log retention: the conversation chain keeps ~{} MiB at request_log_max_bytes x \
+                 request_log_max_files, which at its observed write rate cannot span the {} h of \
+                 history_hours — older Activity rows will list but not open. Raise \
+                 request_log_max_bytes / request_log_max_files, or lower history_hours.",
+                cap / (1 << 20),
+                hours
+            );
+        }
+    }
     if !state.model_aliases.lock_or_recover().is_empty() {
         info!("{} model alias(es) loaded", state.model_aliases.lock_or_recover().len());
     }

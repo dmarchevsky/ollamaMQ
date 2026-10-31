@@ -769,7 +769,15 @@
         return delay({ changed_at_ms: me.password_changed_at_ms });
       }
       if (method === 'GET' && p === 'clients') return delay(clientList());
-      if (method === 'GET' && seg[0] === 'logs' && seg.length === 1) return delay(logs);
+      // The real endpoint answers the window (`since`) with an envelope; the
+      // demo keeps every sample inside its own window, so the shape is what the
+      // UI has to cope with, not a second filter implementation.
+      if (method === 'GET' && seg[0] === 'logs' && seg.length === 1) {
+        const since = +(qs(path).since || 0);
+        const events = logs.filter(l => !since || l.at_ms >= since);
+        return delay({ events, oldest_ms: events.length ? events[events.length - 1].at_ms : null,
+          chain_start_ms: null, truncated: false, indexing: false });
+      }
       if (method === 'GET' && seg[0] === 'logs') {
         const ev = logs.find(l => String(l.seq) === seg[1]) || err('log event expired');
         let content = contentBySeq[ev.seq] ?? null;
@@ -777,7 +785,7 @@
         return delay({ ...ev, content });
       }
       if (method === 'GET' && p === 'convs') return delay(convList());
-      if (method === 'GET' && p === 'capture') return delay({ log: true, path: 'demo-conversations.jsonl' });
+      if (method === 'GET' && p === 'capture') return delay({ log: true, path: 'demo-conversations.jsonl', indexing: false, chain_back_ms: null });
       if (method === 'GET' && p === 'audit') return delay({ mode: 'full', backend: 'http://192.168.6.11:8731',
         backend_online: true, queue: 0, queue_max: 64, dropped: 0, scan_redacted: true, flag_threshold: 0.85 });
       if (method === 'GET' && p === 'conv') return delay(convIndex(qs(path)));

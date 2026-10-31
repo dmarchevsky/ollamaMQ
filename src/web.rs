@@ -56,9 +56,14 @@ const PUBLIC_PATHS: &[&str] = &[
     "/ui/api/logout",
 ];
 
-/// Upper bound on the logs one `/ui/api/logs` call returns (the ring buffer
-/// itself holds fewer).
+/// Upper bound on the conversations one listing call returns. The Logs
+/// window itself no longer caps on this (log-viewer-share): a `since` call
+/// returns everything the window holds, bounded only by retention.
 const MAX_LOG_LIMIT: usize = 1000;
+/// Hard safety bound on the rows `/api/logs` will assemble and serialise.
+/// Not a window and not a count the operator is meant to reach — retention
+/// is supposed to bite first; `truncated` reports honestly when this did.
+const MAX_LOG_ROWS: usize = 200_000;
 
 /// Header every mutating API call must carry (see the module docs).
 const CSRF_HEADER: &str = "x-ollamamq-ui";
@@ -782,6 +787,70 @@ fn session_labels(state: &AppState) -> HashMap<String, String> {
 #[derive(Deserialize)]
 struct LogQuery {
     limit: Option<usize>,
+    /// Window start (unix ms). With `since` the answer is the whole window —
+    /// every event at or after it, live ring and journalled history alike —
+    /// and `limit` is ignored. This is the shape the Logs page polls with;
+    /// the old count shape (`limit` alone) keeps working for old callers and
+    /// defaults to 300 events when neither parameter is given.
+    since: Option<u64>,
+    /// How wide the caller's window is (ms), sent alongside `since`. `since`
+    /// slides forward with every poll, so it cannot identify the ANSWER — two
+    /// polls one second apart ask the same question in every way that matters.
+    /// The change-tag hashes this instead, which is what makes the 304 path
+    /// reachable from a live 1 s poll at all.
+    win: Option<u64>,
+}
+
+/// One `/api/logs` answer: the window itself, plus an honest account of its
+/// reach. The list used to be a bare array capped at 300 events, which one
+/// chatty conversation could collapse to itself; now the window is the
+/// contract, retention is the only limit, and a row that cannot open says
+/// so before it is ever clicked.
+#[derive(Serialize)]
+struct LogsPage {
+    events: Vec<LogView>,
+    /// Oldest `at_ms` in `events` (null for an empty window).
+    oldest_ms: Option<u64>,
+    /// Oldest moment the conversation log can still resolve. Rows older than
+    /// this render as inert history — clicking them can open nothing. Null
+    /// when unknown (capture off, or nothing indexed yet).
+    chain_start_ms: Option<u64>,
+    /// True only when the hard safety bound (MAX_LOG_ROWS) refused to serve
+    /// the whole window. It has no count-cap meaning any more.
+    truncated: bool,
+    /// The boot scan of the rotation chain is still filling the disk index:
+    /// the retained history is arriving, the list is not settled yet.
+    indexing: bool,
+}
+
+/// One ring event as a `LogView`, with its session label and audit flags.
+fn ring_log_view(
+    state: &AppState,
+    labels: &HashMap<String, String>,
+    seq: u64,
+    ev: &crate::dispatcher::LogEvent,
+) -> LogView {
+    let label = ev.session.as_ref().and_then(|s| labels.get(s).cloned());
+    let flags = ev
+        .rid
+        .and_then(|rid| state.audit.flags_for(rid))
+        .unwrap_or_default();
+    log_view(seq, ev, false, label, flags)
+}
+
+/// Hash of the numbers that change exactly when a Logs window changes:
+/// newest seq (ring growth and eviction alike), rows in the window on both
+/// sides, the journal's newest stamp, the chain reach, the indexing bit and
+/// the live audit-verdict count (so a flag landing after its row was served
+/// still changes the tag). Cheap by construction — this is what a 1 s poll
+/// answers a 304 from.
+fn logs_tag(parts: [u64; 9]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut h);
+    }
+    format!("\"{:016x}\"", h.finish())
 }
 
 /// Newest first, without content (fetch one event for that). The live ring
@@ -790,32 +859,77 @@ struct LogQuery {
 /// panel opens with its history instead of a blank page. Replayed records the
 /// ring still holds are the same requests (deduped by rid); rids are unique
 /// across restarts because the counter is seeded from the retained files.
+/// With `since` the whole window comes back (no count cap below the safety
+/// bound), and an `If-None-Match` carrying the previous change-tag answers a
+/// 304 with no body, so the 1 s poll costs nothing while nothing is new.
 async fn list_logs(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<LogQuery>,
-) -> Json<Vec<LogView>> {
-    let limit = q.limit.unwrap_or(300).min(MAX_LOG_LIMIT);
+) -> Response {
+    let since = q.since;
+    let limit = q.limit.unwrap_or(300).min(MAX_LOG_ROWS);
+    let chain_start_ms = state.convlog.chain_start_ms();
+    let indexing = state.convlog.indexing();
+    // The cheap change-tag first, without building a single view.
+    let (hist_count, hist_newest) = state.stats.window_tag(since.unwrap_or(0));
+    let ring_tag = {
+        let logs = state.logs.lock_or_recover();
+        let base = state.logs_evicted.load(Ordering::Relaxed);
+        let in_window = match since {
+            Some(ms) => logs.iter().filter(|e| ring_at_ms(e) >= ms).count(),
+            None => logs.len().min(limit),
+        };
+        (base + logs.len() as u64, in_window as u64)
+    };
+    let tag = logs_tag([
+        // The window's IDENTITY, not its moving start: asked one second later
+        // the question is the same question, so hashing `since` alone would
+        // make a 304 impossible on a live poll. Callers that send no `win`
+        // (old count-shaped ones) keep the previous behaviour.
+        match (q.win, since) {
+            (Some(w), _) => w,
+            (None, Some(s)) => s,
+            (None, None) => u64::MAX,
+        },
+        limit as u64,
+        ring_tag.0,
+        ring_tag.1,
+        hist_count as u64,
+        hist_newest,
+        chain_start_ms.unwrap_or(0),
+        indexing as u64,
+        state.audit.live_flags(),
+    ]);
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().trim_start_matches("W/") == tag)
+    {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response();
+    }
     let labels = session_labels(&state);
     let (mut views, oldest_ring, seen_rids, next_seq) = {
         let logs = state.logs.lock_or_recover();
         let base = state.logs_evicted.load(Ordering::Relaxed);
-        let views: Vec<LogView> = logs
-            .iter()
-            .enumerate()
-            .rev()
-            .take(limit)
-            .map(|(i, ev)| {
-                let label = ev
-                    .session
-                    .as_ref()
-                    .and_then(|s| labels.get(s).cloned());
-                let flags = ev
-                    .rid
-                    .and_then(|rid| state.audit.flags_for(rid))
-                    .unwrap_or_default();
-                log_view(base + i as u64, ev, false, label, flags)
-            })
-            .collect();
+        let views: Vec<LogView> = match since {
+            // The whole window: every ring event at or after `since`. The
+            // ring is a memory bound only — its size has never been a window.
+            Some(ms) => logs
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, ev)| ring_at_ms(ev) >= ms)
+                .map(|(i, ev)| ring_log_view(&state, &labels, base + i as u64, ev))
+                .collect(),
+            None => logs
+                .iter()
+                .enumerate()
+                .rev()
+                .take(limit)
+                .map(|(i, ev)| ring_log_view(&state, &labels, base + i as u64, ev))
+                .collect(),
+        };
         (
             views,
             logs.front().map(ring_at_ms).unwrap_or(u64::MAX),
@@ -825,47 +939,86 @@ async fn list_logs(
             base + logs.len() as u64,
         )
     };
-    if views.len() < limit {
-        let need = limit - views.len();
-        // Margin: ring-resident replays are filtered out below, and there
-        // can be at most one per rid the ring holds.
-        for (i, f) in state
-            .stats
-            .finished_tail(need + seen_rids.len())
-            .into_iter()
-            .filter(|f| f.at_ms < oldest_ring && !f.rid.is_some_and(|r| seen_rids.contains(&r)))
-            .take(need)
-            .enumerate()
-        {
-            let label = f
-                .session_label
-                .clone()
-                .or_else(|| f.session.as_ref().and_then(|s| labels.get(s).cloned()));
-            views.push(LogView {
-                seq: next_seq + i as u64,
-                at_ms: f.at_ms,
-                dir: "OUT",
-                user: f.client,
-                model: if f.model == "none" { None } else { Some(f.model) },
-                backend: f.backend,
-                info: f.outcome.to_string(),
-                // The row opens through the conversation log; without a
-                // session tag (or without capture) there is nothing to open.
-                has_content: state.convlog.enabled() && f.session.is_some(),
-                redacted: false,
-                content: None,
-                rid: f.rid,
-                session: f.session,
-                session_label: label,
-                hist: true,
-                flags: f
-                    .rid
-                    .and_then(|rid| state.audit.flags_for(rid))
-                    .unwrap_or_default(),
-            });
+    // The journal's half of the window, newest first under the ring. With
+    // `since` this is the whole walk — no `finished_tail` slicing, no event
+    // count, the MAX_LOG_ROWS safety bound may still bite and then says so.
+    let mut replay: Vec<crate::stats::Finished> = match since {
+        Some(ms) => {
+            let mut all: Vec<_> = state
+                .stats
+                .finished_since(ms)
+                .into_iter()
+                .filter(|f| f.at_ms < oldest_ring && !f.rid.is_some_and(|r| seen_rids.contains(&r)))
+                .collect();
+            all.reverse(); // the walk is oldest first; the list reads newest first
+            all
         }
+        None if views.len() < limit => {
+            let need = limit - views.len();
+            // Margin: ring-resident replays are filtered out below, and there
+            // can be at most one per rid the ring holds.
+            state
+                .stats
+                .finished_tail(need + seen_rids.len())
+                .into_iter()
+                .filter(|f| f.at_ms < oldest_ring && !f.rid.is_some_and(|r| seen_rids.contains(&r)))
+                .take(need)
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let truncated = replay.len() > MAX_LOG_ROWS;
+    replay.truncate(MAX_LOG_ROWS);
+    // Which rows can open: ONE bulk set of the rids the conversation log can
+    // resolve. A journalled row whose rid is not in it names a conversation
+    // that rotated out of the chain — it renders as inert history, never as
+    // a click that 404s.
+    let openable = if replay.is_empty() {
+        HashSet::new()
+    } else {
+        state.convlog.resolvable_rids()
+    };
+    views.extend(replay.into_iter().enumerate().map(|(i, f)| {
+        let label = f
+            .session_label
+            .clone()
+            .or_else(|| f.session.as_ref().and_then(|s| labels.get(s).cloned()));
+        LogView {
+            seq: next_seq + i as u64,
+            at_ms: f.at_ms,
+            dir: "OUT",
+            user: f.client,
+            model: if f.model == "none" { None } else { Some(f.model) },
+            backend: f.backend,
+            info: f.outcome.to_string(),
+            // The row opens through the conversation log, so it has content
+            // exactly when the log can resolve its rid.
+            has_content: f.rid.is_some_and(|r| openable.contains(&r)),
+            redacted: false,
+            content: None,
+            rid: f.rid,
+            session: f.session,
+            session_label: label,
+            hist: true,
+            flags: f
+                .rid
+                .and_then(|rid| state.audit.flags_for(rid))
+                .unwrap_or_default(),
+        }
+    }));
+    let oldest_ms = views.iter().map(|v| v.at_ms).min();
+    let mut resp = Json(LogsPage {
+        events: views,
+        oldest_ms,
+        chain_start_ms,
+        truncated,
+        indexing,
+    })
+    .into_response();
+    if let Ok(v) = header::HeaderValue::from_str(&tag) {
+        resp.headers_mut().insert(header::ETAG, v);
     }
-    Json(views)
+    resp
 }
 
 async fn get_log(State(state): State<Arc<AppState>>, Path(seq): Path<u64>) -> ApiResult<LogView> {
@@ -933,6 +1086,12 @@ async fn capture_state(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     Json(json!({
         "log": state.convlog.enabled(),
         "path": state.convlog.path(),
+        // The boot scan may still be filling the disk index, and the chain
+        // may reach back less far than the window the Logs page offers: the
+        // UI says "indexing the log…" or names retention rather than
+        // letting rows open with a 404.
+        "indexing": state.convlog.indexing(),
+        "chain_back_ms": state.convlog.chain_start_ms(),
     }))
 }
 
@@ -947,10 +1106,13 @@ async fn get_conv(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ConvQuery>,
 ) -> ApiResult<crate::convlog::Conv> {
-    let missing = if state.convlog.enabled() {
-        "no such conversation in the log"
-    } else {
+    let missing = if !state.convlog.enabled() {
         "body capture is off — set a writable Request log path in Settings and restart to store conversations"
+    } else if state.convlog.indexing() {
+        "the conversation log is still indexing the retained files — try again in a moment"
+    } else {
+        "no such conversation: it aged out of the log chain — raise request_log_max_files \
+         (and request_log_max_bytes) to keep more slots"
     };
     state
         .convlog
@@ -1886,7 +2048,7 @@ mod tests {
         state.stats.record(rec(now - 60_000, Some(41), "ok")); // restored history
         state.stats.record(rec(now, Some(3), "ok")); // the live round, not yet evicted
         let base = serve(state).await;
-        let list: Vec<serde_json::Value> = http()
+        let page: serde_json::Value = http()
             .get(format!("{base}/ui/api/logs?limit=50"))
             .basic_auth("admin", Some("pw"))
             .send()
@@ -1895,6 +2057,7 @@ mod tests {
             .json()
             .await
             .unwrap();
+        let list = page["events"].as_array().unwrap();
         assert_eq!(list.len(), 2, "the live event and one restored row: {list:?}");
         assert_eq!(list[0]["dir"], "IN");
         assert!(list[0]["hist"].is_null(), "ring rows are not marked history");
@@ -1903,7 +2066,388 @@ mod tests {
         assert_eq!(list[1]["session"], "c342d9");
         assert_eq!(list[1]["session_label"], "nightly");
         assert_eq!(list[1]["info"], "ok", "the outcome is the compact segment");
-        assert_eq!(list[1]["has_content"], true, "capture on: the row opens");
+        assert_eq!(
+            list[1]["has_content"], false,
+            "the journal remembers rid 41, but no conversation in the chain can open it: \
+             the row is inert history, not a click that 404s"
+        );
+    }
+
+    /// The window is the window: `/api/logs?since=` returns EVERY journalled
+    /// row in it — the old 300-event default and 1000-cap collapsed a 48 h
+    /// window to its newest few conversations, which is the bug this
+    /// endpoint's shape was built to kill.
+    #[tokio::test]
+    async fn logs_since_returns_the_whole_window_not_a_count() {
+        let state = test_state();
+        let now = crate::stats::now_ms();
+        let rec = |at_ms: u64, rid: u64| crate::stats::Finished {
+            at_ms,
+            client: "dm".into(),
+            key: "main".into(),
+            model: "qwen".into(),
+            backend: Some("gpu1".into()),
+            outcome: "ok",
+            session: Some(format!("s{rid}")),
+            session_label: None,
+            priority: "normal",
+            rid: Some(rid),
+            tools: vec![],
+            queue_wait: Some(1.0),
+            stage: Default::default(),
+            timing: Default::default(),
+            session_key: None,
+            kind: None,
+            link: None,
+        };
+        // 1200 finished requests in one 20-minute burst: both the default
+        // answer (300) and the retired MAX_LOG_LIMIT (1000) would truncate it.
+        for i in 0..1_200u64 {
+            state.stats.record(rec(now - 20 * 60_000 + i * 500, 100 + i));
+        }
+        let base = serve(state).await;
+        let c = http();
+        let page: serde_json::Value = c
+            .get(format!("{base}/ui/api/logs?since={}", now - 48 * 3_600_000))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let events = page["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1_200, "the 48 h window holds every journalled row");
+        assert_eq!(page["truncated"], false, "a served window is not a truncated one");
+        assert_eq!(page["oldest_ms"].as_u64().unwrap(), now - 20 * 60_000);
+        // A narrow since really cuts: asking for the last minute alone
+        // returns none of them.
+        let narrow: serde_json::Value = c
+            .get(format!("{base}/ui/api/logs?since={}", now - 60_000))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(narrow["events"].as_array().unwrap().is_empty());
+    }
+
+    /// The 1 s Logs poll has to be free while nothing happens: the endpoint
+    /// hands out a change-tag and answers it with a bodyless 304 until the
+    /// window actually changes.
+    #[tokio::test]
+    async fn logs_etag_answers_304_while_the_window_is_unchanged() {
+        let state = test_state();
+        let ev = |info: &'static str| LogEvent {
+            at: std::time::SystemTime::now(),
+            dir: "IN",
+            user: "u".into(),
+            model: None,
+            backend: None,
+            info: info.into(),
+            content: None,
+            rid: None,
+            session: None,
+            redacted: false,
+        };
+        state.log_event(ev("e1"));
+        let base = serve(state.clone()).await;
+        let c = http();
+        let res = c
+            .get(format!("{base}/ui/api/logs?since=0"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap();
+        let tag = res
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(tag.len() > 8, "a change-tag is handed out: {tag}");
+        let res = c
+            .get(format!("{base}/ui/api/logs?since=0"))
+            .basic_auth("admin", Some("pw"))
+            .header(header::IF_NONE_MATCH, &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(res.text().await.unwrap(), "", "304 carries no body");
+        // A new event changes the tag: the cached list is stale again.
+        state.log_event(ev("e2"));
+        let res = c
+            .get(format!("{base}/ui/api/logs?since=0"))
+            .basic_auth("admin", Some("pw"))
+            .header(header::IF_NONE_MATCH, &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_ne!(
+            res.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+            tag,
+            "a changed window carries a new tag"
+        );
+    }
+
+    /// The poll that matters: the Logs page asks for its window every second,
+    /// and each ask starts a second later than the last. Sliding `since` must
+    /// not count as a change — if it did, the 304 path existed only in tests
+    /// and a 48 h window was re-sent whole once a second in production.
+    #[tokio::test]
+    async fn logs_etag_survives_the_window_sliding_forward() {
+        let state = test_state();
+        let ev = LogEvent {
+            at: std::time::SystemTime::now(),
+            dir: "IN",
+            user: "u".into(),
+            model: None,
+            backend: None,
+            info: "e1".into(),
+            content: None,
+            rid: None,
+            session: None,
+            redacted: false,
+        };
+        state.log_event(ev);
+        let base = serve(state.clone()).await;
+        let c = http();
+        let first = c
+            .get(format!("{base}/ui/api/logs?since=1000&win=86400000"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap();
+        let tag = first
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        drop(first);
+        // One second later, same width, nothing new: the answer is "nothing".
+        let again = c
+            .get(format!("{base}/ui/api/logs?since=1001&win=86400000"))
+            .basic_auth("admin", Some("pw"))
+            .header(header::IF_NONE_MATCH, &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            again.status(),
+            StatusCode::NOT_MODIFIED,
+            "a poll one second later must not re-fetch the window"
+        );
+        // A different width is a different question, unchanged data or not.
+        let wider = c
+            .get(format!("{base}/ui/api/logs?since=1&win=90000000"))
+            .basic_auth("admin", Some("pw"))
+            .header(header::IF_NONE_MATCH, &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wider.status(), StatusCode::OK, "48 h is not 25 h");
+    }
+
+
+    /// The audit slot of the change-tag is the only route a flagged request has
+    /// to an operator whose window has otherwise stopped moving: the verdict
+    /// arrives after the row was served, from a background job, and if it does
+    /// not change the answer, the flag is invisible until something else moves.
+    #[tokio::test]
+    async fn logs_etag_notices_a_verdict_that_landed_after_the_row() {
+        let state = test_state();
+        let ev = LogEvent {
+            at: std::time::SystemTime::now(),
+            dir: "IN",
+            user: "u".into(),
+            model: None,
+            backend: None,
+            info: "e1".into(),
+            content: None,
+            rid: Some(7),
+            session: None,
+            redacted: false,
+        };
+        state.log_event(ev);
+        let base = serve(state.clone()).await;
+        let c = http();
+        let first = c
+            .get(format!("{base}/ui/api/logs?since=0"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap();
+        let tag = first
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        drop(first);
+        state.audit.remember(
+            7,
+            &[crate::audit::Flag {
+                kind: crate::audit::Kind::Injection,
+                src: crate::audit::Src::User,
+                by: "rule:test".into(),
+                prob: None,
+                category: None,
+                detail: None,
+                excerpt: None,
+                bad: true,
+            }],
+        );
+        let after = c
+            .get(format!("{base}/ui/api/logs?since=0"))
+            .basic_auth("admin", Some("pw"))
+            .header(header::IF_NONE_MATCH, &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            after.status(),
+            StatusCode::OK,
+            "a verdict that lands late must not hide behind a 304"
+        );
+    }
+
+    /// A journalled row the conversation chain cannot open renders as inert
+    /// history (has_content false), and the 404 left for the race names
+    /// retention and the knob that fixes it — the operator's complaint was
+    /// rows the list showed and the viewer refused to open.
+    #[tokio::test]
+    async fn journalled_rows_only_offer_the_log_they_can_open() {
+        let state = test_state();
+        record_two_turns(&state); // rids 7 and 8 sit in the conversation log
+        let now = crate::stats::now_ms();
+        let rec = |at_ms: u64, rid: Option<u64>| crate::stats::Finished {
+            at_ms,
+            client: "alice".into(),
+            key: "main".into(),
+            model: "qwen".into(),
+            backend: Some("gpu1".into()),
+            outcome: "ok",
+            session: Some("a3f19c".into()),
+            session_label: None,
+            priority: "normal",
+            rid,
+            tools: vec![],
+            queue_wait: Some(1.0),
+            stage: Default::default(),
+            timing: Default::default(),
+            session_key: None,
+            kind: None,
+            link: None,
+        };
+        state.stats.record(rec(now - 60_000, Some(7))); // the chain resolves it
+        state.stats.record(rec(now - 59_000, Some(41))); // its conversation is gone
+        let base = serve(state.clone()).await;
+        let c = http();
+        let page: serde_json::Value = c
+            .get(format!("{base}/ui/api/logs?since=0"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let events = page["events"].as_array().unwrap();
+        let by_rid = |rid: u64| {
+            events
+                .iter()
+                .find(|e| e["rid"] == serde_json::json!(rid))
+                .unwrap_or_else(|| panic!("rid {rid} in {events:?}"))
+        };
+        assert_eq!(by_rid(7)["has_content"], true, "a resolvable row is a clickable row");
+        assert_eq!(by_rid(41)["has_content"], false, "an aged-out row is inert history");
+        assert!(page["chain_start_ms"].is_number(), "the answer states the chain reach");
+        assert!(page["indexing"].is_boolean());
+        // The bare "no such conversation" 404 is gone: let the (empty-file)
+        // boot scan settle so the indexing answer cannot precede, then ask
+        // for a conversation that is really not there.
+        for _ in 0..100 {
+            if !state.convlog.indexing() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!state.convlog.indexing(), "the boot scan finished");
+        let r = c
+            .get(format!("{base}/ui/api/conv?rid=999"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let err: serde_json::Value = r.json().await.unwrap();
+        let msg = err["error"].as_str().unwrap_or_default();
+        assert!(msg.contains("request_log_max_files"), "the 404 names the knob: {msg}");
+    }
+
+    /// A restart keeps its promises: after the writer has flushed and a
+    /// FRESH logger (the stand-in for a fresh process) opens the same file,
+    /// `conv?rid=` and `conv?key=` still resolve — cold, from the retained
+    /// files only. A link copied before the restart still opens its log.
+    #[tokio::test]
+    async fn conv_endpoints_resolve_history_in_a_fresh_process() {
+        let path = std::env::temp_dir().join(format!(
+            "omq-web-cold-{}-{}.jsonl",
+            std::process::id(),
+            crate::clients::random_hex(6)
+        ));
+        let path = path.to_string_lossy().into_owned();
+        {
+            // Boot 1: record a conversation, let the writer flush it (a short
+            // idle interval so the line reaches the file), then let go.
+            let logger = crate::convlog::ConvLogger::start(
+                path.clone(),
+                1 << 20,
+                1,
+                std::time::Duration::from_millis(20),
+            )
+            .unwrap()
+            .0;
+            let state = test_state_with(logger);
+            record_two_turns(&state);
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
+                    break;
+                }
+            }
+            assert!(std::fs::metadata(&path).is_ok_and(|m| m.len() > 0), "the line flushed");
+        }
+        // Boot 2: a fresh logger over the same file — the only knowledge left
+        // is what the retained files hold.
+        let logger =
+            crate::convlog::ConvLogger::start(path.clone(), 1 << 20, 1, std::time::Duration::from_secs(3600))
+                .unwrap()
+                .0;
+        let state = test_state_with(logger);
+        let base = serve(state).await;
+        let c = http();
+        for q in ["conv?rid=7", "conv?key=alice%23a3f19c"] {
+            let res = c
+                .get(format!("{base}/ui/api/{q}"))
+                .basic_auth("admin", Some("pw"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{q} resolves cold");
+            let conv: serde_json::Value = res.json().await.unwrap();
+            assert_eq!(conv["key"], "alice#a3f19c", "{q}");
+            assert_eq!(conv["turns"].as_array().unwrap().len(), 2, "{q}");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     async fn serve(state: Arc<AppState>) -> String {
@@ -2389,12 +2933,13 @@ mod tests {
                 .send()
         };
 
-        let list: Vec<serde_json::Value> = get("logs?limit=5".into())
+        let page: serde_json::Value = get("logs?limit=5".into())
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
+        let list = page["events"].as_array().unwrap();
         assert_eq!(list.len(), 5);
         assert_eq!(list[0]["info"], "e349");
         assert_eq!(list[0]["seq"], 349);
@@ -2439,7 +2984,7 @@ mod tests {
             redacted: false,
         });
         let base = serve(state).await;
-        let list: Vec<serde_json::Value> = http()
+        let page: serde_json::Value = http()
             .get(format!("{base}/ui/api/logs"))
             .basic_auth("admin", Some("pw"))
             .send()
@@ -2448,6 +2993,7 @@ mod tests {
             .json()
             .await
             .unwrap();
+        let list = page["events"].as_array().unwrap();
         assert_eq!(list[1]["rid"], 7);
         assert_eq!(list[1]["session"], "a3f19c");
         // Absent when unset — old-shaped records keep their exact shape.
