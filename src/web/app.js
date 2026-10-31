@@ -2133,7 +2133,7 @@ async function openDeep(p) {
   const tries = [
     p.rid && (() => openConv({ rid: +p.rid }, { silent: true })),
     p.conv && (() => openConv({ key: p.conv }, { silent: true })),
-    p.seq && (async () => { await openSeq(+p.seq); return true; }),
+    p.seq && (() => openSeq(+p.seq, { silent: true })),
   ].filter(Boolean);
   for (const t of tries) {
     try { if (await t()) return true; }
@@ -2252,9 +2252,12 @@ async function lvPrefetch() {
 
 /** A log event with no proxied request behind it (a control action): the same
  *  dialog with a single turn, its text taken from the event ring. */
-async function openSeq(seq) {
+async function openSeq(seq, { silent = false } = {}) {
   let ev;
-  try { ev = await api('GET', `logs/${seq}`); } catch (e) { return toast(e.message, false); }
+  // Silent mode is the deep-link path: a seq that no longer resolves must not
+  // toast its own raw message and count as opened — the caller owns the verdict.
+  try { ev = await api('GET', `logs/${seq}`); }
+  catch (e) { if (silent) throw e; return toast(e.message, false); }
   LV.conv = {
     key: 'ctl:' + seq, user: ev.user || '\u2014', model: 'control', session: null,
     start_ms: ev.at_ms, end_ms: ev.at_ms,
@@ -2271,6 +2274,7 @@ async function openSeq(seq) {
   if (!dlg.open) dlg.showModal();
   await lvDraw({ scroll: true });
   lvHashWrite();
+  return true;
 }
 
 /** Captured text of one turn, fetched once and kept for the session. */

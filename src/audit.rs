@@ -1233,9 +1233,6 @@ impl Audit {
         self.live_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// How many verdict records the live view holds. Rides the Logs
-    /// change-tag so a flag landing after its row was served still changes
-    /// the answer instead of hiding behind an unconditional 304.
     /// How many verdicts the audit has ever remembered — a monotonic witness,
     /// not the live window's size. The Logs change-tag rides this: a verdict
     /// that arrives after the live window is full (`LIVE_FLAGS`) still changes
