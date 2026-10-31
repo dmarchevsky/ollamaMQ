@@ -3,7 +3,7 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
-## Unreleased
+## v0.26.0 — 2026-10-30
 
 ### Changed
 
@@ -14,9 +14,11 @@ since upstream `v0.5.0`.
     URL (`#logs?rid=904&conv=codex-laptop%23a3f19c`) and stepping `⏮ ‹ › ⏭`
     keeps it current. Copy it from the browser, paste it into another machine
     that already has a session, and the same conversation opens on the same
-    request; closing the viewer hands the address back. A link whose
-    conversation aged out says so in a toast instead of opening an empty modal.
-    There is no copy button — the bar is the copy.
+    request; closing the viewer hands the address back (and Back leaves the
+    page instead of reopening what you closed). A link the log cannot resolve
+    says so in a toast, saying which it is — gone from the chain, or unreadable
+    right now — instead of opening an empty modal. There is no copy button: the
+    bar is the copy.
   - **One way to read a log.** The Raw/Formatted switch is gone: the viewer
     shows the transcript (a streamed answer reassembled into the message it
     produced, thinking collapsed, tool calls rebuilt) and nothing else. The
@@ -33,8 +35,12 @@ since upstream `v0.5.0`.
     conversation rotated out of the chain is greyed history carrying the reason
     instead of a click that answered `no log for this conversation`; the boot
     log warns when the size caps cannot span `history_hours`; a cold start says
-    `indexing` while the disk index is still being built. The 1 s poll carries
-    `If-None-Match`, so a wide window costs a `304` while nothing is new.
+    `indexing` while the disk index is still being built. A greyed row names its
+    own reason — aged out of the chain, capture switched off, or the index still
+    filling — so the advice fits the cause. The 1 s poll carries `If-None-Match`
+    keyed on the window rather than the moment it was asked, so a 48 h list costs
+    a `304` while nothing new arrives, and an audit verdict that lands after its
+    row was served still gets through.
 
   Nothing here needs a new setting: retention stays `request_log_max_bytes ×
   (1 + request_log_max_files)`, and every width `history_hours` offers is now
