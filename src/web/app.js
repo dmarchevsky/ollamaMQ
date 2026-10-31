@@ -216,7 +216,9 @@ async function api(method, path, body) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!res.ok) {
-    throw new Error((data && data.error) || text || `${res.status} ${res.statusText}`);
+    const e = new Error((data && data.error) || text || `${res.status} ${res.statusText}`);
+    e.status = res.status;   // callers that must tell "gone" from "unreachable"
+    throw e;
   }
   return data;
 }
@@ -2122,8 +2124,12 @@ const lvHashClear = () => {
   if (location.hash.startsWith('#logs?')) history.replaceState(null, '', '#logs');
 };
 /** Open what the address names: rid -> conv -> seq, each form falling through
- *  when the server cannot resolve it. openConv reports its own success. */
+ *  when the server cannot resolve it. openConv reports its own success. If
+ *  nothing opens, the LAST error is rethrown: a log that is not there and a log
+ *  the server could not read are different news, and the caller must not report
+ *  the first when it hit the second. */
 async function openDeep(p) {
+  let last = null;
   const tries = [
     p.rid && (() => openConv({ rid: +p.rid }, { silent: true })),
     p.conv && (() => openConv({ key: p.conv }, { silent: true })),
@@ -2131,8 +2137,9 @@ async function openDeep(p) {
   ].filter(Boolean);
   for (const t of tries) {
     try { if (await t()) return true; }
-    catch { /* next form */ }
+    catch (e) { last = e; }
   }
+  if (last) throw last;
   return false;
 }
 /** Called at the end of every poll: an address that names a log opens once, and
@@ -2147,6 +2154,15 @@ async function maybeOpenDeepLink() {
   try {
     if (await openDeep(p)) deepSeen = h;
     else toast('that log is not in the chain any more — it aged out of the log files', false);
+  } catch (e) {
+    // The address named something the log could not resolve (404: gone, kept by
+    // a shorter chain than the window) — say that. Anything else is the log
+    // being unreadable, and pretending it aged out would send the operator
+    // hunting for a retention knob that was never the problem.
+    const gone = e && (e.status === 404
+      || /aged out|not in the chain|no (such )?conversation|no log for/i.test(String(e && e.message)));
+    toast(gone ? 'that log is not in the chain any more — it aged out of the log files'
+      : `that log would not open: ${(e && e.message) || 'unknown error'}`, false);
   } finally { deepBusy = false; }
 }
 
