@@ -199,6 +199,24 @@ async function copyText(text) {
 
 const DEMO = new URLSearchParams(location.search).has('demo');
 
+/** Where a lost session goes: sign in, then come back to this exact view.
+ *  Shared because the log poll cannot go through `api()` (a 304 has no body to
+ *  read) and must still take the same route the rest of the UI takes. */
+function toLogin() {
+  location.href = 'login?next=' + encodeURIComponent(location.pathname + location.hash);
+}
+
+/** A failed response as the error an operator reads: the server's own message
+ *  when it sent one, the bare status when it did not. The status rides along so
+ *  a caller can tell "that log is gone" from "the log could not be read". */
+async function responseError(res, text) {
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  const e = new Error((data && data.error) || text || `${res.status} ${res.statusText}`);
+  e.status = res.status;
+  return e;
+}
+
 async function api(method, path, body) {
   if (DEMO) return window.DemoApi.handle(method, path, body);
   const opts = { method, headers: { 'X-OllamaMQ-UI': '1' } };
@@ -209,17 +227,13 @@ async function api(method, path, body) {
   const res = await fetch('api/' + path, opts);
   if (res.status === 401) {
     // Session expired or signed out elsewhere: sign in, then come back here.
-    location.href = 'login?next=' + encodeURIComponent(location.pathname + location.hash);
+    toLogin();
     throw new Error('sign in required');
   }
   const text = await res.text();
+  if (!res.ok) throw await responseError(res, text);
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  if (!res.ok) {
-    const e = new Error((data && data.error) || text || `${res.status} ${res.statusText}`);
-    e.status = res.status;   // callers that must tell "gone" from "unreachable"
-    throw e;
-  }
   return data;
 }
 
@@ -242,18 +256,13 @@ async function fetchLogs() {
   // exactly what a 304 means here. Any other window re-asks from scratch.
   if (logsTag && logsTagWin === win) headers['If-None-Match'] = logsTag;
   const res = await fetch(`api/logs?since=${since}&win=${winMs_}`, { headers });
-  if (res.status === 401) {
-    location.href = 'login?next=' + encodeURIComponent(location.pathname + location.hash);
-    throw new Error('sign in required');
-  }
-  if (res.status === 304) return null;
+  if (res.status === 401) { toLogin(); throw new Error('sign in required'); }
+  if (res.status === 304) return null;              // nothing changed; keep the list
   const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
-  if (!res.ok) throw new Error((data && data.error) || text || `${res.status} ${res.statusText}`);
+  if (!res.ok) throw await responseError(res, text);
   logsTag = res.headers.get('ETag');
   logsTagWin = win;
-  return data;
+  return JSON.parse(text);
 }
 
 /** Run a mutating call, toast the outcome, refresh right away. */
@@ -1817,7 +1826,7 @@ function logTable(rounds) {
       const open = dead ? '' : rid ? `data-action="log-round" data-rid="${rid}"`
         : `data-action="log-detail" data-seq="${e.seq}"`;
       const inert = dead || (e.hist && !rid);
-      return `<tr class="${inert ? '' : 'clickable'}" ${open}${dead ? ' title="this conversation has aged out of the log files — the row is all that is left"' : ''}>
+      return `<tr class="${inert ? '' : 'clickable'}" ${open}${dead ? ` title="${deadWhy()}"` : ''}>
       <td class="time">${fmtTime(e.at_ms)}</td>
       <td class="mono">${esc(e.user)}</td>
       <td class="trunc ${e.model ? '' : 'none'}">${esc(e.model ?? '—')}</td>
@@ -1929,7 +1938,7 @@ function convTable(rounds) {
     const span = `${esc(g.user)} \u00b7 ${fmtTime(g.first)} \u2192 ${fmtTime(g.at)} \u00b7 ${g.reqs} requests`;
     return `<tr class="${g.open ? 'clickable' : ''}" ${g.open
         ? `data-action="conv-open" data-session="${esc(g.session)}" data-user="${esc(g.user)}"${g.rid != null ? ` data-rid="${g.rid}"` : ''} title="${esc(span)}"`
-        : 'title="this conversation has aged out of the log files — the row is all that is left"'}>
+        : `title="${deadWhy()}"`}>
       <td class="time">${fmtTime(g.at)}</td>
       <td><span class="mono">${esc(g.user)}</span>${sessTag(g)}</td>
       <td class="trunc ${model ? '' : 'none'}">${model ?? '—'}</td>
@@ -1945,6 +1954,17 @@ function convTable(rounds) {
 // from the live ring buffer), and saying so beats a bare “no such conversation”.
 const NOCAP_BADGE = '<span class="badge warn" title="body capture is off — no conversation is stored for this request">not captured</span>';
 const captureOff = () => S.capture && S.capture.log === false;
+
+/** Why a history row will not open. Three causes, three different fixes: a row
+ *  greyed while capture is off, or while the index is still filling after a
+ *  start, has NOT aged out, and telling the operator to raise retention in
+ *  either case sends them turning a knob that was never the problem. */
+function deadWhy() {
+  if (captureOff()) return 'request capture is off — there is no conversation log to open';
+  if (S.logsMeta && S.logsMeta.indexing)
+    return 'the log is still being indexed since the last start — try again in a moment';
+  return 'this conversation has aged out of the log files — the row is all that is left';
+}
 
 function renderLogs() {
   const q = $('#log-filter').value.trim().toLowerCase();
@@ -1984,14 +2004,15 @@ function renderLogs() {
     ? `<div class="empty">No row matches the filters (${esc(bits.join(' · '))}) — open Filters to widen them.</div>`
     : (S.logGroup === 'request' ? logTable(rounds) : convTable(rounds));
   // The only reach note a complete list may carry: the window asks for more
-  // than the log chain can still answer. What is listed is everything on disk
-  // and every row of it opens; retention is the only limit, and this says so.
+  // than the log chain can still answer. What is listed is everything on disk;
+  // retention is the only limit, and this says so.
   // An event-count note must never appear again — the list is the window.
   const meta = S.logsMeta;
   const chainShort = meta && all.length && meta.chain_start_ms != null
     && meta.chain_start_ms > nowish() - winMs(S.filters.win)
     ? `<div class="capnote">The window asks for ${winLabel(S.filters.win)}; the log chain reaches back to `
-      + `${fmtTime(meta.chain_start_ms)} — that is everything still on disk, and every row above opens. `
+      + `${fmtTime(meta.chain_start_ms)} — that is everything still on disk. Anything the log can no longer `
+      + `open is dimmed and says why. `
       + `Retention is the only limit: raise <code>request_log_max_files</code> to keep more slots.</div>`
     : '';
   const indexingNote = meta && meta.indexing

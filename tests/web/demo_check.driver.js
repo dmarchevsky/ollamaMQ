@@ -919,7 +919,11 @@ addEventListener('load', () => setTimeout(async () => {
   document.querySelector('#dlg-log .lv-close').click();
   await w(500);
   location.hash = '#logs?rid=999999&conv=nobody%23deadbe';
-  await w(3000);
+  // Wait for the verdict, not for a fixed slice of virtual time: the toast rides
+  // the poll that first sees the pending link, and a fixed wait loses it whenever
+  // the page has more work queued than the budget guessed.
+  await until(() => toasts.length > 0, 8000);
+  await w(200);
   window.toast = realToast;
   A5('deep-link-missing-says-so', !dlg().open
     && toasts.some(t => /aged out|not in the chain/.test(t)),

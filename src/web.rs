@@ -2255,6 +2255,70 @@ mod tests {
         assert_eq!(wider.status(), StatusCode::OK, "48 h is not 25 h");
     }
 
+
+    /// The audit slot of the change-tag is the only route a flagged request has
+    /// to an operator whose window has otherwise stopped moving: the verdict
+    /// arrives after the row was served, from a background job, and if it does
+    /// not change the answer, the flag is invisible until something else moves.
+    #[tokio::test]
+    async fn logs_etag_notices_a_verdict_that_landed_after_the_row() {
+        let state = test_state();
+        let ev = LogEvent {
+            at: std::time::SystemTime::now(),
+            dir: "IN",
+            user: "u".into(),
+            model: None,
+            backend: None,
+            info: "e1".into(),
+            content: None,
+            rid: Some(7),
+            session: None,
+            redacted: false,
+        };
+        state.log_event(ev);
+        let base = serve(state.clone()).await;
+        let c = http();
+        let first = c
+            .get(format!("{base}/ui/api/logs?since=0"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap();
+        let tag = first
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        drop(first);
+        state.audit.remember(
+            7,
+            &[crate::audit::Flag {
+                kind: crate::audit::Kind::Injection,
+                src: crate::audit::Src::User,
+                by: "rule:test".into(),
+                prob: None,
+                category: None,
+                detail: None,
+                excerpt: None,
+                bad: true,
+            }],
+        );
+        let after = c
+            .get(format!("{base}/ui/api/logs?since=0"))
+            .basic_auth("admin", Some("pw"))
+            .header(header::IF_NONE_MATCH, &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            after.status(),
+            StatusCode::OK,
+            "a verdict that lands late must not hide behind a 304"
+        );
+    }
+
     /// A journalled row the conversation chain cannot open renders as inert
     /// history (has_content false), and the 404 left for the race names
     /// retention and the knob that fixes it — the operator's complaint was
