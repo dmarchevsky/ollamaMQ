@@ -126,6 +126,13 @@ settings:
   #   backend: ""               # verdict-model host; empty = first enabled backend
   #   flag_threshold: 0.85      # model confidence at or above which a flag is
   #                             # confirmed (red) instead of a watch (amber)
+  #   watch_floor: 0.6            # below this a model verdict is not recorded at
+  #                             # all: a shrug is not a finding
+  #   tool_watch_floor: 0.75      # the same floor for a verdict about a tool
+  #                             # result, which is held higher — code answers
+  #                             # the intent questions far too readily
+  #   guard_strict: true          # ask the moderation model for its controversial
+  #                             # band too (noisier, and what catches steering)
   #   scan_redacted: true       # judge X-Redact-Log traffic in memory; verdicts
   #                             # are stored, its text never is
   #   max_questions_per_turn: 6 # decision-model questions per turn (NPU budget)
