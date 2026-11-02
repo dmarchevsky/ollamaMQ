@@ -19,7 +19,9 @@
 //!   model asked to run is a different event from a user quoting one.
 //! * **`d3-nano`** noul intent questions on the *new* content of a turn
 //!   (instruction override, secret disclosure, third-party transfer);
-//! * **`qwen3guard-gen`** moderation on the last user message and the reply.
+//! * **`qwen3guard-gen`** moderation on this turn's new user messages and the
+//!   reply's own prose — its tool calls are stripped, because a command is the
+//!   rule scanner's business and not a topic of conversation.
 //!
 //! The NPU calls are the expensive half, so they run through a bounded queue in
 //! a small worker pool, cost one batch per turn (not per byte of context), and
@@ -120,7 +122,9 @@ impl Kind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Src {
-    /// The request's last user message.
+    /// One of this turn's new user messages — what arrived after the last
+    /// answer, which is usually one message and sometimes a real instruction
+    /// plus a harness's boilerplate after it ([`TurnText::user`]).
     User,
     /// The assistant's reply, including the tool calls it issued.
     Reply,
