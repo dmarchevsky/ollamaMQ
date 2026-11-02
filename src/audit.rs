@@ -2762,6 +2762,25 @@ mod tests {
     }
 
     #[test]
+    fn a_tail_cut_lands_on_a_char_boundary() {
+        // The reply budget is counted in bytes and the tail of a real reply is
+        // full of multi-byte text — an em dash, an arrow, CJK, an emoji — so a
+        // cut at the limit can land inside a character. That is a panic on the
+        // slice if the clamp does not walk to a boundary, and the half it has to
+        // keep is the end.
+        let accented = "aa".to_string() + &"é".repeat(10); // 2 + 20 bytes
+        assert_eq!(clamp_tail(&accented, 11), "é".repeat(5), "the cut moves to the next boundary");
+        let emoji = "xxxxx".to_string() + "\u{1F600}\u{1F600}"; // 5 + 8 bytes
+        assert_eq!(clamp_tail(&emoji, 6), "\u{1F600}", "one byte in would slice an emoji in half");
+        // On a boundary already, and under the limit: nothing is cut at all.
+        assert_eq!(clamp_tail(&accented, 12), "é".repeat(6), "a cut already on a boundary cuts nothing");
+        assert_eq!(clamp_tail(&accented, 1 << 20), accented);
+        for cut in [clamp_tail(&emoji, 6), clamp_tail(&accented, 11)] {
+            assert!(std::str::from_utf8(cut.as_bytes()).is_ok(), "what the rules read is text");
+        }
+    }
+
+    #[test]
     fn decision_parsing_accepts_the_shapes_we_have_seen() {
         let map = parse_decisions(r#"{"results":{"instruction_override_user":0.91}}"#);
         assert_eq!(map.get("instruction_override_user"), Some(&0.91));
