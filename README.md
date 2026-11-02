@@ -945,6 +945,7 @@ docker run -d \
 cargo clippy --all-targets -- -D warnings  # CI treats every lint as an error — run it before pushing
 cargo test                    # unit tests: routing, sessions, queueing, the log
 bash tests/e2e/run.sh         # model load/unload and the admin gate, against mock backends
+bash tests/e2e/audit_run.sh  # the audit on a streamed reply: split tool-call arguments, a reply past the reply cap, and a clean control
 ```
 
 The Rust toolchain is pinned in `rust-toolchain.toml`, so local and CI clippy
