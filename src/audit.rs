@@ -234,8 +234,9 @@ impl Mode {
     }
 
     /// Anything unrecognised is `full`, the plan's default for a configured
-    /// section; validation rejects the typo before it ever gets here.
-    pub fn from_str(s: &str) -> Self {
+    /// section; validation rejects the typo before it ever gets here. Not named
+    /// `from_str`, which would read as `std::str::FromStr` and answer to no `?`.
+    pub fn parse(s: &str) -> Self {
         match s {
             "off" => Mode::Off,
             "scanner" => Mode::Scanner,
@@ -1590,7 +1591,7 @@ impl Audit {
     /// once at startup — growing a pool or shrinking a live queue mid-flight is a
     /// different problem than flagging suspicious traffic.
     pub fn apply(&self, s: &AuditSettings) {
-        self.mode.store(Mode::from_str(&s.enabled).as_u8(), Relaxed);
+        self.mode.store(Mode::parse(&s.enabled).as_u8(), Relaxed);
         self.threshold.store(s.flag_threshold.to_bits(), Relaxed);
         self.watch_floor.store(s.watch_floor.to_bits(), Relaxed);
         self.tool_watch_floor.store(s.tool_watch_floor.to_bits(), Relaxed);
