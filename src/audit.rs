@@ -1449,6 +1449,12 @@ pub fn build_questions(text: &TurnText, budget: usize) -> (String, Vec<(String, 
 /// back out of it: the suffix says whose words it was, which decides the floor a
 /// guess is held to; the name says which question, which decides what a yes would
 /// mean ([`QUESTIONS`]).
+///
+/// A key ending in neither `_user` nor `_tool` is **dropped**. It cannot be
+/// attributed to a block this turn asked about, and a verdict that cannot say who
+/// said it cannot be triaged: it would file some unknown answer as a user's
+/// words, at the prose floor, which is the one floor the audit must not hand out
+/// for free. A server answering `q0` is a server we should not be believing.
 pub fn decision_flags(
     answers: &HashMap<String, f64>,
     threshold: f64,
@@ -1457,9 +1463,16 @@ pub fn decision_flags(
 ) -> Vec<Flag> {
     let mut out = Vec::new();
     for (key, prob) in answers {
-        // Read from the end, where the block number cannot hide it: a key always
-        // ends `_user` or `_tool`, however many blocks of that source came first.
-        let src = if key.ends_with("_user") { Src::User } else { Src::Tool };
+        // Read from the end, where the block number cannot hide it: a key can
+        // carry a block number and still name its source, however many blocks of
+        // that source came first. Anything that names none is not attributable.
+        let src = match key.strip_suffix("_user") {
+            Some(_) => Src::User,
+            None => match key.strip_suffix("_tool") {
+                Some(_) => Src::Tool,
+                None => continue,
+            },
+        };
         if *prob < if src == Src::Tool { tool_watch_floor } else { watch_floor } {
             continue;
         }
@@ -2776,9 +2789,12 @@ mod tests {
         assert_eq!(flags[0].by, "d3-nano");
         assert_eq!(flags[0].prob, Some(0.61));
         assert!(!flags[0].bad, "0.61 is under the threshold: a watch");
-        let sure = decision_flags(&HashMap::from([("q_0".into(), 0.9)]), 0.85, WATCH_FLOOR, WATCH_FLOOR);
+        let sure = decision_flags(&HashMap::from([("q_0_user".into(), 0.9)]), 0.85, WATCH_FLOOR, WATCH_FLOOR);
+        assert_eq!(sure.len(), 1, "a key we never asked for still lands, with the plainest story");
+        assert_eq!(sure[0].category.as_deref(), Some("intent"), "and it says so: {sure:?}");
+        assert_eq!(sure[0].src, Src::User, "the suffix is what says who: {sure:?}");
         assert!(sure[0].bad);
-        assert!(decision_flags(&HashMap::from([("q".into(), 0.1)]), 0.85, WATCH_FLOOR, WATCH_FLOOR).is_empty(), "a shrug is not a flag");
+        assert!(decision_flags(&HashMap::from([("instruction_override_user".into(), 0.1)]), 0.85, WATCH_FLOOR, WATCH_FLOOR).is_empty(), "a shrug is not a flag");
     }
 
     #[test]
@@ -2805,6 +2821,33 @@ mod tests {
             "the numbered key still names whose words it was: {seen:?}"
         );
         assert!(flags.iter().all(|f| f.bad), "0.9 is over the threshold: {flags:?}");
+    }
+
+    #[test]
+    fn an_answer_that_names_no_block_is_not_a_flag() {
+        // A key is the only thing tying a verdict to a block, so a key that ends
+        // in neither `_user` nor `_tool` is an answer about nobody. Filing it
+        // would hand the prose floor — the loosest bar there is — to a string the
+        // audit never asked about.
+        let answers = HashMap::from([
+            ("q0".to_string(), 0.99),
+            ("secret_disclosure".to_string(), 0.99),
+            ("third_party_transfer_1".to_string(), 0.99),
+            ("instruction_override".to_string(), 0.99),
+            ("instruction_override_user".to_string(), 0.9),
+        ]);
+        let flags = decision_flags(&answers, 0.85, WATCH_FLOOR, TOOL_WATCH_FLOOR);
+        assert_eq!(flags.len(), 1, "only the answer that names its block survives: {flags:?}");
+        assert_eq!((flags[0].src, flags[0].kind), (Src::User, Kind::Injection));
+        // The numbered shape is still attributable: `_1_tool` names its block too.
+        let numbered = decision_flags(
+            &HashMap::from([("secret_disclosure_2_tool".to_string(), 0.9)]),
+            0.85,
+            WATCH_FLOOR,
+            TOOL_WATCH_FLOOR,
+        );
+        assert_eq!(numbered.len(), 1, "a numbered key still says who: {numbered:?}");
+        assert_eq!((numbered[0].src, numbered[0].kind), (Src::Tool, Kind::Exfil));
     }
 
     #[test]
