@@ -3,6 +3,98 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## Unreleased
+
+### Changed
+
+- **A streamed tool call is now judged as the command it was** — the audit was
+  reading the SSE fragments, not the call: every argument delta arrived with a
+  leading space, so `curl -X PUT --data-binary @x https://bucket…` reached the
+  rules and the moderation model as `curl  - X  PUT -- data - binary @ x`, and
+  `169.254.169.254` as `1 6 9 . 2 5 4 …`. Multi-token rules — the whole point of
+  them — were silent on the path every agent here actually uses, and the garble
+  was also what the guard judged. The stream is now parsed once into its calls:
+  names taken from the first delta that carries one, argument fragments joined
+  with no separator, each call emitted once at the end, and a `command`/`cmd`
+  field unescaped so the rules read real shell text (non-streamed `tool_calls`
+  get the same treatment). This is the fix the rest of the audit was waiting for
+  — and the reason three of the corpus's flags were nonsense.
+- **The whole stored response is judged, not its first 128 KiB.** The raw SSE was
+  sliced before parsing, and chunks are ~230 bytes, so a long reply lost its
+  tail — exactly where a streamed tool call lives. The job now carries the full
+  stored response (already bounded by `log_content_limit`) and the clamp happens
+  after reconstruction, keeping the **tail** within the same 128 KiB budget.
+- **Every new user message is judged, and each one only once.** The audit read
+  the *last* user message, which for a harness that appends its own boilerplate
+  after the real instruction meant ignoring the instruction and re-flagging the
+  boilerplate on every turn — 15 of the 27 flags in the reviewed corpus were one
+  such message. Now all user messages after the last answer are collected, and
+  a block already judged for that conversation is skipped by both detectors, via
+  a bounded in-memory ledger of keyed digests: never persisted, never exported,
+  never compared outside the process, and forgotten at restart.
+- **Rules are boundary-aware, and they say whose words they judge.** Substring
+  matching meant `.env` hit `process.env`, `| sh` hit `outText || showStderr`
+  and `ip addr` hit a description of a zip address — and two of those hits in one
+  turn escalated to a **red** exfil. Patterns are compiled regexes with consumed
+  boundaries now, each carrying a short label a badge shows, and the source is
+  part of the rule: the exfil transfer, credential-path and sandbox rules read
+  the model's **own reply** (prose and the calls it issued), because a user or a
+  document naming `docker/.env` is describing a file, not shipping it, and a
+  chain needs its transfer leg to be the reply's. The accepted misses are in the
+  README, not hidden: a user-pasted exfil command the model runs verbatim, and
+  chains that still stop at one turn. The moderation guard is now fed the reply
+  **without** its tool calls — the commands are legible after the fix above, and
+  keeping them from the guard is still the deliberate split: the rule scanner is
+  their only detector, and `Controversial` verdicts on shell text were this host's
+  noisiest false positives.
+- **A `d3-nano` yes says what it meant, is held to a floor per source, and is
+  not asked about code.** Every verdict used to come back as `injection`,
+  including the two questions about exfil intents, and all 21 of the corpus's
+  model flags were false: the questions ask whether a text is asking an assistant
+  to do something, which is a question code answers too readily. Each question
+  now maps to its kind (`instruction_override` → `injection`, secret disclosure
+  and third-party transfer → `exfil`), a verdict below its floor is not recorded
+  at all — `watch_floor` 0.6 for a user block, the stricter `tool_watch_floor`
+  0.75 for a tool result — and a tool block that is code or command output (or
+  under 40 characters) is never asked, which spends that NPU on the fetched
+  pages and documents where indirect injection actually lives. The guard keeps a
+  `Controversial` verdict on a **reply** only at `flag_threshold` or above; a
+  person's own words keep the whole band.
+- **A redacted turn now says what fired.** Stripping the text also stripped the
+  `detail`, so 8 of 25 flagged turns were unauditable even by the operator who
+  flagged them; a flag now keeps its static pattern label (`pattern:
+  dotenv-path`, `pattern: curl-put`, `flagged by the guard`, the watchlist entry
+  that matched) and loses only the quoted excerpt. Nothing quoted survives a
+  strip.
+
+### Added
+
+- **`secret-in-tool-output`: a rule for the half of a leak this host never saw**
+  — a key coming back through a tool result. Key shapes (PEM, `AKIA…`, `ghp_…`,
+  `sk-…`, `xox[bp]-`), a `PASSWORD=<real value>` assignment, and a whole dotenv
+  **body** judged on its shape rather than its variable names: three or more
+  distinct `NAME=value` lines with at least one value that is not a placeholder,
+  so `cat docker/.env` returning `SIGNIN=password` is caught although nothing
+  there is called a secret. Templates stay quiet by design — `.env.example`,
+  READMEs and fixtures full of `<values>`, `changeme`, `${VAR}` and `example`
+  cost nothing — and a legitimate `printenv` dump going amber is the accepted
+  false positive, because that output is credential material. A secret in a
+  result is a watch on its own; the same reply carrying a transfer is what makes
+  it red.
+- **Three audit settings**, all optional: `audit.watch_floor` (default **0.6**)
+  and `audit.tool_watch_floor` (default **0.75**), the two floors above, and
+  `audit.guard_strict` (default **true**) — whether the moderation model is asked
+  for its controversial band, which is noisier and also the only thing that
+  catches an agent being steered. Defaults preserve shipped behavior except where
+  a floor was silently 0.4.
+- **`tests/e2e/audit_run.sh`** — the streamed-reply proof, end to end: it builds
+  the binary, starts its own mock and proxy, sends an OpenAI tool call whose
+  arguments arrive split across fragments, and reads the request log back to
+  assert the verdict (`bash tests/e2e/audit_run.sh`, ~40 s, run by hand like
+  `run.sh` — `cargo test` does not run it). Plus **`examples/audit_replay.rs`**:
+  the modules are a library now, so an offline tool can replay a recorded request
+  log through the *real* scanner instead of a copy that drifts from it.
+
 ## v0.26.0 — 2026-10-30
 
 ### Changed
