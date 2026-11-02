@@ -109,7 +109,7 @@ settings:
                               # on a busy box; raise both to make `history_hours` honest. The boot log
                               # warns when the chain cannot span `history_hours` at the current caps.
   request_log_flush_secs: 5                     # write a conversation out after this much quiet (default 5 s)
-  log_content_limit: 65536                    # max body bytes captured per record, min 1024 (default 64 KiB)
+  log_content_limit: 1048576                  # max body bytes captured per record, min 1024 (default 1 MiB)
   history_hours: 24                          # Activity (Overview) history depth, and the age its journaled
                               # records survive a restart (default 24); the Logs page replays the same
                               # journal. The journal rides next to the
@@ -138,7 +138,11 @@ settings:
   #   max_questions_per_turn: 6 # decision-model questions per turn (NPU budget)
   #   concurrency: 2            # audit requests in flight against the backend
   #   queue: 64                 # turns held while the audit is busy; past it a
-  #                             # turn is dropped and counted, never waited on
+  #                             # turn is dropped and counted, never waited on.
+  #                             # Memory rides this too: a held job carries a
+  #                             # whole stored reply (up to log_content_limit,
+  #                             # default 1 MiB), so (queue + concurrency) x that
+  #                             # is the audit's worst case — ~66 MiB as shipped
   #   extra_watch_hosts: []     # domains that turn a transfer into an exfil flag
   #   guard_model: qwen3guard-gen-0.6b
   #   decision_model: d3-nano
