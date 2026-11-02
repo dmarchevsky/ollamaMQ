@@ -14,6 +14,10 @@ Which stream it answers is chosen by a marker in the request:
   E2E-AUDIT-BENIGN   an ordinary `ls -la` call (the control that must stay quiet)
   anything else      the split transfer call
 
+The redacted scenario is not the mock's business at all: it sends the marker
+for the split transfer call with the proxy's `X-Redact-Log` header, and the
+harness reads the verdict out of a turn whose text the proxy never stored.
+
 It answers `GET /v1/models` with the one model it serves, which is what makes
 the proxy classify it as an OpenAI-family backend at all.
 """

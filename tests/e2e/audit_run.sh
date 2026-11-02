@@ -13,6 +13,9 @@
 #      the reply-scoping of D4) → a **confirmed** exfil flag naming the transfer
 #   B  the same call after prose past 128 KiB, at the very end    (audit D2)     → still flagged
 #   C  an ordinary `ls -la` tool call (the control)                              → no flag at all
+#   D  A again, sent with `X-Redact-Log`: the turn has no stored text, so the
+#      audit has to judge the reply from the copy it keeps in memory → the same
+#      confirmed exfil flag, with **no** quoting text on the record
 #
 # Needs: python3 (the mock), cargo (builds the proxy), free ports 11993/11994.
 # Never 8081 or 11435: the production container owns those.
@@ -74,18 +77,26 @@ check "0: the backend is listed, so its family was probed" "yes" \
   "$(curl -s $P/v1/models | grep -q "$MODEL" && echo yes || echo no)"
 
 # One streamed chat request per scenario. The marker in the user text is what
-# the mock reads to pick its stream, and what the reader uses to find the turn.
+# the mock reads to pick its stream, and what the reader uses to find the turn —
+# except for D, whose turn keeps no text at all and which the reader finds by
+# its `redacted` flag instead.
 chat() { # marker
   curl -s --max-time 90 -N -X POST $P/v1/chat/completions -H "$JH" \
     -d "{\"model\":\"$MODEL\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"$1 do the thing\"}]}"
 }
+chat_redact() { # marker, same request with log capture switched off
+  curl -s --max-time 90 -N -X POST $P/v1/chat/completions -H "$JH" -H "x-redact-log: 1" \
+    -d "{\"model\":\"$MODEL\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"$1 do the thing\"}]}"
+}
 
-echo "=== the three turns ==="
+echo "=== the four turns ==="
 A=$(chat "E2E-AUDIT-SPLIT"); B=$(chat "E2E-AUDIT-BIG"); C=$(chat "E2E-AUDIT-BENIGN")
+D=$(chat_redact "E2E-AUDIT-REDACT")
 done_ok() { printf '%s' "$1" | grep -q '\[DONE\]' && echo yes || echo no; }
 check "0: A reached the client as a stream"      "yes" "$(done_ok "$A")"
 check "0: B reached the client as a stream"      "yes" "$(done_ok "$B")"
 check "0: C reached the client as a stream"      "yes" "$(done_ok "$C")"
+check "0: D reached the client as a stream (redaction is not a refusal)" "yes" "$(done_ok "$D")"
 check "0: A really was streamed in fragments"    "yes" \
   "$(printf '%s' "$A" | grep -c '^data: {' | awk '{print ($1>3)?"yes":"no"}')"
 
@@ -96,11 +107,22 @@ check "0: A really was streamed in fragments"    "yes" \
 # silence a verdict rather than a turn the audit never got to.
 echo "=== reading the verdicts back out of the request log ==="
 RESULT=$(python3 - "$SCRATCH/reqlog.jsonl" "$P/metrics" "$MODEL" <<'PY'
-import json, sys, time, urllib.request
+import json, re, sys, time, urllib.request
 
 log_path, metrics_url, model = sys.argv[1], sys.argv[2], sys.argv[3]
 MARKS = {"A": "E2E-AUDIT-SPLIT", "B": "E2E-AUDIT-BIG", "C": "E2E-AUDIT-BENIGN"}
 OLD_CAP = 128 * 1024          # audit::RESPONSE_CHARS, the cut D2 removed
+TURNS = 4                     # A, B, C, and D sent with X-Redact-Log
+# What a redacted verdict is allowed to say: a pattern label, a chain's one-line
+# story, the watchlist entry that matched, or the guard's category. Anything else
+# in a `detail` is a quote from a turn whose text was never supposed to be saved.
+NAMED = re.compile(
+    r"^(pattern: [a-z0-9-]+|host [a-z0-9., -]+"
+    r"|[a-z +]*in one turn"
+    r"|a secret in a tool result and a transfer in the same turn)$"
+)
+# Strings that would mean the redacted record quotes the traffic.
+QUOTES = ("curl", "data-binary", "webhook.site/x", "E2E-AUDIT-REDACT")
 
 
 def scanned():
@@ -135,20 +157,25 @@ def turns():
                 continue
             req = ((t.get("content") or {}).get("req")) or ""
             mark = next((k for k, m in MARKS.items() if m in req), None)
+            # D stored no text, so there is no marker to read: it is the one turn
+            # of ours the log says it redacted.
+            if mark is None and t.get("redacted") and "content" not in t:
+                mark = "D"
             if mark:
                 out.append((mark, t))
     return out
 
 
 def settled():
-    by = {k: None for k in MARKS}
+    by = {k: None for k in ("A", "B", "C", "D")}
     for mark, t in turns():
         by[mark] = t
     if any(t is None for t in by.values()):
         return None
-    if not all(((t.get("content") or {}).get("resp")) for t in by.values()):
-        return None            # the stream is not stored yet
-    return by if scanned() >= 3 else None
+    for k in ("A", "B", "C"):
+        if not ((by[k].get("content") or {}).get("resp")):
+            return None            # the stream is not stored yet
+    return by if scanned() >= TURNS else None
 
 
 deadline = time.time() + 90
@@ -170,7 +197,7 @@ def first(flags, kind="exfil", bad=None):
     return {}
 
 
-for mark in ("A", "B", "C"):
+for mark in ("A", "B", "C", "D"):
     t = found[mark]
     flags = t.get("audit") or []
     resp = (t.get("content") or {}).get("resp") or ""
@@ -184,7 +211,18 @@ for mark in ("A", "B", "C"):
     out[f"{mark}_fragments"] = "yes" if '"rl -X P"' in resp else "no"
     out[f"{mark}_joined"] = "yes" if "curl -X PUT --data-binary" in resp else "no"
     out[f"{mark}_flags"] = str(len(flags))
+
+d = found["D"]
+dflags = d.get("audit") or []
+blob = json.dumps(d)
+out["D_text_stored"] = "yes" if "content" in d else "no"
+out["D_redacted"] = "yes" if d.get("redacted") else "no"
+out["D_excerpts"] = str(sum(1 for f in dflags if "excerpt" in f))
+out["D_named_detail"] = "yes" if all(NAMED.match(f["detail"]) for f in dflags if f.get("detail")) else "no"
+out["D_details"] = ";".join(sorted({f["detail"] for f in dflags if f.get("detail")}))
+out["D_quotes"] = "yes" if any(q in blob for q in QUOTES) else "no"
 print("\n".join(f"{k}={v}" for k, v in out.items()))
+
 PY
 )
 get() { printf '%s\n' "$RESULT" | grep "^$1=" | head -1 | cut -d= -f2-; }
@@ -192,8 +230,8 @@ echo "$RESULT" | sed 's/^/  log: /'
 
 check "A: the log holds the split fragments, not a joined command" "yes" "$(get A_fragments)"
 check "A: the joined command is nowhere in those bytes (the audit rebuilt it)" "no" "$(get A_joined)"
-check "A: the audit really judged all three turns (C's silence is a verdict)" "yes" \
-  "$(printf '%s\n' "$RESULT" | awk -F= '$1=="scanned"{print ($2>=3)?"yes":"no"}')"
+check "A: the audit really judged all four turns (C's silence is a verdict)" "yes" \
+  "$(printf '%s\n' "$RESULT" | awk -F= '$1=="scanned"{print ($2>=4)?"yes":"no"}')"
 
 echo "=== A: a tool call split across deltas is rebuilt before the rules read it (D1 + D4 reply scoping) ==="
 check "A: the turn carries a confirmed (red) exfil flag" "yes" "$(get A_bad_exfil)"
@@ -209,9 +247,19 @@ check "B: and it is the same reply-side transfer rule" "exfil|reply|rule:transfe
 check "B: it read the rebuilt command, not the fragments" "yes" "$(get B_names_cmd)"
 
 echo "=== C: the control — an ordinary ls -la is not suspicious ==="
-check "C: the turn was judged (the counter covers all three turns)" "0" "$(get C_flags)"
+check "C: the turn was judged (the counter covers all four turns)" "0" "$(get C_flags)"
 check "C: no exfil flag of any severity" "no" "$(get C_bad_exfil)"
 check "C: and no flags at all on the turn" "0" "$(get C_flags)"
+
+echo "=== D: a redacted turn is judged in memory, and keeps no quoting text ==="
+check "D: the log holds no text at all for it (no content to leak)" "no" "$(get D_text_stored)"
+check "D: and the turn is marked redacted, so the viewer says so" "yes" "$(get D_redacted)"
+check "D: the reply was still judged — the same confirmed exfil fires" "yes" "$(get D_bad_exfil)"
+check "D: same reply, same verdict as the unredacted turn A" "$(get A_by)" "$(get D_by)"
+check "D: it still names the chain it saw" "$(get A_detail)" "$(get D_detail)"
+check "D: no flag carries an excerpt" "0" "$(get D_excerpts)"
+check "D: every detail is a name the audit wrote, never a quote" "yes" "$(get D_named_detail)"
+check "D: nothing on the record quotes the command or the prompt" "no" "$(get D_quotes)"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

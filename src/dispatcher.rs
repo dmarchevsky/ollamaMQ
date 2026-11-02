@@ -4045,6 +4045,18 @@ pub async fn run_worker(state: Arc<AppState>) {
                         // total_bytes keeps counting).
                         let mut total_bytes: u64 = 0;
                         let mut content_acc: Vec<u8> = Vec::new();
+                        // The reply half of a **redacted** turn, for the audit
+                        // alone. When text is not stored `content_acc` stays
+                        // empty, so the judge was handed empty bytes: the
+                        // reply-scoped rules (the transfer, the credential path,
+                        // the sandbox push) never read a word of a redacted turn,
+                        // and neither did the guard. `scan_redacted` promises
+                        // in-memory judging, so the audit gets its own copy of
+                        // the same bounded bytes — the same
+                        // `log_content_limit`, never written anywhere, freed when
+                        // the job is judged. A reply nobody read is a reply no
+                        // rule can flag.
+                        let mut audit_acc: Vec<u8> = Vec::new();
                         // The end of the body, where token usage is reported.
                         let mut tail: Vec<u8> = Vec::new();
                         let started = std::time::Instant::now();
@@ -4169,6 +4181,25 @@ pub async fn run_worker(state: Arc<AppState>) {
                                                     let room = state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)
                                                         - content_acc.len();
                                                     content_acc
+                                                        .extend_from_slice(&chunk[..n.min(room)]);
+                                                }
+                                                // The audit's own copy, for the
+                                                // turns the log keeps no text of
+                                                // (see `audit_acc`). Bounded
+                                                // exactly like the log's buffer,
+                                                // held in memory only, and only
+                                                // filled while the audit says it
+                                                // will judge redacted traffic:
+                                                // what `strip_text` drops in
+                                                // `judge` is what keeps it out of
+                                                // the record.
+                                                if redact
+                                                    && state_clone.audit.wants_redacted()
+                                                    && audit_acc.len() < state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)
+                                                {
+                                                    let room = state_clone.log_content_limit.load(std::sync::atomic::Ordering::Relaxed)
+                                                        - audit_acc.len();
+                                                    audit_acc
                                                         .extend_from_slice(&chunk[..n.min(room)]);
                                                 }
                                                 if task
@@ -4411,8 +4442,19 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             // exactly what the audit needed. The
                                             // clamp happens in `judge`, after the
                                             // reply has been parsed out.
-                                            resp: (total_bytes > 0)
-                                                .then(|| Bytes::copy_from_slice(&content_acc)),
+                                            // Whichever buffer holds the
+                                            // reply: the log's when text is
+                                            // stored, the audit's copy when it
+                                            // is not — one of the two is always
+                                            // empty, so this is never a third
+                                            // copy of the stream.
+                                            resp: (total_bytes > 0).then(|| {
+                                                Bytes::copy_from_slice(if redact {
+                                                    &audit_acc
+                                                } else {
+                                                    &content_acc
+                                                })
+                                            }),
                                         },
                                     );
                                 }

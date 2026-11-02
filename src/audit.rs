@@ -1700,6 +1700,15 @@ impl Audit {
         self.scan_redacted.load(Relaxed)
     }
 
+    /// Whether a **redacted** turn is worth judging at all: the mode, plus
+    /// `audit.scan_redacted`. The serving path asks this before it keeps a
+    /// redacted reply in memory for the audit ([`crate::dispatcher`]'s
+    /// `audit_acc`) — [`Audit::submit`] drops such a job otherwise, so copying
+    /// the bytes for it would be a megabyte spent on a turn thrown away.
+    pub fn wants_redacted(&self) -> bool {
+        self.mode() != Mode::Off && self.scan_redacted()
+    }
+
     pub fn settings(&self) -> AuditSettings {
         self.settings.lock_or_recover().clone()
     }
