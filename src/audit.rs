@@ -298,8 +298,9 @@ pub enum Filter {
     /// A `KEY=value` line whose value is not a hole in a template — see
     /// [`placeholder_value`].
     Value,
-    /// Enough distinct `NAME=value` lines to be the body of a dotenv file, with
-    /// one real value among them — see [`DUMP_MIN_LINES`] and [`dotenv_dump`].
+    /// Enough distinct `NAME=value` lines to be the body of a dotenv file, and
+    /// one line that is both named like a secret and holding a real value — see
+    /// [`DUMP_MIN_LINES`], [`secret_named`] and [`dotenv_dump`].
     Dump,
 }
 
@@ -336,14 +337,40 @@ fn placeholder_value(value: &str) -> bool {
 /// credential file reads.
 const DUMP_MIN_LINES: usize = 3;
 
-/// The dotenv-dump test: enough distinct assignments to be a file, and at least
-/// one of them holding a real value. The match returned is the assignment that
-/// holds it — or nothing, which is the answer for every template file.
+/// Whether a dotenv variable's **name** is the kind that holds a credential.
 ///
-/// The false positive taken here is deliberate and accepted: a `printenv` or
-/// `env` dump of an ordinary deployment now goes amber, and it should — that
-/// output *is* credential material, and a watch on the turn that read it out is
-/// what we want in the log, not something to tune away.
+/// Matched on segments, not as a substring, because these words hide inside
+/// ordinary names: `MONKEY`, `KEYBOARD` and `TOKENS` are not secrets,
+/// `DB_PASSWD`, `APP_SECRET` and `auth_key` are. And the shell's own `PWD` is
+/// the working directory, which `printenv` prints on every line of every
+/// `env` dump — counting it as a secret-named line is what made a bare
+/// `printenv` fire, so the bare name alone is not one.
+fn secret_named(name: &str) -> bool {
+    name != "pwd" && SECRET_NAME.is_match(name)
+}
+
+static SECRET_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(^|_)(password|passwd|pwd|secret|token|credential|key)(_|$)").unwrap());
+
+/// The dotenv-dump test: enough distinct assignments to be a file, and at least
+/// one line whose name says secret **and** whose value is not a hole in a
+/// template. The match returned is that assignment — or nothing, which is the
+/// answer for a template file, a Makefile, a PKGBUILD header and a `printenv`.
+///
+/// The shape alone was too loud. A PKGBUILD's `pkgbase=… pkgver=… pkgrel=…`, a
+/// Makefile's `CC=gcc CFLAGS=-O2` and a three-line config sample are all
+/// `NAME=value` lines with a real value in them, and this host — which is doing
+/// exactly that packaging work all day — collected three new amber false
+/// positive classes from them. So a credential file is now judged by its shape
+/// **and** by one of its names, and the accepted miss is the mirror of it: a
+/// dumped file whose every name is innocent (`SIGNIN=password` and friends)
+/// stays quiet unless one of its names says secret or a value carries a key
+/// shape. The README says so too.
+///
+/// What is still taken on purpose: an `env` dump of a real deployment that *does*
+/// hold a `*_TOKEN=` or `*_PASSWORD=` line goes amber, and it should — that
+/// output is credential material, and a watch on the turn that read it out is
+/// what we want in the log.
 fn dotenv_dump<'a>(hits: impl Iterator<Item = regex::Match<'a>>) -> Option<regex::Match<'a>> {
     let mut lines: Vec<&str> = Vec::new();
     let mut real: Option<regex::Match<'a>> = None;
@@ -353,8 +380,10 @@ fn dotenv_dump<'a>(hits: impl Iterator<Item = regex::Match<'a>>) -> Option<regex
             continue; // the same line twice is one line of the file, not two
         }
         lines.push(line);
-        let holds_a_value = line.split_once('=').is_some_and(|(_, v)| !placeholder_value(v));
-        if real.is_none() && holds_a_value {
+        let named_a_secret_holding_a_value = line
+            .split_once('=')
+            .is_some_and(|(name, value)| secret_named(name) && !placeholder_value(value));
+        if real.is_none() && named_a_secret_holding_a_value {
             real = Some(hit);
         }
     }
@@ -378,15 +407,15 @@ impl Pat {
         Pat { filter: Filter::Value, ..Pat::new(re, label) }
     }
 
-    /// A pattern for the body of a dotenv file rather than one of its lines —
-    /// see [`Filter::Dump`].
+    /// A pattern for the body of a dotenv file rather than one of its lines:
+    /// shape **and** a secret-shaped name, see [`Filter::Dump`].
     fn dump(re: &str, label: &'static str) -> Pat {
         Pat { filter: Filter::Dump, ..Pat::new(re, label) }
     }
 
     /// The first match this pattern's filter accepts. For a dump that is the
-    /// assignment holding the real value, so the excerpt points at credential
-    /// material rather than at `LOG_LEVEL=debug`.
+    /// assignment whose name says secret and holds a real value, so the excerpt
+    /// points at credential material rather than at `LOG_LEVEL=debug`.
     fn find<'a>(&self, text: &'a str) -> Option<regex::Match<'a>> {
         match self.filter {
             Filter::Plain => self.re.find(text),
@@ -555,11 +584,12 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
                     r"(?m)^[a-z_]*(password|secret|token|api_key)=\S+",
                     "env-assignment",
                 ),
-                // ... and the whole file at once. The pattern above keys on the
-                // variable *name*, so the corpus shape `SIGNIN=password` was
-                // invisible through it: no name in that file ends in `password`,
-                // the *body* is the evidence. A dotenv dump is a secret whatever
-                // its variables are called.
+                // ... and the whole file at once. The pattern above reads one
+                // line's name; this one reads the file — but the body alone is
+                // not evidence, or every PKGBUILD and Makefile in the log is a
+                // leak. A dump fires on its shape **and** on a name that says
+                // secret with a real value behind it, which is what a credential
+                // file has and a build file does not. See [`dotenv_dump`].
                 Pat::dump(r"(?m)^[a-z][a-z0-9_]{2,}=\S+$", "dotenv-dump"),
             ],
         },
@@ -2315,15 +2345,22 @@ mod tests {
 
     #[test]
     fn a_credential_file_dumped_into_a_result_fires_on_its_shape() {
-        // The corpus case the name-keyed pattern above still missed: `cat
-        // docker/.env` came back holding `SIGNIN=password`, and no variable in
-        // that file is named anything like a secret — the body is the evidence.
-        let dump = "# ollamaMQ local config\nAPP_PORT=8081\nOLLAMA_HOST=localhost:11435\nSIGNIN=password\n";
+        // A real `.env` handed back by `cat docker/.env`: enough assignments to
+        // be a file, and a name that says what the file is for. The shape alone
+        // is not the evidence any more — a PKGBUILD has that — but a body of
+        // assignments *with* a secret-named line is.
+        let dump = "# docker/.env\nPOSTGRES_USER=app\nPOSTGRES_PASSWORD=Tr0ub4dor3x\nAPP_PORT=8081\nOLLAMA_HOST=localhost:11435\n";
         let flags = scan(dump);
         assert!(fired(&flags, "secret-in-tool-output"), "a dotenv dump fires on its shape: {flags:?}");
         assert!(patterns(&flags).contains(&"pattern: dotenv-dump".to_string()), "{:?}", patterns(&flags));
         assert!(has(&flags, Kind::Exfil, false), "a config that has not left is a watch: {flags:?}");
         assert!(!has(&flags, Kind::Exfil, true), "nothing has left yet: {flags:?}");
+        // The name pattern above does not know `PASSWD`, and neither does it
+        // count the file: this is the dump shape carrying a case on its own.
+        let passwd = "HOST=one\nPORT=two\nDB_PASSWD=hunter2\n";
+        let flags = scan(passwd);
+        assert!(fired(&flags, "secret-in-tool-output"), "an innocent-looking name, a real secret: {flags:?}");
+        assert!(patterns(&flags).contains(&"pattern: dotenv-dump".to_string()), "{:?}", patterns(&flags));
         // The pair that is the story: the reply ships the file it just read.
         let flags = scan_turn(
             &[
@@ -2337,10 +2374,22 @@ mod tests {
 
     #[test]
     fn a_file_shape_alone_is_not_a_dump() {
-        // The near-misses are what the threshold is for: each of these is a
-        // block of `NAME=value` lines that a rule keyed on assignment lines
-        // alone would turn amber for no reason.
+        // Every one of these is a block of `NAME=value` lines with a real value
+        // in it, and every one of them fired when the dump shape was the whole
+        // contract — that is the three FP classes this rule was tightened for:
+        // a build file's header, a shell environment, and a plain config sample.
         let quiet = [
+            // A PKGBUILD header. Names everywhere, no credential anywhere.
+            "pkgname=python-weasyprint\npkgver=61.2\npkgrel=1\narch=x86_64\nlicense=MIT\n",
+            // A Makefile's top, same shape and same nothing.
+            "CC=gcc\nCFLAGS=-O2 -Wall\nPREFIX=/usr/local\nDESTDIR=\n",
+            // A `printenv` fragment: this is the one that made `PWD=` a secret.
+            "PWD=/home/dima\nOLDPWD=/home/dima/work\nLANG=en_US.UTF-8\nSHELL=/bin/bash\nEDITOR=vim\n",
+            // A three-line config sample: an application's settings, not its secrets.
+            "app_title=Notes\nlog_level=debug\nlisten_addr=127.0.0.1:8081\n",
+            // And the case the tightening trades away, written down rather than
+            // hidden: a real dump whose names are all innocent stays quiet.
+            "HOST=one\nPORT=two\nSIGNIN=password\n",
             // One line quoted in a README, and a two-variable snippet.
             "PORT=8081",
             "SIGNIN=password",
@@ -2351,6 +2400,9 @@ mod tests {
             // the start of a line and nothing but its value after it.
             "Set SIGNIN to something strong. mode=fast, retries=3\nport = 8081\nif (n == 0) return -1;\n",
             "total=count*price\nx = 0; y = 0;\nresult = read()\n",
+            // A name that only *reads* like a secret because these words hide
+            // inside it: the match is on segments, not substrings.
+            "monkey=circus\nkeyboard=iso\ntokens=three\n",
         ];
         for text in quiet {
             let flags = scan(text);
@@ -2365,19 +2417,25 @@ mod tests {
             "one line is not a file: {:?}",
             patterns(&flags)
         );
-        // Three assignments, one of them real: that is a file.
+        // Three assignments, one of them a secret-shaped name holding a real
+        // value: that is a file.
         assert!(
-            fired(&scan("HOST=one\nPORT=two\nSIGNIN=password\n"), "secret-in-tool-output"),
-            "three assignments: a dump"
+            fired(&scan("HOST=one\nPORT=two\nDB_PASSWD=hunter2\n"), "secret-in-tool-output"),
+            "three assignments and a secret-shaped name: a dump"
+        );
+        // A secret-shaped name with a placeholder value is still a template.
+        assert!(
+            !fired(&scan("HOST=one\nPORT=two\nDB_PASSWD=${DB_PASSWD}\n"), "secret-in-tool-output"),
+            "the name has to come with a value"
         );
         // A repeated line is one line of the file, not two.
         assert!(
-            !fired(&scan("HOST=one\nHOST=one\nSIGNIN=password\n"), "secret-in-tool-output"),
+            !fired(&scan("HOST=one\nDB_PASSWD=hunter2\nDB_PASSWD=hunter2\n"), "secret-in-tool-output"),
             "distinct lines only"
         );
         // And the floor is three assignments of at least three characters: a
         // one-letter name sits under the shape, and no credential file reads `A=`.
-        let letters = scan("A=one\nB=two\nSIGNIN=password\n");
+        let letters = scan("A=one\nB=two\nDB_PASSWD=hunter2\n");
         assert!(
             !fired(&letters, "secret-in-tool-output"),
             "one-letter names are below the shape's floor: {letters:?}"
