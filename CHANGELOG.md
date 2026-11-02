@@ -23,7 +23,10 @@ since upstream `v0.5.0`.
   sliced before parsing, and chunks are ~230 bytes, so a long reply lost its
   tail — exactly where a streamed tool call lives. The job now carries the full
   stored response (already bounded by `log_content_limit`) and the clamp happens
-  after reconstruction, keeping the **tail** within the same 128 KiB budget.
+  after reconstruction, keeping the **tail** within the same 128 KiB budget. That
+  bound is also what the audit's memory is sized by: a held job costs up to
+  `log_content_limit`, so `(queue + concurrency) × log_content_limit` is the
+  worst case — about 66 MiB as shipped.
 - **Every new user message is judged, and each one only once.** The audit read
   the *last* user message, which for a harness that appends its own boilerplate
   after the real instruction meant ignoring the instruction and re-flagging the
@@ -59,28 +62,42 @@ since upstream `v0.5.0`.
   under 40 characters) is never asked, which spends that NPU on the fetched
   pages and documents where indirect injection actually lives. The guard keeps a
   `Controversial` verdict on a **reply** only at `flag_threshold` or above; a
-  person's own words keep the whole band.
-- **A redacted turn now says what fired.** Stripping the text also stripped the
-  `detail`, so 8 of 25 flagged turns were unauditable even by the operator who
-  flagged them; a flag now keeps its static pattern label (`pattern:
-  dotenv-path`, `pattern: curl-put`, `flagged by the guard`, the watchlist entry
-  that matched) and loses only the quoted excerpt. Nothing quoted survives a
-  strip.
+  person's own words keep the whole band. And an answer whose key names no block
+  the audit asked about — neither `_user` nor `_tool` — is dropped instead of
+  filed: a verdict that cannot say who said it cannot be triaged.
+- **A redacted turn is judged now, and says what it judged.** Two halves of the
+  same blind spot. Stripping the text also stripped the `detail`, so 8 of 25
+  flagged turns were unauditable even by the operator who flagged them; a flag
+  now keeps its static pattern label (`pattern: dotenv-path`, `pattern:
+  curl-put`, `flagged by the guard`, the watchlist entry that matched) and loses
+  only the quoted excerpt — nothing quoted survives a strip. And the **reply**
+  half of a redacted turn was never read at all: the job was handed the log's
+  copy of the response, which an `X-Redact-Log` turn does not have, so the rules
+  scoped to a reply (the transfer, the credential path, the sandbox push, and
+  every chain's transfer leg) saw an empty string and the moderation model was
+  asked about nothing. `scan_redacted` promises redacted traffic is judged in
+  memory, and now it is — the audit gets its own copy of the reply under the same
+  `log_content_limit` bound, held in RAM and written nowhere.
 
 ### Added
 
 - **`secret-in-tool-output`: a rule for the half of a leak this host never saw**
   — a key coming back through a tool result. Key shapes (PEM, `AKIA…`, `ghp_…`,
   `sk-…`, `xox[bp]-`), a `PASSWORD=<real value>` assignment, and a whole dotenv
-  **body** judged on its shape rather than its variable names: three or more
-  distinct `NAME=value` lines with at least one value that is not a placeholder,
-  so `cat docker/.env` returning `SIGNIN=password` is caught although nothing
-  there is called a secret. Templates stay quiet by design — `.env.example`,
-  READMEs and fixtures full of `<values>`, `changeme`, `${VAR}` and `example`
-  cost nothing — and a legitimate `printenv` dump going amber is the accepted
-  false positive, because that output is credential material. A secret in a
-  result is a watch on its own; the same reply carrying a transfer is what makes
-  it red.
+  **body** — but a body is judged by its shape *and* its names: three or more
+  distinct `NAME=value` lines **plus** one line whose name says secret
+  (`*_PASSWORD`, `*_TOKEN`, `*_KEY`, `PASSWD`…) holding a value that is not a
+  placeholder. Shape alone was too loud: a PKGBUILD header, a Makefile's
+  `CC=gcc CFLAGS=-O2` and a three-line config sample are all `NAME=value` lines
+  with a real value in them, and a bare `printenv` prints `PWD=` on every run.
+  Templates stay quiet by design — `.env.example`, READMEs and fixtures full of
+  `<values>`, `changeme`, `${VAR}` and `example` cost nothing — and the miss the
+  tightening trades away is written down rather than hidden: a dumped file whose
+  every name is innocent (`SIGNIN=password` and friends) is silent unless a value
+  carries a key shape. What does fire is the real `env` dump holding a
+  `*_TOKEN=` or `*_PASSWORD=` line, and that amber is intended — that output is
+  credential material. A secret in a result is a watch on its own; the same reply
+  carrying a transfer is what makes it red.
 - **Three audit settings**, all optional: `audit.watch_floor` (default **0.6**)
   and `audit.tool_watch_floor` (default **0.75**), the two floors above, and
   `audit.guard_strict` (default **true**) — whether the moderation model is asked
