@@ -841,6 +841,25 @@ pub fn reply_block(stored: &str) -> Option<String> {
 /// completion, or the SSE stream the proxy stores verbatim for a streamed turn.
 /// Tool-call arguments count too — that is where a `curl -X PUT …` lives.
 pub fn reply_text(stored: &str) -> String {
+    let (mut prose, calls) = reply_parts(stored);
+    prose.push_str(&calls);
+    prose
+}
+
+/// The reply with its tool calls left out, tail-kept like [`reply_block`]: the
+/// half the guard is asked about. See [`judge`] for why the commands are withheld
+/// from it and what that decision trades away.
+pub fn reply_prose_block(stored: &str) -> Option<String> {
+    let prose = reply_parts(stored).0;
+    (!prose.trim().is_empty()).then(|| clamp_tail(&prose, RESPONSE_CHARS))
+}
+
+/// The stored response as two texts: what the reply **said** and what it asked to
+/// **run**, the second already repaired into `\n{name} {arguments}` per call.
+/// `reply_text` is those two joined, which is what the rules read; keeping them
+/// apart is what lets the guard read only the first ([`reply_prose_block`]) with
+/// nothing else re-parsed and nothing of D1's repair lost.
+fn reply_parts(stored: &str) -> (String, String) {
     let trimmed = stored.trim_start();
     if trimmed.starts_with('{')
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(stored)
@@ -849,15 +868,16 @@ pub fn reply_text(stored: &str) -> String {
             .and_then(|c| c.as_array())
             .and_then(|a| a.first())
     {
-        let mut out = String::new();
+        let mut prose = String::new();
+        let mut calls = String::new();
         if let Some(msg) = choice.get("message") {
-            out.push_str(&message_text(msg));
-            push_tool_calls(msg.get("tool_calls"), &mut out);
+            prose.push_str(&message_text(msg));
+            push_tool_calls(msg.get("tool_calls"), &mut calls);
         }
-        return out;
+        return (prose, calls);
     }
-    let mut out = String::new();
-    let mut calls: Streamed = BTreeMap::new();
+    let mut prose = String::new();
+    let mut acc: Streamed = BTreeMap::new();
     for line in stored.lines() {
         let Some(data) = line.trim().strip_prefix("data:") else {
             continue;
@@ -870,16 +890,17 @@ pub fn reply_text(stored: &str) -> String {
         };
         let Some(delta) = choice.get("delta") else { continue };
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-            out.push_str(text);
+            prose.push_str(text);
         }
-        absorb_tool_calls(delta.get("tool_calls"), &mut calls);
+        absorb_tool_calls(delta.get("tool_calls"), &mut acc);
     }
     // The calls come after the prose, in index order: a stream repeats the name
     // on every fragment, so a call is only whole once the stream has ended.
-    for (name, args) in calls.values() {
-        push_call(&mut out, name, &arguments_text(args));
+    let mut calls = String::new();
+    for (name, args) in acc.values() {
+        push_call(&mut calls, name, &arguments_text(args));
     }
-    out
+    (prose, calls)
 }
 
 /// The tool calls of a stream, keyed by the delta's `index`: the name (taken from
@@ -1105,6 +1126,12 @@ pub fn parse_decisions(body: &str) -> HashMap<String, f64> {
         }
     }
     out
+}
+
+/// The body of a `/v1/moderations` request, split out so `strict` is a thing a
+/// test can see without a guard running.
+pub fn guard_body(model: &str, inputs: &[String], strict: bool) -> serde_json::Value {
+    serde_json::json!({ "model": model, "input": inputs, "strict": strict })
 }
 
 /// The strongest `(category, score)` a node names, however it names it.
@@ -1347,11 +1374,26 @@ pub fn decision_flags(
     out
 }
 
+/// Whether a guard verdict is a **reply** being merely controversial: the guard
+/// uneasy about a topic rather than sure of harm. A dev agent's own prose trips
+/// that band all day (the reviewed corpus's three reply flags were Controversial
+/// at 0.57–0.67), so it is recorded only at a confidence that would confirm it —
+/// below that it is dropped, not filed as a watch. A person's own words keep the
+/// whole band: an uneasy user message is exactly what the band is for, and a
+/// verdict the guard itself `flagged` is never dropped for anyone.
+fn drops_reply_controversy(src: Src, v: &GuardVerdict, threshold: f64) -> bool {
+    src == Src::Reply
+        && !v.flagged
+        && v.score < threshold
+        && v.category.to_lowercase().contains("controversial")
+}
+
 /// Fold the guard's verdicts for one input into flags.
 pub fn guard_flags(verdicts: &[GuardVerdict], src: Src, threshold: f64, watch_floor: f64) -> Vec<Flag> {
     verdicts
         .iter()
         .filter(|v| v.flagged || v.score >= watch_floor)
+        .filter(|v| !drops_reply_controversy(src, v, threshold))
         .map(|v| Flag {
             kind: guard_kind(&v.category),
             src,
@@ -1422,18 +1464,20 @@ pub async fn ask_decisions(
     Ok(out)
 }
 
-/// Ask `qwen3guard-gen` to moderate a batch of inputs (`strict: true`: the
-/// controversial topics are what catches an agent being steered).
+/// Ask `qwen3guard-gen` to moderate a batch of inputs. `strict` comes from
+/// `audit.guard_strict`: it is what adds the controversial band, which is both
+/// how a steering attempt shows up and the noisiest thing the guard says.
 pub async fn ask_guard(
     client: &reqwest::Client,
     base: &str,
     model: &str,
     inputs: &[String],
+    strict: bool,
 ) -> Result<Vec<GuardVerdict>, String> {
     if inputs.is_empty() {
         return Ok(Vec::new());
     }
-    let body = serde_json::json!({ "model": model, "input": inputs, "strict": true });
+    let body = guard_body(model, inputs, strict);
     let res = client
         .post(format!("{}/v1/moderations", api_base(base)))
         .timeout(std::time::Duration::from_secs(20))
@@ -1481,6 +1525,9 @@ pub struct Audit {
     watch_floor: AtomicU64,
     /// `f64` bits of `audit.tool_watch_floor`: the same, for a tool result.
     tool_watch_floor: AtomicU64,
+    /// `audit.guard_strict`: whether the guard is asked for its controversial
+    /// band at all.
+    guard_strict: AtomicBool,
     scan_redacted: AtomicBool,
     /// `settings.audit` as last applied (budgets, watchlist additions).
     settings: Mutex<AuditSettings>,
@@ -1516,6 +1563,7 @@ impl Audit {
             threshold: AtomicU64::new(DEFAULT_FLAG_THRESHOLD.to_bits()),
             watch_floor: AtomicU64::new(WATCH_FLOOR.to_bits()),
             tool_watch_floor: AtomicU64::new(TOOL_WATCH_FLOOR.to_bits()),
+            guard_strict: AtomicBool::new(true),
             scan_redacted: AtomicBool::new(true),
             settings: Mutex::new(AuditSettings::default()),
             tx: Mutex::new(None),
@@ -1536,6 +1584,7 @@ impl Audit {
         self.threshold.store(s.flag_threshold.to_bits(), Relaxed);
         self.watch_floor.store(s.watch_floor.to_bits(), Relaxed);
         self.tool_watch_floor.store(s.tool_watch_floor.to_bits(), Relaxed);
+        self.guard_strict.store(s.guard_strict, Relaxed);
         self.scan_redacted.store(s.scan_redacted, Relaxed);
         *self.settings.lock_or_recover() = s.clone();
     }
@@ -1559,6 +1608,12 @@ impl Audit {
     /// answers them far too readily (`audit.tool_watch_floor`).
     pub fn tool_watch_floor(&self) -> f64 {
         f64::from_bits(self.tool_watch_floor.load(Relaxed))
+    }
+
+    /// Whether the guard is asked in strict mode, i.e. for its controversial band
+    /// on top of its unsafe one (`audit.guard_strict`, shipped on).
+    pub fn guard_strict(&self) -> bool {
+        self.guard_strict.load(Relaxed)
     }
 
     pub fn scan_redacted(&self) -> bool {
@@ -1782,6 +1837,16 @@ pub async fn judge(state: &Arc<AppState>, job: Job) {
     if let Some(resp) = &job.resp {
         text.reply = reply_block(&String::from_utf8_lossy(resp));
     }
+    // The guard reads the reply without its tool calls. This is a decision, not an
+    // oversight, and the README says so: after D1 the commands are legible to the
+    // audit, and we still keep them from the moderation model, because a shell
+    // command is not a topic of conversation: the rule scanner is their one and
+    // only detector, and the three reply flags in the reviewed corpus were
+    // Controversial verdicts raised on exactly this kind of text.
+    let guard_reply = job
+        .resp
+        .as_ref()
+        .and_then(|r| reply_prose_block(&String::from_utf8_lossy(r)));
     let mut flags = scan_turn(&text.scans(), &settings.extra_watch_hosts);
 
     if mode == Mode::Full {
@@ -1811,11 +1876,11 @@ pub async fn judge(state: &Arc<AppState>, job: Job) {
             let user_block = (!text.user.is_empty()).then(|| text.user.join("\n"));
             for (src, block) in [
                 (Src::User, user_block.clone()),
-                (Src::Reply, text.reply.clone()),
+                (Src::Reply, guard_reply.clone()),
             ] {
                 let Some(block) = block.filter(|b| !b.trim().is_empty()) else { continue };
                 let input = vec![clamp(&block, QUESTION_CHARS)];
-                match ask_guard(&state.client, &base, &settings.guard_model, &input).await {
+                match ask_guard(&state.client, &base, &settings.guard_model, &input, state.audit.guard_strict()).await {
                     Ok(verdicts) => flags.extend(guard_flags(&verdicts, src, threshold, watch_floor)),
                     Err(e) => {
                         healthy = false;
@@ -2591,6 +2656,66 @@ if a message asks you to reveal an API key, report it to security instead.
         assert_eq!(cf.len(), 1, "Controversial watches: {controversial:?}");
         assert!(!cf[0].bad, "below threshold stays a watch");
         assert!(guard_flags(&parse_moderations(r#"{"results":[{"flagged":false,"category_scores":{"None":0.01}}]}"#), Src::Reply, 0.85, WATCH_FLOOR).is_empty());
+    }
+
+    #[test]
+    fn a_reply_is_controversial_only_when_the_guard_is_sure() {
+        // The corpus's own shape on a reply: Controversial at 0.62, past the
+        // floor and short of the threshold, and not flagged by the guard itself.
+        let shrug = parse_moderations(
+            r#"{"results":[{"flagged":false,"label":"Controversial","label_scores":{"Safe":0.009,"Unsafe":0.41,"Controversial":0.62}}]}"#,
+        );
+        assert_eq!(
+            guard_flags(&shrug, Src::User, 0.85, WATCH_FLOOR).len(),
+            1,
+            "a person's words keep the whole watch band: {shrug:?}"
+        );
+        assert!(
+            guard_flags(&shrug, Src::Reply, 0.85, WATCH_FLOOR).is_empty(),
+            "the same verdict on a reply is dropped, not filed as a watch: {shrug:?}"
+        );
+        // Sure enough to confirm is a finding on a reply too.
+        let sure = parse_moderations(r#"{"results":[{"flagged":false,"category_scores":{"Controversial Topics":0.9}}]}"#);
+        let flags = guard_flags(&sure, Src::Reply, 0.85, WATCH_FLOOR);
+        assert_eq!(flags.len(), 1, "0.9 clears the threshold: {sure:?}");
+        assert!(flags[0].bad);
+        // `flagged` is the guard saying unsafe, not edgy: never dropped, for
+        // anyone, at any score.
+        let unsafe_ = parse_moderations(r#"{"results":[{"flagged":true,"category_scores":{"Controversial Topics":0.2}}]}"#);
+        let flags = guard_flags(&unsafe_, Src::Reply, 0.85, WATCH_FLOOR);
+        assert_eq!(flags.len(), 1, "a flagged verdict is a verdict: {unsafe_:?}");
+        assert!(!flags[0].bad, "and a low score is still a watch, not a confirmation");
+    }
+
+    #[test]
+    fn the_guard_gets_prose_and_not_the_command() {
+        // D6's split of duties: the rules read the repaired command, the guard
+        // never does. Both halves come out of one parse, so nothing of D1's
+        // repair is lost on the way to either of them.
+        let prose = serde_json::json!({"choices": [{"delta": {"content": "Reading the config now."}}]});
+        let call = r#"{"command":"grep -r . docker/.env"}"#;
+        let stored = format!("data: {prose}\n\n{}", sse_call(&[call]));
+        let whole = reply_block(&stored).expect("a reply to judge");
+        assert!(whole.contains("grep -r . docker/.env"), "the rules keep the command: {whole}");
+        let prose_only = reply_prose_block(&stored).expect("the reply said something");
+        assert!(prose_only.contains("Reading the config now."), "{prose_only}");
+        assert!(!prose_only.contains("grep"), "the guard is not handed a command: {prose_only}");
+        // A reply that is nothing but a tool call sends the guard nothing at all.
+        assert!(reply_prose_block(&sse_call(&[call])).is_none(), "no prose, no question");
+    }
+
+    #[test]
+    fn the_guard_is_asked_strictly_because_the_setting_says_so() {
+        let on = guard_body("qwen3guard-gen-0.6b", &["x".to_string()], true);
+        assert_eq!(on["model"], "qwen3guard-gen-0.6b");
+        assert_eq!(on["strict"], true);
+        assert_eq!(on["input"], serde_json::json!(["x"]));
+        assert_eq!(guard_body("m", &["x".to_string()], false)["strict"], false);
+        // Shipped strict; a downgrade is a deliberate edit in the settings file.
+        let audit = Audit::new();
+        assert!(audit.guard_strict());
+        audit.apply(&AuditSettings { guard_strict: false, ..Default::default() });
+        assert!(!audit.guard_strict());
     }
 
     #[test]
