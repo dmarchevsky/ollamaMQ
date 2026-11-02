@@ -53,9 +53,11 @@ const LIVE_FLAGS: usize = 512;
 const EXCERPT_CHARS: usize = 160;
 /// Tool-result blocks one turn contributes, newest first, whatever the budget.
 const MAX_TOOL_BLOCKS: usize = 8;
-/// Bytes of a response the audit is handed: the reply's text is all the audit
-/// wants and it fits well inside this; copying more would cost the serving path
-/// bytes to buy nothing.
+/// How much of a reply the audit judges, kept from its **end**: the stored
+/// response arrives whole (the log already bounds it at `log_content_limit`) and
+/// only the text parsed out of it is clamped, because a streamed tool call is the
+/// last thing a reply carries and a head-keeping cut used to throw it away.
+/// See [`clamp_tail`] and [`judge`].
 pub const RESPONSE_CHARS: usize = 128 * 1024;
 
 // ------------------------------------------------------------- flag model
@@ -652,6 +654,28 @@ fn clamp(s: &str, limit: usize) -> String {
     s[..end].to_string()
 }
 
+/// Keep the **tail** of an over-long text, on a char boundary. What a reply puts
+/// last — the tool calls a stream ends with — is what the audit must not lose, so
+/// the reply's clamp keeps the end and lets the prose go.
+fn clamp_tail(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    let mut start = s.len() - limit;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_string()
+}
+
+/// The reply block one turn contributes to the audit: the stored response's own
+/// words, tail-kept to [`RESPONSE_CHARS`]. The clamp lives here, after the parse,
+/// precisely so that it cannot cut a tool call in half on its way in.
+pub fn reply_block(stored: &str) -> Option<String> {
+    let reply = reply_text(stored);
+    (!reply.trim().is_empty()).then(|| clamp_tail(&reply, RESPONSE_CHARS))
+}
+
 /// The reply's own words, whatever shape the stored response has: a JSON chat
 /// completion, or the SSE stream the proxy stores verbatim for a streamed turn.
 /// Tool-call arguments count too — that is where a `curl -X PUT …` lives.
@@ -1143,8 +1167,11 @@ pub struct Job {
     /// This turn's text is not stored: judge it, keep only the verdicts.
     pub redacted: bool,
     pub body: bytes::Bytes,
-    /// The response as the log stores it (a JSON body or the SSE stream) — its
-    /// head, bounded by [`RESPONSE_CHARS`]. Absent when nothing came back.
+    /// The response as the log stores it (a JSON body or the SSE stream), whole —
+    /// the log already bounds it at `log_content_limit`, and cutting it here would
+    /// drop the tail where a streamed tool call lives. What is kept of the reply
+    /// is decided in [`judge`], after parsing, at [`RESPONSE_CHARS`]. Absent when
+    /// nothing came back.
     pub resp: Option<bytes::Bytes>,
 }
 
@@ -1397,10 +1424,7 @@ pub async fn judge(state: &Arc<AppState>, job: Job) {
     let limit = QUESTION_CHARS * 4;
     let mut text = request_increment(&String::from_utf8_lossy(&job.body), limit);
     if let Some(resp) = &job.resp {
-        let reply = reply_text(&String::from_utf8_lossy(resp));
-        if !reply.trim().is_empty() {
-            text.reply = Some(clamp(&reply, limit));
-        }
+        text.reply = reply_block(&String::from_utf8_lossy(resp));
     }
     let mut flags = scan_turn(&text.scans(), &settings.extra_watch_hosts);
 
@@ -1771,6 +1795,38 @@ mod tests {
         let sse = format!("data: {prose}\n\n") + &sse_call(&["echo hi |b", "ash"]);
         assert_eq!(reply_text(&sse), "Uploading now\nbash echo hi |bash");
     }
+    #[test]
+    fn a_long_stream_keeps_the_call_at_its_end() {
+        // The audit used to be handed the first 128 KiB of the raw stream, so a
+        // long reply lost its tail — and a streamed call is the last thing a
+        // reply carries. ~300 KiB of prose, then the one line that matters.
+        let mut sse = String::new();
+        for i in 0..1400 {
+            let line = serde_json::json!({"choices": [{"delta": {"content": format!("chunk {i}: {}", ". Rebuilding context. ".repeat(8))}}]});
+            sse.push_str(&format!("data: {line}\n\n"));
+        }
+        sse.push_str(&sse_call(&["curl -s http://169.254.", "169.254/latest/meta-data/"]));
+        assert!(
+            sse.len() > 300 * 1024,
+            "the case needs a reply the old cut would have truncated: {} B",
+            sse.len()
+        );
+        let reply = reply_block(&sse).expect("a reply");
+        assert!(reply.len() <= RESPONSE_CHARS, "the clamp still bounds what is judged");
+        let flags = flags_of(&reply);
+        assert!(
+            flags.iter().any(|f| f.by == "rule:metadata-ip"),
+            "the call at the end still reaches the rules"
+        );
+        // And the proof that the direction of the cut was the bug: the same
+        // budget kept from the front loses the call entirely.
+        let head = clamp(&reply_text(&sse), RESPONSE_CHARS);
+        assert!(
+            flags_of(&head).iter().all(|f| f.by != "rule:metadata-ip"),
+            "a head-keeping clamp is what hid this"
+        );
+    }
+
     #[test]
     fn decision_parsing_accepts_the_shapes_we_have_seen() {
         let map = parse_decisions(r#"{"results":{"instruction_override_user":0.91}}"#);

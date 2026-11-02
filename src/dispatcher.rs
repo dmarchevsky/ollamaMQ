@@ -4403,11 +4403,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                                             rid,
                                             redacted: redact,
                                             body: audit_body.clone(),
-                                            resp: (total_bytes > 0).then(|| {
-                                                Bytes::copy_from_slice(
-                                                    &content_acc[..content_acc.len().min(crate::audit::RESPONSE_CHARS)],
-                                                )
-                                            }),
+                                            // Whole, not its head:
+                                            // `content_acc` is already bounded by
+                                            // `log_content_limit`, and a tool call
+                                            // is the last thing a stream carries —
+                                            // cutting the raw SSE here threw away
+                                            // exactly what the audit needed. The
+                                            // clamp happens in `judge`, after the
+                                            // reply has been parsed out.
+                                            resp: (total_bytes > 0)
+                                                .then(|| Bytes::copy_from_slice(&content_acc)),
                                         },
                                     );
                                 }
