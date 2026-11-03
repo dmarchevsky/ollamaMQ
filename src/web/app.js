@@ -2010,10 +2010,11 @@ function renderLogs() {
   const meta = S.logsMeta;
   const chainShort = meta && all.length && meta.chain_start_ms != null
     && meta.chain_start_ms > nowish() - winMs(S.filters.win)
-    ? `<div class="capnote">The window asks for ${winLabel(S.filters.win)}; the log chain reaches back to `
+    ? `<div class="capnote">The window asks for ${winLabel(S.filters.win)}; the log reaches back to `
       + `${fmtTime(meta.chain_start_ms)} — that is everything still on disk. Anything the log can no longer `
       + `open is dimmed and says why. `
-      + `Retention is the only limit: raise <code>request_log_max_files</code> to keep more slots.</div>`
+      + `Retention is the only limit: raise <code>request_log_max_total_bytes</code> (or `
+      + `<code>request_log_max_days</code>) to keep more.</div>`
     : '';
   const indexingNote = meta && meta.indexing
     ? '<p class="hint">indexing the log…</p>' : '';
@@ -2847,19 +2848,54 @@ function lvAutoStop() {
   if (lvAutoTimer) { clearInterval(lvAutoTimer); lvAutoTimer = null; }
 }
 
-/** Refetch everything and hand the browser a file: the raw log, always —
- *  one JSONL line, the conversation index plus every turn's captured request
- *  and response verbatim. What `log_content_limit` did not capture was never
- *  stored, and the truncated-capture note says so. */
+/** Hand the browser a file: the raw log — one JSONL line, the whole
+ *  conversation as the server keeps it, every request rebuilt in full and
+ *  every reply as stored, fetched in one request. What `log_content_limit` did
+ *  not capture was never stored, and the truncated-capture note says so. */
 async function lvDownload() {
   if (!LV.conv) return;
   toast('preparing raw log…', true);
-  const turns = lvTurns();
-  for (const t of turns) await lvLoad(t.rid);
   const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '').slice(0, 11);
   const base = `ollamamq-${(LV.conv.user || 'client').replace(/[^\w.-]/g, '_')}-${(LV.conv.session || 'one-shot')}-${stamp}`;
-  const line = JSON.stringify({ ...LV.conv, turns: turns.map(t => ({ ...t, content: { req: LV.content.get(t.rid)?.req ?? null, resp: LV.content.get(t.rid)?.resp ?? null } })) });
-  lvSave(line + '\n', base + '.jsonl', 'application/x-ndjson');
+  let conv;
+  if (LV.conv.key) conv = await api('GET', 'conv/export?key=' + encodeURIComponent(LV.conv.key));
+  else {
+    // A control event has no conversation behind it: save what the viewer holds.
+    const turns = lvTurns();
+    for (const t of turns) await lvLoad(t.rid);
+    conv = { ...LV.conv, turns: turns.map(t => ({ ...t, content: { req: LV.content.get(t.rid)?.req ?? null, resp: LV.content.get(t.rid)?.resp ?? null } })) };
+  }
+  lvSave(JSON.stringify(conv) + '\n', base + '.jsonl', 'application/x-ndjson');
+}
+
+/** Delete the open conversation from the log — two clicks: the first arms
+ *  the button for a few seconds, the second deletes. The Logs rows stay (they
+ *  come from the Activity journal) and turn inert, like any aged-out row. */
+async function lvDelete() {
+  const btn = $('#lv-del');
+  const key = LV.conv?.key;
+  if (!key) { toast('this entry is not a stored conversation', false); return; }
+  if (LV.delArm !== key) {
+    LV.delArm = key;
+    btn.textContent = 'Confirm';
+    btn.classList.add('armed');
+    clearTimeout(LV.delTimer);
+    LV.delTimer = setTimeout(lvDeleteDisarm, 4000);
+    return;
+  }
+  lvDeleteDisarm();
+  await api('DELETE', 'conv?key=' + encodeURIComponent(key));
+  $('#dlg-log').close();
+  toast('conversation deleted from the log', true);
+  render();
+}
+
+function lvDeleteDisarm() {
+  LV.delArm = null;
+  clearTimeout(LV.delTimer);
+  const btn = $('#lv-del');
+  btn.textContent = 'Delete';
+  btn.classList.remove('armed');
 }
 
 /** A non-stream response has no SSE to rebuild, but reads out the same way. */
@@ -3317,8 +3353,8 @@ const SET_GROUPS = [
   ['Logging & server', ['log_content_limit', '@startup']],
 ];
 const STARTUP_LABEL = {
-  host: 'Listen address', port: 'Port', request_log_path: 'Request log file', request_log_max_bytes: 'Log file size',
-  request_log_max_files: 'Log files kept', clients_file: 'Clients file', models_file: 'Model rules file',
+  host: 'Listen address', port: 'Port', request_log_path: 'Request log file', request_log_max_total_bytes: 'Log size budget',
+  request_log_max_days: 'Log kept (days)', clients_file: 'Clients file', models_file: 'Model rules file',
 };
 const SOURCE_LABEL = { default: 'default', file: 'appconf.yaml', cli: 'command line', env: 'environment' };
 
@@ -3403,7 +3439,8 @@ function setRow(f) {
 
 function fmtStartup(key, v) {
   if (v == null) return '<span class="dim">—</span>';
-  if (key === 'request_log_max_bytes') return fmtBytes(v);
+  if (key === 'request_log_max_total_bytes') return fmtBytes(v);
+  if (key === 'request_log_max_days' && v === 0) return 'no age limit';
   return `<code>${esc(v)}</code>`;
 }
 
@@ -4010,6 +4047,8 @@ $('#lv-next').addEventListener('click', () => lvStep(1));
 $('#lv-last').addEventListener('click', () => lvFocus(lvTurns().at(-1)?.rid));
 $('#lv-reload').addEventListener('click', () => lvReload().catch(e => toast(e.message, false)));
 $('#lv-dl').addEventListener('click', () => lvDownload().catch(e => toast(e.message, false)));
+$('#lv-del').addEventListener('click', () => lvDelete().catch(e => toast(e.message, false)));
+$('#dlg-log').addEventListener('close', lvDeleteDisarm);
 $('#client-filter').addEventListener('change', e => { S.clientFilter = e.target.value; render(); });
 $('#model-search').addEventListener('input', e => { S.modelQuery = e.target.value.trim().toLowerCase(); render(); });
 $('#model-show').addEventListener('change', e => { S.modelShow = e.target.value; render(); });

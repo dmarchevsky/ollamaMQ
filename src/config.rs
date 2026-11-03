@@ -173,12 +173,22 @@ pub struct Settings {
     /// `appconf.yaml`, like every other state file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_log_path: Option<String>,
-    /// Max bytes per request-log file before rotation (default 10 MiB).
+    /// Retired in v0.29.0: sized the old shared rotation chain. Still parsed so an
+    /// existing appconf.yaml loads; boot warns and names the replacements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_log_max_bytes: Option<u64>,
-    /// Number of rotated request-log files to keep (default 5).
+    /// Retired in v0.29.0, see `request_log_max_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_log_max_files: Option<usize>,
+    /// Bytes on disk the conversation log may take, all conversation files and
+    /// any legacy chain together (default 1 GiB). Past it, the oldest finished
+    /// conversations are removed whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_log_max_total_bytes: Option<u64>,
+    /// Days a conversation is kept after its last turn (default 30; 0 = no
+    /// age limit, only the byte budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_log_max_days: Option<u64>,
     /// Seconds a conversation must be quiet for before it is written to the log
     /// (default 60). A conversation that resumes is written again as one longer
     /// line, so a smaller value costs file size and a larger one delays the
@@ -616,6 +626,7 @@ impl Settings {
             max_concurrent_per_backend, detect_backend_slots, model_aliases, ip_identity,
             sticky_routing, sticky_ttl, sticky_lag, sticky_max_entries, client_priority,
             request_log_path, request_log_max_bytes, request_log_max_files,
+            request_log_max_total_bytes, request_log_max_days,
             request_log_flush_secs, log_content_limit,
             history_hours, history_max_records,
             max_body_bytes, max_queued_bytes, clients_file, models_file,
@@ -642,6 +653,7 @@ impl Settings {
             "history_max_records",
         )?;
         at_least(self.request_log_flush_secs, 5, "request_log_flush_secs")?;
+        at_least(self.request_log_max_total_bytes, 1024 * 1024, "request_log_max_total_bytes")?;
         at_least(self.sticky_ttl, 1, "sticky_ttl")?;
         at_least(self.sticky_max_entries.map(|v| v as u64), 1, "sticky_max_entries")?;
         if let Some(audit) = &self.audit {

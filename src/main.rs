@@ -254,8 +254,19 @@ async fn main() {
             .max()
             .unwrap_or(1)
     });
-    let request_log_max_bytes = eff.request_log_max_bytes.unwrap_or(10 * 1024 * 1024);
-    let request_log_max_files = eff.request_log_max_files.unwrap_or(5);
+    let retention = ollamamq::convlog::Retention {
+        max_total_bytes: eff.request_log_max_total_bytes.unwrap_or(1 << 30),
+        max_days: eff.request_log_max_days.unwrap_or(30),
+    };
+    if eff.request_log_max_bytes.is_some() || eff.request_log_max_files.is_some() {
+        tracing::warn!(
+            "request_log_max_bytes / request_log_max_files are retired: each conversation now has \
+             its own file, kept or removed whole. Size the log with request_log_max_total_bytes \
+             (now {} MiB) and request_log_max_days (now {}), and drop the old keys.",
+            retention.max_total_bytes >> 20,
+            retention.max_days
+        );
+    }
     let request_log_flush =
         std::time::Duration::from_secs(eff.request_log_flush_secs.unwrap_or(5));
     let log_content_limit = eff
@@ -374,8 +385,7 @@ async fn main() {
     for cand in ollamamq::convlog::ConvLogger::open_candidates(&request_log_path, &config_dir) {
         match ollamamq::convlog::ConvLogger::start(
             cand.clone(),
-            request_log_max_bytes,
-            request_log_max_files,
+            retention,
             request_log_flush,
         ) {
             Ok(pair) => {
@@ -497,17 +507,22 @@ async fn main() {
     // write rate the chain itself has seen says it cannot span the window,
     // name both knobs at boot: rows listed from the journal that 404 in the
     // viewer otherwise read as a broken viewer, not as retention.
-    if let Some((used_bytes, oldest_ms)) = state.convlog.chain_disk_stats() {
+    if let Some((used_bytes, cap, Some(oldest_ms))) = state.convlog.retention_usage() {
         let hours = state.stats.history_hours();
-        // The live file plus the `request_log_max_files` rotated slots.
-        let cap = request_log_max_bytes.saturating_mul(request_log_max_files.max(1) as u64 + 1);
-        if ollamamq::convlog::retention_shortfall(cap, used_bytes, oldest_ms, ollamamq::stats::now_ms(), hours) {
+        let by_age = retention.max_days > 0 && retention.max_days * 24 < hours;
+        if by_age
+            || ollamamq::convlog::retention_shortfall(cap, used_bytes, oldest_ms, ollamamq::stats::now_ms(), hours)
+        {
+            let days = match retention.max_days {
+                0 => "no age limit".to_string(),
+                d => format!("{d} days"),
+            };
             tracing::warn!(
-                "log retention: the conversation chain keeps ~{} MiB at request_log_max_bytes x \
-                 request_log_max_files, which at its observed write rate cannot span the {} h of \
-                 history_hours — older Activity rows will list but not open. Raise \
-                 request_log_max_bytes / request_log_max_files, or lower history_hours.",
-                cap / (1 << 20),
+                "log retention: the conversation log keeps {} MiB / {days}, which at its observed \
+                 growth cannot span the {} h of history_hours — older Activity rows will list but \
+                 not open. Raise request_log_max_total_bytes / request_log_max_days, or lower \
+                 history_hours.",
+                cap >> 20,
                 hours
             );
         }

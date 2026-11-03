@@ -228,6 +228,8 @@ tr.selected > td { background: var(--accent-soft); }
 .btn.primary:hover { filter: brightness(1.08); }
 .btn.danger { color: var(--bad); }
 .btn.danger.solid, dialog .btn.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+/* The viewer's Delete stays quiet until a first click arms it. */
+dialog .btn.danger.lv-del:not(.armed) { background: var(--surface); border-color: var(--border); color: var(--bad); }
 .btn.sm { font-size: 12px; padding: 3px 9px; border-radius: 6px; }
 .btn.on-vip { background: var(--vip-soft); color: var(--vip); border-color: transparent; }
 .btn.on-boost { background: var(--warn-soft); color: var(--warn); border-color: transparent; }

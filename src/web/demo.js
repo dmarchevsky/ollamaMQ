@@ -679,8 +679,8 @@
     ],
     startup: [
       F('host', '0.0.0.0', 'file', false), F('port', 11435, 'file', false),
-      F('request_log_path', '/data/ollamamq-requests.jsonl', 'file', false), F('request_log_max_bytes', 10 * MiB, 'default', false),
-      F('request_log_max_files', 5, 'default', false), F('clients_file', '/config/clients.yaml', 'default', false),
+      F('request_log_path', '/data/ollamamq-requests.jsonl', 'file', false), F('request_log_max_total_bytes', 1024 * MiB, 'default', false),
+      F('request_log_max_days', 30, 'default', false), F('clients_file', '/config/clients.yaml', 'default', false),
       F('models_file', '/config/models.yaml', 'default', false),
     ],
     restart_pending: [],
@@ -790,6 +790,15 @@
         backend_online: true, queue: 0, queue_max: 64, dropped: 0, scan_redacted: true, flag_threshold: 0.85 });
       if (method === 'GET' && p === 'conv') return delay(convIndex(qs(path)));
       if (method === 'GET' && p === 'conv/content') return delay(convContent(qs(path)));
+      if (method === 'GET' && p === 'conv/export') {
+        const c = convIndex(qs(path));
+        return delay({ ...c, turns: c.turns.map(t => ({ ...t, content: { req: (CONV_TEXT[t.rid] || {}).in ?? null, resp: (CONV_TEXT[t.rid] || {}).out ?? null } })) });
+      }
+      if (method === 'DELETE' && p === 'conv') {
+        const c = convIndex(qs(path));
+        convs.splice(convs.indexOf(c), 1);
+        return delay({ deleted: c.key });
+      }
       if (method === 'POST' && p === 'config/reload') return delay({ models: 3 });
       if (method === 'GET' && p === 'models') return delay(policyView());
       if (method === 'PUT' && p === 'models/mode') { policy.mode = body.mode; return delay({}); }

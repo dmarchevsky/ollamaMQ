@@ -1,21 +1,21 @@
 //! Read, migrate and check the conversation log outside the proxy.
 //!
 //! ```text
-//! cargo run --release --example convlog_tool -- export  <log files…>  > all.jsonl
-//! cargo run --release --example convlog_tool -- compact <out.jsonl> <log files…>
-//! cargo run --release --example convlog_tool -- check   <log files…>
+//! cargo run --release --example convlog_tool -- export  <logs dir or files…>  > all.jsonl
+//! cargo run --release --example convlog_tool -- compact <out.jsonl> <logs dir or files…>
+//! cargo run --release --example convlog_tool -- check   <logs dir or files…>
 //! ```
 //!
-//! The proxy writes each conversation as a series of v4 lines that carry only
-//! what changed, with request deltas and compressed rotated slots (see
-//! `src/convlog.rs`). That keeps days of agent traffic in the space minutes used
-//! to take, but a line on disk is no longer a whole conversation. These commands
-//! give scripts the whole view back and move older logs forward:
+//! The proxy writes each conversation to a file of its own under
+//! `<logs>/sessions/<day>/`, as v4 lines that carry only what changed, with
+//! request deltas and compressed sealed frames (see `src/convlog.rs`). A line on
+//! disk is not a whole conversation, so these commands give scripts the whole
+//! view back and move older logs forward. Pass the logs folder (the one holding
+//! `sessions/`) or any files:
 //!
 //! - **export** prints one line per conversation with every turn's request
-//!   rebuilt whole — the shape `jq`, DuckDB or a Python script wants. Pass every
-//!   file of the chain (`'/srv/logs/ollamamq-requests.jsonl'*`): a conversation's
-//!   lines can span several files.
+//!   rebuilt whole — the shape `jq`, DuckDB or a Python script wants. Deleted
+//!   conversations stay hidden; a legacy shared chain in the folder is read too.
 //! - **compact** rewrites a chain (any schema, e.g. v3 snapshots from before the
 //!   compact format) into v4 lines, one per turn, to stand in for the live file
 //!   of a stopped proxy or to archive. It writes plain JSONL; compress it with
@@ -51,9 +51,9 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: convlog_tool export <log files…>");
-    eprintln!("       convlog_tool compact <out.jsonl> <log files…>");
-    eprintln!("       convlog_tool check <log files…>");
+    eprintln!("usage: convlog_tool export <logs dir or files…>");
+    eprintln!("       convlog_tool compact <out.jsonl> <logs dir or files…>");
+    eprintln!("       convlog_tool check <logs dir or files…>");
     std::process::exit(2);
 }
 
@@ -133,7 +133,11 @@ fn compact(out: PathBuf, files: &[PathBuf]) {
 }
 
 fn check(files: &[PathBuf]) {
-    let input: u64 = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+    let input: u64 = convlog::expand_log_paths(files)
+        .iter()
+        .filter_map(|f| std::fs::metadata(f).ok())
+        .map(|m| m.len())
+        .sum();
     let originals = load(files);
     let mut text = String::new();
     for conv in &originals {
