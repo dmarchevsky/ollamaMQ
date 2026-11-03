@@ -3,7 +3,7 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
-## Unreleased
+## v0.27.0 — 2026-11-03
 
 ### Changed
 
@@ -46,7 +46,10 @@ since upstream `v0.5.0`.
   document naming `docker/.env` is describing a file, not shipping it, and a
   chain needs its transfer leg to be the reply's. The accepted misses are in the
   README, not hidden: a user-pasted exfil command the model runs verbatim, and
-  chains that still stop at one turn. The moderation guard is now fed the reply
+  chains that still stop at one turn. The transfer patterns are a set and not a
+  parser, so an asked-for upload in a shape they do not read — plain
+  `curl -T <file> <url>`, where `--upload-file` is matched and `-T` only as
+  `-t http…` — stays two amber watches. The moderation guard is now fed the reply
   **without** its tool calls — the commands are legible after the fix above, and
   keeping them from the guard is still the deliberate split: the rule scanner is
   their only detector, and `Controversial` verdicts on shell text were this host's
