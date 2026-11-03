@@ -147,6 +147,9 @@ since upstream `v0.5.0`.
   so an offline tool could use the real scanner, but the Dockerfile's dependency-cache
   stub wrote only a `main.rs` and cargo would not parse the manifest — the stub writes
   an empty `lib.rs` too now.
+  and because that stub is what the dependency cache is built from, the real build then
+  re-used the stub library and the binary could not find its own modules — every source is
+  touched before the release build now, not just `main.rs`.
 
 ## v0.26.0 — 2026-10-30
 
