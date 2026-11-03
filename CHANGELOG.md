@@ -113,6 +113,21 @@ since upstream `v0.5.0`.
   the modules are a library now, so an offline tool can replay a recorded request
   log through the *real* scanner instead of a copy that drifts from it.
 
+### Fixed
+
+- **Traffic with a case fold in it could take the audit down with it.** The rule
+  scanner judged a **lower-cased copy** of every block and cut its excerpt out of
+  the original text, using the offset the copy had reported. `to_lowercase` does
+  not preserve byte length (`ẞ` folds to two bytes, `İ` to two characters), so one
+  of those offsets could land between the bytes of a single character and the
+  slice panicked mid-UTF-8 — and a turn that tripped it recorded no verdict at
+  all and never released its place in the audit queue. Every pattern is compiled
+  case-insensitive now and matched against the text as it arrived, which is the
+  same match set for a corpus written in lower case and the only text whose
+  offsets the excerpt may use. Watch hosts were the same substring search on the
+  same copy, so they are searched in the text itself now too. Shipped since
+  v0.24.0, and only loud on traffic that contains characters like those.
+
 ## v0.26.0 — 2026-10-30
 
 ### Changed
