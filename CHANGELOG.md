@@ -143,6 +143,10 @@ since upstream `v0.5.0`.
   offsets the excerpt may use. Watch hosts were the same substring search on the
   same copy, so they are searched in the text itself now too. Shipped since
   v0.24.0, and only loud on traffic that contains characters like those.
+  The tag's image build also broke on the same release: the modules became a library
+  so an offline tool could use the real scanner, but the Dockerfile's dependency-cache
+  stub wrote only a `main.rs` and cargo would not parse the manifest — the stub writes
+  an empty `lib.rs` too now.
 
 ## v0.26.0 — 2026-10-30
 

@@ -8,7 +8,7 @@ WORKDIR /build
 
 # Create dummy project for caching dependencies
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
+RUN mkdir src && echo "fn main() {}" > src/main.rs && : > src/lib.rs && cargo build --release && rm -rf src
 
 # Copy source code
 COPY src ./src
