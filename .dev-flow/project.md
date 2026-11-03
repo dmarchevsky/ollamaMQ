@@ -1,8 +1,15 @@
+# ollamaMQ — dev-flow playbook
+
+<!-- Operator-owned and tracked: a change rides a docs flow and a PR. -->
+
 ## global
 
 ```flow
 defaultBranch = master
-release.artifact = docker buildx imagetools inspect ghcr.io/dmarchevsky/ollamamq:{version}
+```
+
+```flow-guard
+protect config :: live backend credentials (untracked, real keys) — never echo or edit them without the operator
 ```
 
 ## plan
@@ -15,14 +22,28 @@ release.artifact = docker buildx imagetools inspect ghcr.io/dmarchevsky/ollamamq
 test = cargo clippy --all-targets --locked -- -D warnings && node --check src/web/app.js && node --check src/web/demo.js && node --check src/web/login.js && cargo test
 build = cargo build --release
 run = cargo run
+healthWait = 0
 ```
 
 ```flow-check health
-target/release/ollamaMQ --no-tui -c /home/dima/work/ollamaMQ/config/appconf.yaml --port 8099 >/tmp/devflow-health.log 2>&1 & pid=$!
-sleep 2
+cargo build --release -q || exit 1
+cfg="$(git rev-parse --path-format=absolute --git-common-dir)/../config/appconf.yaml"
+target/release/ollamaMQ --no-tui -c "$cfg" --port 8099 >/tmp/devflow-health.log 2>&1 & pid=$!
+for i in $(seq 1 15); do curl -fs http://127.0.0.1:8099/health >/dev/null && break; sleep 1; done
 curl -fs http://127.0.0.1:8099/health; rc=$?
-kill $pid; exit $rc
+kill $pid 2>/dev/null; for i in 1 2 3 4 5; do kill -0 $pid 2>/dev/null || break; sleep 1; done
+kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null
+exit $rc
 ```
+
+The health probe builds first (`flow check` runs no build, and a fresh worktree has no binary), reads the
+main checkout's untracked `config/` through `git rev-parse --git-common-dir` (worktrees carry no config),
+waits up to 15 s for readiness, and stops its instance with TERM, then KILL — a bare `kill` once left a
+zombie holding :8099 that answered a later probe for the wrong build. It retries itself, hence
+`healthWait = 0`.
+
+The repo is not rustfmt-clean under the pinned toolchain (a `cargo fmt` drive-by reformats ~17 files):
+hand-format new code to the surrounding style and never run a `cargo fmt` sweep inside a feature flow.
 
 - [ ] (ui) visual pass in light **and** dark at 390px and 1280px: no overflows, no stray scrollbars, legible contrast
 - [ ] app runs locally against real backends (not `?demo`); primary views walked with live data
@@ -47,9 +68,9 @@ login.js}` to a scratch dir, splice the driver's body into the copied `index.htm
 "file://<copy>/index.html?demo=1" 2>&1 | grep ASSERT`. `--enable-logging=stderr` is what surfaces the
 `ASSERT PASS/FAIL <name>` lines (the harness is silent without it); the virtual-time budget must exceed the
 driver's 3 s timeline. It drives the log viewer (background scroll-lock, body scrollability, `≣` rail
-stamps) and must open a round that has stored text — a redacted round legitimately has nothing to scroll,
-so the body-scrollable check goes silently wrong once the demo carries a redacted round first; the driver
-skips rows marked `no text` for exactly that reason. The shell's screenshot can still capture a stale frame
+stamps) and must open a turn that has stored text — a redacted turn legitimately has nothing to scroll,
+so the body-scrollable check goes silently wrong once the demo carries a redacted turn first; the driver
+skips rows marked `redacted` for exactly that reason. The shell's screenshot can still capture a stale frame
 of the modal; the assertions are trustworthy, the PNG is a coin-flip.
 Gotchas: each shot starts at the page top-left (no scroll) — for a lower region hide what is
 above with an inline `<style>`; a `--user-data-dir` profile persists between shots, so use a
@@ -66,9 +87,11 @@ verified must be the one answering there (`--port 8081 --host 0.0.0.0`); `8099` 
 production container and a dev walk contend for the same port: before starting, check
 `ss -ltnp | grep :8081` / `pgrep -a ollamaMQ`, and re-check if the UI shows stale behaviour —
 a proxy left running pins the port after its worktree is rebuilt or deleted
-(`exe -> …/ollamaMQ (deleted)`) and silently serves the wrong build. Start it only after
+(`exe -> …/ollamaMQ (deleted)`) and silently serves the wrong build. With two flows live in parallel,
+:8081 may be held by the *other* flow's worktree binary — then walk on another free port
+(`--port 8092`) and kill yours before finish. Start it only after
 implementation completes, kill it before `flow finish`. Run the worktree binary against the
-repo's own config by absolute path: `-c /home/dima/work/ollamaMQ/config/appconf.yaml` — real
+repo's own config by absolute path: `-c "$(git rev-parse --path-format=absolute --git-common-dir)/../config/appconf.yaml"` — real
 backends, real credentials, sign-in-able with the operator's saved login; no config copy, no
 test password, no `.dev-flow/<slug>/live/` dir (retired). `config/` is untracked, so worktrees
 carry no config of their own — the `flow-check health` probe resolves it the same way.
@@ -90,33 +113,43 @@ Persist as you go: draft findings, calibration constants and mid-stage decisions
 `plan/plan.md` (or a scratch file under the feature dir) as they happen, not only at stage
 boundaries — long implement stages otherwise lose them to context compaction.
 
+## pre-release
+
+```flow
+versionFile = Cargo.toml
+versionTag = v{version}
+```
+
+Semver: minor for user-facing features, patch for chores/fixes. The version-bump commit must
+include the refreshed `Cargo.lock` — a release commit that leaves the lock stale is incomplete.
+The changelog has no `## Unreleased` section, so every release is versioned; a `--no-version` flow
+needs that heading added first.
+
 ## release
 
-Before `flow release`, `git status --porcelain` in the worktree must be empty: `flow check` and
-`flow release` do not report uncommitted paths (only `flow verify` prints them), and the squash
-ships without them — v0.17.0 released with a review fix to `app.css` left uncommitted.
+```flow
+merge = squash
+artifact = docker buildx imagetools inspect ghcr.io/dmarchevsky/ollamamq:{version}
+preflight = docker build -q -t ollamamq:preflight .
+```
+
+`preflight` builds the release image from the worktree before anything ships: the tag-triggered
+`docker-release` build is otherwise the only check of the Cargo layout in the Dockerfile's cache stage,
+and v0.27.0 broke it twice after tagging (#47, #48).
 
 **No tag on red CI:** the local `test` command runs the same `cargo clippy --all-targets --locked
 -- -D warnings` as the hosted `test` workflow, and `rust-toolchain.toml` pins the toolchain both
 sides use — so lint fallout must surface at implement, never in CI. Still, the merge commit is the
 first commit the hosted workflow actually runs on, and `docker-release` publishes from the tag
-gardless of the `test` verdict: v0.22.0–v0.24.0 all shipped on red CI. So after the merge lands and
+regardless of the `test` verdict: v0.22.0–v0.24.0 all shipped on red CI. So after the merge lands and
 before tagging, wait for the `test` run on the merge commit and require green:
 `concl=$(gh run list --workflow=test --branch master --commit "$(git rev-parse origin/master)" --json conclusion -q '.[0].conclusion // "no run"'); [ "$concl" = success ] || { echo "test workflow on the merge commit: $concl"; exit 1; }`
 A red or missing run means fix-forward with a new PR (or abort the tag), never tag anyway.
 
 - [ ] `test` workflow green on the merge commit before the tag (`gh run list --workflow=test --branch master --commit <merge-sha>`)
 
-Semver: minor for user-facing features, patch for chores/fixes. The version-bump commit must
-include the refreshed `Cargo.lock` — a release commit that leaves the lock stale is incomplete.
 Release images are published to GHCR (`ghcr.io/dmarchevsky/ollamamq`) by the tag-triggered
 workflow; `release-done`'s artifact probe is the proof — never claim "published" before it
 passes. Production runs from the deploy
 checkout: `docker compose pull && docker compose up -d`, because compose tracks
 `ghcr.io/dmarchevsky/ollamamq:latest`, which CI publishes from the release tag.
-
-```flow
-merge = squash
-versionFile = Cargo.toml
-versionTag = v{version}
-```
