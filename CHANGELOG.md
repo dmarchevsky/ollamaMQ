@@ -3,6 +3,147 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.27.0 — 2026-11-03
+
+### Changed
+
+- **A streamed tool call is now judged as the command it was** — the audit was
+  reading the SSE fragments, not the call: every argument delta arrived with a
+  leading space, so `curl -X PUT --data-binary @x https://bucket…` reached the
+  rules and the moderation model as `curl  - X  PUT -- data - binary @ x`, and
+  `169.254.169.254` as `1 6 9 . 2 5 4 …`. Multi-token rules — the whole point of
+  them — were silent on the path every agent here actually uses, and the garble
+  was also what the guard judged. The stream is now parsed once into its calls:
+  names taken from the first delta that carries one, argument fragments joined
+  with no separator, each call emitted once at the end, and a `command`/`cmd`
+  field unescaped so the rules read real shell text (non-streamed `tool_calls`
+  get the same treatment). This is the fix the rest of the audit was waiting for
+  — and the reason three of the corpus's flags were nonsense.
+- **The whole stored response is judged, not its first 128 KiB.** The raw SSE was
+  sliced before parsing, and chunks are ~230 bytes, so a long reply lost its
+  tail — exactly where a streamed tool call lives. The job now carries the full
+  stored response (already bounded by `log_content_limit`) and the clamp happens
+  after reconstruction, keeping the **tail** within the same 128 KiB budget. That
+  bound is also where the audit's memory sizing starts: a held job costs a reply
+  of up to `log_content_limit` **plus the request body it came with** (a second
+  buffer, bounded by `max_body_bytes`), so `(queue + concurrency) × (reply +
+  body)` is the worst case — roughly 66 MiB of replies as shipped, plus bodies.
+- **Every new user message is judged, and each one only once.** The audit read
+  the *last* user message, which for a harness that appends its own boilerplate
+  after the real instruction meant ignoring the instruction and re-flagging the
+  boilerplate on every turn — 15 of the 27 flags in the reviewed corpus were one
+  such message. Now all user messages after the last answer are collected, and
+  a block already judged for that conversation is skipped by both detectors, via
+  a bounded in-memory ledger of keyed digests: never persisted, never exported,
+  never compared outside the process, and forgotten at restart.
+- **Rules are boundary-aware, and they say whose words they judge.** Substring
+  matching meant `.env` hit `process.env`, `| sh` hit `outText || showStderr`
+  and `ip addr` hit a description of a zip address — and two of those hits in one
+  turn escalated to a **red** exfil. Patterns are compiled regexes with consumed
+  boundaries now, each carrying a short label a badge shows, and the source is
+  part of the rule: the exfil transfer, credential-path and sandbox rules read
+  the model's **own reply** (prose and the calls it issued), because a user or a
+  document naming `docker/.env` is describing a file, not shipping it, and a
+  chain needs its transfer leg to be the reply's. The accepted misses are in the
+  README, not hidden: a user-pasted exfil command the model runs verbatim, and
+  chains that still stop at one turn. The transfer patterns are a set and not a
+  parser, so an asked-for upload in a shape they do not read — plain
+  `curl -T <file> <url>`, where `--upload-file` is matched and `-T` only as
+  `-t http…` — stays two amber watches. The moderation guard is now fed the reply
+  **without** its tool calls — the commands are legible after the fix above, and
+  keeping them from the guard is still the deliberate split: the rule scanner is
+  their only detector, and `Controversial` verdicts on shell text were this host's
+  noisiest false positives.
+- **A watch host named in prose no longer confirms an exfil on its own.** A
+  single watchlist hit — `webhook.site`, `*.aliyuncs.com`, one of your
+  `extra_watch_hosts` — was a **red** badge by itself, because the chain let that
+  one hit stand in for both legs: `check my webhook.site listener` came back as
+  `rule:transfer · transfer + watch host in one turn` with no transfer pattern
+  hit anywhere in the turn, and the corpus's false positives were exactly
+  ordinary dev traffic about those hosts. A watch host is now a destination only
+  where the model met it — in its own reply (the address it was told to ship to)
+  or in a tool result that carried it back. Mentioned in your own message it is
+  still an amber watch, flag and excerpt intact, so the operator still sees the
+  mention. This is a deliberate narrowing: a turn whose only trace of an exfil is
+  an address in someone's sentence stays amber, and a **red** exfil now always
+  means a transfer the model actually asked for.
+- **A `d3-nano` yes says what it meant, is held to a floor per source, and is
+  not asked about code.** Every verdict used to come back as `injection`,
+  including the two questions about exfil intents, and all 21 of the corpus's
+  model flags were false: the questions ask whether a text is asking an assistant
+  to do something, which is a question code answers too readily. Each question
+  now maps to its kind (`instruction_override` → `injection`, secret disclosure
+  and third-party transfer → `exfil`), a verdict below its floor is not recorded
+  at all — `watch_floor` 0.6 for a user block, the stricter `tool_watch_floor`
+  0.75 for a tool result — and a tool block that is code or command output (or
+  under 40 characters) is never asked, which spends that NPU on the fetched
+  pages and documents where indirect injection actually lives. The guard keeps a
+  `Controversial` verdict on a **reply** only at `flag_threshold` or above; a
+  person's own words keep the whole band. And an answer whose key names no block
+  the audit asked about — neither `_user` nor `_tool` — is dropped instead of
+  filed: a verdict that cannot say who said it cannot be triaged.
+- **A redacted turn is judged now, and says what it judged.** Two halves of the
+  same blind spot. Stripping the text also stripped the `detail`, so 8 of 25
+  flagged turns were unauditable even by the operator who flagged them; a flag
+  now keeps its static pattern label (`pattern: dotenv-path`, `pattern:
+  curl-put`, `flagged by the guard`, the watchlist entry that matched) and loses
+  only the quoted excerpt — nothing quoted survives a strip. And the **reply**
+  half of a redacted turn was never read at all: the job was handed the log's
+  copy of the response, which an `X-Redact-Log` turn does not have, so the rules
+  scoped to a reply (the transfer, the credential path, the sandbox push, and
+  every chain's transfer leg) saw an empty string and the moderation model was
+  asked about nothing. `scan_redacted` promises redacted traffic is judged in
+  memory, and now it is — the audit gets its own copy of the reply under the same
+  `log_content_limit` bound, held in RAM and written nowhere.
+
+### Added
+
+- **`secret-in-tool-output`: a rule for the half of a leak this host never saw**
+  — a key coming back through a tool result. Key shapes (PEM, `AKIA…`, `ghp_…`,
+  `sk-…`, `xox[bp]-`), a `PASSWORD=<real value>` assignment, and a whole dotenv
+  **body** — but a body is judged by its shape *and* its names: three or more
+  distinct `NAME=value` lines **plus** one line whose name says secret
+  (`*_PASSWORD`, `*_TOKEN`, `*_KEY`, `PASSWD`…) holding a value that is not a
+  placeholder. Shape alone was too loud: a PKGBUILD header, a Makefile's
+  `CC=gcc CFLAGS=-O2` and a three-line config sample are all `NAME=value` lines
+  with a real value in them, and a bare `printenv` prints `PWD=` on every run.
+  Templates stay quiet by design — `.env.example`, READMEs and fixtures full of
+  `<values>`, `changeme`, `${VAR}` and `example` cost nothing — and the miss the
+  tightening trades away is written down rather than hidden: a dumped file whose
+  every name is innocent (`SIGNIN=password` and friends) is silent unless a value
+  carries a key shape. What does fire is the real `env` dump holding a
+  `*_TOKEN=` or `*_PASSWORD=` line, and that amber is intended — that output is
+  credential material. A secret in a result is a watch on its own; the same reply
+  carrying a transfer is what makes it red.
+- **Three audit settings**, all optional: `audit.watch_floor` (default **0.6**)
+  and `audit.tool_watch_floor` (default **0.75**), the two floors above, and
+  `audit.guard_strict` (default **true**) — whether the moderation model is asked
+  for its controversial band, which is noisier and also the only thing that
+  catches an agent being steered. Defaults preserve shipped behavior except where
+  a floor was silently 0.4.
+- **`tests/e2e/audit_run.sh`** — the streamed-reply proof, end to end: it builds
+  the binary, starts its own mock and proxy, sends an OpenAI tool call whose
+  arguments arrive split across fragments, and reads the request log back to
+  assert the verdict (`bash tests/e2e/audit_run.sh`, ~40 s, run by hand like
+  `run.sh` — `cargo test` does not run it). Plus **`examples/audit_replay.rs`**:
+  the modules are a library now, so an offline tool can replay a recorded request
+  log through the *real* scanner instead of a copy that drifts from it.
+
+### Fixed
+
+- **Traffic with a case fold in it could take the audit down with it.** The rule
+  scanner judged a **lower-cased copy** of every block and cut its excerpt out of
+  the original text, using the offset the copy had reported. `to_lowercase` does
+  not preserve byte length (`ẞ` folds to two bytes, `İ` to two characters), so one
+  of those offsets could land between the bytes of a single character and the
+  slice panicked mid-UTF-8 — and a turn that tripped it recorded no verdict at
+  all and never released its place in the audit queue. Every pattern is compiled
+  case-insensitive now and matched against the text as it arrived, which is the
+  same match set for a corpus written in lower case and the only text whose
+  offsets the excerpt may use. Watch hosts were the same substring search on the
+  same copy, so they are searched in the text itself now too. Shipped since
+  v0.24.0, and only loud on traffic that contains characters like those.
+
 ## v0.26.0 — 2026-10-30
 
 ### Changed

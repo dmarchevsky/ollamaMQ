@@ -12,29 +12,11 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod admin;
-mod audit;
-mod auth;
-mod classify;
-mod clients;
-mod config;
-mod config_store;
-mod control;
-mod dispatcher;
-mod lock;
-mod metrics;
-mod model_policy;
-mod convlog;
-mod link;
-mod session;
-mod settings;
-mod snapshot;
-mod stats;
-mod web;
+use ollamamq::{admin, audit, auth, clients, config, control, dispatcher, metrics, model_policy, settings, web};
 
-use crate::control::{admin_model_load, admin_model_unload, admin_models_state};
-use crate::dispatcher::{AppState, proxy_handler, run_worker};
-use crate::lock::LockExt;
+use ollamamq::control::{admin_model_load, admin_model_unload, admin_models_state};
+use ollamamq::dispatcher::{AppState, proxy_handler, run_worker};
+use ollamamq::lock::LockExt;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -297,7 +279,7 @@ async fn main() {
     let (log_path, log_legacy) = settings::store_path(
         eff.request_log_path
             .as_deref()
-            .unwrap_or(crate::convlog::DEFAULT_LOG_FILE),
+            .unwrap_or(ollamamq::convlog::DEFAULT_LOG_FILE),
         &config_dir,
         std::path::Path::new(""),
     );
@@ -389,8 +371,8 @@ async fn main() {
     // `_convlog_guard` below.
     let mut opened = None;
     let mut attempts = Vec::new();
-    for cand in crate::convlog::ConvLogger::open_candidates(&request_log_path, &config_dir) {
-        match crate::convlog::ConvLogger::start(
+    for cand in ollamamq::convlog::ConvLogger::open_candidates(&request_log_path, &config_dir) {
+        match ollamamq::convlog::ConvLogger::start(
             cand.clone(),
             request_log_max_bytes,
             request_log_max_files,
@@ -413,7 +395,7 @@ async fn main() {
         None => {
             tracing::error!("request log disabled — tried {}", attempts.join(", "));
             (
-                crate::convlog::ConvLogger::disabled(),
+                ollamamq::convlog::ConvLogger::disabled(),
                 tokio::task::spawn(async {}),
             )
         }
@@ -519,7 +501,7 @@ async fn main() {
         let hours = state.stats.history_hours();
         // The live file plus the `request_log_max_files` rotated slots.
         let cap = request_log_max_bytes.saturating_mul(request_log_max_files.max(1) as u64 + 1);
-        if crate::convlog::retention_shortfall(cap, used_bytes, oldest_ms, crate::stats::now_ms(), hours) {
+        if ollamamq::convlog::retention_shortfall(cap, used_bytes, oldest_ms, ollamamq::stats::now_ms(), hours) {
             tracing::warn!(
                 "log retention: the conversation chain keeps ~{} MiB at request_log_max_bytes x \
                  request_log_max_files, which at its observed write rate cannot span the {} h of \
@@ -719,7 +701,7 @@ mod tests {
             1,
             "appconf.yaml".into(),
             Vec::new(),
-            crate::convlog::ConvLogger::disabled(),
+            ollamamq::convlog::ConvLogger::disabled(),
             65_536,
             512 * 1024 * 1024,
         ))

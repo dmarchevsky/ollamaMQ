@@ -1,12 +1,18 @@
 [package]
 name = "ollamaMQ"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2024"
 description = "High-performance Ollama proxy with per-user fair-share queuing, round-robin scheduling, and a real-time web dashboard."
 license = "MIT"
 authors = ["Chleba <chlebik@gmail.com>"]
 repository = "https://github.com/Chleba/ollamaMQ"
 homepage = "https://github.com/Chleba/ollamaMQ"
+
+# The library is the program (see `src/lib.rs`); the binary below is its CLI.
+# Named lower-case so `use ollamamq::…` carries no non-snake-case lint the way
+# the package name `ollamaMQ` would, while the shipped binary keeps its name.
+[lib]
+name = "ollamamq"
 
 [dependencies]
 axum = "0.8.8"
@@ -24,3 +30,4 @@ serde_yaml = "0.9"
 getrandom = "0.3"
 base64 = "0.22"
 argon2 = "0.5"
+regex = "1.11"

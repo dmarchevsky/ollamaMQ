@@ -141,7 +141,11 @@ impl WebAuth {
     }
 }
 
-pub(crate) struct AuthState {
+/// The dashboard's credentials and its session table behind one `Arc`, so the
+/// admin gate and the UI agree on what "signed in" means (see [`auth_state`]).
+/// The type is public because the functions handing it out are; its fields are
+/// its own.
+pub struct AuthState {
     /// Replaced when the password is changed in the UI.
     creds: std::sync::Mutex<WebAuth>,
     sessions: crate::session::Sessions,

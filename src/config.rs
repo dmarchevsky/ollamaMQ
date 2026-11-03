@@ -248,6 +248,9 @@ pub struct Settings {
 ///     enabled: scanner        # off | scanner | full
 ///     backend: ""             # defaults to the first configured backend
 ///     flag_threshold: 0.85    # at or above this a verdict is confirmed, not a watch
+///     watch_floor: 0.6          # below this a model verdict is not recorded
+///     tool_watch_floor: 0.75    # the same floor, for a verdict about a tool result
+///     guard_strict: true        # ask the guard for its controversial band
 ///     max_questions_per_turn: 6
 ///     concurrency: 2
 ///     queue: 64
@@ -265,9 +268,25 @@ pub struct AuditSettings {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub backend: String,
     /// Probability at or above which a model verdict gets a red badge instead of
-    /// an amber one. A rule hit is always red.
+    /// an amber one. A rule hit does not read it: each rule carries its own
+    /// severity, and only `metadata-ip` and `injection-phrase` are red on their
+    /// own — the rest are amber watches unless a chain confirms them.
     #[serde(default = "audit_default_threshold", skip_serializing_if = "is_default_threshold")]
     pub flag_threshold: f64,
+    /// Below this a model verdict is not recorded at all: under it the audit
+    /// says nothing rather than shrug. A verdict about a tool result is held to
+    /// [`Self::tool_watch_floor`] instead.
+    #[serde(default = "audit_default_watch_floor", skip_serializing_if = "is_default_watch_floor")]
+    pub watch_floor: f64,
+    /// The floor for a verdict about a **tool result**, which is higher by
+    /// default: the intent questions ask who is being asked, and code answers
+    /// them far too readily.
+    #[serde(default = "audit_default_tool_watch_floor", skip_serializing_if = "is_default_tool_watch_floor")]
+    pub tool_watch_floor: f64,
+    /// Ask the guard in `strict` mode. Its controversial band is what catches an
+    /// agent being steered, and it is also the noisiest thing the guard says.
+    #[serde(default = "audit_yes", skip_serializing_if = "std::ops::Not::not")]
+    pub guard_strict: bool,
     /// Noul questions one turn may ask the decision model — the NPU budget, per
     /// turn rather than per byte of resent context.
     #[serde(default = "audit_default_questions", skip_serializing_if = "is_default_questions")]
@@ -283,8 +302,9 @@ pub struct AuditSettings {
     /// never is. False: that traffic is not scanned at all.
     #[serde(default = "audit_yes", skip_serializing_if = "std::ops::Not::not")]
     pub scan_redacted: bool,
-    /// Hosts added to the built-in watchlist (a transfer to one of these, with a
-    /// payload, is an exfil flag).
+    /// Hosts added to the built-in watchlist. One of these in the model's own
+    /// reply — or in a tool result it got back — beside a transfer is what makes
+    /// the pair an exfil; named in a message it is a watch and nothing more.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_watch_hosts: Vec<String>,
     /// Moderation model asked on the backend.
@@ -304,6 +324,9 @@ impl Default for AuditSettings {
             enabled: audit_default_mode(),
             backend: String::new(),
             flag_threshold: audit_default_threshold(),
+            watch_floor: audit_default_watch_floor(),
+            tool_watch_floor: audit_default_tool_watch_floor(),
+            guard_strict: audit_yes(),
             max_questions_per_turn: audit_default_questions(),
             concurrency: audit_default_concurrency(),
             queue: audit_default_queue(),
@@ -321,6 +344,14 @@ fn audit_default_mode() -> String {
 
 fn audit_default_threshold() -> f64 {
     crate::audit::DEFAULT_FLAG_THRESHOLD
+}
+
+fn audit_default_watch_floor() -> f64 {
+    crate::audit::WATCH_FLOOR
+}
+
+fn audit_default_tool_watch_floor() -> f64 {
+    crate::audit::TOOL_WATCH_FLOOR
 }
 
 fn audit_default_questions() -> u32 {
@@ -349,6 +380,14 @@ fn audit_default_decision_model() -> String {
 
 fn is_default_threshold(v: &f64) -> bool {
     *v == audit_default_threshold()
+}
+
+fn is_default_watch_floor(v: &f64) -> bool {
+    *v == audit_default_watch_floor()
+}
+
+fn is_default_tool_watch_floor(v: &f64) -> bool {
+    *v == audit_default_tool_watch_floor()
 }
 
 fn is_default_questions(v: &u32) -> bool {
@@ -612,6 +651,11 @@ impl Settings {
             if !(0.0..=1.0).contains(&audit.flag_threshold) {
                 return Err("audit.flag_threshold is a probability between 0 and 1".into());
             }
+            for (name, floor) in [("watch_floor", audit.watch_floor), ("tool_watch_floor", audit.tool_watch_floor)] {
+                if !(0.0..=1.0).contains(&floor) {
+                    return Err(format!("audit.{name} is a probability between 0 and 1"));
+                }
+            }
             if audit.concurrency < 1 || audit.concurrency > 8 {
                 return Err("audit.concurrency is between 1 and 8".into());
             }
@@ -871,6 +915,51 @@ models:
         let cfg = load_config(tmp.to_str().unwrap()).unwrap();
         assert_eq!(cfg.settings.load_keep_alive, Some(-1));
         assert_eq!(cfg.models[0].keep_alive, Some(-1));
+    }
+
+    /// A floor is a probability: `watch_floor: 1.5` — a typo for a very low one —
+    /// must not be accepted as "record nothing, ever". The floors are validated
+    /// where every audit setting is, on the settings a config actually yields.
+    #[test]
+    fn audit_floors_are_probabilities() {
+        let settings = |yaml: String, name: &str| {
+            let tmp = std::env::temp_dir().join(name);
+            std::fs::write(&tmp, yaml).unwrap();
+            load_config(tmp.to_str().unwrap()).unwrap().settings
+        };
+        let ok = settings(
+            "settings:\n  audit:\n    enabled: full\n    watch_floor: 0.55\n    tool_watch_floor: 0.9\n    guard_strict: false\n".into(),
+            "ollamamq_test_audit_floors_ok.yaml",
+        );
+        ok.validate().unwrap();
+        let audit = ok.audit.clone().unwrap();
+        assert_eq!((audit.watch_floor, audit.tool_watch_floor, audit.guard_strict), (0.55, 0.9, false));
+        for bad in ["1.5", "-0.1"] {
+            let s = settings(
+                format!("settings:\n  audit:\n    watch_floor: {bad}\n"),
+                "ollamamq_test_audit_floors_bad.yaml",
+            );
+            let err = s.validate().err().unwrap_or_else(|| panic!("{bad} must not validate: {s:?}"));
+            assert!(err.contains("audit.watch_floor"), "{bad}: {err}");
+        }
+        let s = settings(
+            "settings:\n  audit:\n    tool_watch_floor: 2\n".into(),
+            "ollamamq_test_audit_twf_bad.yaml",
+        );
+        assert!(s.validate().err().unwrap_or_else(|| panic!("2 is no floor: {s:?}")).contains("audit.tool_watch_floor"));
+        // An audit section that names none of them keeps the shipped floors, and
+        // shipped strictness: a downgrade is a deliberate edit, never a default.
+        let s = settings(
+            "settings:\n  audit:\n    enabled: full\n".into(),
+            "ollamamq_test_audit_floors_default.yaml",
+        );
+        s.validate().unwrap();
+        let audit = s.audit.clone().unwrap();
+        assert_eq!(
+            (audit.watch_floor, audit.tool_watch_floor),
+            (crate::audit::WATCH_FLOOR, crate::audit::TOOL_WATCH_FLOOR)
+        );
+        assert!(audit.guard_strict);
     }
 
     #[test]
