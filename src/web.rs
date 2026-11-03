@@ -215,8 +215,9 @@ pub fn router_with_state(auth: Arc<AuthState>) -> Router<Arc<AppState>> {
         .route("/capture", get(capture_state))
         .route("/audit", get(audit_status))
         .route("/convs", get(list_convs))
-        .route("/conv", get(get_conv))
+        .route("/conv", get(get_conv).delete(delete_conv))
         .route("/conv/content", get(get_conv_content))
+        .route("/conv/export", get(export_conv))
         .route("/users/{id}/{op}", post(user_action))
         .route("/sessions/{tag}/priority", post(session_priority))
         .route("/blocked/unblock", post(unblock))
@@ -1115,14 +1116,48 @@ async fn get_conv(
     } else if state.convlog.indexing() {
         "the conversation log is still indexing the retained files — try again in a moment"
     } else {
-        "no such conversation: it aged out of the log chain — raise request_log_max_files \
-         (and request_log_max_bytes) to keep more slots"
+        "no such conversation: retention removed it — raise request_log_max_total_bytes \
+         (or request_log_max_days) to keep more"
     };
     state
         .convlog
         .index(&find_of(&q))
         .map(Json)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, missing))
+}
+
+/// The whole conversation as one record — every request rebuilt in full,
+/// every reply as stored: what `⤓ Raw log` saves and what a review is handed.
+async fn export_conv(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ConvQuery>,
+) -> ApiResult<crate::convlog::Conv> {
+    let key = q
+        .key
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "key is required"))?;
+    state
+        .convlog
+        .load_session(key)
+        .map(Json)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no such conversation in the log"))
+}
+
+/// Delete one conversation from the log, everywhere it is kept. The
+/// `X-OllamaMQ-UI` header is required like on every other change.
+async fn delete_conv(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ConvQuery>,
+) -> ApiResult<serde_json::Value> {
+    let key = q
+        .key
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "key is required"))?;
+    if !state.convlog.delete(key) {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "no such conversation in the log"));
+    }
+    info!("web: conversation {key} deleted from the log");
+    Ok(Json(json!({ "deleted": key })))
 }
 
 async fn get_conv_content(
@@ -1743,15 +1778,13 @@ mod tests {
     /// A real conversation log in a temp file: the conversation endpoints are
     /// worth testing against the store the dispatcher would fill, not a stub.
     fn test_convlog() -> crate::convlog::ConvLogger {
-        let path = std::env::temp_dir().join(format!(
-            "omq-web-conv-{}-{}.jsonl",
-            std::process::id(),
-            crate::clients::random_hex(6)
-        ));
+        // Its own folder: every logger keeps its sessions next to its path.
+        let path = std::env::temp_dir()
+            .join(format!("omq-web-conv-{}-{}", std::process::id(), crate::clients::random_hex(6)))
+            .join("requests.jsonl");
         crate::convlog::ConvLogger::start(
             path.to_string_lossy().into_owned(),
-            1 << 20,
-            1,
+            crate::convlog::Retention::default(),
             std::time::Duration::from_secs(3600),
         )
         .unwrap()
@@ -2394,7 +2427,7 @@ mod tests {
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         let err: serde_json::Value = r.json().await.unwrap();
         let msg = err["error"].as_str().unwrap_or_default();
-        assert!(msg.contains("request_log_max_files"), "the 404 names the knob: {msg}");
+        assert!(msg.contains("request_log_max_total_bytes"), "the 404 names the knob: {msg}");
     }
 
     /// A restart keeps its promises: after the writer has flushed and a
@@ -2403,19 +2436,26 @@ mod tests {
     /// files only. A link copied before the restart still opens its log.
     #[tokio::test]
     async fn conv_endpoints_resolve_history_in_a_fresh_process() {
-        let path = std::env::temp_dir().join(format!(
-            "omq-web-cold-{}-{}.jsonl",
-            std::process::id(),
-            crate::clients::random_hex(6)
-        ));
-        let path = path.to_string_lossy().into_owned();
+        let dir = std::env::temp_dir()
+            .join(format!("omq-web-cold-{}-{}", std::process::id(), crate::clients::random_hex(6)));
+        let path = dir.join("requests.jsonl").to_string_lossy().into_owned();
+        // A line has reached a conversation file under `sessions/`.
+        let flushed = || {
+            std::fs::read_dir(dir.join("sessions"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|d| std::fs::read_dir(d.path()).ok())
+                .flatten()
+                .flatten()
+                .any(|f| f.metadata().is_ok_and(|m| m.len() > 0))
+        };
         {
             // Boot 1: record a conversation, let the writer flush it (a short
             // idle interval so the line reaches the file), then let go.
             let logger = crate::convlog::ConvLogger::start(
                 path.clone(),
-                1 << 20,
-                1,
+                crate::convlog::Retention::default(),
                 std::time::Duration::from_millis(20),
             )
             .unwrap()
@@ -2424,16 +2464,20 @@ mod tests {
             record_two_turns(&state);
             for _ in 0..50 {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
+                if flushed() {
                     break;
                 }
             }
-            assert!(std::fs::metadata(&path).is_ok_and(|m| m.len() > 0), "the line flushed");
+            assert!(flushed(), "the line flushed");
         }
         // Boot 2: a fresh logger over the same file — the only knowledge left
         // is what the retained files hold.
         let logger =
-            crate::convlog::ConvLogger::start(path.clone(), 1 << 20, 1, std::time::Duration::from_secs(3600))
+            crate::convlog::ConvLogger::start(
+                path.clone(),
+                crate::convlog::Retention::default(),
+                std::time::Duration::from_secs(3600),
+            )
                 .unwrap()
                 .0;
         let state = test_state_with(logger);
@@ -2451,7 +2495,47 @@ mod tests {
             assert_eq!(conv["key"], "alice#a3f19c", "{q}");
             assert_eq!(conv["turns"].as_array().unwrap().len(), 2, "{q}");
         }
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The export hands out the whole conversation in one record, and the
+    /// delete takes it out of the log — only with the UI header, like every
+    /// other change — after which both answer 404.
+    #[tokio::test]
+    async fn conv_export_and_delete() {
+        let state = test_state_with(test_convlog());
+        record_two_turns(&state);
+        let base = serve(state).await;
+        let c = http();
+        let url = |p: &str| format!("{base}/ui/api/{p}?key=alice%23a3f19c");
+        let res = c.get(url("conv/export")).basic_auth("admin", Some("pw")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let conv: serde_json::Value = res.json().await.unwrap();
+        let turns = conv["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert!(turns.iter().any(|t| t["content"]["req"].is_string()), "requests come whole: {conv}");
+        let res = c.delete(url("conv")).basic_auth("admin", Some("pw")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "a delete needs the UI header");
+        let res = c
+            .delete(url("conv"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        for p in ["conv", "conv/export"] {
+            let res = c.get(url(p)).basic_auth("admin", Some("pw")).send().await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{p} after delete");
+        }
+        let res = c
+            .delete(url("conv"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "deleting twice is a 404");
     }
 
     async fn serve(state: Arc<AppState>) -> String {

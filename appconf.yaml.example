@@ -100,15 +100,15 @@ settings:
   request_log_path: ollamamq-requests.jsonl   # request/response JSONL log file (default shown).
                               # A relative path resolves from the folder holding appconf.yaml
                               # (a docker-compose layout beside config/ uses ../logs/ollamamq-requests.jsonl).
-  request_log_max_bytes: 10485760             # rotate when file exceeds this (default 10 MiB)
-  request_log_max_files: 5                    # rotated files kept as .0 .1 ... (default 5)
-                              # Together these two ARE the Logs page's memory: the list shows every
-                              # event in the window you pick and the viewer opens any conversation the
-                              # chain still holds — so `max_bytes × (1 + max_files)` (uncompressed;
-                              # rotated files are zstd-compressed to ~1/10 on disk) divided by your
-                              # traffic is how far back a click works. The log stores only what each
-                              # turn adds, so 5 × 10 MiB is about a day of heavy agent traffic.
-                              # The boot log warns when the chain cannot span `history_hours`.
+                              # Each conversation gets its own file under <that folder>/sessions/<day>/.
+  request_log_max_total_bytes: 1073741824     # bytes on disk the conversation log may take (default 1 GiB)
+  request_log_max_days: 30                    # days a conversation is kept after its last turn (default 30; 0 = off)
+                              # Together these two ARE the Logs page's memory: conversations are removed
+                              # whole, past max_days first, then oldest until the budget holds. The log
+                              # stores only what each turn adds (well under 1 MB/hour of heavy agent
+                              # traffic, compressed), so the age limit usually decides. The boot log warns when
+                              # they cannot span `history_hours`. (request_log_max_bytes /
+                              # request_log_max_files are retired and only warn.)
   request_log_flush_secs: 5                     # write a conversation out after this much quiet (default 5 s)
   log_content_limit: 1048576                  # max body bytes captured per record, min 1024 (default 1 MiB)
   history_hours: 24                          # Activity (Overview) history depth, and the age its journaled

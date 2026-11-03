@@ -3,6 +3,35 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.29.0 — 2026-11-03
+
+### Changed
+
+- **Every conversation has a file of its own** (`<logs>/sessions/<day>/<client>__<tag>.jsonl[.zst]`),
+  instead of sharing one size-rotated chain. A conversation is kept, downloaded, replayed and
+  deleted **whole**: rotation used to drop the oldest *file*, so a long session could lose its
+  first turns while its newest stayed — fatal for anything that reads a conversation end to end,
+  like the coming LLM review. The v4 lines, deltas and folded replies are unchanged; deltas now
+  span the whole conversation. A tail is sealed into one more zstd frame after an hour of quiet,
+  with a `.meta.json` summary so a restart lists everything without reading it. A client's
+  session-less requests share one file per day.
+- **Retention keeps or drops whole conversations**: `request_log_max_days` (default 30) and
+  `request_log_max_total_bytes` (default 1 GiB on disk) replace `request_log_max_bytes` /
+  `request_log_max_files`, which are retired and only warn at boot. A conversation still in
+  memory or with an open tail is never removed.
+- An existing shared chain (`ollamamq-requests.jsonl*`) stays readable — listed, opened, folded
+  with the same conversation's newer file — and goes first under retention.
+
+### Added
+
+- **Delete a conversation**: a two-click **Delete** button in the conversation viewer and
+  `DELETE /ui/api/conv?key=…` remove it from memory and its files; lines it left in shared files
+  (a client's one-shot file, the legacy chain) are hidden by `sessions/deleted.json` until those
+  files go too.
+- **`GET /ui/api/conv/export?key=…`**: the whole conversation as one record, every request
+  rebuilt in full. `⤓ Raw log` uses it — one request instead of two per turn.
+- `convlog_tool` and `audit_replay` take the logs folder and read the per-conversation files.
+
 ## v0.28.0 — 2026-11-03
 
 ### Changed

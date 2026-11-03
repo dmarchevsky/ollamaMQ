@@ -1,7 +1,7 @@
 //! Replay recorded turns through the audit's rule scanner.
 //!
 //! ```text
-//! cargo run --example audit_replay -- '/srv/logs/ollamamq-requests.jsonl*'
+//! cargo run --example audit_replay -- /srv/logs
 //! ```
 //!
 //! The chain is read the way the viewer reads it ([`convlog::load_conversations`]):
@@ -46,7 +46,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!("usage: cargo run --example audit_replay -- <request-log> [more logs or globs…]");
-        eprintln!("  e.g. cargo run --example audit_replay -- '/srv/logs/ollamamq-requests.jsonl*'");
+        eprintln!("  e.g. cargo run --example audit_replay -- /srv/logs");
         std::process::exit(2);
     }
     let files = expand(&args);
@@ -84,13 +84,9 @@ fn expand(args: &[String]) -> Vec<PathBuf> {
     for arg in args {
         let path = Path::new(arg);
         if path.is_dir() {
-            match dir_entries(path) {
-                Some(entries) => {
-                    let jsonl = glob_pattern("*.jsonl*");
-                    found.extend(entries.filter(|n| jsonl.is_match(n)).map(|n| path.join(n)));
-                }
-                None => eprintln!("audit_replay: cannot read directory {arg}"),
-            }
+            // A logs folder: its legacy chain and every conversation file
+            // under `sessions/`, the way the proxy reads it.
+            found.extend(convlog::expand_log_paths(&[path.to_path_buf()]));
             continue;
         }
         let name = match path.file_name().and_then(|n| n.to_str()) {

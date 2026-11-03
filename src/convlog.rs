@@ -42,6 +42,9 @@ use tracing::warn;
 use crate::lock::LockExt;
 
 pub mod codec;
+mod sessions;
+
+pub use sessions::Retention;
 
 /// Schema marker of a conversation line. Lines from the old per-request format
 /// (`{"dir":"IN"|"OUT", …}`) carry no `v` and are ignored when reading back.
@@ -850,70 +853,63 @@ pub enum Dir {
 #[derive(Clone)]
 pub struct ConvLogger {
     store: Arc<Mutex<ConvStore>>,
-    /// `None` when the log is disabled (unwritable path): notes are dropped and
-    /// the store stays empty, so the API reports "no conversations".
-    file: Option<Arc<FileTarget>>,
-    /// The on-disk index of everything the rotation chain holds, so the views
-    /// cover the retained history and not just the seeded hot set. `None`
-    /// exactly when `file` is.
-    disk: Option<Arc<DiskIndex>>,
+    /// The per-conversation files. `None` when the log is disabled (no
+    /// writable folder): notes are dropped and the API reports "no
+    /// conversations".
+    sessions: Option<Arc<sessions::SessionStore>>,
+    /// The shared chain an older build wrote (`ollamamq-requests.jsonl*`):
+    /// read-only, listed and opened like the rest until retention removes it.
+    legacy: Option<Arc<DiskIndex>>,
     /// The newest rid on disk when the log was opened, read synchronously so
-    /// [`Self::max_rid`] is right at boot, before the background scan is done.
+    /// [`Self::max_rid`] is right at boot, before the legacy scan is done.
     boot_rid: u64,
 }
 
-struct FileTarget {
-    path: String,
-    max_bytes: u64,
-    max_files: usize,
-}
-
 impl ConvLogger {
-    /// Open (or create) the log file and start the writer task, which indexes
-    /// the rotation chain before its first flush. Nothing is read back into the
-    /// hot store: every read folds the key's lines on disk with whatever the
-    /// store holds of it, so a resumed conversation appends to its history. A missing parent directory is created: naming a
+    /// Open the log next to `path` — conversations go to
+    /// `<dir of path>/sessions/`, and a chain an older build wrote at `path`
+    /// stays readable — then start the writer task. The sessions are indexed
+    /// here, synchronously (their metas make that cheap); the legacy chain is
+    /// scanned on the writer task. A missing directory is created: naming a
     /// log path whose directory is not there yet is a normal setup step, not a
-    /// reason to run without capture. The initial open is synchronous so a bad
-    /// path or permission error surfaces to the caller, which tries
-    /// [`Self::open_candidates`] and then falls back to [`Self::disabled`].
+    /// reason to run without capture. A bad path or permission error surfaces
+    /// to the caller, which tries [`Self::open_candidates`] and then falls back
+    /// to [`Self::disabled`].
     pub fn start(
         path: String,
-        max_bytes: u64,
-        max_files: usize,
+        retention: Retention,
         flush_idle: Duration,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), std::io::Error> {
-        if let Some(dir) = std::path::Path::new(&path).parent()
-            && !dir.as_os_str().is_empty()
-        {
-            // A directory in the way is as fatal as an unwritable parent:
-            // better to report the open failure than to log next to it.
-            if dir.exists() && !dir.is_dir() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotADirectory,
-                    format!("{} is not a directory", dir.display()),
-                ));
-            }
-            std::fs::create_dir_all(dir)?;
+        let dir = Path::new(&path)
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        // A file in the way is as fatal as an unwritable parent: better to
+        // report the failure than to log next to it.
+        if dir.exists() && !dir.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                format!("{} is not a directory", dir.display()),
+            ));
         }
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let sessions = Arc::new(sessions::SessionStore::open(
+            dir.join(sessions::SESSIONS_DIR),
+            retention,
+        )?);
+        sessions.scan();
+        let legacy = DiskIndex::existing(&path, Arc::clone(&sessions.tombs)).map(Arc::new);
         let store = Arc::new(Mutex::new(ConvStore::new()));
-        let target = Arc::new(FileTarget {
-            path,
-            max_bytes,
-            max_files: max_files.max(1),
-        });
-        let disk = Arc::new(DiskIndex::new(&target.path, target.max_files));
+        let boot_rid = sessions
+            .max_rid()
+            .max(legacy.as_ref().map_or(0, |l| l.newest_rid()));
         let logger = Self {
             store: Arc::clone(&store),
-            file: Some(Arc::clone(&target)),
-            boot_rid: disk.newest_rid(),
-            disk: Some(Arc::clone(&disk)),
+            sessions: Some(Arc::clone(&sessions)),
+            legacy: legacy.clone(),
+            boot_rid,
         };
-        let handle = tokio::spawn(writer_loop(target, store, disk, flush_idle));
+        let handle = tokio::spawn(writer_loop(store, sessions, legacy, flush_idle));
         Ok((logger, handle))
     }
 
@@ -921,8 +917,8 @@ impl ConvLogger {
     pub fn disabled() -> Self {
         Self {
             store: Arc::new(Mutex::new(ConvStore::new())),
-            file: None,
-            disk: None,
+            sessions: None,
+            legacy: None,
             boot_rid: 0,
         }
     }
@@ -945,16 +941,16 @@ impl ConvLogger {
         out
     }
 
-    /// `true` when a log file was opened at boot, i.e. bodies are being
+    /// `true` when the log folder was opened at boot, i.e. bodies are being
     /// captured. The UI says this out loud instead of letting every row fail to
     /// open with the same error as an evicted conversation.
     pub fn enabled(&self) -> bool {
-        self.file.is_some()
+        self.sessions.is_some()
     }
 
-    /// Where conversations are written, when capturing.
+    /// Where conversations are written (the sessions folder), when capturing.
     pub fn path(&self) -> Option<&str> {
-        self.file.as_ref().map(|f| f.path.as_str())
+        self.sessions.as_ref().and_then(|s| s.root().to_str())
     }
 
     /// Turns lost to the per-conversation cap (reported where the old logger's
@@ -963,72 +959,88 @@ impl ConvLogger {
         self.store.lock_or_recover().dropped_count()
     }
 
-    /// True while the boot scan of the rotation chain is still filling the
-    /// disk index. The hot store already answers for what is live, but the
-    /// retained older half is not fully listable yet — the UI says "indexing
-    /// the log…" instead of letting a row 404 for a conversation that is on
-    /// disk and simply not indexed yet.
+    /// True while the boot scan of a legacy chain is still filling its index.
+    /// The hot store and the session files already answer, but the older
+    /// history is not fully listable yet — the UI says "indexing the log…"
+    /// instead of letting a row 404 for a conversation that is on disk and
+    /// simply not indexed yet.
     pub fn indexing(&self) -> bool {
-        self.disk
+        self.legacy
             .as_ref()
             .is_some_and(|d| !d.scan_done.load(Ordering::Relaxed))
+            || self.sessions.as_ref().is_some_and(|s| !s.scanned())
     }
 
-    /// The oldest moment the conversation chain can still resolve: the
-    /// smallest `end_ms` over everything the hot store and the disk index
-    /// know. `None` when capture is off or nothing is retained (or indexed)
-    /// yet. A Logs row older than this is inert history — clicking it cannot
-    /// open, because the line it names has rotated out of the chain.
+    /// Every conversation's header and turn facts across the legacy chain,
+    /// the session files and the hot store, each later source winning — the
+    /// one view the list, the rid set and the reach are all taken from.
+    fn all_rows(&self) -> HashMap<String, (Conv, TurnSums)> {
+        let mut out: HashMap<String, (Conv, TurnSums)> = HashMap::new();
+        let mut merge = |head: Conv, turns: TurnSums| match out.get_mut(&head.key) {
+            Some((h, t)) => {
+                fold_head(h, &head);
+                t.extend(turns);
+            }
+            None => {
+                out.insert(head.key.clone(), (head, turns));
+            }
+        };
+        if let Some(l) = &self.legacy {
+            for (head, turns) in l.rows() {
+                merge(head, turns);
+            }
+        }
+        if let Some(s) = &self.sessions {
+            for (head, turns) in s.rows() {
+                merge(head, turns);
+            }
+        }
+        // Owned rows, so the store lock is never held with an index lock.
+        let hot = self.store.lock_or_recover().rows();
+        for (head, turns) in hot {
+            merge(head, turns);
+        }
+        out
+    }
+
+    /// The oldest moment the log can still resolve: the smallest `end_ms` over
+    /// every retained conversation. `None` when capture is off or nothing is
+    /// retained (or indexed) yet. A Logs row older than this is inert history —
+    /// clicking it cannot open, because retention removed its conversation.
     pub fn chain_start_ms(&self) -> Option<u64> {
-        let mut out: Option<u64> = None;
-        {
-            let store = self.store.lock_or_recover();
-            for e in store.entries.values() {
-                out = Some(out.map_or(e.conv.end_ms, |m| m.min(e.conv.end_ms)));
-            }
-        }
-        if let Some(disk) = &self.disk {
-            for e in disk.entries.lock_or_recover().values() {
-                out = Some(out.map_or(e.head.end_ms, |m| m.min(e.head.end_ms)));
-            }
-        }
-        out
+        self.all_rows().values().map(|(h, _)| h.end_ms).min()
     }
 
-    /// Every turn `rid` the conversation log can resolve right now (hot store
-    /// and disk index) as ONE pass: the Logs page marks its rows clickable
-    /// from membership in this set instead of probing the log per row (same
-    /// single-pass shape as [`Self::max_rid`], which is its boot-only sibling).
+    /// Every turn `rid` the conversation log can resolve right now as ONE
+    /// pass: the Logs page marks its rows clickable from membership in this
+    /// set instead of probing the log per row.
     pub fn resolvable_rids(&self) -> std::collections::HashSet<u64> {
-        let mut out = std::collections::HashSet::new();
-        {
-            let store = self.store.lock_or_recover();
-            for e in store.entries.values() {
-                for t in &e.conv.turns {
-                    out.insert(t.rid);
-                }
-            }
-        }
-        if let Some(disk) = &self.disk {
-            for e in disk.entries.lock_or_recover().values() {
-                out.extend(e.turns.keys().copied());
-            }
-        }
-        out
+        self.all_rows()
+            .into_values()
+            .flat_map(|(_, t)| t.into_keys())
+            .collect()
     }
 
-    /// What the rotation chain physically holds: `(bytes on disk across all
-    /// slots, unix ms of the oldest slot's last write)`, `None` when capture
-    /// is off or no slot file exists yet. The boot retention warning weighs
-    /// this against `history_hours` (see [`retention_shortfall`]).
-    pub fn chain_disk_stats(&self) -> Option<(u64, u64)> {
-        self.disk.as_ref().and_then(|d| d.disk_stats())
+    /// What the log takes on disk against its budget: `(bytes, budget,
+    /// last activity of the oldest retained conversation or file)`. `None`
+    /// when capture is off. The boot retention warning weighs this against
+    /// `history_hours` (see [`retention_shortfall`]).
+    pub fn retention_usage(&self) -> Option<(u64, u64, Option<u64>)> {
+        let s = self.sessions.as_ref()?;
+        let (mut bytes, mut oldest) = s.usage();
+        if let Some(l) = &self.legacy {
+            for (_, len, mtime) in l.slot_files() {
+                bytes += len;
+                oldest = Some(oldest.map_or(mtime, |o| o.min(mtime)));
+            }
+        }
+        Some((bytes, s.retention.max_total_bytes, oldest))
     }
 
     /// Apply one change. The work under the lock is a handful of moves and a
     /// size update — no parsing and no I/O — so this is safe on the request path.
     pub fn note(&self, note: Note) {
-        if self.file.is_none() {
+        if self.sessions.is_none() {
             return;
         }
         let mut store = self.store.lock_or_recover();
@@ -1164,94 +1176,105 @@ impl ConvLogger {
 
     // --- reads (web API) ---
 
-    /// Conversations newest-first, without turns: the hot store first (it
-    /// knows what is live), then the disk index for everything older that the
-    /// rotation chain still holds.
+    /// Conversations newest-first, without turns: every source merged (the
+    /// hot store knows what is live, the files everything retained).
     pub fn summaries(&self, limit: usize) -> Vec<ConvSummary> {
-        // Owned rows, so the store lock is released before the disk index is
-        // taken — no lock nesting with the writer.
-        let hot = self.store.lock_or_recover().rows();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut out = Vec::with_capacity(hot.len());
-        for (mut head, mut turns) in hot {
-            // A resumed conversation: the disk holds its earlier turns.
-            if let Some((mut disk_head, disk_turns)) =
-                self.disk.as_ref().and_then(|d| d.row(&head.key))
-            {
-                fold_head(&mut disk_head, &head);
-                head = disk_head;
-                for (rid, t) in disk_turns {
-                    turns.entry(rid).or_insert(t);
-                }
-            }
-            seen.insert(head.key.clone());
-            out.push(summarize(&head, &turns));
-        }
-        if let Some(disk) = &self.disk {
-            out.extend(disk.summaries(&|k| seen.contains(k)));
-        }
+        let mut out: Vec<ConvSummary> =
+            self.all_rows().values().map(|(h, t)| summarize(h, t)).collect();
         out.sort_by_key(|s| std::cmp::Reverse(s.end_ms));
         out.truncate(limit);
         out
     }
 
-    /// The largest turn `rid` any retained record carries (hot store — seeded
-    /// from the newest lines at open — and whatever the disk index has scanned
-    /// so far). The rid counter restarts at 1 every boot; a fresh process must
-    /// start its counter above this so restored history keeps pointing at the
-    /// request its rid names (see [`crate::dispatcher::AppState::seed_rid_floor`]).
+    /// The largest turn `rid` any retained record carries. The rid counter
+    /// restarts at 1 every boot; a fresh process must start its counter above
+    /// this so restored history keeps pointing at the request its rid names
+    /// (see [`crate::dispatcher::AppState::seed_rid_floor`]).
     pub fn max_rid(&self) -> u64 {
-        let mut m = self.boot_rid;
-        {
-            let store = self.store.lock_or_recover();
-            for e in store.entries.values() {
-                for t in &e.conv.turns {
-                    m = m.max(t.rid);
-                }
-            }
-        }
-        if let Some(disk) = &self.disk {
-            let ents = disk.entries.lock_or_recover();
-            for e in ents.values() {
-                if let Some((r, _)) = e.turns.last_key_value() {
-                    m = m.max(*r);
-                }
-            }
-        }
-        m
+        let rows = self.all_rows();
+        let on_file = rows.values().filter_map(|(_, t)| t.last_key_value().map(|(r, _)| *r)).max();
+        self.boot_rid.max(on_file.unwrap_or(0))
     }
 
     /// The conversation named by `q`, with captured text stripped (fetch one
-    /// turn's text with [`Self::content`]). Hot store first, then disk.
+    /// turn's text with [`Self::content`]).
     pub fn index(&self, q: &Find) -> Option<Conv> {
         Some(self.assemble(q)?.without_content())
     }
 
-    /// The whole conversation `q` names: the key's lines on disk folded oldest
-    /// first, then the hot store's copy on top — the newest view, and the only
-    /// home of turns not flushed yet. The hot store picks the key when it
-    /// matches; otherwise the disk index does.
+    /// The key `q` names: the hot store's match when it has one (it knows
+    /// what is live), else the newest match on disk.
+    fn resolve_key(&self, q: &Find) -> Option<String> {
+        if let Some(k) = self.store.lock_or_recover().find(q) {
+            return Some(k.to_string());
+        }
+        let in_sessions = self.sessions.as_ref().and_then(|s| s.find(q));
+        let in_legacy = self
+            .legacy
+            .as_ref()
+            .and_then(|l| l.find(q))
+            .map(|f| (f.summary.key.clone(), f.summary.end_ms));
+        match (in_sessions, in_legacy) {
+            (Some(a), Some(b)) => Some(if b.1 > a.1 { b.0 } else { a.0 }),
+            (a, b) => a.or(b).map(|x| x.0),
+        }
+    }
+
+    /// The whole conversation `q` names, text as stored: its legacy lines,
+    /// then its session files, then the hot store's copy on top — the newest
+    /// view, and the only home of turns not flushed yet.
     fn assemble(&self, q: &Find) -> Option<Conv> {
-        let hot = {
-            let store = self.store.lock_or_recover();
-            store.find(q).and_then(|k| store.entries.get(k)).map(|e| e.conv.clone())
-        };
-        let on_disk = self.disk.as_ref().and_then(|d| {
-            let found = match &hot {
-                Some(h) => d.find(&Find { key: Some(&h.key), ..Default::default() }),
-                None => d.find(q),
-            }?;
-            d.read(&found)
-        });
-        let mut conv = match (on_disk, hot) {
-            (Some(mut d), Some(h)) => {
-                fold_line(&mut d, h);
-                d
+        let key = self.resolve_key(q)?;
+        let by_key = Find { key: Some(&key), ..Default::default() };
+        let mut acc: Option<Conv> = None;
+        let mut take = |c: Option<Conv>| {
+            if let Some(c) = c {
+                match acc.as_mut() {
+                    Some(a) => fold_line(a, c),
+                    None => acc = Some(c),
+                }
             }
-            (d, h) => d.or(h)?,
         };
+        take(self.legacy.as_ref().and_then(|l| l.read(&l.find(&by_key)?)));
+        take(self.sessions.as_ref().and_then(|s| s.read(&key)));
+        take({
+            let store = self.store.lock_or_recover();
+            store.entries.get(&key).map(|e| e.conv.clone())
+        });
+        let mut conv = acc?;
         conv.turns.sort_by_key(|t| t.rid);
         Some(conv)
+    }
+
+    /// One conversation, whole: every turn with its request rebuilt in full
+    /// and its reply as stored. The one entry point for anything that hands a
+    /// conversation on — the export download, offline tools, a review.
+    pub fn load_session(&self, key: &str) -> Option<Conv> {
+        let mut conv = self.assemble(&Find { key: Some(key), ..Default::default() })?;
+        resolve_all(&mut conv);
+        Some(conv)
+    }
+
+    /// Delete one conversation everywhere it is kept: the hot store, its
+    /// session files, and (hidden by a tombstone, since those files are
+    /// shared) any legacy-chain lines. Returns whether anything of it existed.
+    pub fn delete(&self, key: &str) -> bool {
+        let Some(sessions) = &self.sessions else { return false };
+        let conv = self.assemble(&Find { key: Some(key), ..Default::default() });
+        let upto = conv.as_ref().and_then(|c| c.turns.last()).map_or(0, |t| t.rid);
+        let hot = {
+            let mut store = self.store.lock_or_recover();
+            match store.entries.remove(key) {
+                Some(e) => {
+                    store.content_bytes = store.content_bytes.saturating_sub(e.conv.content_bytes());
+                    true
+                }
+                None => false,
+            }
+        };
+        let legacy = self.legacy.as_ref().is_some_and(|l| l.forget(key));
+        let files = sessions.delete(key, upto, legacy);
+        hot || legacy || files || conv.is_some()
     }
 
     /// Captured text of one turn (`rid` defaults to the newest turn). Falls
@@ -1276,13 +1299,12 @@ impl ConvLogger {
     }
 }
 
-/// Whether the conversation log's size caps (`cap_bytes` — the operator's
-/// `request_log_max_bytes` × the slots `request_log_max_files` keeps) can
-/// span `history_hours` of traffic at the write rate the chain has actually
-/// been seeing. `used_bytes` is the chain's current size and `oldest_ms` the
-/// age of its oldest slot: while the chain is still growing, the rate is
-/// measured from its own history; once rotation bites, the surviving age IS
-/// the coverage, and the ratio says so either way. A chain younger than a
+/// Whether the log's byte budget (`cap_bytes`, `request_log_max_total_bytes`)
+/// can span `history_hours` of traffic at the rate the log has actually been
+/// growing on disk. `used_bytes` is what it takes now and `oldest_ms` the last
+/// activity of the oldest retained conversation: while the log is still
+/// growing, the rate is measured from its own history; once retention bites,
+/// the surviving age IS the coverage, and the ratio says so either way. A chain younger than a
 /// minute is read as one minute old so the first flush cannot read as
 /// infinite throughput. Pure so the boot warning's rule is testable without
 /// a disk.
@@ -1484,28 +1506,94 @@ fn chain_rank(path: &Path) -> u64 {
         .map_or(0, |n| n + 1)
 }
 
-/// Every conversation the given chain files hold, folded across files and
-/// with each turn's request rebuilt whole ([`resolve_all`]): what an analysis
-/// script or an export wants, whatever schema wrote the lines. Files are read
-/// oldest first by their rotation suffix, compressed ones decompressed.
-/// Returns the conversations (oldest-first by first sight) and the number of
-/// lines that were not conversation records.
-pub fn load_conversations(files: &[std::path::PathBuf]) -> std::io::Result<(Vec<Conv>, usize)> {
-    let mut files: Vec<&std::path::PathBuf> = files.iter().collect();
-    files.sort_by_key(|p| std::cmp::Reverse(chain_rank(p)));
+/// The sessions directory a file lives in, if it is a session unit file.
+fn sessions_dir_of(file: &Path) -> Option<&Path> {
+    file.ancestors()
+        .skip(1)
+        .find(|a| a.file_name().and_then(|n| n.to_str()) == Some(sessions::SESSIONS_DIR))
+}
+
+/// The log files a set of paths names: a file is itself; a directory stands
+/// for the legacy chain files in it (`*requests.jsonl*`) and every session
+/// unit under its `sessions/` (or under it, when it is the sessions folder).
+pub fn expand_log_paths(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.to_str().is_some_and(|n| n.ends_with(".jsonl") || n.ends_with(".jsonl.zst")) {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for p in paths {
+        if !p.is_dir() {
+            out.push(p.clone());
+            continue;
+        }
+        if p.file_name().and_then(|n| n.to_str()) == Some(sessions::SESSIONS_DIR) {
+            walk(p, &mut out);
+            continue;
+        }
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let f = e.path();
+                if f.is_file()
+                    && f.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("requests.jsonl"))
+                {
+                    out.push(f);
+                }
+            }
+        }
+        walk(&p.join(sessions::SESSIONS_DIR), &mut out);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every conversation the given log paths hold (files, or folders as
+/// [`expand_log_paths`] reads them), folded across files and with each
+/// turn's request rebuilt whole ([`resolve_all`]): what an analysis script or
+/// an export wants, whatever schema or layout wrote the lines. Legacy chain
+/// files are read oldest first by their rotation suffix, then each session
+/// unit (sealed frames before the open tail); compressed files are
+/// decompressed and operator-deleted conversations stay hidden. Returns the
+/// conversations (by first sight) and the number of lines that were not
+/// conversation records.
+pub fn load_conversations(paths: &[std::path::PathBuf]) -> std::io::Result<(Vec<Conv>, usize)> {
+    let files = expand_log_paths(paths);
+    let (mut legacy, mut units): (Vec<&std::path::PathBuf>, Vec<&std::path::PathBuf>) =
+        files.iter().partition(|f| sessions_dir_of(f).is_none());
+    legacy.sort_by_key(|p| std::cmp::Reverse(chain_rank(p)));
+    // A unit's sealed `.zst` before its open tail.
+    units.sort_by_key(|p| {
+        (sessions::base_of(p).unwrap_or_else(|| p.to_path_buf()), !p.to_str().is_some_and(|n| n.ends_with(".zst")))
+    });
+    let mut tombs: HashMap<std::path::PathBuf, sessions::Tombs> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut convs: HashMap<String, Conv> = HashMap::new();
     let mut skipped = 0usize;
-    for file in files {
+    for file in legacy.into_iter().chain(units) {
+        let sdir = sessions_dir_of(file)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join(sessions::SESSIONS_DIR));
+        let tomb = tombs.entry(sdir.clone()).or_insert_with(|| sessions::Tombs::read_dir(&sdir));
         let data = codec::read_slot_file(file)?;
         for raw in data.split(|b| *b == b'\n') {
             if raw.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let Some(line) = parse_line(raw) else {
+            let Some(mut line) = parse_line(raw) else {
                 skipped += 1;
                 continue;
             };
+            if !tomb.mask(&mut line) {
+                continue;
+            }
             match convs.get_mut(&line.key) {
                 Some(acc) => fold_line(acc, line),
                 None => {
@@ -1645,6 +1733,8 @@ struct DiskIndex {
     /// Decompressed slots recently read, newest last: opening the turns of one
     /// conversation one after another decompresses its file once.
     cache: Mutex<Vec<(usize, Arc<Vec<u8>>)>>,
+    /// Operator-deleted conversations, hidden from every scan and read.
+    tombs: Arc<sessions::Tombs>,
 }
 
 /// Index entries held for at most this many conversations; past it a new key
@@ -1656,7 +1746,7 @@ const MAX_INDEX_ENTRIES: usize = 200_000;
 const SLOT_CACHE: usize = 2;
 
 impl DiskIndex {
-    fn new(path: &str, max_files: usize) -> Self {
+    fn new(path: &str, max_files: usize, tombs: Arc<sessions::Tombs>) -> Self {
         let mut slots = vec![path.to_string()];
         slots.extend((0..max_files).map(|i| format!("{path}.{i}")));
         Self {
@@ -1664,7 +1754,63 @@ impl DiskIndex {
             entries: Mutex::new(HashMap::new()),
             scan_done: AtomicBool::new(false),
             cache: Mutex::new(Vec::new()),
+            tombs,
         }
+    }
+
+    /// The legacy chain at `path` (`path`, `path.N`, `path.N.zst`), sized to
+    /// the highest slot on disk; `None` when no file of it exists.
+    fn existing(path: &str, tombs: Arc<sessions::Tombs>) -> Option<Self> {
+        let p = Path::new(path);
+        let name = p.file_name()?.to_str()?.to_string();
+        let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let mut any = p.is_file();
+        let mut max_slot: Option<usize> = None;
+        for f in std::fs::read_dir(dir).ok()?.flatten() {
+            let Some(n) = f.file_name().to_str().map(str::to_string) else { continue };
+            let Some(rest) = n.strip_prefix(&format!("{name}.")) else { continue };
+            let num = rest.strip_suffix(codec::ZST).unwrap_or(rest);
+            if let Ok(i) = num.parse::<usize>() {
+                any = true;
+                max_slot = Some(max_slot.map_or(i, |m| m.max(i)));
+            }
+        }
+        any.then(|| Self::new(path, max_slot.map_or(0, |m| m + 1), tombs))
+    }
+
+    /// Every chain file still on disk: `(slot, bytes, mtime ms)`.
+    fn slot_files(&self) -> Vec<(usize, u64, u64)> {
+        (0..self.slots.len())
+            .filter_map(|slot| {
+                let (file, _) = self.slot_file(slot)?;
+                let m = std::fs::metadata(&file).ok()?;
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_millis() as u64);
+                Some((slot, m.len(), mtime))
+            })
+            .collect()
+    }
+
+    /// Retention deleted one chain file: forget what only it held.
+    fn drop_slot(&self, slot: usize) {
+        if let Some((file, _)) = self.slot_file(slot) {
+            let _ = std::fs::remove_file(file);
+        }
+        self.cache.lock_or_recover().clear();
+        self.entries.lock_or_recover().retain(|_, e| {
+            e.locs.retain(|l| l.slot != slot);
+            e.turns.retain(|_, t| t.slot != slot);
+            !e.locs.is_empty()
+        });
+    }
+
+    /// An operator deleted `key`: drop it from the index (its lines stay in
+    /// the shared files, hidden by the tombstone). Whether it was indexed.
+    fn forget(&self, key: &str) -> bool {
+        self.entries.lock_or_recover().remove(key).is_some()
     }
 
     /// The file behind a slot, compressed form first (a slot is compressed
@@ -1680,33 +1826,6 @@ impl DiskIndex {
         }
         let plain = std::path::PathBuf::from(base);
         plain.is_file().then_some((plain, false))
-    }
-
-    /// Total bytes the slots hold **uncompressed** — the quantity
-    /// `request_log_max_bytes` caps, so the retention warning compares like with
-    /// like — and the last-write time of the oldest existing slot: the chain's
-    /// honest reach on disk. Slot mtimes are cheap and never wrong by more than
-    /// a rotation interval.
-    fn disk_stats(&self) -> Option<(u64, u64)> {
-        let mut bytes = 0u64;
-        let mut oldest_ms: Option<u64> = None;
-        for slot in (0..self.slots.len()).rev() {
-            // Oldest slot first: its mtime is the age of the oldest retained
-            // data (its last write before it stopped being the live file).
-            let Some((file, zst)) = self.slot_file(slot) else {
-                continue; // a missing slot is just a shorter chain
-            };
-            let Ok(m) = std::fs::metadata(&file) else { continue };
-            bytes += if zst { codec::zst_content_size(&file).unwrap_or(m.len()) } else { m.len() };
-            if oldest_ms.is_none() {
-                oldest_ms = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64);
-            }
-        }
-        Some((bytes, oldest_ms?))
     }
 
     /// The largest turn rid in the newest slot that holds any: rids only grow,
@@ -1778,7 +1897,9 @@ impl DiskIndex {
             let mut offset = 0u64;
             for raw in data.split_inclusive(|b| *b == b'\n') {
                 let len = raw.len() as u64;
-                if let Some(line) = parse_line(raw) {
+                if let Some(mut line) = parse_line(raw)
+                    && self.tombs.mask(&mut line)
+                {
                     self.record(Loc { slot, offset, len }, &line);
                 }
                 offset += len;
@@ -1802,44 +1923,13 @@ impl DiskIndex {
         e.turns.extend(turn_sums(&line.turns, loc.slot));
     }
 
-    /// A rotation renamed every file one slot older and deleted what fell off:
-    /// shift every location to follow, dropping what is gone — a turn whose
-    /// newest record went with the old file, a key with no line left.
-    fn shift_for_rotation(&self) {
-        let n = self.slots.len();
-        self.cache.lock_or_recover().clear();
-        let mut entries = self.entries.lock_or_recover();
-        entries.retain(|_, e| {
-            e.locs.retain_mut(|l| {
-                l.slot += 1;
-                l.slot < n
-            });
-            e.turns.retain(|_, t| {
-                t.slot += 1;
-                t.slot < n
-            });
-            if let Some(first) = e.turns.values().map(|t| t.at_ms).min() {
-                e.head.start_ms = e.head.start_ms.max(first.min(e.head.end_ms));
-            }
-            !e.locs.is_empty()
-        });
-    }
-
-    /// Summaries newest-first, for the list's on-disk half.
-    fn summaries(&self, skip: &dyn Fn(&str) -> bool) -> Vec<ConvSummary> {
+    /// Every indexed conversation's header and turn facts.
+    fn rows(&self) -> Vec<(Conv, TurnSums)> {
         self.entries
             .lock_or_recover()
-            .iter()
-            .filter(|(k, _)| !skip(k))
-            .map(|(_, e)| summarize(&e.head, &e.turns))
+            .values()
+            .map(|e| (e.head.clone(), e.turns.clone()))
             .collect()
-    }
-
-    /// One key's header and turn facts, for merging with the hot store's row.
-    fn row(&self, key: &str) -> Option<(Conv, TurnSums)> {
-        let entries = self.entries.lock_or_recover();
-        let e = entries.get(key)?;
-        Some((e.head.clone(), e.turns.clone()))
     }
 
     /// The entry `q` names, newest match wins — same matcher as the store,
@@ -1883,13 +1973,16 @@ impl DiskIndex {
         let mut acc: Option<Conv> = None;
         for loc in &found.locs {
             let line = self.read_at(*loc).as_deref().and_then(parse_line);
-            let Some(line) = line.filter(|l| &l.key == key) else {
+            let Some(mut line) = line.filter(|l| &l.key == key) else {
                 let mut entries = self.entries.lock_or_recover();
                 if entries.get(key).is_some_and(|e| e.locs == found.locs) {
                     entries.remove(key);
                 }
                 return None;
             };
+            if !self.tombs.mask(&mut line) {
+                continue;
+            }
             match acc.as_mut() {
                 Some(a) => fold_line(a, line),
                 None => {
@@ -1918,13 +2011,13 @@ struct Pending {
     rev: u64,
 }
 
-/// What the writer remembers of a key it has written into the live file:
-/// enough to leave out what that file already holds, and to write a new
-/// request as a delta against the last one. Reset whenever the live file is a
-/// new one, so no line ever refers outside its own file.
+/// What the writer remembers of a key it has written into its unit: enough
+/// to leave out what that file already holds, and to write a new request as a
+/// delta against the last one. Reset whenever the unit is a different one, so
+/// no line ever refers outside its own file.
 #[derive(Default)]
 struct KeyState {
-    /// The rotation count this state belongs to.
+    /// The file unit this state belongs to.
     epoch: u64,
     /// Turns whose `msgs` are in the file.
     msgs: std::collections::HashSet<u64>,
@@ -1984,7 +2077,7 @@ fn encode_req(req: &str, rid: u64, st: &mut KeyState) -> Option<codec::ReqDelta>
     out
 }
 
-/// Encode one pending conversation as a v4 line for the live file `epoch`:
+/// Encode one pending conversation as a v4 line for file unit `epoch`:
 /// changed turns only, without the text and `msgs` that file already holds,
 /// requests and `msgs` as deltas where they extend an earlier turn, streamed
 /// replies folded.
@@ -2046,109 +2139,138 @@ fn encode(p: &Pending, st: &mut KeyState, epoch: u64) -> Conv {
     line
 }
 
-/// Writer task: every `SWEEP`, append the conversations that have gone quiet.
+/// Open tail handles the writer keeps, by unit identity. A deleted unit
+/// re-created at the same path gets a new identity, so a stale handle (onto
+/// the unlinked file) is never written to again.
+#[derive(Default)]
+struct Handles {
+    open: HashMap<u64, (tokio::fs::File, u64)>,
+    tick: u64,
+}
+
+/// Open tails kept at once; the least recently used is closed past this.
+const MAX_HANDLES: usize = 64;
+
+impl Handles {
+    async fn append(&mut self, id: u64, tail: &Path, line: &str) -> Result<u64, std::io::Error> {
+        self.tick += 1;
+        if !self.open.contains_key(&id) {
+            if self.open.len() >= MAX_HANDLES
+                && let Some(lru) = self.open.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k)
+            {
+                self.open.remove(&lru);
+            }
+            let f = tokio::fs::OpenOptions::new().create(true).append(true).open(tail).await?;
+            self.open.insert(id, (f, self.tick));
+        }
+        let (f, used) = self.open.get_mut(&id).expect("inserted above");
+        *used = self.tick;
+        let mut buf = String::with_capacity(line.len() + 1);
+        buf.push_str(line);
+        buf.push('\n');
+        // One write per line, so a tailing reader never sees half a line.
+        let res = async {
+            f.write_all(buf.as_bytes()).await?;
+            f.flush().await
+        }
+        .await;
+        match res {
+            Ok(()) => Ok(buf.len() as u64),
+            Err(e) => {
+                self.open.remove(&id);
+                Err(e)
+            }
+        }
+    }
+
+    fn close(&mut self, id: u64) {
+        self.open.remove(&id);
+    }
+}
+
+/// Writer task: every sweep, append the conversations that have gone quiet
+/// to their own files, seal the files that went quiet for good, and apply
+/// retention every [`sessions::RETENTION_EVERY`].
 async fn writer_loop(
-    file: Arc<FileTarget>,
     store: Arc<Mutex<ConvStore>>,
-    disk: Arc<DiskIndex>,
+    sessions: Arc<sessions::SessionStore>,
+    legacy: Option<Arc<DiskIndex>>,
     flush_idle: Duration,
 ) {
-    // Index the rotation chain before the first sweep. On this task, not at
-    // boot: the hot store answers meanwhile, so a large chain costs early
-    // entries of the oldest hour, never a slow start.
-    disk.scan();
-    disk.scan_done.store(true, Ordering::Relaxed);
-    // Continue sizing from the existing file so restarts keep rotation honest.
-    let mut current_size = tokio::fs::metadata(&file.path)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
-    // One handle, kept open across sweeps: a flush is one line per changed
-    // conversation, and opening and closing the file for each of them was pure
-    // overhead. It is dropped before a rotation and reopened afterwards.
-    let mut handle: Option<tokio::fs::File> = open_append(&file.path).await.ok();
-    if handle.is_none() {
-        warn!(
-            "conversation log: cannot open {} for writing yet; will retry on the next flush",
-            file.path
-        );
+    // Index a legacy chain before the first sweep. On this task, not at
+    // boot: everything else answers meanwhile, so a large old chain costs
+    // early entries of the oldest hours, never a slow start.
+    if let Some(l) = &legacy {
+        let l2 = Arc::clone(l);
+        let _ = tokio::task::spawn_blocking(move || l2.scan()).await;
+        l.scan_done.store(true, Ordering::Relaxed);
     }
-    // Rotations so far: the identity of the live file, which every delta and
-    // every left-out text must stay inside. The live file found at boot is
-    // its own generation too — nothing written before this process is known
-    // to the writer's key states, so they all start empty.
-    let mut epoch: u64 = 1;
+    let mut handles = Handles::default();
     let mut keys: HashMap<String, KeyState> = HashMap::new();
+    let mut last_sweep: Option<std::time::Instant> = None;
     // Wake at least as often as the flush target, so a short
     // `request_log_flush_secs` is honoured instead of rounded up to the sweep.
     let mut ticker = tokio::time::interval(SWEEP.min(flush_idle.max(Duration::from_millis(10))));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        let pending = take_pending(&store, flush_idle);
-        for p in pending {
-            let mut conv = encode(&p, keys.entry(p.key.clone()).or_default(), epoch);
-            let Ok(mut line) = serde_json::to_string(&conv) else {
+        for p in take_pending(&store, flush_idle) {
+            let at = p.turns.first().map_or(p.head.end_ms, |t| t.at_ms);
+            let (unit, tail) = match sessions.unit_for(&p.key, &p.head, at) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!("conversation log: no file for {} ({e}); will retry", p.key);
+                    continue;
+                }
+            };
+            // A key's deltas never leave its unit: a new unit (first write
+            // of this process, a new part) starts it over whole.
+            let conv = encode(&p, keys.entry(p.key.clone()).or_default(), unit);
+            let Ok(line) = serde_json::to_string(&conv) else {
                 warn!("conversation log: failed to serialize {}", p.key);
                 keys.remove(&p.key);
                 continue;
             };
-            if current_size > 0 && current_size + line.len() as u64 + 1 > file.max_bytes {
-                // Nothing may hold the old file while it is renamed, or the
-                // writer would keep appending to the rotated copy.
-                drop(handle.take());
-                match rotate(&file.path, file.max_files).await {
-                    Ok(()) => {
-                        current_size = 0;
-                        epoch += 1;
-                        // The chain shifted one file older; the entries follow.
-                        disk.shift_for_rotation();
-                        compress_rotated(&file.path).await;
-                        // A fresh file: encode again, so the line refers to
-                        // nothing the previous file holds.
-                        conv = encode(&p, keys.entry(p.key.clone()).or_default(), epoch);
-                        match serde_json::to_string(&conv) {
-                            Ok(l) => line = l,
-                            Err(_) => {
-                                keys.remove(&p.key);
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Resetting the size to 0 here would disable rotation
-                        // for good: every later check would start from zero and
-                        // the file would grow past its ceiling in silence.
-                        current_size = tokio::fs::metadata(&file.path)
-                            .await
-                            .map(|m| m.len())
-                            .unwrap_or(current_size);
-                        warn!(
-                            "conversation log: rotation of {} failed ({e}); appending to it and \
-                             keeping its real size ({} B) so the {} B ceiling still bites",
-                            file.path, current_size, file.max_bytes
-                        );
-                    }
-                }
-            }
-            let offset = current_size;
-            let written = match append(&mut handle, &file.path, &line).await {
+            match handles.append(unit, &tail, &line).await {
                 Ok(n) => {
-                    current_size += n;
-                    n
+                    if !sessions.record(unit, &tail, n, &conv) {
+                        // Deleted while it was being written: what was just
+                        // appended must not bring it back.
+                        handles.close(unit);
+                        if !sessions.holds(unit, &tail) {
+                            let _ = tokio::fs::remove_file(&tail).await;
+                        }
+                        keys.remove(&p.key);
+                        continue;
+                    }
+                    let revs: Vec<(u64, u64)> = p.turns.iter().map(|t| (t.rid, t.rev)).collect();
+                    store.lock_or_recover().mark_written(&p.key, &revs, p.rev);
                 }
                 Err(e) => {
-                    warn!("conversation log: failed to append to {}: {}", file.path, e);
+                    warn!("conversation log: failed to append to {}: {e}", tail.display());
                     // What the key state says the file holds is now wrong:
                     // start that key over, whole.
                     keys.remove(&p.key);
-                    continue;
                 }
-            };
-            // The line is on disk: it is now part of the retained history.
-            disk.record(Loc { slot: 0, offset, len: written }, &conv);
-            let revs: Vec<(u64, u64)> = p.turns.iter().map(|t| (t.rid, t.rev)).collect();
-            store.lock_or_recover().mark_written(&p.key, &revs, p.rev);
+            }
+        }
+        // Seal what went quiet: one more zstd frame per unit.
+        for (unit, base) in sessions.due_for_seal(now_unix_millis()) {
+            handles.close(unit);
+            let s = Arc::clone(&sessions);
+            let b = base.clone();
+            match tokio::task::spawn_blocking(move || s.seal(unit, &b)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("conversation log: could not seal {} ({e}); it stays open", base.display()),
+                Err(e) => warn!("conversation log: sealing {} failed ({e})", base.display()),
+            }
+        }
+        if last_sweep.is_none_or(|t| t.elapsed() >= sessions::RETENTION_EVERY) {
+            last_sweep = Some(std::time::Instant::now());
+            let hot: std::collections::HashSet<String> =
+                store.lock_or_recover().entries.keys().cloned().collect();
+            let (s, l) = (Arc::clone(&sessions), legacy.clone());
+            let _ = tokio::task::spawn_blocking(move || s.sweep(&hot, l.as_deref(), now_unix_millis())).await;
         }
         // Forget keys the store no longer holds; a key that comes back starts
         // over whole, which costs bytes, never correctness.
@@ -2163,155 +2285,88 @@ fn take_pending(store: &Arc<Mutex<ConvStore>>, flush_idle: Duration) -> Vec<Pend
     store.lock_or_recover().take_pending(flush_idle)
 }
 
-/// Compress the slot a rotation just made (`.0`) in the background pool. A
-/// failure leaves it plain, which every reader still opens.
-async fn compress_rotated(path: &str) {
-    let src = std::path::PathBuf::from(format!("{path}.0"));
-    let dst = std::path::PathBuf::from(format!("{path}.0{}", codec::ZST));
-    let done = tokio::task::spawn_blocking(move || codec::compress_slot(&src, &dst)).await;
-    match done {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!("conversation log: could not compress {path}.0 ({e}); it stays uncompressed"),
-        Err(e) => warn!("conversation log: compressing {path}.0 failed ({e}); it stays uncompressed"),
-    }
-}
-
-async fn open_append(path: &str) -> Result<tokio::fs::File, std::io::Error> {
-    tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-}
-
-/// Append one flushed line through the shared handle (reopened when it is not
-/// open), so a tailing reader never sees half a line. A failed write drops the
-/// handle, so the next call starts from a fresh one. Returns the bytes written.
-async fn append(
-    handle: &mut Option<tokio::fs::File>,
-    path: &str,
-    line: &str,
-) -> Result<u64, std::io::Error> {
-    if handle.is_none() {
-        *handle = Some(open_append(path).await?);
-    }
-    let mut buf = String::with_capacity(line.len() + 1);
-    buf.push_str(line);
-    buf.push('\n');
-    let f = handle
-        .as_mut()
-        .expect("the handle is open on this path through the function");
-    match f.write_all(buf.as_bytes()).await {
-        Ok(()) => match f.flush().await {
-            Ok(()) => Ok(buf.len() as u64),
-            Err(e) => {
-                *handle = None;
-                Err(e)
-            }
-        },
-        Err(e) => {
-            *handle = None;
-            Err(e)
-        }
-    }
-}
-
-/// Shift the rotation chain: `{path}.{max_files-1}` (plain or `.zst`) is
-/// deleted, each existing `{path}.{i}[.zst]` moves up one slot (missing files
-/// skipped), and the current file becomes `{path}.0`. Reports the first
-/// failure instead of swallowing it: the caller has to keep the file's true
-/// size when the chain did not move.
-async fn rotate(path: &str, max_files: usize) -> Result<(), String> {
-    // Nothing on disk to move (deleted out of band, or a first write that has
-    // not happened yet): the caller's next append recreates the file, so this
-    // is not a failure.
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(());
-    }
-    let mut failed: Option<String> = None;
-    let note = |what: &str, e: std::io::Error, failed: &mut Option<String>| {
-        if failed.is_none() {
-            *failed = Some(format!("{what}: {e}"));
-        }
-    };
-    for suffix in ["", codec::ZST] {
-        let oldest = format!("{}.{}{suffix}", path, max_files - 1);
-        if let Err(e) = tokio::fs::remove_file(&oldest).await
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            note("cannot drop the oldest file", e, &mut failed);
-        }
-    }
-    for i in (0..max_files.saturating_sub(1)).rev() {
-        for suffix in ["", codec::ZST] {
-            let from = format!("{path}.{i}{suffix}");
-            if tokio::fs::metadata(&from).await.is_ok() {
-                let to = format!("{path}.{}{suffix}", i + 1);
-                if let Err(e) = tokio::fs::rename(&from, &to).await {
-                    note("cannot shift", e, &mut failed);
-                }
-            }
-        }
-    }
-    if let Err(e) = tokio::fs::rename(path, format!("{}.0", path)).await {
-        note("cannot rotate the current file", e, &mut failed);
-    }
-    match failed {
-        None => Ok(()),
-        Some(e) => Err(e),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use sessions::{SessionStore, Tombs};
 
-    /// The boot retention warning's rule, without a disk: the chain's own
-    /// write rate decides whether its size caps can span `history_hours`.
+    /// The boot retention warning's rule, without a disk: the log's own
+    /// growth decides whether its budget can span `history_hours`.
     #[test]
-    fn retention_shortfall_names_a_chain_too_small_for_the_window() {
+    fn retention_shortfall_names_a_budget_too_small_for_the_window() {
         let hour = 3_600_000u64;
         let now = 100 * hour;
-        // 10 MiB x 6 slots = 60 MiB of chain, 40 MiB written in the last
-        // hour: a 24 h window needs ~960 MiB — the caps cannot cover it.
+        // 60 MiB of budget, 40 MiB written in the last hour: a 24 h window
+        // needs ~960 MiB — the budget cannot cover it.
         assert!(retention_shortfall(60 << 20, 40 << 20, now - hour, now, 24));
-        // The same caps at a quiet rate cover the window easily.
+        // The same budget at a quiet rate covers the window easily.
         assert!(!retention_shortfall(60 << 20, 1 << 20, now - hour, now, 24));
-        // A brand-new chain that barely wrote says nothing yet (the one-minute
-        // floor keeps the first flush from reading as infinite throughput).
+        // A brand-new log that barely wrote says nothing yet.
         assert!(!retention_shortfall(60 << 20, 16 << 10, now, now, 24));
-        // A full chain that survived only 6 of the 24 requested hours is a
-        // shortfall — rotation is eating history faster than the window drains.
+        // A full budget that kept only 6 of the 24 requested hours is short.
         assert!(retention_shortfall(60 << 20, 60 << 20, now - 6 * hour, now, 24));
-        // ...and one that survived the whole window does not warn.
         assert!(!retention_shortfall(60 << 20, 60 << 20, now - 25 * hour, now, 24));
     }
 
-    /// A logger without a boot scan (the disabled one) is never "indexing":
-    /// there is no chain to scan, and the UI must not wait for nothing.
+    /// A disabled logger is never "indexing" and holds nothing.
     #[test]
-    fn disabled_logger_is_never_indexing_and_has_no_chain() {
+    fn disabled_logger_is_never_indexing_and_has_no_log() {
         let log = ConvLogger::disabled();
         assert!(!log.indexing());
         assert_eq!(log.chain_start_ms(), None);
         assert!(log.resolvable_rids().is_empty());
-        assert_eq!(log.chain_disk_stats(), None);
+        assert_eq!(log.retention_usage(), None);
+        assert!(!log.delete("x#y"));
     }
-    use super::*;
 
+    /// A fresh folder per test (each logger keeps `sessions/` beside its
+    /// path); returns the log path inside it.
     fn tmp(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("ollamamq_convlog_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ollamamq_convlog_{}_{}_{}",
+            std::process::id(),
+            name.replace('.', "_"),
+            crate::clients::random_hex(4)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
-        let _ = std::fs::remove_file(&path);
-        for i in 0..4 {
-            let _ = std::fs::remove_file(format!("{}.{}", path.display(), i));
-            let _ = std::fs::remove_file(format!("{}.{}.zst", path.display(), i));
+        dir.join("ollamamq-requests.jsonl").to_string_lossy().into_owned()
+    }
+
+    fn log_dir(path: &str) -> std::path::PathBuf {
+        Path::new(path).parent().unwrap().to_path_buf()
+    }
+
+    fn unit_path(path: &str, rel: &str) -> std::path::PathBuf {
+        log_dir(path).join("sessions").join(rel)
+    }
+
+    /// Append one line to a unit's tail, as the writer would.
+    fn put_line(path: &str, unit: &str, line: &str) {
+        let tail = unit_path(path, &format!("{unit}.jsonl"));
+        std::fs::create_dir_all(tail.parent().unwrap()).unwrap();
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(tail).unwrap();
+        std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()).unwrap();
+    }
+
+    /// Every file under the log's sessions folder, relative, sorted.
+    fn session_files(path: &str) -> Vec<String> {
+        let root = log_dir(path).join("sessions");
+        let mut out = Vec::new();
+        for d in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            if !d.path().is_dir() {
+                continue;
+            }
+            for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
+                out.push(f.path().strip_prefix(&root).unwrap().to_string_lossy().into_owned());
+            }
         }
-        path.to_string_lossy().into_owned()
+        out.sort();
+        out
     }
 
     /// What the writer would append for the pending conversations: encoded
-    /// against `st` as one live file, then marked written in the store.
+    /// against `st` as one file, then marked written in the store.
     fn flush_lines(log: &ConvLogger, st: &mut HashMap<String, KeyState>) -> Vec<(Conv, String)> {
         let pending = take_pending(&log.store, Duration::ZERO);
         let mut out = Vec::new();
@@ -2334,7 +2389,7 @@ mod tests {
         }
     }
 
-    /// Wait for a logger's boot scan of the chain to finish.
+    /// Wait for a logger's boot scans to finish.
     async fn indexed(log: &ConvLogger) {
         for _ in 0..400 {
             if !log.indexing() {
@@ -2345,13 +2400,24 @@ mod tests {
         panic!("the boot scan never finished");
     }
 
+    /// Wait until `ok` holds (the writer runs on its own task).
+    async fn until(what: &str, ok: impl Fn() -> bool) {
+        for _ in 0..400 {
+            if ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
     fn begin(key: &str, rid: u64, at: u64) -> Note {
         Note::Begin(Box::new(Begin {
             kind: None,
             link: None,
             key: key.into(),
             rid,
-            user: key.split('#').next().unwrap().into(),
+            user: key.split(['#', '\u{00b7}']).next().unwrap().into(),
             session_label: Some("refactor-auth".into()),
             model: Some("qwen".into()),
             method: "POST".into(),
@@ -2387,531 +2453,274 @@ mod tests {
         }))
     }
 
-    fn read_lines(path: &str) -> Vec<Conv> {
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str::<Conv>(l).unwrap())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn turn_cap_keeps_the_newest_and_counts_the_rest() {
-        let path = tmp("cap.jsonl");
-        let (log, handle) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
-        for i in 0..(MAX_TURNS as u64) + 5 {
-            log.note(begin("cap#s", i, 1000 + i));
-        }
-        let guard = log.store.lock_or_recover();
-        let conv = &guard.entries["cap#s"].conv;
-        assert_eq!(conv.turns.len(), MAX_TURNS);
-        assert_eq!(conv.dropped_turns, 5);
-        // The newest turn is present, the first five are gone.
-        assert_eq!(conv.turns.last().unwrap().rid, (MAX_TURNS as u64) + 4);
-        assert_eq!(conv.turns.first().unwrap().rid, 5);
-        drop(guard);
-        assert_eq!(log.dropped_count(), 5);
-        handle.abort();
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn one_line_per_conversation_after_idle() {
-        let path = tmp("one_line.jsonl");
-        // The writer task would flush on its own after `flush_idle`; an hour
-        // keeps the file for the test alone, which drives `take_pending`.
-        let (log, handle) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
-        log.note(begin("alice#a1", 1, 1000));
-        log.note(Note::ReqText {
-            key: "alice#a1".into(),
-            rid: 1,
-            bytes: Some(100),
-            text: Arc::new("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}".into()),
-        });
-        log.note(resp("alice#a1", 1, 2000));
-        log.note(begin("alice#a1", 2, 3000));
-        log.note(resp("alice#a1", 2, 4000));
-        // Two turns of one conversation, flushed as one line.
-        let mut st = HashMap::new();
-        let lines = flush_lines(&log, &mut st);
-        assert_eq!(lines.len(), 1, "one conversation must produce one line");
-        let conv: Conv = serde_json::from_str(&lines[0].1).unwrap();
-        assert_eq!(conv.turns.len(), 2);
-        assert_eq!(conv.v, SCHEMA_V);
-        assert_eq!(conv.session.as_deref(), Some("a1"));
-        assert_eq!(conv.session_label.as_deref(), Some("refactor-auth"));
-        assert_eq!(conv.turns[0].tl.queue, Some(1001));
-        assert_eq!(conv.turns[0].tl.end, Some(2000));
-        assert_eq!(conv.turns[0].content.as_ref().unwrap().req.as_deref().unwrap(), "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
-        assert_eq!(conv.turns[0].req.as_ref().unwrap().chars, Some(45));
-        assert_eq!(conv.start_ms, 1000);
-        assert_eq!(conv.end_ms, 4000);
-        assert!(!conv.redacted);
-
-        // A flush clears the dirty flag; nothing new is pending.
-        assert!(take_pending(&log.store, Duration::ZERO).is_empty());
-        // A late verdict on turn 1 brings back that turn alone, without the
-        // text the file already holds.
-        log.note(Note::Audit { key: "alice#a1".into(), rid: 1, flags: Vec::new() });
-        let again = flush_lines(&log, &mut st);
-        assert_eq!(again.len(), 1);
-        let conv = &again[0].0;
-        assert_eq!(conv.turns.iter().map(|t| t.rid).collect::<Vec<_>>(), vec![1]);
-        assert!(conv.turns[0].content.is_none(), "no text written twice");
-        assert!(conv.turns[0].msgs.is_empty(), "no msgs written twice");
-        handle.abort();
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn redacted_conversation_keeps_structure_without_text() {
-        let path = tmp("redacted.jsonl");
-        let (log, handle) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
-        let mut b = begin("bob#b1", 7, 5000);
-        if let Note::Begin(bx) = &mut b {
-            bx.redacted = true;
-        }
-        log.note(b);
-        log.note(resp("bob#b1", 7, 6000));
-        let line = flush_lines(&log, &mut HashMap::new()).remove(0).1;
-        let conv: Conv = serde_json::from_str(&line).unwrap();
-        assert!(conv.redacted && conv.turns[0].redacted);
-        // No text anywhere in the line, but the timeline and sizes are intact.
-        assert!(!line.contains("\"content\""));
-        assert!(!line.contains("hi"));
-        let t = &conv.turns[0];
-        assert_eq!(t.tl.end, Some(6000));
-        assert_eq!(t.status, Some(200));
-        assert_eq!(t.req.as_ref().unwrap().bytes, Some(100));
-        assert_eq!(t.msgs[0].role, "user");
-        assert_eq!(t.msgs[0].chars, 12);
-        assert_eq!(log.content(&Find { session: Some("b1"), ..Default::default() }, Dir::Req), None);
-        handle.abort();
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A rotation that cannot move the chain has to say so: the caller keeps
-    /// the file's real size only when it learns the chain did not move, and a
-    /// silent success would disable rotation for the rest of the process.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn rotate_reports_a_chain_it_cannot_move() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("ollamamq_rotate_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let path = dir.join("log.jsonl");
-        std::fs::write(&path, "{\"v\":2}\n").expect("write log");
-        // No rename may happen in the log's directory (a read-only mount, the
-        // case this exists for).
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
-        let outcome = rotate(path.to_str().expect("utf-8 path"), 2).await;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
-        let err = outcome.expect_err("renaming into a read-only directory must fail");
-        assert!(!err.is_empty(), "the failure names what went wrong");
-        assert!(
-            std::fs::metadata(&path).is_ok(),
-            "a failed rotation leaves the current file alone"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn rotating_a_log_that_is_not_there_is_not_a_failure() {
-        let path = tmp("never-written.jsonl");
-        let _ = std::fs::remove_file(&path);
-        rotate(&path, 3).await.expect("nothing to move");
-    }
-
-    #[tokio::test]
-    async fn resume_appends_only_the_new_turns_and_folds_back_whole() {
-        let path = tmp("resume.jsonl");
-        {
-            let (log, handle) =
-                ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
-            let mut st = HashMap::new();
-            log.note(begin("carol#c1", 1, 1000));
-            log.note(resp("carol#c1", 1, 2000));
-            for (_, line) in flush_lines(&log, &mut st) {
-                append(&mut None, &path, &line).await.unwrap();
-            }
-            // The conversation resumes: a second line carries turn 2 alone.
-            log.note(begin("carol#c1", 2, 9000));
-            log.note(resp("carol#c1", 2, 9500));
-            let second = flush_lines(&log, &mut st);
-            assert_eq!(second[0].0.turns.len(), 1, "only the new turn is written");
-            assert_eq!(second[0].0.turns[0].rid, 2);
-            for (_, line) in second {
-                append(&mut None, &path, &line).await.unwrap();
-            }
-            handle.abort();
-        }
-        // The reader's rule: a key's lines fold oldest first into one
-        // conversation holding both turns.
-        let (convs, skipped) = load_conversations(&[path.clone().into()]).unwrap();
-        assert_eq!((convs.len(), skipped), (1, 0));
-        assert_eq!(convs[0].turns.iter().map(|t| t.rid).collect::<Vec<_>>(), vec![1, 2]);
-        assert_eq!((convs[0].start_ms, convs[0].end_ms), (1000, 9500));
-        assert_eq!(convs[0].turns[1].msgs.len(), 1, "msgs survive their delta");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The point of v4: a session that resends its history stores each
-    /// message once, and every turn's body still reads back exactly — from
-    /// the file alone, through a fresh process, across a compaction that
-    /// broke the prefix.
-    #[tokio::test]
-    async fn request_deltas_store_each_message_once_and_rebuild_exactly() {
-        let path = tmp("delta.jsonl");
-        let sys = format!("{{\"role\":\"system\",\"content\":\"{}\"}}", "s".repeat(4000));
-        let mut msgs = vec![sys.clone()];
-        let mut bodies = Vec::new();
-        for i in 0..6u64 {
-            msgs.push(format!("{{\"role\":\"user\",\"content\":\"step {i} \\u00e9\"}}"));
-            if i == 4 {
-                // A compaction: the history is replaced by a summary.
-                msgs = vec![sys.clone(), "{\"role\":\"user\",\"content\":\"summary\"}".into()];
-            }
-            bodies.push(format!(
-                "{{\"model\":\"q\",\"messages\":[{}],\"stream\":true,\"tools\":[{{\"type\":\"function\",\"function\":{{\"name\":\"bash\"}}}}]}}",
-                msgs.join(",")
-            ));
-        }
-        {
-            let (log, handle) =
-                ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
-            let mut st = HashMap::new();
-            for (i, body) in bodies.iter().enumerate() {
-                let rid = 10 + i as u64;
-                let mut b = begin("dan#d1", rid, 1000 + rid);
-                if let Note::Begin(bx) = &mut b {
-                    bx.msgs = msg_meta(body);
-                }
-                log.note(b);
-                log.note(req_text("dan#d1", rid, body));
-                log.note(resp("dan#d1", rid, 1500 + rid));
-                // One line per turn, as an agent's pauses between turns make.
-                for (_, line) in flush_lines(&log, &mut st) {
-                    append(&mut None, &path, &line).await.unwrap();
-                }
-            }
-            handle.abort();
-        }
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(raw.matches(&"s".repeat(4000)).count(), 1, "the system prompt is stored once");
-        assert_eq!(raw.matches("\"req_d\"").count(), 5, "every turn after the first is a delta");
-        assert!(raw.len() < bodies.iter().map(String::len).sum::<usize>() / 3);
-        // Read back from the file by a script…
-        let (convs, _) = load_conversations(&[path.clone().into()]).unwrap();
-        for (t, body) in convs[0].turns.iter().zip(&bodies) {
-            assert_eq!(t.content.as_ref().unwrap().req.as_deref().map(String::as_str), Some(body.as_str()));
-            assert_eq!(t.msgs, msg_meta(body), "msgs rebuilt from their deltas");
-        }
-        // …and by a fresh process's viewer.
-        let (log, handle) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
-        indexed(&log).await;
-        for (i, body) in bodies.iter().enumerate() {
-            let q = Find { key: Some("dan#d1"), rid: Some(10 + i as u64), ..Default::default() };
-            assert_eq!(log.content(&q, Dir::Req).as_deref(), Some(body.as_str()), "turn {i}");
-        }
-        let conv = log.index(&find_key("dan#d1")).unwrap();
-        assert_eq!(conv.turns.len(), 6);
-        assert_eq!(conv.turns[5].msgs, msg_meta(&bodies[5]));
-        handle.abort();
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A streamed reply is stored as the completion it amounts to; an errored
-    /// one keeps its stream as evidence.
-    #[tokio::test]
-    async fn streamed_replies_are_folded_unless_the_turn_failed() {
-        let path = tmp("sse.jsonl");
-        let (log, handle) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
-        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi \"}}]}\n\n\
-                   data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"there\"},\"finish_reason\":\"stop\"}]}\n\n\
-                   data: [DONE]\n\n";
-        for (rid, outcome) in [(1u64, "ok"), (2, "backend_error")] {
-            log.note(begin("eve#e1", rid, 1000 * rid));
-            if let Note::Resp(mut r) = resp("eve#e1", rid, 1000 * rid + 500) {
-                r.outcome = outcome.into();
-                log.note(Note::Resp(r));
-            }
-            log.note(Note::RespText {
-                key: "eve#e1".into(),
-                rid,
-                bytes: Some(sse.len() as u64),
-                text: Arc::new(sse.into()),
-            });
-        }
-        let (conv, _) = flush_lines(&log, &mut HashMap::new()).remove(0);
-        let folded = conv.turns[0].content.as_ref().unwrap().resp.as_deref().unwrap();
-        let v: serde_json::Value = serde_json::from_str(folded).unwrap();
-        assert_eq!(v["choices"][0]["message"]["content"], "hi there");
-        assert_eq!(v["choices"][0]["finish_reason"], "stop");
-        let kept = conv.turns[1].content.as_ref().unwrap().resp.as_deref().unwrap();
-        assert_eq!(kept.as_str(), sse);
-        // The hot store still answers with the stream as captured.
-        let q = Find { key: Some("eve#e1"), rid: Some(1), ..Default::default() };
-        assert_eq!(log.content(&q, Dir::Resp).as_deref(), Some(sse));
-        handle.abort();
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// One flushed conversation line for the index tests.
-    fn idx_line(key: &str, end_ms: u64, text: &str) -> String {
-        serde_json::json!({
-            "v": SCHEMA_V, "key": key,
-            "user": key.split('#').next().unwrap(),
-            "session": key.split('#').nth(1),
-            "start_ms": end_ms - 1000, "end_ms": end_ms,
-            "turns": [{ "rid": 42, "at_ms": end_ms - 1000, "path": "/v1/chat/completions",
-                        "tl": { "end": end_ms },
-                        "content": { "req": text } }]
-        })
-        .to_string()
+    /// One turn, recorded whole: begin, request text, response.
+    fn turn(log: &ConvLogger, key: &str, rid: u64, at: u64, body: &str) {
+        log.note(begin(key, rid, at));
+        log.note(req_text(key, rid, body));
+        log.note(resp(key, rid, at + 500));
     }
 
     fn find_key(key: &str) -> Find<'_> {
         Find { key: Some(key), session: None, user: None, rid: None }
     }
 
-    /// The index's three contracts: newest line per key wins across the chain
-    /// (supersede), rotation shifts entries with their files and drops what
-    /// falls off, and a (slot, offset, len) actually reads back its line.
-    #[test]
-    fn disk_index_supersedes_shifts_and_reads() {
-        let base = tmp("idx.jsonl");
-        // `.0` holds the only view of one conversation and the stale view of
-        // another; the live file holds the newer view — written oldest first,
-        // exactly as the chain sits on disk.
-        std::fs::write(&base, "").unwrap();
-        std::fs::write(
-            format!("{base}.0"),
-            format!(
-                "{}\n{}\n",
-                idx_line("ann#k1", 5_000, "old view"),
-                idx_line("bob#k2", 6_000, "only view")
-            ),
-        )
-        .unwrap();
-        std::fs::write(&base, format!("{}\n", idx_line("ann#k1", 9_000, "new view"))).unwrap();
-        let idx = DiskIndex::new(&base, 2); // slots: [live, .0, .1]
-        idx.scan();
-
-        let sums = idx.summaries(&|_| false);
-        assert_eq!(sums.len(), 2, "superseded lines must not double-list");
-        let ann = idx.find(&find_key("ann#k1")).expect("ann");
-        assert_eq!(ann.summary.end_ms, 9_000, "the live file's newer line wins");
-        assert_eq!(ann.locs.iter().map(|l| l.slot).collect::<Vec<_>>(), vec![1, 0], "oldest first");
-        let conv = idx.read(&ann).expect("ann reads back");
-        assert_eq!(
-            conv.turns[0].content.as_ref().unwrap().req.as_deref().map(String::as_str),
-            Some("new view"),
-            "the newer record of a turn wins the fold"
-        );
-        // rid matching works off the index without reading the line back.
-        let bob = idx
-            .find(&Find {
-                key: None,
-                session: None,
-                user: Some("bob"),
-                rid: Some(42),
-            })
-            .expect("bob by rid+user");
-        assert_eq!(bob.locs.iter().map(|l| l.slot).collect::<Vec<_>>(), vec![1], "the only view sits in .0");
-        let conv = idx.read(&bob).expect("read back");
-        assert_eq!(
-            conv.turns[0].content.as_ref().unwrap().req.as_deref().map(String::as_str),
-            Some("only view")
-        );
-
-        // A rotation renames every file one slot older: entries follow; a
-        // second rotation drops what moved past the chain's last slot.
-        idx.shift_for_rotation();
-        assert_eq!(idx.find(&find_key("bob#k2")).unwrap().locs[0].slot, 2);
-        idx.shift_for_rotation();
-        assert!(idx.find(&find_key("bob#k2")).is_none());
-        // ann keeps the line that has not fallen off yet.
-        assert_eq!(idx.find(&find_key("ann#k1")).unwrap().locs.len(), 1);
-        let _ = std::fs::remove_file(format!("{base}.0"));
+    /// A conversation line (a whole v3-style snapshot) for chain and store tests.
+    fn snapshot(key: &str, rids: &[u64], end_ms: u64, text: &str) -> String {
+        let (user, session) = key.split_once('#').map_or((key, None), |(u, s)| (u, Some(s)));
+        serde_json::json!({
+            "v": 3, "key": key, "user": user, "session": session,
+            "start_ms": end_ms - 1000, "end_ms": end_ms,
+            "turns": rids.iter().map(|r| serde_json::json!({
+                "rid": r, "at_ms": end_ms - 1000 + r, "path": "/v1/chat/completions",
+                "tl": { "end": end_ms }, "content": { "req": format!("{text} {r}") } })).collect::<Vec<_>>()
+        })
+        .to_string()
     }
 
-    /// The writer's own contract: a flushed line is immediately findable in
-    /// the index and reads back from disk — the path that lets the views show
-    /// history the hot store dropped.
-    #[tokio::test]
-    async fn writer_indexes_every_flushed_line() {
-        let path = tmp("widx.jsonl");
-        let (log, handle) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_millis(20)).unwrap();
-        log.note(begin("erin#e1", 1, 1000));
-        log.note(Note::ReqText {
-            key: "erin#e1".into(),
-            rid: 1,
-            bytes: Some(11),
-            text: std::sync::Arc::new("hello erin".into()),
-        });
-        log.note(resp("erin#e1", 1, 2000));
-        let disk = log.disk.clone().unwrap();
-        let entry = loop {
-            if let Some(e) = disk.find(&find_key("erin#e1")) {
-                break e;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        assert_eq!(entry.locs[0].slot, 0);
-        assert_eq!(entry.summary.turns, 1);
-        let conv = disk.read(&entry).expect("the flushed line reads back");
-        assert_eq!(
-            conv.turns[0].content.as_ref().unwrap().req.as_deref().map(String::as_str),
-            Some("hello erin")
-        );
-        handle.abort();
-        let _ = std::fs::remove_file(&path);
+    /// Write `line` into `store` the way the writer does.
+    fn store_put(store: &SessionStore, line: &str) {
+        let conv: Conv = serde_json::from_str(line).unwrap();
+        let at = conv.turns.first().map_or(conv.end_ms, |t| t.at_ms);
+        let (id, tail) = store.unit_for(&conv.key, &conv.head(), at).unwrap();
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&tail).unwrap();
+        std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()).unwrap();
+        assert!(store.record(id, &tail, line.len() as u64 + 1, &conv));
     }
 
-    /// The rid floor a new process needs must see everything retained:
-    /// hot conversations and the disk index loaded at open.
-    #[tokio::test]
-    async fn max_rid_covers_hot_store_and_disk_index() {
-        let path = tmp("maxrid.jsonl");
-        let (log, handle) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_millis(20)).unwrap();
-        log.note(begin("erin#e1", 7, 1000));
-        log.note(resp("erin#e1", 7, 2000));
-        log.note(begin("erin#e1", 13, 3000));
-        log.note(resp("erin#e1", 13, 4000));
-        let disk = log.disk.clone().unwrap();
-        loop {
-            if disk
-                .find(&find_key("erin#e1"))
-                .is_some_and(|e| e.summary.turns >= 2)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    fn seal_all(store: &SessionStore) {
+        for (id, base) in store.due_for_seal(u64::MAX) {
+            store.seal(id, &base).unwrap();
         }
-        assert_eq!(log.max_rid(), 13, "the hot conversation's newest rid");
-        handle.abort();
-        drop(log);
-        // A fresh process: empty hot store, the floor comes off the disk index.
-        let (log2, handle2) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
-        assert_eq!(log2.max_rid(), 13, "the startup disk index carries the rid");
-        handle2.abort();
-        let _ = std::fs::remove_file(&path);
     }
 
+    /// The writer's own contract: each conversation lands in a file of its
+    /// own, a resumed one appends to it, and the fold reads both turns back.
     #[tokio::test]
-    async fn reopening_reads_history_back_and_skips_old_format() {
-        let path = tmp("seed.jsonl");
-        // A v1 line (old per-request format) must be ignored.
-        std::fs::write(
-            &path,
-            "{\"ts\":1,\"dir\":\"IN\",\"user\":\"x\",\"method\":\"GET\",\"path\":\"/\",\"priority\":\"normal\"}\n",
-        )
-        .unwrap();
-        {
-            let (log, handle) =
-                ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
-            log.note(begin("dave#d1", 1, 1000));
-            log.note(resp("dave#d1", 1, 2000));
-            for (_, line) in flush_lines(&log, &mut HashMap::new()) {
-                append(&mut None, &path, &line).await.unwrap();
-            }
-            handle.abort();
-        }
+    async fn each_conversation_gets_its_own_file_and_resumes_into_it() {
+        let path = tmp("own_file");
+        let (log, handle) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_millis(20)).unwrap();
+        turn(&log, "carol#c1", 1, 1000, "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}]}");
+        turn(&log, "dave#d1", 2, 1100, "plain body");
+        log.note(begin("dave\u{00b7}9", 9, 1200));
+        log.note(begin("dave\u{00b7}10", 10, 1300));
+        until("four conversations flushed", || log.store.lock_or_recover().entries.values().all(|e| !e.dirty)).await;
+        turn(&log, "carol#c1", 3, 9000, "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"user\",\"content\":\"b\"}]}");
+        until("the resumed turn flushed", || log.store.lock_or_recover().entries.values().all(|e| !e.dirty)).await;
+        handle.abort();
+        // Session-less requests of one client share a day file.
+        assert_eq!(
+            session_files(&path),
+            vec!["1970-01-01/carol__c1.jsonl", "1970-01-01/dave__d1.jsonl", "1970-01-01/dave__oneshot.jsonl"]
+        );
+        let (convs, skipped) = load_conversations(&[log_dir(&path)]).unwrap();
+        assert_eq!(skipped, 0);
+        let carol = convs.iter().find(|c| c.key == "carol#c1").unwrap();
+        assert_eq!(carol.turns.iter().map(|t| t.rid).collect::<Vec<_>>(), vec![1, 3]);
+        assert!(carol.turns[1].content.as_ref().unwrap().req.as_deref().unwrap().contains("\"b\""));
+        assert_eq!(convs.len(), 4, "the two one-shots stay separate conversations");
+        // A fresh process lists and opens all of it.
         let (log2, h2) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
         indexed(&log2).await;
-        let back = log2.index(&Find { session: Some("d1"), ..Default::default() });
-        assert!(back.is_some(), "the line must be read back");
-        assert_eq!(back.unwrap().turns.len(), 1);
-        // The conversation resumes in the new process: the view is the
-        // history on disk plus the new turn, not the new turn alone.
-        log2.note(begin("dave#d1", 2, 5000));
-        let both = log2.index(&find_key("dave#d1")).unwrap();
-        assert_eq!(both.turns.iter().map(|t| t.rid).collect::<Vec<_>>(), vec![1, 2]);
-        assert_eq!(both.start_ms, 1000);
-        let row = log2.summaries(10).remove(0);
-        assert_eq!((row.turns, row.live), (2, true));
+        assert_eq!(log2.summaries(10).len(), 4);
+        assert_eq!(log2.max_rid(), 10);
+        let q = Find { key: Some("carol#c1"), rid: Some(3), ..Default::default() };
+        assert!(log2.content(&q, Dir::Req).unwrap().contains("\"b\""));
         h2.abort();
-        let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    async fn rotation_keeps_the_file_within_its_budget() {
-        let path = tmp("rotate.jsonl");
-        let body = Arc::new("x".repeat(500));
-        // The writer flushes conversations that have been quiet for
-        // `flush_idle`, so a short one drives the real task end to end.
-        let (log, handle) =
-            ConvLogger::start(path.clone(), 1200, 2, Duration::from_millis(30)).unwrap();
-        for i in 0..12u64 {
-            let key = format!("u#s{i}");
-            log.note(begin(&key, i, 1000 + i));
-            log.note(Note::ReqText {
-                key: key.clone(),
-                rid: i,
-                bytes: Some(500),
-                text: Arc::clone(&body),
-            });
-            log.note(resp(&key, i, 1500 + i));
+    /// Sealing compresses the tail into one more frame of the unit; a resumed
+    /// conversation opens a new tail, and a second seal appends a second
+    /// frame — deltas resolve across them, and a boot reads only the meta.
+    #[test]
+    fn seal_resume_seal_keeps_one_delta_history() {
+        let path = tmp("seal");
+        let store = SessionStore::open(log_dir(&path).join("sessions"), Retention::default()).unwrap();
+        let body = |n: usize| {
+            let msgs: Vec<String> = (0..n)
+                .map(|i| format!("{{\"role\":\"user\",\"content\":\"message {i} {}\"}}", "z".repeat(200)))
+                .collect();
+            format!("{{\"model\":\"q\",\"messages\":[{}]}}", msgs.join(","))
+        };
+        let mut st = KeyState::default();
+        let mut write = |rid: u64, n: usize| {
+            let t: Turn = serde_json::from_value(serde_json::json!({
+                "rid": rid, "at_ms": 1000 + rid, "path": "/v1/chat/completions", "tl": { "end": 2000 + rid },
+                "outcome": "ok", "content": { "req": body(n) } }))
+            .unwrap();
+            let head: Conv = serde_json::from_str(&snapshot("erin#e1", &[], 3000 + rid, "")).unwrap();
+            let p = Pending { key: "erin#e1".into(), head, turns: vec![t], rev: 0 };
+            let (id, _) = store.unit_for("erin#e1", &p.head, 1000).unwrap();
+            let line = serde_json::to_string(&encode(&p, &mut st, id)).unwrap();
+            store_put(&store, &line);
+        };
+        write(1, 1);
+        write(2, 2);
+        seal_all(&store);
+        assert_eq!(session_files(&path), vec!["1970-01-01/erin__e1.jsonl.zst", "1970-01-01/erin__e1.meta.json"]);
+        write(3, 3);
+        seal_all(&store);
+        assert_eq!(session_files(&path).len(), 2, "the second seal appends a frame, no new file");
+        let conv = store.read("erin#e1").unwrap();
+        assert_eq!(resolve_req(&conv, 3).as_deref(), Some(body(3).as_str()), "a delta across frames");
+        // A boot that only reads the meta still lists every turn.
+        let again = SessionStore::open(log_dir(&path).join("sessions"), Retention::default()).unwrap();
+        again.scan();
+        let (_, turns) = again.rows().into_iter().find(|(h, _)| h.key == "erin#e1").unwrap();
+        assert_eq!(turns.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(again.max_rid(), 3);
+    }
+
+    /// A unit past its part size closes; the conversation continues in `.p2`,
+    /// which starts its delta history over, and reads back as one.
+    #[test]
+    fn a_full_part_continues_in_the_next() {
+        let path = tmp("parts");
+        let mut store = SessionStore::open(log_dir(&path).join("sessions"), Retention::default()).unwrap();
+        store_set_part_max(&mut store, 600);
+        store_put(&store, &snapshot("finn#f1", &[1], 2000, &"a".repeat(500)));
+        store_put(&store, &snapshot("finn#f1", &[2], 3000, "b"));
+        assert_eq!(session_files(&path), vec!["1970-01-01/finn__f1.jsonl", "1970-01-01/finn__f1.p2.jsonl"]);
+        let conv = store.read("finn#f1").unwrap();
+        assert_eq!(conv.turns.iter().map(|t| t.rid).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    fn store_set_part_max(store: &mut SessionStore, n: u64) {
+        store.set_part_max(n);
+    }
+
+    /// Retention keeps or drops whole conversations: past the age limit,
+    /// then oldest first until the budget holds — never an open tail, never
+    /// a conversation the hot store still holds.
+    #[test]
+    fn retention_drops_whole_conversations_oldest_first() {
+        let day = 86_400_000u64;
+        let now = 100 * day;
+        let path = tmp("retention");
+        let store = SessionStore::open(
+            log_dir(&path).join("sessions"),
+            Retention { max_total_bytes: u64::MAX, max_days: 30 },
+        )
+        .unwrap();
+        for (key, age_days) in [("old#o1", 40u64), ("mid#m1", 20), ("new#n1", 1), ("hot#h1", 50)] {
+            store_put(&store, &snapshot(key, &[1, 2], now - age_days * day, &"x".repeat(2000)));
         }
-        // Which conversation is written last depends on the store order, and
-        // rotation deletes what falls off the end — so what proves the writer
-        // works is: lines arrived, they rotated, and every surviving line is a
-        // whole record inside the budget.
-        let mut files = Vec::new();
-        for _ in 0..200 {
-            let mut all = read_lines(&path);
-            for i in 0..2 {
-                if let Ok(data) = codec::read_slot_file(Path::new(&format!("{path}.{i}.zst"))) {
-                    all.extend(String::from_utf8(data).unwrap().lines().map(|l| serde_json::from_str::<Conv>(l).unwrap()));
-                }
-            }
-            if !all.is_empty() && std::fs::metadata(format!("{path}.0.zst")).is_ok() {
-                files = all;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        handle.abort();
-        assert!(!files.is_empty(), "no conversation reached the file");
+        seal_all(&store);
+        store_put(&store, &snapshot("open#p1", &[1], now - 60 * day, "still open"));
+        let hot: std::collections::HashSet<String> = ["hot#h1".to_string()].into();
+        store.sweep(&hot, None, now);
+        let keys = |s: &SessionStore| {
+            let mut k: Vec<String> = s.rows().into_iter().map(|(h, _)| h.key).collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&store), vec!["hot#h1", "mid#m1", "new#n1", "open#p1"], "40 days old goes");
+        // Now a budget only the newest sealed conversation fits in.
+        let (used, _) = store.usage();
+        let tight = SessionStore::open(
+            log_dir(&path).join("sessions"),
+            Retention { max_total_bytes: used / 2, max_days: 0 },
+        )
+        .unwrap();
+        tight.scan();
+        tight.sweep(&hot, None, now);
+        let left = keys(&tight);
+        assert!(!left.contains(&"mid#m1".to_string()), "the oldest sealed one went first: {left:?}");
+        assert!(left.contains(&"hot#h1".to_string()) && left.contains(&"open#p1".to_string()));
         assert!(
-            std::fs::metadata(format!("{path}.0")).is_err(),
-            "the rotated slot is replaced by its compressed form"
+            !session_files(&path).iter().any(|f| f.contains("mid__m1")),
+            "a conversation goes with all of its files"
         );
-        for c in &files {
-            assert_eq!(c.v, SCHEMA_V);
-            assert_eq!(c.turns.len(), 1);
-        }
-        let cur = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        assert!(cur <= 1200, "current file {cur}B exceeds the budget");
-        // A fresh process opens a turn that lives in a compressed slot.
-        let (log2, h2) = ConvLogger::start(path.clone(), 1200, 2, Duration::from_secs(3600)).unwrap();
+    }
+
+    /// Deleting a conversation removes its own files, hides what it left in a
+    /// shared one-shot file and in the legacy chain, and stays deleted across
+    /// a restart — while the client's other one-shots stay.
+    #[tokio::test]
+    async fn delete_removes_a_conversation_everywhere() {
+        let path = tmp("delete");
+        // A legacy chain holding gus#g1 and a turn of hal#h1.
+        std::fs::write(&path, format!("{}\n{}\n", snapshot("gus#g1", &[1], 5000, "old"), snapshot("hal#h1", &[2], 5000, "hal"))).unwrap();
+        let (log, handle) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_millis(20)).unwrap();
+        indexed(&log).await;
+        turn(&log, "gus#g1", 10, 9000, "new gus turn");
+        log.note(begin("ivy\u{00b7}11", 11, 9100));
+        log.note(begin("ivy\u{00b7}12", 12, 9200));
+        until("flushed", || log.store.lock_or_recover().entries.values().all(|e| !e.dirty)).await;
+        assert_eq!(log.index(&find_key("gus#g1")).unwrap().turns.len(), 2, "legacy + session fold");
+        assert!(log.delete("gus#g1"));
+        assert!(log.delete("ivy\u{00b7}11"));
+        assert!(!log.delete("nobody#x"));
+        assert!(log.index(&find_key("gus#g1")).is_none());
+        assert!(log.index(&find_key("ivy\u{00b7}11")).is_none());
+        assert!(log.index(&find_key("ivy\u{00b7}12")).is_some(), "the other one-shot stays");
+        assert!(log.index(&find_key("hal#h1")).is_some(), "the legacy file's other conversation stays");
+        assert!(!session_files(&path).iter().any(|f| f.contains("gus__g1")), "its own file is gone");
+        handle.abort();
+        // Still gone for a fresh process and for offline readers.
+        let (log2, h2) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
         indexed(&log2).await;
-        let in_zst = log2
-            .summaries(100)
-            .into_iter()
-            .find(|row| {
-                log2.disk.as_ref().unwrap().find(&find_key(&row.key)).unwrap().locs[0].slot > 0
-            })
-            .expect("a conversation sits in a rotated slot");
-        let q = Find { key: Some(&in_zst.key), ..Default::default() };
-        assert_eq!(log2.content(&q, Dir::Req).as_deref(), Some(body.as_str()));
+        let keys: Vec<String> = log2.summaries(10).into_iter().map(|s| s.key).collect();
+        assert!(!keys.contains(&"gus#g1".to_string()) && !keys.contains(&"ivy\u{00b7}11".to_string()), "{keys:?}");
+        assert!(keys.contains(&"hal#h1".to_string()) && keys.contains(&"ivy\u{00b7}12".to_string()));
+        let (convs, _) = load_conversations(&[log_dir(&path)]).unwrap();
+        assert!(!convs.iter().any(|c| c.key == "gus#g1" || c.key == "ivy\u{00b7}11"));
+        // A deleted conversation that resumes is a new one from there on.
+        log2.note(begin("gus#g1", 20, 20_000));
+        assert_eq!(log2.index(&find_key("gus#g1")).unwrap().turns.len(), 1);
         h2.abort();
-        for i in 0..3 {
-            let _ = std::fs::remove_file(format!("{path}.{i}"));
-            let _ = std::fs::remove_file(format!("{path}.{i}.zst"));
-        }
-        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The legacy chain stays readable: compressed and plain files, newest
+    /// record of a turn wins, and retention can drop its files one by one.
+    #[test]
+    fn legacy_chain_reads_back_and_drops_files() {
+        let base = tmp("legacy");
+        std::fs::write(format!("{base}.1"), format!("{}\n", snapshot("ann#k1", &[42], 5_000, "old view"))).unwrap();
+        codec::compress_slot(Path::new(&format!("{base}.1")), Path::new(&format!("{base}.1.zst"))).unwrap();
+        std::fs::write(format!("{base}.0"), format!("{}\n", snapshot("bob#k2", &[43], 6_000, "only view"))).unwrap();
+        std::fs::write(&base, format!("{}\n", snapshot("ann#k1", &[42], 9_000, "new view"))).unwrap();
+        let idx = DiskIndex::existing(&base, Arc::new(Tombs::none())).expect("a chain is there");
+        idx.scan();
+        assert_eq!(idx.rows().len(), 2);
+        let ann = idx.find(&find_key("ann#k1")).unwrap();
+        assert_eq!(ann.summary.end_ms, 9_000);
+        let conv = idx.read(&ann).unwrap();
+        assert_eq!(resolve_req(&conv, 42).as_deref(), Some("new view 42"));
+        assert_eq!(idx.slot_files().len(), 3);
+        // Retention drops the oldest file: ann keeps its newer line.
+        idx.drop_slot(2);
+        assert!(idx.find(&find_key("ann#k1")).is_some());
+        idx.drop_slot(1);
+        assert!(idx.find(&find_key("bob#k2")).is_none());
+        assert!(!Path::new(&format!("{base}.1.zst")).exists());
+    }
+
+    /// The rid floor a new process needs must see everything retained,
+    /// before any background scan.
+    #[tokio::test]
+    async fn max_rid_is_right_at_boot() {
+        let path = tmp("maxrid");
+        let (log, handle) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_millis(20)).unwrap();
+        turn(&log, "erin#e1", 7, 1000, "a");
+        turn(&log, "erin#e1", 13, 3000, "b");
+        assert_eq!(log.max_rid(), 13, "the hot conversation's newest rid");
+        until("flushed", || log.store.lock_or_recover().entries.values().all(|e| !e.dirty)).await;
+        handle.abort();
+        std::fs::write(&path, format!("{}\n", snapshot("old#o1", &[21], 5000, "x"))).unwrap();
+        let (log2, h2) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
+        assert_eq!(log2.max_rid(), 21, "the legacy chain's newest rid, read at open");
+        h2.abort();
+        std::fs::remove_file(&path).unwrap();
+        let (log3, h3) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
+        assert_eq!(log3.max_rid(), 13, "the session files' newest rid, read at open");
+        h3.abort();
     }
 
     #[test]
@@ -3011,27 +2820,6 @@ mod tests {
         }
     }
 
-    /// A log path whose directory does not exist yet is a setup step, not a
-    /// reason to run without capture — the earlier failure mode left every log
-    /// row unopenable while looking like a broken viewer.
-    #[tokio::test]
-    async fn start_creates_the_log_directory_when_it_is_missing() {
-        let dir = std::env::temp_dir().join(format!("omq-convdir-{}", crate::clients::random_hex(6)));
-        let path = dir.join("nested").join("conv.jsonl");
-        let _ = std::fs::remove_dir_all(&dir);
-        let (log, _h) = ConvLogger::start(
-            path.to_string_lossy().into_owned(),
-            1 << 20,
-            1,
-            Duration::from_secs(3600),
-        )
-        .expect("a missing directory is created");
-        assert!(log.enabled());
-        assert!(path.exists(), "the file is opened under the new directory");
-        assert_eq!(log.path(), Some(path.to_str().unwrap()));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// A config that names a container path on a host without one still gets a
     /// second try, in the store directory next to appconf.yaml.
     #[test]
@@ -3059,14 +2847,235 @@ mod tests {
         assert_eq!(log.dropped_count(), 0);
     }
 
+    /// A streamed reply is stored as the completion it amounts to; an errored
+    /// one keeps its stream as evidence.
+    #[tokio::test]
+    async fn streamed_replies_are_folded_unless_the_turn_failed() {
+        let path = tmp("sse.jsonl");
+        let (log, handle) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi \"}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"there\"},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: [DONE]\n\n";
+        for (rid, outcome) in [(1u64, "ok"), (2, "backend_error")] {
+            log.note(begin("eve#e1", rid, 1000 * rid));
+            if let Note::Resp(mut r) = resp("eve#e1", rid, 1000 * rid + 500) {
+                r.outcome = outcome.into();
+                log.note(Note::Resp(r));
+            }
+            log.note(Note::RespText {
+                key: "eve#e1".into(),
+                rid,
+                bytes: Some(sse.len() as u64),
+                text: Arc::new(sse.into()),
+            });
+        }
+        let (conv, _) = flush_lines(&log, &mut HashMap::new()).remove(0);
+        let folded = conv.turns[0].content.as_ref().unwrap().resp.as_deref().unwrap();
+        let v: serde_json::Value = serde_json::from_str(folded).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "hi there");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        let kept = conv.turns[1].content.as_ref().unwrap().resp.as_deref().unwrap();
+        assert_eq!(kept.as_str(), sse);
+        // The hot store still answers with the stream as captured.
+        let q = Find { key: Some("eve#e1"), rid: Some(1), ..Default::default() };
+        assert_eq!(log.content(&q, Dir::Resp).as_deref(), Some(sse));
+        handle.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn one_line_per_conversation_after_idle() {
+        let path = tmp("one_line.jsonl");
+        // The writer task would flush on its own after `flush_idle`; an hour
+        // keeps the file for the test alone, which drives `take_pending`.
+        let (log, handle) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
+        log.note(begin("alice#a1", 1, 1000));
+        log.note(Note::ReqText {
+            key: "alice#a1".into(),
+            rid: 1,
+            bytes: Some(100),
+            text: Arc::new("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}".into()),
+        });
+        log.note(resp("alice#a1", 1, 2000));
+        log.note(begin("alice#a1", 2, 3000));
+        log.note(resp("alice#a1", 2, 4000));
+        // Two turns of one conversation, flushed as one line.
+        let mut st = HashMap::new();
+        let lines = flush_lines(&log, &mut st);
+        assert_eq!(lines.len(), 1, "one conversation must produce one line");
+        let conv: Conv = serde_json::from_str(&lines[0].1).unwrap();
+        assert_eq!(conv.turns.len(), 2);
+        assert_eq!(conv.v, SCHEMA_V);
+        assert_eq!(conv.session.as_deref(), Some("a1"));
+        assert_eq!(conv.session_label.as_deref(), Some("refactor-auth"));
+        assert_eq!(conv.turns[0].tl.queue, Some(1001));
+        assert_eq!(conv.turns[0].tl.end, Some(2000));
+        assert_eq!(conv.turns[0].content.as_ref().unwrap().req.as_deref().unwrap(), "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+        assert_eq!(conv.turns[0].req.as_ref().unwrap().chars, Some(45));
+        assert_eq!(conv.start_ms, 1000);
+        assert_eq!(conv.end_ms, 4000);
+        assert!(!conv.redacted);
+
+        // A flush clears the dirty flag; nothing new is pending.
+        assert!(take_pending(&log.store, Duration::ZERO).is_empty());
+        // A late verdict on turn 1 brings back that turn alone, without the
+        // text the file already holds.
+        log.note(Note::Audit { key: "alice#a1".into(), rid: 1, flags: Vec::new() });
+        let again = flush_lines(&log, &mut st);
+        assert_eq!(again.len(), 1);
+        let conv = &again[0].0;
+        assert_eq!(conv.turns.iter().map(|t| t.rid).collect::<Vec<_>>(), vec![1]);
+        assert!(conv.turns[0].content.is_none(), "no text written twice");
+        assert!(conv.turns[0].msgs.is_empty(), "no msgs written twice");
+        handle.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn redacted_conversation_keeps_structure_without_text() {
+        let path = tmp("redacted.jsonl");
+        let (log, handle) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
+        let mut b = begin("bob#b1", 7, 5000);
+        if let Note::Begin(bx) = &mut b {
+            bx.redacted = true;
+        }
+        log.note(b);
+        log.note(resp("bob#b1", 7, 6000));
+        let line = flush_lines(&log, &mut HashMap::new()).remove(0).1;
+        let conv: Conv = serde_json::from_str(&line).unwrap();
+        assert!(conv.redacted && conv.turns[0].redacted);
+        // No text anywhere in the line, but the timeline and sizes are intact.
+        assert!(!line.contains("\"content\""));
+        assert!(!line.contains("hi"));
+        let t = &conv.turns[0];
+        assert_eq!(t.tl.end, Some(6000));
+        assert_eq!(t.status, Some(200));
+        assert_eq!(t.req.as_ref().unwrap().bytes, Some(100));
+        assert_eq!(t.msgs[0].role, "user");
+        assert_eq!(t.msgs[0].chars, 12);
+        assert_eq!(log.content(&Find { session: Some("b1"), ..Default::default() }, Dir::Req), None);
+        handle.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn turn_cap_keeps_the_newest_and_counts_the_rest() {
+        let path = tmp("cap.jsonl");
+        let (log, handle) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
+        for i in 0..(MAX_TURNS as u64) + 5 {
+            log.note(begin("cap#s", i, 1000 + i));
+        }
+        let guard = log.store.lock_or_recover();
+        let conv = &guard.entries["cap#s"].conv;
+        assert_eq!(conv.turns.len(), MAX_TURNS);
+        assert_eq!(conv.dropped_turns, 5);
+        // The newest turn is present, the first five are gone.
+        assert_eq!(conv.turns.last().unwrap().rid, (MAX_TURNS as u64) + 4);
+        assert_eq!(conv.turns.first().unwrap().rid, 5);
+        drop(guard);
+        assert_eq!(log.dropped_count(), 5);
+        handle.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A log path whose directory does not exist yet is a setup step, not a
+    /// reason to run without capture — the earlier failure mode left every log
+    /// row unopenable while looking like a broken viewer.
+    #[tokio::test]
+    async fn start_creates_the_log_directory_when_it_is_missing() {
+        let dir = std::env::temp_dir().join(format!("omq-convdir-{}", crate::clients::random_hex(6)));
+        let path = dir.join("nested").join("conv.jsonl");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (log, _h) = ConvLogger::start(
+            path.to_string_lossy().into_owned(),
+            Retention::default(),
+            Duration::from_secs(3600),
+        )
+        .expect("a missing directory is created");
+        assert!(log.enabled());
+        let sessions = dir.join("nested").join("sessions");
+        assert!(sessions.is_dir(), "the conversation folder is made under the new directory");
+        assert_eq!(log.path(), Some(sessions.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn start_fails_on_unwritable_path() {
         assert!(ConvLogger::start(
             "/nonexistent-dir-ollamaMQ/conv.jsonl".into(),
-            1024,
-            2,
+            Retention::default(),
             Duration::from_secs(1)
         )
         .is_err());
+    }
+
+    /// The point of v4: a session that resends its history stores each
+    /// message once, and every turn's body still reads back exactly — from
+    /// the file alone, through a fresh process, across a compaction that
+    /// broke the prefix.
+    #[tokio::test]
+    async fn request_deltas_store_each_message_once_and_rebuild_exactly() {
+        let path = tmp("delta.jsonl");
+        let sys = format!("{{\"role\":\"system\",\"content\":\"{}\"}}", "s".repeat(4000));
+        let mut msgs = vec![sys.clone()];
+        let mut bodies = Vec::new();
+        for i in 0..6u64 {
+            msgs.push(format!("{{\"role\":\"user\",\"content\":\"step {i} \\u00e9\"}}"));
+            if i == 4 {
+                // A compaction: the history is replaced by a summary.
+                msgs = vec![sys.clone(), "{\"role\":\"user\",\"content\":\"summary\"}".into()];
+            }
+            bodies.push(format!(
+                "{{\"model\":\"q\",\"messages\":[{}],\"stream\":true,\"tools\":[{{\"type\":\"function\",\"function\":{{\"name\":\"bash\"}}}}]}}",
+                msgs.join(",")
+            ));
+        }
+        {
+            let (log, handle) =
+                ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
+            let mut st = HashMap::new();
+            for (i, body) in bodies.iter().enumerate() {
+                let rid = 10 + i as u64;
+                let mut b = begin("dan#d1", rid, 1000 + rid);
+                if let Note::Begin(bx) = &mut b {
+                    bx.msgs = msg_meta(body);
+                }
+                log.note(b);
+                log.note(req_text("dan#d1", rid, body));
+                log.note(resp("dan#d1", rid, 1500 + rid));
+                // One line per turn, as an agent's pauses between turns make.
+                for (_, line) in flush_lines(&log, &mut st) {
+                    put_line(&path, "1970-01-01/dan__d1", &line);
+                }
+            }
+            handle.abort();
+        }
+        let raw = std::fs::read_to_string(unit_path(&path, "1970-01-01/dan__d1.jsonl")).unwrap();
+        assert_eq!(raw.matches(&"s".repeat(4000)).count(), 1, "the system prompt is stored once");
+        assert_eq!(raw.matches("\"req_d\"").count(), 5, "every turn after the first is a delta");
+        assert!(raw.len() < bodies.iter().map(String::len).sum::<usize>() / 3);
+        // Read back from the file by a script…
+        let (convs, _) = load_conversations(&[log_dir(&path)]).unwrap();
+        for (t, body) in convs[0].turns.iter().zip(&bodies) {
+            assert_eq!(t.content.as_ref().unwrap().req.as_deref().map(String::as_str), Some(body.as_str()));
+            assert_eq!(t.msgs, msg_meta(body), "msgs rebuilt from their deltas");
+        }
+        // …and by a fresh process's viewer.
+        let (log, handle) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
+        indexed(&log).await;
+        for (i, body) in bodies.iter().enumerate() {
+            let q = Find { key: Some("dan#d1"), rid: Some(10 + i as u64), ..Default::default() };
+            assert_eq!(log.content(&q, Dir::Req).as_deref(), Some(body.as_str()), "turn {i}");
+        }
+        let conv = log.index(&find_key("dan#d1")).unwrap();
+        assert_eq!(conv.turns.len(), 6);
+        assert_eq!(conv.turns[5].msgs, msg_meta(&bodies[5]));
+        handle.abort();
+        let _ = std::fs::remove_file(&path);
     }
 }

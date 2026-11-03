@@ -29,7 +29,7 @@ sleep 1
 
 # Isolate from any appconf.yaml in the repo (its backends/load_keep_alive
 # would override the test's expectations). The request log goes to the scratch
-# dir so section M can read it back.
+# dir (its conversation files under sessions/) so section M can read it back.
 cat > "$SCRATCH/appconf.yaml" <<YAML
 backends: []
 models: []
@@ -144,9 +144,10 @@ curl -s -o /dev/null -X POST $P/api/chat -H "X-User-ID: e2e" -H "X-Redact-Log: 1
 # A line is written once the conversation has been quiet for
 # request_log_flush_secs (5 s by default), so give the flush its time.
 sleep 7
-MRESULT=$(python3 - "$SCRATCH/reqlog.jsonl" <<'PY'
-import json, sys
-rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+MRESULT=$(python3 - "$SCRATCH/sessions" <<'PY'
+import glob, json, sys
+# One file per conversation (open tails: nothing has been quiet for an hour).
+rows = [json.loads(l) for f in glob.glob(sys.argv[1] + "/*/*.jsonl") for l in open(f) if l.strip()]
 red = [r for r in rows if r.get("redacted")]
 plain = [r for r in rows if not r.get("redacted")]
 # the keyless X-Redact-Log request landed under user "e2e", redacted like a config rule
