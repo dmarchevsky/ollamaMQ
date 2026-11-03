@@ -44,7 +44,10 @@ use crate::dispatcher::AppState;
 use crate::lock::LockExt;
 
 /// Confidence at or above which a model verdict is *confirmed* (red badge)
-/// rather than a watch (amber). A rule hit is always confirmed.
+/// rather than a watch (amber). A rule hit does not read this number: each rule
+/// carries its own [`Sev`], and only `metadata-ip` and `injection-phrase` are
+/// confirmed on their own — every other hit is a watch until a chain in the same
+/// turn makes it a story ([`scan_turn`]).
 pub const DEFAULT_FLAG_THRESHOLD: f64 = 0.85;
 /// Default `audit.watch_floor`: below it a model verdict is not even recorded —
 /// an audit that shows every shrug teaches the operator to ignore it. It was
@@ -279,8 +282,9 @@ pub enum Sev {
 /// when it hits (`pattern: <label>`) — a static name, never a quote from the
 /// traffic, so it says something even on a turn whose text was redacted.
 ///
-/// Patterns run on text that has already been lower-cased, so they are written
-/// lower-case. And `regex` has no lookbehind: every boundary is a group the match
+/// Patterns are written lower case and compiled case-insensitive ([`Pat::new`]),
+/// so they read the text as it arrived. And `regex` has no lookbehind: every
+/// boundary is a group the match
 /// **consumes** (`(^|[^|])\|…`), never an assertion. The bare substrings these
 /// replaced matched `process.env` for `.env` and `outText || showStderr` for
 /// `| sh`, and two such hits in one turn escalated to a red exfil.

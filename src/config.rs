@@ -268,7 +268,9 @@ pub struct AuditSettings {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub backend: String,
     /// Probability at or above which a model verdict gets a red badge instead of
-    /// an amber one. A rule hit is always red.
+    /// an amber one. A rule hit does not read it: each rule carries its own
+    /// severity, and only `metadata-ip` and `injection-phrase` are red on their
+    /// own — the rest are amber watches unless a chain confirms them.
     #[serde(default = "audit_default_threshold", skip_serializing_if = "is_default_threshold")]
     pub flag_threshold: f64,
     /// Below this a model verdict is not recorded at all: under it the audit

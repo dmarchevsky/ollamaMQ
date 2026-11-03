@@ -3305,7 +3305,7 @@ const FIELD_META = {
   metrics_token: { label: 'Metrics token', kind: 'secret', help: 'Bearer token that <code>GET /metrics</code> requires.' },
   log_content_limit: { label: 'Captured text per log record', unit: 'KiB', scale: 1024, min: 1, help: 'Request and response text kept for the Logs page.' },
   audit_mode: { label: 'Audit mode', kind: 'seg', options: [['off', 'Off'], ['scanner', 'Scanner'], ['full', 'Full']], help: 'Scanner = local rules only. Full adds d3-nano + Qwen3Guard verdicts on the audit backend. The audit marks suspicious activity after the request is served — it never blocks, holds or changes a reply.' },
-  audit_flag_threshold: { label: 'Flag threshold', kind: 'float', unit: '(0–1)', help: 'Probability at or above which a model verdict is confirmed (red badge) instead of watch (amber). Rule hits are always confirmed.' },
+  audit_flag_threshold: { label: 'Flag threshold', kind: 'float', unit: '(0–1)', help: 'Probability at or above which a model verdict is confirmed (red badge) instead of watch (amber). Rule hits do not read it: a metadata probe or an injection phrase confirms on its own, every other rule is a watch unless a second hit in the same turn makes it a story.' },
   audit_scan_redacted: { label: 'Scan redacted requests', kind: 'bool', help: 'X-Redact-Log traffic is judged in memory; verdicts and probabilities are stored, its text never is.' },
   audit_backend: { label: 'Audit backend', kind: 'text', help: 'The server running <code>qwen3guard-gen</code> and <code>d3-nano</code>. Empty: the first enabled backend. While it is unreachable the scanner keeps working alone.' },
 };
