@@ -32,7 +32,19 @@ if ss -tln 2>/dev/null | grep -qE ":(11993|11994)\b"; then
 fi
 
 SCRATCH="$(mktemp -d /tmp/ollamamq-audit-e2e.XXXXXX)"
-trap 'pkill -f "audit_mocks.py" 2>/dev/null; pkill -f -- "--port 11994" 2>/dev/null' EXIT
+# Kill what we started, then take the scratch dir with us. Every exit is covered:
+# a failed assertion, a refused port, a Ctrl-C or a kill — an interrupted run used
+# to leave its config, its request log and two logs behind in /tmp (eleven had
+# piled up). Nothing the run reads outlives it: the log reader turns the log into
+# $RESULT before the first check, and every check reads that, not the files.
+cleanup() {
+  pkill -f "audit_mocks.py" 2>/dev/null
+  pkill -f -- "--port 11994" 2>/dev/null
+  [ -n "${SCRATCH:-}" ] && rm -rf "$SCRATCH"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 PASS=0; FAIL=0
 check() { # name, expected, actual
   if [ "$2" == "$3" ]; then PASS=$((PASS+1)); echo "PASS: $1";
