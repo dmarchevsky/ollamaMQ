@@ -51,6 +51,19 @@ since upstream `v0.5.0`.
   keeping them from the guard is still the deliberate split: the rule scanner is
   their only detector, and `Controversial` verdicts on shell text were this host's
   noisiest false positives.
+- **A watch host named in prose no longer confirms an exfil on its own.** A
+  single watchlist hit — `webhook.site`, `*.aliyuncs.com`, one of your
+  `extra_watch_hosts` — was a **red** badge by itself, because the chain let that
+  one hit stand in for both legs: `check my webhook.site listener` came back as
+  `rule:transfer · transfer + watch host in one turn` with no transfer pattern
+  hit anywhere in the turn, and the corpus's false positives were exactly
+  ordinary dev traffic about those hosts. A watch host is now a destination only
+  where the model met it — in its own reply (the address it was told to ship to)
+  or in a tool result that carried it back. Mentioned in your own message it is
+  still an amber watch, flag and excerpt intact, so the operator still sees the
+  mention. This is a deliberate narrowing: a turn whose only trace of an exfil is
+  an address in someone's sentence stays amber, and a **red** exfil now always
+  means a transfer the model actually asked for.
 - **A `d3-nano` yes says what it meant, is held to a floor per source, and is
   not asked about code.** Every verdict used to come back as `injection`,
   including the two questions about exfil intents, and all 21 of the corpus's

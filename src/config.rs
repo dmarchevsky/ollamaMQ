@@ -302,8 +302,9 @@ pub struct AuditSettings {
     /// never is. False: that traffic is not scanned at all.
     #[serde(default = "audit_yes", skip_serializing_if = "std::ops::Not::not")]
     pub scan_redacted: bool,
-    /// Hosts added to the built-in watchlist (a transfer to one of these, with a
-    /// payload, is an exfil flag).
+    /// Hosts added to the built-in watchlist. One of these in the model's own
+    /// reply — or in a tool result it got back — beside a transfer is what makes
+    /// the pair an exfil; named in a message it is a watch and nothing more.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_watch_hosts: Vec<String>,
     /// Moderation model asked on the backend.
