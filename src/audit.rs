@@ -2125,6 +2125,36 @@ pub async fn judge(state: &Arc<AppState>, job: Job) {
 mod tests {
     use super::*;
 
+    /// The serving path asks this before it copies a redacted reply for the
+    /// audit at all, so it is the one switch that decides whether a megabyte is
+    /// spent on a turn — and both halves of it move from Settings while the
+    /// process runs, so it has to read them live and not from what boot saw.
+    #[test]
+    fn wants_redacted_follows_the_mode_and_the_scan_redacted_switch() {
+        let audit = Audit::new();
+        let mut s = AuditSettings { enabled: "off".into(), scan_redacted: true, ..Default::default() };
+        audit.apply(&s);
+        assert!(!audit.wants_redacted(), "an audit that is off wants nothing, switch or not");
+
+        s.enabled = "scanner".into();
+        audit.apply(&s);
+        assert!(audit.wants_redacted(), "scanner with scan_redacted on is a job worth taking");
+
+        s.enabled = "full".into();
+        s.scan_redacted = false;
+        audit.apply(&s);
+        assert!(!audit.wants_redacted(), "the models do not override scan_redacted: false");
+
+        // And a change in either direction is seen mid-run, which is what the
+        // operator driving Settings expects.
+        s.scan_redacted = true;
+        audit.apply(&s);
+        assert!(audit.wants_redacted(), "turning the switch back on takes effect");
+        s.enabled = "off".into();
+        audit.apply(&s);
+        assert!(!audit.wants_redacted(), "and turning the audit off does");
+    }
+
     /// The Logs change-tag rides this counter, so it must keep moving after the
     /// live window fills: a verdict that changes nothing visible is a verdict
     /// that leaves a flagged request hidden behind a `not modified`.
