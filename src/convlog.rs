@@ -1,18 +1,28 @@
-//! Conversation log: one line per conversation in a size-rotated JSONL file.
+//! Conversation log: the turns of each client session in a size-rotated JSONL
+//! chain.
 //!
-//! The proxy used to write one line per inbound request and one per upstream
-//! response, which scattered a conversation over 2·N lines and left every reader
-//! to re-join them. Here a conversation — the turns of one client's session —
-//! is assembled in memory and written as **one line** carrying every turn with
-//! absolute unix-ms timestamps, so the file, the web UI and a `jq` pipe all see
-//! the same conversation the operator had with their agent.
+//! A conversation — the turns of one client's session — is assembled in memory
+//! with absolute unix-ms timestamps. Notes arrive on the request path and only
+//! touch memory (a mutex update, like the rest of the bookkeeping in this
+//! crate); a background task encodes and appends lines and rotates the file, so
+//! no request task ever does log I/O.
 //!
-//! Notes arrive on the request path and only touch memory (a mutex update, like
-//! the rest of the bookkeeping in this crate); a background task serializes and
-//! appends lines and rotates the file, so no request task ever does log I/O. A
-//! conversation is written once it has been quiet for `flush_idle`, and written
-//! again (as one longer line under the same key) when it resumes — so a reader
-//! keeps **the line with the newest `end_ms`** for each key.
+//! **On disk (schema v4) a line carries only what changed.** Once a
+//! conversation has been quiet for `flush_idle`, one line is appended with its
+//! header and the turns that changed since they were last written; a turn is
+//! written again only when it changes (its response lands, an audit verdict
+//! arrives), and then without the text already on disk. Within a slot file, a
+//! turn's request keeps only the messages it added to an earlier turn's list
+//! ([`codec::ReqDelta`], the same for its `msgs` roles), and a streamed reply
+//! is stored as the one completion it amounts to ([`codec::assemble_sse`]).
+//! Every reference stays inside its slot file, so rotating a slot out never
+//! breaks a newer one, and rotated slots are zstd-compressed. A reader folds
+//! a key's lines oldest first ([`fold_line`]); v2/v3 lines — one whole
+//! snapshot per flush — fold by the same rule.
+//!
+//! Before v4 every flush rewrote the whole conversation with every turn's full
+//! body: a 64-turn agent session was a 20 MB line written 35 times, and 50
+//! slots of 10 MB held 37 minutes of traffic with under 25 MB of distinct text.
 //!
 //! When body-text capture is switched off for a client, key or backend, no text
 //! is ever handed to the store; the turn still records its timeline, sizes,
@@ -31,18 +41,21 @@ use tracing::warn;
 
 use crate::lock::LockExt;
 
+pub mod codec;
+
 /// Schema marker of a conversation line. Lines from the old per-request format
 /// (`{"dir":"IN"|"OUT", …}`) carry no `v` and are ignored when reading back.
 ///
 /// v3 added the per-turn `audit` flags (see [`crate::audit`]); v2 lines are
 /// still read and gain no flags, so a log written before the audit existed keeps
-/// opening after an upgrade.
-pub const SCHEMA_V: u64 = 3;
+/// opening after an upgrade. v4 lines carry only changed turns, with deltas
+/// (see the module docs); v2/v3 lines are whole snapshots and fold the same way.
+pub const SCHEMA_V: u64 = 4;
 
 /// Schema versions a reader accepts. A new version is appended, never replaces:
 /// an upgrade that silently drops the retained history is the failure mode to
 /// avoid here, and additive fields read back as empty on their own.
-pub const SCHEMA_READS: [u64; 2] = [2, SCHEMA_V];
+pub const SCHEMA_READS: [u64; 3] = [2, 3, SCHEMA_V];
 
 /// Default conversation-log file name: used when no path is configured, and
 /// again by [`ConvLogger::open_candidates`] when the configured one is
@@ -57,8 +70,9 @@ const MAX_CONTENT_BYTES: usize = 64 << 20;
 const MAX_TURNS: usize = 500;
 /// How often the writer looks for conversations that have gone quiet.
 const SWEEP: Duration = Duration::from_secs(60);
-/// Bytes of the current file read back at startup to rehydrate the store.
-const SEED_TAIL_BYTES: u64 = 8 << 20;
+/// Longest chain of request deltas before a turn's body is stored whole
+/// again, so reading one turn back never walks more than this many records.
+const MAX_DELTA_DEPTH: u32 = 64;
 /// Marker `truncate_utf8` appends; a body carrying it was cut at the limit.
 const TRUNCATED_MARK: &str = "...[truncated:";
 
@@ -94,7 +108,7 @@ pub fn truncate_utf8(data: &[u8], limit: usize) -> String {
 /// its text: role, size, and the tool it carries or calls. This is what survives
 /// capture being switched off, and what the UI draws as a chip in place of the
 /// message itself.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MsgMeta {
     pub role: String,
     /// Characters of text content (0 for a message with none).
@@ -148,10 +162,16 @@ pub struct BodyMeta {
 
 /// Captured text of one turn. Absent when capture is off; one half missing
 /// means that direction was never captured (no response yet, or an error).
+///
+/// On disk the request may instead be `req_d`, a delta against an earlier turn
+/// of the same slot file; readers resolve it ([`resolve_req`]) before handing
+/// text out, so in memory `req_d` is only ever seen between a read and that.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnContent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub req: Option<Arc<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_d: Option<codec::ReqDelta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resp: Option<Arc<String>>,
 }
@@ -210,6 +230,12 @@ pub struct Turn {
     /// The request's messages as roles and sizes (never their text).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub msgs: Vec<MsgMeta>,
+    /// On disk: `msgs` continues the first `msgs_keep` entries of turn
+    /// `msgs_base`'s list (same slot file). Resolved away on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msgs_base: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msgs_keep: Option<usize>,
     /// True when text capture was switched off for this turn's client, key or
     /// backend: the entry is complete, only the text is deliberately absent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -222,6 +248,10 @@ pub struct Turn {
     pub audit: Vec<crate::audit::Flag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<TurnContent>,
+    /// The store's revision of this turn's last change: what tells the writer
+    /// which turns a flush has to carry. Memory only.
+    #[serde(skip)]
+    pub rev: u64,
 }
 
 impl Turn {
@@ -273,6 +303,25 @@ impl Conv {
         self.turns.iter().map(Turn::content_bytes).sum()
     }
 
+    /// The header alone: every field but the turns.
+    fn head(&self) -> Conv {
+        Conv {
+            v: self.v,
+            key: self.key.clone(),
+            user: self.user.clone(),
+            session: self.session.clone(),
+            session_label: self.session_label.clone(),
+            model: self.model.clone(),
+            backend: self.backend.clone(),
+            priority: self.priority.clone(),
+            redacted: self.redacted,
+            start_ms: self.start_ms,
+            end_ms: self.end_ms,
+            dropped_turns: self.dropped_turns,
+            turns: Vec::new(),
+        }
+    }
+
     /// The conversation with all captured text removed: what the web API sends
     /// as the turn index, so a 600 KB resent prompt is not refetched on every
     /// navigation.
@@ -294,6 +343,9 @@ struct Entry {
     rev: u64,
     /// When this conversation last changed (drives flush order and eviction).
     last_ms: u64,
+    /// The revision each turn was last written at (by `rid`): a flush carries
+    /// only the turns whose [`Turn::rev`] moved past it.
+    written: HashMap<u64, u64>,
 }
 
 /// One change to the store, produced by the proxy's request path.
@@ -415,10 +467,12 @@ pub struct ConvSummary {
 
 /// The conversation's flags for its row: one entry per (kind, severity) that any
 /// of its turns earned, worst first. A row is a summary, not a transcript.
-fn worst_flags(turns: &[Turn]) -> Vec<crate::audit::Flag> {
+fn worst_flags<'a>(
+    lists: impl Iterator<Item = &'a [crate::audit::Flag]>,
+) -> Vec<crate::audit::Flag> {
     let mut out: Vec<crate::audit::Flag> = Vec::new();
-    for t in turns {
-        for f in &t.audit {
+    for flags in lists {
+        for f in flags {
             if !out
                 .iter()
                 .any(|k: &crate::audit::Flag| k.kind == f.kind && k.bad == f.bad)
@@ -577,15 +631,22 @@ impl ConvStore {
             dirty: true,
             rev: 0,
             last_ms: now,
+            written: HashMap::new(),
         })
     }
 
-    fn touch(&mut self, key: &str) {
+    /// Record a change to one turn: the conversation is dirty again and the
+    /// turn carries the revision the writer compares against.
+    fn bump(&mut self, key: &str, rid: u64) {
         let now = now_unix_millis();
         if let Some(e) = self.entries.get_mut(key) {
             e.dirty = true;
             e.rev += 1;
             e.last_ms = now;
+            let rev = e.rev;
+            if let Some(t) = e.conv.turns.iter_mut().rev().find(|t| t.rid == rid) {
+                t.rev = rev;
+            }
         }
     }
 
@@ -622,38 +683,7 @@ impl ConvStore {
             }
         }
         self.content_bytes = self.content_bytes - before + t.content_bytes();
-        e.dirty = true;
-        e.rev += 1;
-        e.last_ms = now_unix_millis();
-    }
-
-    /// Insert a conversation read back from the file (already written, so not
-    /// dirty). An older or shorter view of a key is ignored: both the store and
-    /// the file keep the newest, longest line per key.
-    fn seed(&mut self, conv: Conv) {
-        let key = conv.key.clone();
-        let bytes = conv.content_bytes();
-        if let Some(e) = self.entries.get_mut(&key) {
-            if e.conv.end_ms > conv.end_ms || e.conv.turns.len() > conv.turns.len() {
-                return;
-            }
-            self.content_bytes = self.content_bytes.saturating_sub(e.conv.content_bytes());
-            e.conv = conv;
-            self.content_bytes += bytes;
-            e.dirty = false;
-            e.last_ms = now_unix_millis();
-            return;
-        }
-        self.content_bytes += bytes;
-        self.entries.insert(
-            key,
-            Entry {
-                conv,
-                dirty: false,
-                rev: 0,
-                last_ms: now_unix_millis(),
-            },
-        );
+        self.bump(key, rid);
     }
 
     /// Drop the quietest conversations until both budgets hold. A dirty
@@ -703,10 +733,10 @@ impl ConvStore {
         }
     }
 
-    /// Serialize the conversations quiet for at least `flush_idle`, quietest
-    /// first. Cloned out of the lock so serializing a large conversation and the
-    /// file write never block the request path. The summary and `rid` list come
-    /// along so the writer can index the line without parsing it back.
+    /// The conversations quiet for at least `flush_idle`, quietest first, each
+    /// with only the turns changed since they were last written. Cloned out of
+    /// the lock (text is shared, not copied) so encoding and the file write
+    /// never block the request path.
     fn take_pending(&mut self, flush_idle: Duration) -> Vec<Pending> {
         let now = now_unix_millis();
         let idle_ms = flush_idle.as_millis() as u64;
@@ -720,18 +750,38 @@ impl ConvStore {
         let mut out = Vec::with_capacity(keys.len());
         for (_, key) in keys {
             let Some(e) = self.entries.get(&key) else { continue };
-            match serde_json::to_string(&e.conv) {
-                Ok(line) => out.push(Pending {
-                    summary: conv_summary(&e.conv),
-                    rids: e.conv.turns.iter().map(|t| t.rid).collect(),
-                    key,
-                    line,
-                    rev: e.rev,
-                }),
-                Err(err) => warn!("conversation log: failed to serialize {key}: {err}"),
-            }
+            let turns: Vec<Turn> = e
+                .conv
+                .turns
+                .iter()
+                .filter(|t| e.written.get(&t.rid) != Some(&t.rev))
+                .cloned()
+                .collect();
+            out.push(Pending {
+                head: e.conv.head(),
+                turns,
+                key,
+                rev: e.rev,
+            });
         }
         out
+    }
+
+    /// A flushed line reached the file: its turns are written at the
+    /// revisions it carried, and the conversation is clean unless it changed
+    /// while the writer was busy.
+    fn mark_written(&mut self, key: &str, turns: &[(u64, u64)], rev: u64) {
+        let Some(e) = self.entries.get_mut(key) else { return };
+        for (rid, r) in turns {
+            e.written.insert(*rid, *r);
+        }
+        if e.written.len() > e.conv.turns.len() {
+            let live: std::collections::HashSet<u64> = e.conv.turns.iter().map(|t| t.rid).collect();
+            e.written.retain(|rid, _| live.contains(rid));
+        }
+        if e.rev == rev {
+            e.dirty = false;
+        }
     }
 
     fn find(&self, q: &Find) -> Option<&str> {
@@ -778,12 +828,12 @@ impl ConvStore {
         best.map(|(_, k)| k)
     }
 
-    fn summaries(&self, limit: usize) -> Vec<ConvSummary> {
-        let mut rows: Vec<&Conv> = self.entries.values().map(|e| &e.conv).collect();
-        rows.sort_by_key(|c| std::cmp::Reverse(c.end_ms));
-        rows.into_iter()
-            .take(limit)
-            .map(conv_summary)
+    /// Every held conversation as the list sees it: its header and per-turn
+    /// row facts, ready to merge with what the disk index knows of the key.
+    fn rows(&self) -> Vec<(Conv, TurnSums)> {
+        self.entries
+            .values()
+            .map(|e| (e.conv.head(), turn_sums(&e.conv.turns, 0)))
             .collect()
     }
 }
@@ -807,6 +857,9 @@ pub struct ConvLogger {
     /// cover the retained history and not just the seeded hot set. `None`
     /// exactly when `file` is.
     disk: Option<Arc<DiskIndex>>,
+    /// The newest rid on disk when the log was opened, read synchronously so
+    /// [`Self::max_rid`] is right at boot, before the background scan is done.
+    boot_rid: u64,
 }
 
 struct FileTarget {
@@ -816,8 +869,10 @@ struct FileTarget {
 }
 
 impl ConvLogger {
-    /// Open (or create) the log file, read its tail back into the store, and
-    /// start the writer task. A missing parent directory is created: naming a
+    /// Open (or create) the log file and start the writer task, which indexes
+    /// the rotation chain before its first flush. Nothing is read back into the
+    /// hot store: every read folds the key's lines on disk with whatever the
+    /// store holds of it, so a resumed conversation appends to its history. A missing parent directory is created: naming a
     /// log path whose directory is not there yet is a normal setup step, not a
     /// reason to run without capture. The initial open is synchronous so a bad
     /// path or permission error surfaces to the caller, which tries
@@ -852,18 +907,10 @@ impl ConvLogger {
             max_files: max_files.max(1),
         });
         let disk = Arc::new(DiskIndex::new(&target.path, target.max_files));
-        {
-            let seeded = seed_from_tail(&target.path);
-            if !seeded.is_empty() {
-                let mut s = store.lock_or_recover();
-                for conv in seeded {
-                    s.seed(conv);
-                }
-            }
-        }
         let logger = Self {
             store: Arc::clone(&store),
             file: Some(Arc::clone(&target)),
+            boot_rid: disk.newest_rid(),
             disk: Some(Arc::clone(&disk)),
         };
         let handle = tokio::spawn(writer_loop(target, store, disk, flush_idle));
@@ -876,6 +923,7 @@ impl ConvLogger {
             store: Arc::new(Mutex::new(ConvStore::new())),
             file: None,
             disk: None,
+            boot_rid: 0,
         }
     }
 
@@ -941,7 +989,7 @@ impl ConvLogger {
         }
         if let Some(disk) = &self.disk {
             for e in disk.entries.lock_or_recover().values() {
-                out = Some(out.map_or(e.summary.end_ms, |m| m.min(e.summary.end_ms)));
+                out = Some(out.map_or(e.head.end_ms, |m| m.min(e.head.end_ms)));
             }
         }
         out
@@ -963,7 +1011,7 @@ impl ConvLogger {
         }
         if let Some(disk) = &self.disk {
             for e in disk.entries.lock_or_recover().values() {
-                out.extend(e.rids.iter().copied());
+                out.extend(e.turns.keys().copied());
             }
         }
         out
@@ -1042,10 +1090,11 @@ impl ConvLogger {
                     redacted: b.redacted,
                     audit: Vec::new(),
                     content: None,
+                    msgs_base: None,
+                    msgs_keep: None,
+                    rev: 0,
                 });
-                e.dirty = true;
-                e.rev += 1;
-                e.last_ms = now_unix_millis();
+                store.bump(&b.key, b.rid);
             }
             Note::ReqText {
                 key,
@@ -1071,22 +1120,19 @@ impl ConvLogger {
                     t.tl.dispatch = dispatch.or(t.tl.dispatch);
                     t.tl.first_token = first_token.or(t.tl.first_token);
                 }
-                store.touch(&key);
+                store.bump(&key, rid);
             }
             Note::Audit { key, rid, flags } => {
                 if let Some(t) = store.turn_mut(&key, rid) {
                     t.audit = flags;
                 }
                 if let Some(e) = store.entries.get_mut(&key) {
-                    let now = now_unix_millis();
                     // A verdict is an event of its own: the conversation's clock
-                    // moves to it, which is also what lets the longer line win
-                    // against the copy that was already flushed without flags.
-                    e.conv.end_ms = e.conv.end_ms.max(now);
-                    e.dirty = true;
-                    e.rev += 1;
-                    e.last_ms = now;
+                    // moves to it, and the turn is written again (without its
+                    // text, which is already on disk) to carry the flags.
+                    e.conv.end_ms = e.conv.end_ms.max(now_unix_millis());
                 }
+                store.bump(&key, rid);
             }
             Note::Resp(r) => {
                 let key = r.key.clone();
@@ -1109,10 +1155,8 @@ impl ConvLogger {
                     }
                     e.conv.end_ms = e.conv.end_ms.max(r.end_ms);
                     e.conv.redacted |= r.redacted;
-                    e.dirty = true;
-                    e.rev += 1;
-                    e.last_ms = now_unix_millis();
                 }
+                store.bump(&key, r.rid);
             }
         }
         store.prune();
@@ -1124,12 +1168,26 @@ impl ConvLogger {
     /// knows what is live), then the disk index for everything older that the
     /// rotation chain still holds.
     pub fn summaries(&self, limit: usize) -> Vec<ConvSummary> {
-        let mut out = self.store.lock_or_recover().summaries(usize::MAX);
+        // Owned rows, so the store lock is released before the disk index is
+        // taken — no lock nesting with the writer.
+        let hot = self.store.lock_or_recover().rows();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(hot.len());
+        for (mut head, mut turns) in hot {
+            // A resumed conversation: the disk holds its earlier turns.
+            if let Some((mut disk_head, disk_turns)) =
+                self.disk.as_ref().and_then(|d| d.row(&head.key))
+            {
+                fold_head(&mut disk_head, &head);
+                head = disk_head;
+                for (rid, t) in disk_turns {
+                    turns.entry(rid).or_insert(t);
+                }
+            }
+            seen.insert(head.key.clone());
+            out.push(summarize(&head, &turns));
+        }
         if let Some(disk) = &self.disk {
-            let seen: std::collections::HashSet<&str> =
-                out.iter().map(|s| s.key.as_str()).collect();
-            // The closure only reads `seen` — no lock nesting with the writer,
-            // which takes store before disk.
             out.extend(disk.summaries(&|k| seen.contains(k)));
         }
         out.sort_by_key(|s| std::cmp::Reverse(s.end_ms));
@@ -1143,7 +1201,7 @@ impl ConvLogger {
     /// start its counter above this so restored history keeps pointing at the
     /// request its rid names (see [`crate::dispatcher::AppState::seed_rid_floor`]).
     pub fn max_rid(&self) -> u64 {
-        let mut m = 0u64;
+        let mut m = self.boot_rid;
         {
             let store = self.store.lock_or_recover();
             for e in store.entries.values() {
@@ -1155,7 +1213,7 @@ impl ConvLogger {
         if let Some(disk) = &self.disk {
             let ents = disk.entries.lock_or_recover();
             for e in ents.values() {
-                if let Some(r) = e.rids.iter().max() {
+                if let Some((r, _)) = e.turns.last_key_value() {
                     m = m.max(*r);
                 }
             }
@@ -1166,37 +1224,54 @@ impl ConvLogger {
     /// The conversation named by `q`, with captured text stripped (fetch one
     /// turn's text with [`Self::content`]). Hot store first, then disk.
     pub fn index(&self, q: &Find) -> Option<Conv> {
-        {
+        Some(self.assemble(q)?.without_content())
+    }
+
+    /// The whole conversation `q` names: the key's lines on disk folded oldest
+    /// first, then the hot store's copy on top — the newest view, and the only
+    /// home of turns not flushed yet. The hot store picks the key when it
+    /// matches; otherwise the disk index does.
+    fn assemble(&self, q: &Find) -> Option<Conv> {
+        let hot = {
             let store = self.store.lock_or_recover();
-            if let Some(key) = store.find(q)
-                && let Some(e) = store.entries.get(key)
-            {
-                return Some(e.conv.clone().without_content());
+            store.find(q).and_then(|k| store.entries.get(k)).map(|e| e.conv.clone())
+        };
+        let on_disk = self.disk.as_ref().and_then(|d| {
+            let found = match &hot {
+                Some(h) => d.find(&Find { key: Some(&h.key), ..Default::default() }),
+                None => d.find(q),
+            }?;
+            d.read(&found)
+        });
+        let mut conv = match (on_disk, hot) {
+            (Some(mut d), Some(h)) => {
+                fold_line(&mut d, h);
+                d
             }
-        }
-        let disk = self.disk.as_ref()?;
-        let entry = disk.find(q)?;
-        Some(disk.read(&entry)?.without_content())
+            (d, h) => d.or(h)?,
+        };
+        conv.turns.sort_by_key(|t| t.rid);
+        Some(conv)
     }
 
     /// Captured text of one turn (`rid` defaults to the newest turn). Falls
-    /// back to the disk index when the hot store no longer holds it.
+    /// back to the disk, where a request may have to be rebuilt from deltas.
     pub fn content(&self, q: &Find, dir: Dir) -> Option<String> {
         let from_store = self.store.lock_or_recover().content(q, dir);
         if from_store.is_some() {
             return from_store;
         }
-        let disk = self.disk.as_ref()?;
-        let entry = disk.find(q)?;
-        let conv = disk.read(&entry)?;
-        let turn = match q.rid {
-            Some(rid) => conv.turns.iter().rev().find(|t| t.rid == rid)?,
-            None => conv.turns.last()?,
+        let conv = self.assemble(q)?;
+        let rid = match q.rid {
+            Some(rid) => rid,
+            None => conv.turns.last()?.rid,
         };
-        let c = turn.content.as_ref()?;
         match dir {
-            Dir::Req => c.req.as_deref().map(|s| s.to_string()),
-            Dir::Resp => c.resp.as_deref().map(|s| s.to_string()),
+            Dir::Req => resolve_req(&conv, rid),
+            Dir::Resp => {
+                let turn = conv.turns.iter().rev().find(|t| t.rid == rid)?;
+                turn.content.as_ref()?.resp.as_deref().map(|s| s.to_string())
+            }
         }
     }
 }
@@ -1241,116 +1316,344 @@ fn session_from_key(key: &str) -> Option<String> {
     key.split_once('#').map(|(_, s)| s.to_string())
 }
 
-/// Read the tail of `path` and return the newest view of every conversation it
-/// holds. Only `v: 2` lines are understood — the older per-request lines are
-/// skipped — and the torn line a seeked tail starts with is ignored.
-fn seed_from_tail(path: &str) -> Vec<Conv> {
-    let len = match std::fs::metadata(path) {
-        Ok(m) => m.len(),
-        Err(_) => return Vec::new(),
-    };
-    let data = std::fs::File::open(path).and_then(|mut f| {
-        use std::io::{Read, Seek, SeekFrom};
-        if len > SEED_TAIL_BYTES {
-            f.seek(SeekFrom::End(-(SEED_TAIL_BYTES as i64)))?;
-        }
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        Ok(buf)
-    });
-    let Ok(data) = data else {
-        return Vec::new();
-    };
-    let text = String::from_utf8_lossy(&data);
-    let seeked = len > SEED_TAIL_BYTES;
-    let mut newest: HashMap<String, Conv> = HashMap::new();
-    for (i, line) in text.lines().enumerate() {
-        if seeked && i == 0 {
-            continue;
-        }
-        let line = line.trim();
-        if line.is_empty() || !line.starts_with('{') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if !v
-            .get("v")
-            .and_then(|v| v.as_u64())
-            .is_some_and(|v| SCHEMA_READS.contains(&v))
+// ------------------------------------------------------------- folding
+
+/// One line of a slot file as a conversation record, `None` for anything that
+/// is not a conversation line of a schema this build reads (the old
+/// per-request format, a torn tail).
+fn parse_line(raw: &[u8]) -> Option<Conv> {
+    let text = std::str::from_utf8(raw).ok()?.trim();
+    // Cheap pre-filter before the full parse; `from_str` still decides.
+    if !text.starts_with('{') || !text.contains("\"v\":") {
+        return None;
+    }
+    let conv = serde_json::from_str::<Conv>(text).ok()?;
+    SCHEMA_READS.contains(&conv.v).then_some(conv)
+}
+
+/// Fold a newer header into what is known of a conversation: the clock only
+/// widens, the newest model and backend win, the first label sticks and the
+/// priority only rises.
+fn fold_head(acc: &mut Conv, line: &Conv) {
+    acc.v = acc.v.max(line.v);
+    if line.start_ms > 0 && (acc.start_ms == 0 || line.start_ms < acc.start_ms) {
+        acc.start_ms = line.start_ms;
+    }
+    acc.end_ms = acc.end_ms.max(line.end_ms);
+    if acc.session_label.is_none() {
+        acc.session_label = line.session_label.clone();
+    }
+    if line.model.is_some() {
+        acc.model = line.model.clone();
+    }
+    if line.backend.is_some() {
+        acc.backend = line.backend.clone();
+    }
+    if let Some(p) = &line.priority
+        && priority_above(acc.priority.as_deref(), p)
+    {
+        acc.priority = Some(p.clone());
+    }
+    acc.redacted |= line.redacted;
+    acc.dropped_turns = acc.dropped_turns.max(line.dropped_turns);
+}
+
+/// Fold one line of a key into what is known of it so far (lines oldest
+/// first; the hot store's copy last). Turns merge by `rid`: a later record of
+/// a turn replaces its fields, the text and `msgs` it leaves out (already
+/// written) carry over, and a `msgs` delta is resolved against the turn it
+/// names. Request deltas stay as they are until [`resolve_req`].
+pub fn fold_line(acc: &mut Conv, line: Conv) {
+    fold_head(acc, &line);
+    for mut t in line.turns {
+        if let (Some(base), Some(keep)) = (t.msgs_base.take(), t.msgs_keep.take())
+            && let Some(b) = acc.turns.iter().rev().find(|x| x.rid == base)
         {
-            continue;
+            let mut msgs = b.msgs[..keep.min(b.msgs.len())].to_vec();
+            msgs.append(&mut t.msgs);
+            t.msgs = msgs;
         }
-        let Ok(conv) = serde_json::from_value::<Conv>(v) else {
+        let Some(old) = acc.turns.iter_mut().rev().find(|x| x.rid == t.rid) else {
+            acc.turns.push(t);
             continue;
         };
-        match newest.get(&conv.key) {
-            Some(prev) if prev.end_ms >= conv.end_ms || prev.turns.len() > conv.turns.len() => {}
-            _ => {
-                newest.insert(conv.key.clone(), conv);
+        if t.msgs.is_empty() {
+            t.msgs = std::mem::take(&mut old.msgs);
+        }
+        match (&mut t.content, old.content.take()) {
+            (Some(new), Some(prev)) => {
+                if new.req.is_none() && new.req_d.is_none() {
+                    new.req = prev.req;
+                    new.req_d = prev.req_d;
+                }
+                if new.resp.is_none() {
+                    new.resp = prev.resp;
+                }
+            }
+            (None, prev) => t.content = prev,
+            (Some(_), None) => {}
+        }
+        *old = t;
+    }
+}
+
+/// A rebuilt request: its messages and the object around them.
+type ReqParts = Arc<(Vec<Arc<str>>, Arc<str>)>;
+
+/// The messages and template of turn `rid`'s request, following its delta
+/// chain back to a whole body. `memo` shares the work across the turns of one
+/// conversation, so rebuilding all of them stays linear.
+fn req_parts(
+    conv: &Conv,
+    rid: u64,
+    memo: &mut HashMap<u64, Option<ReqParts>>,
+    depth: u32,
+) -> Option<ReqParts> {
+    if let Some(p) = memo.get(&rid) {
+        return p.clone();
+    }
+    // A chain longer than the writer ever makes is a corrupt one (or a cycle).
+    if depth > MAX_DELTA_DEPTH * 4 {
+        return None;
+    }
+    let c = conv.turns.iter().rev().find(|t| t.rid == rid)?.content.as_ref()?;
+    let out = if let Some(full) = &c.req {
+        codec::split_body(full).map(|s| Arc::new((s.msgs, Arc::from(s.tmpl))))
+    } else if let Some(d) = &c.req_d {
+        req_parts(conv, d.base, memo, depth + 1).and_then(|b| {
+            if d.keep > b.0.len() {
+                return None;
+            }
+            let mut msgs = b.0[..d.keep].to_vec();
+            msgs.extend(d.add.iter().map(|m| Arc::from(m.get())));
+            let tmpl = d.tmpl.as_ref().map_or_else(|| Arc::clone(&b.1), |t| Arc::from(t.get()));
+            Some(Arc::new((msgs, tmpl)))
+        })
+    } else {
+        None
+    };
+    memo.insert(rid, out.clone());
+    out
+}
+
+/// Turn `rid`'s request body as the client sent it: stored whole, or rebuilt
+/// from its deltas (every message byte for byte; the top-level object's
+/// separators normalized). `None` when no text was kept, or its base rotated
+/// out with an older file.
+pub fn resolve_req(conv: &Conv, rid: u64) -> Option<String> {
+    let c = conv.turns.iter().rev().find(|t| t.rid == rid)?.content.as_ref()?;
+    if let Some(full) = &c.req {
+        return Some(full.to_string());
+    }
+    c.req_d.as_ref()?;
+    let p = req_parts(conv, rid, &mut HashMap::new(), 0)?;
+    codec::render_body(&p.1, &p.0)
+}
+
+/// Rebuild every turn's request in place, so `content.req` is the whole body
+/// and no `req_d` is left — the view a script reading the log wants.
+pub fn resolve_all(conv: &mut Conv) {
+    let mut memo = HashMap::new();
+    let rebuilt: Vec<(usize, String)> = conv
+        .turns
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.content.as_ref().is_some_and(|c| c.req.is_none() && c.req_d.is_some()))
+        .filter_map(|(i, t)| {
+            let p = req_parts(conv, t.rid, &mut memo, 0)?;
+            Some((i, codec::render_body(&p.1, &p.0)?))
+        })
+        .collect();
+    for (i, body) in rebuilt {
+        if let Some(c) = conv.turns[i].content.as_mut() {
+            c.req = Some(Arc::new(body));
+        }
+    }
+    for c in conv.turns.iter_mut().filter_map(|t| t.content.as_mut()) {
+        c.req_d = None;
+    }
+}
+
+/// Rotation rank of a chain file by its name: the live file is 0, `.N` and
+/// `.N.zst` are N + 1 — so sorting by descending rank reads oldest first.
+fn chain_rank(path: &Path) -> u64 {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let stem = name.strip_suffix(codec::ZST).unwrap_or(name);
+    stem.rsplit_once('.')
+        .and_then(|(_, n)| n.parse::<u64>().ok())
+        .map_or(0, |n| n + 1)
+}
+
+/// Every conversation the given chain files hold, folded across files and
+/// with each turn's request rebuilt whole ([`resolve_all`]): what an analysis
+/// script or an export wants, whatever schema wrote the lines. Files are read
+/// oldest first by their rotation suffix, compressed ones decompressed.
+/// Returns the conversations (oldest-first by first sight) and the number of
+/// lines that were not conversation records.
+pub fn load_conversations(files: &[std::path::PathBuf]) -> std::io::Result<(Vec<Conv>, usize)> {
+    let mut files: Vec<&std::path::PathBuf> = files.iter().collect();
+    files.sort_by_key(|p| std::cmp::Reverse(chain_rank(p)));
+    let mut order: Vec<String> = Vec::new();
+    let mut convs: HashMap<String, Conv> = HashMap::new();
+    let mut skipped = 0usize;
+    for file in files {
+        let data = codec::read_slot_file(file)?;
+        for raw in data.split(|b| *b == b'\n') {
+            if raw.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let Some(line) = parse_line(raw) else {
+                skipped += 1;
+                continue;
+            };
+            match convs.get_mut(&line.key) {
+                Some(acc) => fold_line(acc, line),
+                None => {
+                    let mut acc = line.head();
+                    order.push(acc.key.clone());
+                    fold_line(&mut acc, line);
+                    convs.insert(acc.key.clone(), acc);
+                }
             }
         }
     }
-    newest.into_values().collect()
+    let mut out = Vec::with_capacity(order.len());
+    for key in order {
+        if let Some(mut c) = convs.remove(&key) {
+            c.turns.sort_by_key(|t| t.rid);
+            resolve_all(&mut c);
+            out.push(c);
+        }
+    }
+    Ok((out, skipped))
 }
 
-/// The list view's row for one conversation (no turn text).
-fn conv_summary(c: &Conv) -> ConvSummary {
-    ConvSummary {
-        key: c.key.clone(),
-        user: c.user.clone(),
-        session: c.session.clone(),
-        session_label: c.session_label.clone(),
-        model: c.model.clone(),
-        backend: c.backend.clone(),
-        priority: c.priority.clone(),
-        turns: c.turns.len(),
-        start_ms: c.start_ms,
-        end_ms: c.end_ms,
-        redacted: c.redacted,
-        live: c.turns.iter().any(|t| t.tl.end.is_none()),
-        dropped_turns: c.dropped_turns,
-        flags: worst_flags(&c.turns),
+/// The v4 lines a writer would append for `conv` had it flushed once per
+/// turn: how a log written by an older build (or exported) is rewritten in
+/// the compact form. Expects whole requests (see [`load_conversations`]).
+pub fn compact_lines(conv: &Conv) -> Vec<String> {
+    let mut st = KeyState::default();
+    let mut out = Vec::with_capacity(conv.turns.len());
+    for t in &conv.turns {
+        let p = Pending {
+            key: conv.key.clone(),
+            head: conv.head(),
+            turns: vec![t.clone()],
+            rev: 0,
+        };
+        if let Ok(line) = serde_json::to_string(&encode(&p, &mut st, 1)) {
+            out.push(line);
+        }
     }
+    out
 }
 
 // ------------------------------------------------------------- disk index
 
-/// Where a flushed conversation line lives on disk: `slot` indexes the slot
-/// table (0 = the live file, `.0`, `.1`, …), `offset`/`len` the line within it.
-/// Rotation renames files and never rewrites them, so an entry stays valid
-/// while its file merely moves one slot older — which is exactly what
+/// Where one line of a key lives: `slot` indexes the slot table (0 = the live
+/// file, then `.0`, `.1`, …), `offset`/`len` the line within the slot's
+/// (decompressed) bytes. Rotation renames and compresses files but never
+/// rewrites their content, so a location stays valid while its file merely
+/// moves one slot older — which is exactly what
 /// [`DiskIndex::shift_for_rotation`] records.
-struct DiskEntry {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Loc {
     slot: usize,
     offset: u64,
     len: u64,
-    /// The turn `rid`s, so an `rid` query can find a conversation without
-    /// reading it back.
-    rids: Vec<u64>,
+}
+
+/// What the list needs of one turn, without its text.
+#[derive(Clone, Debug)]
+struct TurnSum {
+    /// Slot of the turn's newest record — the one that decides it.
+    slot: usize,
+    at_ms: u64,
+    open: bool,
+    flags: Vec<crate::audit::Flag>,
+}
+
+type TurnSums = std::collections::BTreeMap<u64, TurnSum>;
+
+fn turn_sums(turns: &[Turn], slot: usize) -> TurnSums {
+    turns
+        .iter()
+        .map(|t| {
+            (
+                t.rid,
+                TurnSum {
+                    slot,
+                    at_ms: t.at_ms,
+                    open: t.tl.end.is_none(),
+                    flags: t.audit.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The list view's row for a conversation's header and turns.
+fn summarize(head: &Conv, turns: &TurnSums) -> ConvSummary {
+    ConvSummary {
+        key: head.key.clone(),
+        user: head.user.clone(),
+        session: head.session.clone(),
+        session_label: head.session_label.clone(),
+        model: head.model.clone(),
+        backend: head.backend.clone(),
+        priority: head.priority.clone(),
+        turns: turns.len(),
+        start_ms: head.start_ms,
+        end_ms: head.end_ms,
+        redacted: head.redacted,
+        live: turns.values().any(|t| t.open),
+        dropped_turns: head.dropped_turns,
+        flags: worst_flags(turns.values().map(|t| t.flags.as_slice())),
+    }
+}
+
+/// Everything the index keeps of one key: where its lines are, the folded
+/// header, and per-turn row facts.
+struct DiskEntry {
+    /// Oldest first, the order a read folds them in.
+    locs: Vec<Loc>,
+    head: Conv,
+    turns: TurnSums,
+}
+
+/// What a lookup hands back: enough to read the conversation and to answer
+/// with its row without holding the index lock.
+struct Found {
+    locs: Vec<Loc>,
     summary: ConvSummary,
 }
 
-/// The on-disk conversation index: one entry per key, holding everything the
-/// list shows and enough to read a conversation back by (slot, offset, len).
-/// Built once at startup by scanning the rotation chain, then maintained by
-/// the writer as it appends. It is what makes the Conversations view cover the
-/// whole retained file, not just the seeded hot set.
+/// The on-disk index of every conversation the rotation chain holds — what the
+/// list shows and enough to read a conversation back by its lines. Built once
+/// at startup by scanning the rotation chain, then maintained by the writer as
+/// it appends. It is what makes the Conversations view cover the whole retained
+/// file, not just the hot set.
 struct DiskIndex {
-    /// Slot table, newest first: `[live, .0, .1, …]`.
+    /// Slot table, newest first: `[live, .0, .1, …]` (each of the rotated ones
+    /// possibly compressed as `<slot>.zst`).
     slots: Vec<String>,
     entries: Mutex<HashMap<String, DiskEntry>>,
     /// Set once the boot scan of the rotation chain has run: until then the
-    /// views answer from the hot seed only, and the API says so
+    /// views answer from the hot store only, and the API says so
     /// ([`ConvLogger::indexing`]) rather than 404-ing on lines that are on disk.
     scan_done: AtomicBool,
+    /// Decompressed slots recently read, newest last: opening the turns of one
+    /// conversation one after another decompresses its file once.
+    cache: Mutex<Vec<(usize, Arc<Vec<u8>>)>>,
 }
 
 /// Index entries held for at most this many conversations; past it a new key
 /// is not indexed (existing ones still update) — a pathological rotation
 /// chain costs bounded memory, not unbounded.
 const MAX_INDEX_ENTRIES: usize = 200_000;
+
+/// Decompressed slots kept by [`DiskIndex::cache`].
+const SLOT_CACHE: usize = 2;
 
 impl DiskIndex {
     fn new(path: &str, max_files: usize) -> Self {
@@ -1360,22 +1663,41 @@ impl DiskIndex {
             slots,
             entries: Mutex::new(HashMap::new()),
             scan_done: AtomicBool::new(false),
+            cache: Mutex::new(Vec::new()),
         }
     }
 
-    /// Total bytes across the slot files and the last-write time of the
-    /// oldest existing slot — the chain's honest reach on disk. Slot mtimes
-    /// are cheap and never wrong by more than a rotation interval.
+    /// The file behind a slot, compressed form first (a slot is compressed
+    /// into place and the plain file removed only after, so this never misses
+    /// one mid-way), `None` when the slot is empty.
+    fn slot_file(&self, slot: usize) -> Option<(std::path::PathBuf, bool)> {
+        let base = self.slots.get(slot)?;
+        if slot > 0 {
+            let zst = std::path::PathBuf::from(format!("{base}{}", codec::ZST));
+            if zst.is_file() {
+                return Some((zst, true));
+            }
+        }
+        let plain = std::path::PathBuf::from(base);
+        plain.is_file().then_some((plain, false))
+    }
+
+    /// Total bytes the slots hold **uncompressed** — the quantity
+    /// `request_log_max_bytes` caps, so the retention warning compares like with
+    /// like — and the last-write time of the oldest existing slot: the chain's
+    /// honest reach on disk. Slot mtimes are cheap and never wrong by more than
+    /// a rotation interval.
     fn disk_stats(&self) -> Option<(u64, u64)> {
         let mut bytes = 0u64;
         let mut oldest_ms: Option<u64> = None;
-        for slot in self.slots.iter().rev() {
+        for slot in (0..self.slots.len()).rev() {
             // Oldest slot first: its mtime is the age of the oldest retained
             // data (its last write before it stopped being the live file).
-            let Ok(m) = std::fs::metadata(slot) else {
+            let Some((file, zst)) = self.slot_file(slot) else {
                 continue; // a missing slot is just a shorter chain
             };
-            bytes += m.len();
+            let Ok(m) = std::fs::metadata(&file) else { continue };
+            bytes += if zst { codec::zst_content_size(&file).unwrap_or(m.len()) } else { m.len() };
             if oldest_ms.is_none() {
                 oldest_ms = m
                     .modified()
@@ -1387,43 +1709,119 @@ impl DiskIndex {
         Some((bytes, oldest_ms?))
     }
 
-    /// Scan the rotation chain oldest-first, so the last (newest, longest) line
-    /// per key wins — the same supersede rule the store applies. Runs on the
-    /// writer task before its first sweep: the hot store already answers from
-    /// the seed tail, so an index still filling costs a little history at the
-    /// end of the list, never an outage.
+    /// The largest turn rid in the newest slot that holds any: rids only grow,
+    /// so this is the chain's maximum, at the cost of reading one file
+    /// (two right after a rotation) instead of the whole chain.
+    fn newest_rid(&self) -> u64 {
+        for slot in 0..self.slots.len() {
+            let Some(data) = self.slot_file(slot).and_then(|(f, _)| codec::read_slot_file(&f).ok())
+            else {
+                continue;
+            };
+            let max = data
+                .split(|b| *b == b'\n')
+                .filter_map(parse_line)
+                .flat_map(|c| c.turns.into_iter().map(|t| t.rid))
+                .max();
+            if let Some(rid) = max {
+                return rid;
+            }
+        }
+        0
+    }
+
+    /// A compressed slot's bytes, from the cache or decompressed into it.
+    fn slot_bytes(&self, slot: usize, file: &Path) -> Option<Arc<Vec<u8>>> {
+        if let Some((_, data)) = self.cache.lock_or_recover().iter().find(|(s, _)| *s == slot) {
+            return Some(Arc::clone(data));
+        }
+        let data = Arc::new(codec::read_slot_file(file).ok()?);
+        let mut cache = self.cache.lock_or_recover();
+        cache.retain(|(s, _)| *s != slot);
+        cache.push((slot, Arc::clone(&data)));
+        if cache.len() > SLOT_CACHE {
+            cache.remove(0);
+        }
+        Some(data)
+    }
+
+    /// The bytes of one indexed line.
+    fn read_at(&self, loc: Loc) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let (file, zst) = self.slot_file(loc.slot)?;
+        if zst {
+            let data = self.slot_bytes(loc.slot, &file)?;
+            let start = usize::try_from(loc.offset).ok()?;
+            let end = start.checked_add(usize::try_from(loc.len).ok()?)?;
+            return data.get(start..end).map(<[u8]>::to_vec);
+        }
+        let mut f = std::fs::File::open(file).ok()?;
+        f.seek(SeekFrom::Start(loc.offset)).ok()?;
+        let mut buf = vec![0u8; loc.len as usize];
+        f.read_exact(&mut buf).ok()?;
+        Some(buf)
+    }
+
+    /// Scan the rotation chain oldest-first, so every key's lines are folded
+    /// in the order they were written. Runs on the writer task before its first
+    /// sweep: until it is done the views answer from the hot store, so an index
+    /// still filling costs a little history at the end of the list, never an
+    /// outage.
     fn scan(&self) {
         for slot in (0..self.slots.len()).rev() {
-            let Ok(data) = std::fs::read(&self.slots[slot]) else {
+            let Some((file, _)) = self.slot_file(slot) else {
                 continue; // a missing slot is just a shorter chain
+            };
+            let Ok(data) = codec::read_slot_file(&file) else {
+                continue;
             };
             let mut offset = 0u64;
             for raw in data.split_inclusive(|b| *b == b'\n') {
                 let len = raw.len() as u64;
-                if let Some(entry) = parse_disk_entry(raw, slot, offset, len) {
-                    self.entries.lock_or_recover().insert(entry.summary.key.clone(), entry);
+                if let Some(line) = parse_line(raw) {
+                    self.record(Loc { slot, offset, len }, &line);
                 }
                 offset += len;
             }
         }
     }
 
-    /// Record (or supersede) the entry for a line the writer just appended.
-    fn record(&self, key: &str, entry: DiskEntry) {
+    /// Fold a line just written (or scanned) into its key's entry.
+    fn record(&self, loc: Loc, line: &Conv) {
         let mut entries = self.entries.lock_or_recover();
-        if !entries.contains_key(key) && entries.len() >= MAX_INDEX_ENTRIES {
+        if !entries.contains_key(&line.key) && entries.len() >= MAX_INDEX_ENTRIES {
             return;
         }
-        entries.insert(key.to_string(), entry);
+        let e = entries.entry(line.key.clone()).or_insert_with(|| DiskEntry {
+            locs: Vec::new(),
+            head: line.head(),
+            turns: TurnSums::new(),
+        });
+        fold_head(&mut e.head, line);
+        e.locs.push(loc);
+        e.turns.extend(turn_sums(&line.turns, loc.slot));
     }
 
     /// A rotation renamed every file one slot older and deleted what fell off:
-    /// shift every entry to follow, dropping entries whose file is gone.
+    /// shift every location to follow, dropping what is gone — a turn whose
+    /// newest record went with the old file, a key with no line left.
     fn shift_for_rotation(&self) {
+        let n = self.slots.len();
+        self.cache.lock_or_recover().clear();
         let mut entries = self.entries.lock_or_recover();
         entries.retain(|_, e| {
-            e.slot += 1;
-            e.slot < self.slots.len()
+            e.locs.retain_mut(|l| {
+                l.slot += 1;
+                l.slot < n
+            });
+            e.turns.retain(|_, t| {
+                t.slot += 1;
+                t.slot < n
+            });
+            if let Some(first) = e.turns.values().map(|t| t.at_ms).min() {
+                e.head.start_ms = e.head.start_ms.max(first.min(e.head.end_ms));
+            }
+            !e.locs.is_empty()
         });
     }
 
@@ -1431,23 +1829,30 @@ impl DiskIndex {
     fn summaries(&self, skip: &dyn Fn(&str) -> bool) -> Vec<ConvSummary> {
         self.entries
             .lock_or_recover()
-            .values()
-            .filter(|e| !skip(&e.summary.key))
-            .map(|e| e.summary.clone())
+            .iter()
+            .filter(|(k, _)| !skip(k))
+            .map(|(_, e)| summarize(&e.head, &e.turns))
             .collect()
+    }
+
+    /// One key's header and turn facts, for merging with the hot store's row.
+    fn row(&self, key: &str) -> Option<(Conv, TurnSums)> {
+        let entries = self.entries.lock_or_recover();
+        let e = entries.get(key)?;
+        Some((e.head.clone(), e.turns.clone()))
     }
 
     /// The entry `q` names, newest match wins — same matcher as the store,
     /// including that an `rid` query needs the conversation's turn list.
-    fn find(&self, q: &Find) -> Option<DiskEntry> {
+    fn find(&self, q: &Find) -> Option<Found> {
         let entries = self.entries.lock_or_recover();
         let mut best: Option<(u64, &DiskEntry)> = None;
         for (key, e) in entries.iter() {
-            let s = &e.summary;
+            let s = &e.head;
             let hit = match q {
                 Find { key: Some(want), .. } => *want == key.as_str(),
                 Find { rid: Some(rid), session, user, .. } => {
-                    e.rids.iter().any(|r| r == rid)
+                    e.turns.contains_key(rid)
                         && session.is_none_or(|x| s.session.as_deref() == Some(x))
                         && user.is_none_or(|x| s.user == x)
                 }
@@ -1461,66 +1866,184 @@ impl DiskIndex {
                 best = Some((s.end_ms, e));
             }
         }
-        best.map(|(_, e)| DiskEntry {
-            slot: e.slot,
-            offset: e.offset,
-            len: e.len,
-            rids: e.rids.clone(),
-            summary: e.summary.clone(),
+        best.map(|(_, e)| Found {
+            locs: e.locs.clone(),
+            summary: summarize(&e.head, &e.turns),
         })
     }
 
-    /// Read one indexed conversation back from disk. A line that no longer
-    /// matches its entry (log truncated or replaced out of band) drops the
-    /// entry rather than returning a stranger's conversation.
-    fn read(&self, entry: &DiskEntry) -> Option<Conv> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(self.slots.get(entry.slot)?).ok()?;
-        f.seek(SeekFrom::Start(entry.offset)).ok()?;
-        let mut buf = vec![0u8; entry.len as usize];
-        f.read_exact(&mut buf).ok()?;
-        match serde_json::from_slice::<Conv>(&buf) {
-            Ok(conv) if conv.key == entry.summary.key => Some(conv),
-            _ => {
-                self.entries
-                    .lock_or_recover()
-                    .remove(&entry.summary.key);
-                None
+    /// Read one indexed conversation back from disk: its lines folded oldest
+    /// first, requests left as stored (see [`resolve_req`]). A line that no
+    /// longer matches its entry (log truncated or replaced out of band) drops
+    /// the entry rather than returning a stranger's conversation — unless a
+    /// rotation moved the files between the lookup and the read, which only
+    /// makes this answer stale.
+    fn read(&self, found: &Found) -> Option<Conv> {
+        let key = &found.summary.key;
+        let mut acc: Option<Conv> = None;
+        for loc in &found.locs {
+            let line = self.read_at(*loc).as_deref().and_then(parse_line);
+            let Some(line) = line.filter(|l| &l.key == key) else {
+                let mut entries = self.entries.lock_or_recover();
+                if entries.get(key).is_some_and(|e| e.locs == found.locs) {
+                    entries.remove(key);
+                }
+                return None;
+            };
+            match acc.as_mut() {
+                Some(a) => fold_line(a, line),
+                None => {
+                    let mut a = line.head();
+                    fold_line(&mut a, line);
+                    acc = Some(a);
+                }
             }
         }
+        let mut conv = acc?;
+        conv.turns.sort_by_key(|t| t.rid);
+        Some(conv)
     }
 }
 
-/// One raw line of a slot file as an index entry, `None` for anything that is
-/// not a `v: 2` conversation line (old per-request format, torn tails).
-fn parse_disk_entry(raw: &[u8], slot: usize, offset: u64, len: u64) -> Option<DiskEntry> {
-    let trimmed = String::from_utf8_lossy(raw);
-    // Cheap pre-filter before the full parse; `from_str` still decides.
-    if !trimmed.contains("\"v\":") {
-        return None;
-    }
-    let conv = serde_json::from_str::<Conv>(trimmed.trim()).ok()?;
-    if !SCHEMA_READS.contains(&conv.v) {
-        return None;
-    }
-    let rids = conv.turns.iter().map(|t| t.rid).collect();
-    Some(DiskEntry {
-        slot,
-        offset,
-        len,
-        rids,
-        summary: conv_summary(&conv),
-    })
-}
+// ------------------------------------------------------------- writer
 
-/// One flushed conversation handed from the store to the writer: the line to
-/// append and what to index it with, so the writer never parses its own output.
+/// One dirty conversation handed from the store to the writer: its header and
+/// the turns changed since they were last written.
 struct Pending {
     key: String,
-    line: String,
+    head: Conv,
+    turns: Vec<Turn>,
+    /// The conversation's revision when it was taken: if it moved on while
+    /// the line was written, it stays dirty.
     rev: u64,
-    summary: ConvSummary,
-    rids: Vec<u64>,
+}
+
+/// What the writer remembers of a key it has written into the live file:
+/// enough to leave out what that file already holds, and to write a new
+/// request as a delta against the last one. Reset whenever the live file is a
+/// new one, so no line ever refers outside its own file.
+#[derive(Default)]
+struct KeyState {
+    /// The rotation count this state belongs to.
+    epoch: u64,
+    /// Turns whose `msgs` are in the file.
+    msgs: std::collections::HashSet<u64>,
+    /// Turns whose request / response text is in the file, by text identity.
+    req: HashMap<u64, (usize, usize)>,
+    resp: HashMap<u64, (usize, usize)>,
+    /// The last turn whose `msgs` were written, and that list.
+    last_msgs: Option<(u64, Vec<MsgMeta>)>,
+    last_req: Option<ReqBase>,
+}
+
+/// The last request written for a key, as fingerprints.
+struct ReqBase {
+    rid: u64,
+    prints: Vec<(u64, u64)>,
+    tmpl: (u64, u64),
+    depth: u32,
+}
+
+/// Identity of captured text: the same `Arc` is the same capture.
+fn ident(text: &Arc<String>) -> (usize, usize) {
+    (Arc::as_ptr(text) as usize, text.len())
+}
+
+/// The request as a delta against the last one written for its key, when it
+/// extends any prefix of that one's messages; `None` stores it whole.
+fn encode_req(req: &str, rid: u64, st: &mut KeyState) -> Option<codec::ReqDelta> {
+    use serde_json::value::RawValue;
+    // Not a chat body (or cut at the content limit): whole, and no base.
+    let split = codec::split_body(req)?;
+    let prints: Vec<(u64, u64)> = split.msgs.iter().map(|m| codec::fingerprint(m)).collect();
+    let tmpl = codec::fingerprint(&split.tmpl);
+    let mut out = None;
+    let mut depth = 0;
+    if let Some(b) = &st.last_req
+        && b.rid != rid
+        && b.depth < MAX_DELTA_DEPTH
+    {
+        let keep = codec::common_prefix(&b.prints, &prints);
+        let add: Option<Vec<Box<RawValue>>> = split.msgs[keep..]
+            .iter()
+            .map(|m| RawValue::from_string(m.to_string()).ok())
+            .collect();
+        let new_tmpl = if tmpl == b.tmpl {
+            Some(None)
+        } else {
+            RawValue::from_string(split.tmpl.clone()).ok().map(Some)
+        };
+        if keep > 0
+            && let (Some(add), Some(tmpl)) = (add, new_tmpl)
+        {
+            out = Some(codec::ReqDelta { base: b.rid, keep, add, tmpl });
+            depth = b.depth + 1;
+        }
+    }
+    st.last_req = Some(ReqBase { rid, prints, tmpl, depth });
+    out
+}
+
+/// Encode one pending conversation as a v4 line for the live file `epoch`:
+/// changed turns only, without the text and `msgs` that file already holds,
+/// requests and `msgs` as deltas where they extend an earlier turn, streamed
+/// replies folded.
+fn encode(p: &Pending, st: &mut KeyState, epoch: u64) -> Conv {
+    if st.epoch != epoch {
+        *st = KeyState { epoch, ..Default::default() };
+    }
+    let mut line = p.head.clone();
+    line.v = SCHEMA_V;
+    for t in &p.turns {
+        let mut out = t.clone();
+        out.content = None;
+        if st.msgs.contains(&t.rid) {
+            out.msgs = Vec::new();
+        } else {
+            if let Some((base, prev)) = &st.last_msgs
+                && *base != t.rid
+            {
+                let keep = codec::common_prefix(prev, &t.msgs);
+                if keep > 0 {
+                    out.msgs_base = Some(*base);
+                    out.msgs_keep = Some(keep);
+                    out.msgs = t.msgs[keep..].to_vec();
+                }
+            }
+            st.msgs.insert(t.rid);
+            if !t.msgs.is_empty() {
+                st.last_msgs = Some((t.rid, t.msgs.clone()));
+            }
+        }
+        if let Some(c) = &t.content {
+            let mut kept = TurnContent::default();
+            if let Some(req) = &c.req
+                && st.req.get(&t.rid) != Some(&ident(req))
+            {
+                st.req.insert(t.rid, ident(req));
+                match encode_req(req, t.rid, st) {
+                    Some(d) => kept.req_d = Some(d),
+                    None => kept.req = Some(Arc::clone(req)),
+                }
+            }
+            if let Some(resp) = &c.resp
+                && st.resp.get(&t.rid) != Some(&ident(resp))
+            {
+                st.resp.insert(t.rid, ident(resp));
+                // An errored turn keeps its stream as captured: that is the
+                // evidence of what went wrong.
+                let folded = (t.outcome.as_deref() == Some("ok"))
+                    .then(|| codec::assemble_sse(resp))
+                    .flatten();
+                kept.resp = Some(folded.map_or_else(|| Arc::clone(resp), Arc::new));
+            }
+            if kept.req.is_some() || kept.req_d.is_some() || kept.resp.is_some() {
+                out.content = Some(kept);
+            }
+        }
+        line.turns.push(out);
+    }
+    line
 }
 
 /// Writer task: every `SWEEP`, append the conversations that have gone quiet.
@@ -1531,8 +2054,8 @@ async fn writer_loop(
     flush_idle: Duration,
 ) {
     // Index the rotation chain before the first sweep. On this task, not at
-    // boot: the hot store answers from its seed tail meanwhile, so a large
-    // chain costs early entries of the oldest hour, never a slow start.
+    // boot: the hot store answers meanwhile, so a large chain costs early
+    // entries of the oldest hour, never a slow start.
     disk.scan();
     disk.scan_done.store(true, Ordering::Relaxed);
     // Continue sizing from the existing file so restarts keep rotation honest.
@@ -1550,6 +2073,12 @@ async fn writer_loop(
             file.path
         );
     }
+    // Rotations so far: the identity of the live file, which every delta and
+    // every left-out text must stay inside. The live file found at boot is
+    // its own generation too — nothing written before this process is known
+    // to the writer's key states, so they all start empty.
+    let mut epoch: u64 = 1;
+    let mut keys: HashMap<String, KeyState> = HashMap::new();
     // Wake at least as often as the flush target, so a short
     // `request_log_flush_secs` is honoured instead of rounded up to the sweep.
     let mut ticker = tokio::time::interval(SWEEP.min(flush_idle.max(Duration::from_millis(10))));
@@ -1558,15 +2087,33 @@ async fn writer_loop(
         ticker.tick().await;
         let pending = take_pending(&store, flush_idle);
         for p in pending {
-            if current_size + p.line.len() as u64 > file.max_bytes {
+            let mut conv = encode(&p, keys.entry(p.key.clone()).or_default(), epoch);
+            let Ok(mut line) = serde_json::to_string(&conv) else {
+                warn!("conversation log: failed to serialize {}", p.key);
+                keys.remove(&p.key);
+                continue;
+            };
+            if current_size > 0 && current_size + line.len() as u64 + 1 > file.max_bytes {
                 // Nothing may hold the old file while it is renamed, or the
                 // writer would keep appending to the rotated copy.
                 drop(handle.take());
                 match rotate(&file.path, file.max_files).await {
                     Ok(()) => {
                         current_size = 0;
+                        epoch += 1;
                         // The chain shifted one file older; the entries follow.
                         disk.shift_for_rotation();
+                        compress_rotated(&file.path).await;
+                        // A fresh file: encode again, so the line refers to
+                        // nothing the previous file holds.
+                        conv = encode(&p, keys.entry(p.key.clone()).or_default(), epoch);
+                        match serde_json::to_string(&conv) {
+                            Ok(l) => line = l,
+                            Err(_) => {
+                                keys.remove(&p.key);
+                                continue;
+                            }
+                        }
                     }
                     Err(e) => {
                         // Resetting the size to 0 here would disable rotation
@@ -1585,40 +2132,48 @@ async fn writer_loop(
                 }
             }
             let offset = current_size;
-            let written = match append(&mut handle, &file.path, &p.line).await {
+            let written = match append(&mut handle, &file.path, &line).await {
                 Ok(n) => {
                     current_size += n;
                     n
                 }
                 Err(e) => {
                     warn!("conversation log: failed to append to {}: {}", file.path, e);
+                    // What the key state says the file holds is now wrong:
+                    // start that key over, whole.
+                    keys.remove(&p.key);
                     continue;
                 }
             };
             // The line is on disk: it is now part of the retained history.
-            disk.record(
-                &p.key,
-                DiskEntry {
-                    slot: 0,
-                    offset,
-                    len: written,
-                    rids: p.rids,
-                    summary: p.summary,
-                },
-            );
-            // Clear the flag only if nothing changed while we were writing.
-            let mut s = store.lock_or_recover();
-            if let Some(e) = s.entries.get_mut(&p.key)
-                && e.rev == p.rev
-            {
-                e.dirty = false;
-            }
+            disk.record(Loc { slot: 0, offset, len: written }, &conv);
+            let revs: Vec<(u64, u64)> = p.turns.iter().map(|t| (t.rid, t.rev)).collect();
+            store.lock_or_recover().mark_written(&p.key, &revs, p.rev);
+        }
+        // Forget keys the store no longer holds; a key that comes back starts
+        // over whole, which costs bytes, never correctness.
+        if keys.len() > MAX_CONVS * 2 {
+            let s = store.lock_or_recover();
+            keys.retain(|k, _| s.entries.contains_key(k));
         }
     }
 }
 
 fn take_pending(store: &Arc<Mutex<ConvStore>>, flush_idle: Duration) -> Vec<Pending> {
     store.lock_or_recover().take_pending(flush_idle)
+}
+
+/// Compress the slot a rotation just made (`.0`) in the background pool. A
+/// failure leaves it plain, which every reader still opens.
+async fn compress_rotated(path: &str) {
+    let src = std::path::PathBuf::from(format!("{path}.0"));
+    let dst = std::path::PathBuf::from(format!("{path}.0{}", codec::ZST));
+    let done = tokio::task::spawn_blocking(move || codec::compress_slot(&src, &dst)).await;
+    match done {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("conversation log: could not compress {path}.0 ({e}); it stays uncompressed"),
+        Err(e) => warn!("conversation log: compressing {path}.0 failed ({e}); it stays uncompressed"),
+    }
 }
 
 async fn open_append(path: &str) -> Result<tokio::fs::File, std::io::Error> {
@@ -1630,9 +2185,8 @@ async fn open_append(path: &str) -> Result<tokio::fs::File, std::io::Error> {
 }
 
 /// Append one flushed line through the shared handle (reopened when it is not
-/// open), so a tailing reader never sees half a conversation. A failed write
-/// drops the handle, so the next call starts from a fresh one. Returns the bytes
-/// written.
+/// open), so a tailing reader never sees half a line. A failed write drops the
+/// handle, so the next call starts from a fresh one. Returns the bytes written.
 async fn append(
     handle: &mut Option<tokio::fs::File>,
     path: &str,
@@ -1662,10 +2216,11 @@ async fn append(
     }
 }
 
-/// Shift the rotation chain: `{path}.{max_files-1}` is deleted, each existing
-/// `{path}.{i}` moves up one slot (missing files skipped), and the current file
-/// becomes `{path}.0`. Reports the first failure instead of swallowing it: the
-/// caller has to keep the file's true size when the chain did not move.
+/// Shift the rotation chain: `{path}.{max_files-1}` (plain or `.zst`) is
+/// deleted, each existing `{path}.{i}[.zst]` moves up one slot (missing files
+/// skipped), and the current file becomes `{path}.0`. Reports the first
+/// failure instead of swallowing it: the caller has to keep the file's true
+/// size when the chain did not move.
 async fn rotate(path: &str, max_files: usize) -> Result<(), String> {
     // Nothing on disk to move (deleted out of band, or a first write that has
     // not happened yet): the caller's next append recreates the file, so this
@@ -1679,18 +2234,22 @@ async fn rotate(path: &str, max_files: usize) -> Result<(), String> {
             *failed = Some(format!("{what}: {e}"));
         }
     };
-    let oldest = format!("{}.{}", path, max_files - 1);
-    if let Err(e) = tokio::fs::remove_file(&oldest).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        note("cannot drop the oldest file", e, &mut failed);
+    for suffix in ["", codec::ZST] {
+        let oldest = format!("{}.{}{suffix}", path, max_files - 1);
+        if let Err(e) = tokio::fs::remove_file(&oldest).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            note("cannot drop the oldest file", e, &mut failed);
+        }
     }
     for i in (0..max_files.saturating_sub(1)).rev() {
-        let from = format!("{}.{}", path, i);
-        if tokio::fs::metadata(&from).await.is_ok() {
-            let to = format!("{}.{}", path, i + 1);
-            if let Err(e) = tokio::fs::rename(&from, &to).await {
-                note("cannot shift", e, &mut failed);
+        for suffix in ["", codec::ZST] {
+            let from = format!("{path}.{i}{suffix}");
+            if tokio::fs::metadata(&from).await.is_ok() {
+                let to = format!("{path}.{}{suffix}", i + 1);
+                if let Err(e) = tokio::fs::rename(&from, &to).await {
+                    note("cannot shift", e, &mut failed);
+                }
             }
         }
     }
@@ -1746,8 +2305,44 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         for i in 0..4 {
             let _ = std::fs::remove_file(format!("{}.{}", path.display(), i));
+            let _ = std::fs::remove_file(format!("{}.{}.zst", path.display(), i));
         }
         path.to_string_lossy().into_owned()
+    }
+
+    /// What the writer would append for the pending conversations: encoded
+    /// against `st` as one live file, then marked written in the store.
+    fn flush_lines(log: &ConvLogger, st: &mut HashMap<String, KeyState>) -> Vec<(Conv, String)> {
+        let pending = take_pending(&log.store, Duration::ZERO);
+        let mut out = Vec::new();
+        for p in pending {
+            let conv = encode(&p, st.entry(p.key.clone()).or_default(), 1);
+            let line = serde_json::to_string(&conv).unwrap();
+            let revs: Vec<(u64, u64)> = p.turns.iter().map(|t| (t.rid, t.rev)).collect();
+            log.store.lock_or_recover().mark_written(&p.key, &revs, p.rev);
+            out.push((conv, line));
+        }
+        out
+    }
+
+    fn req_text(key: &str, rid: u64, body: &str) -> Note {
+        Note::ReqText {
+            key: key.into(),
+            rid,
+            bytes: Some(body.len() as u64),
+            text: Arc::new(body.into()),
+        }
+    }
+
+    /// Wait for a logger's boot scan of the chain to finish.
+    async fn indexed(log: &ConvLogger) {
+        for _ in 0..400 {
+            if !log.indexing() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the boot scan never finished");
     }
 
     fn begin(key: &str, rid: u64, at: u64) -> Note {
@@ -1840,9 +2435,10 @@ mod tests {
         log.note(begin("alice#a1", 2, 3000));
         log.note(resp("alice#a1", 2, 4000));
         // Two turns of one conversation, flushed as one line.
-        let pending = take_pending(&log.store, Duration::ZERO);
-        assert_eq!(pending.len(), 1, "one conversation must produce one line");
-        let conv: Conv = serde_json::from_str(&pending[0].line).unwrap();
+        let mut st = HashMap::new();
+        let lines = flush_lines(&log, &mut st);
+        assert_eq!(lines.len(), 1, "one conversation must produce one line");
+        let conv: Conv = serde_json::from_str(&lines[0].1).unwrap();
         assert_eq!(conv.turns.len(), 2);
         assert_eq!(conv.v, SCHEMA_V);
         assert_eq!(conv.session.as_deref(), Some("a1"));
@@ -1856,13 +2452,16 @@ mod tests {
         assert!(!conv.redacted);
 
         // A flush clears the dirty flag; nothing new is pending.
-        {
-            let mut s = log.store.lock_or_recover();
-            for p in &pending {
-                s.entries.get_mut(&p.key).unwrap().dirty = false;
-            }
-        }
         assert!(take_pending(&log.store, Duration::ZERO).is_empty());
+        // A late verdict on turn 1 brings back that turn alone, without the
+        // text the file already holds.
+        log.note(Note::Audit { key: "alice#a1".into(), rid: 1, flags: Vec::new() });
+        let again = flush_lines(&log, &mut st);
+        assert_eq!(again.len(), 1);
+        let conv = &again[0].0;
+        assert_eq!(conv.turns.iter().map(|t| t.rid).collect::<Vec<_>>(), vec![1]);
+        assert!(conv.turns[0].content.is_none(), "no text written twice");
+        assert!(conv.turns[0].msgs.is_empty(), "no msgs written twice");
         handle.abort();
         let _ = std::fs::remove_file(&path);
     }
@@ -1878,7 +2477,7 @@ mod tests {
         }
         log.note(b);
         log.note(resp("bob#b1", 7, 6000));
-        let line = take_pending(&log.store, Duration::ZERO).remove(0).line;
+        let line = flush_lines(&log, &mut HashMap::new()).remove(0).1;
         let conv: Conv = serde_json::from_str(&line).unwrap();
         assert!(conv.redacted && conv.turns[0].redacted);
         // No text anywhere in the line, but the timeline and sizes are intact.
@@ -1929,31 +2528,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_rewrites_the_newest_line_for_a_key() {
+    async fn resume_appends_only_the_new_turns_and_folds_back_whole() {
         let path = tmp("resume.jsonl");
         {
             let (log, handle) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
+                ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
+            let mut st = HashMap::new();
             log.note(begin("carol#c1", 1, 1000));
             log.note(resp("carol#c1", 1, 2000));
-            let p = take_pending(&log.store, Duration::ZERO).remove(0);
-            let (line, key, rev) = (p.line, p.key, p.rev);
-            append(&mut None, &path, &line).await.unwrap();
-            log.store.lock_or_recover().entries.get_mut(&key).unwrap().dirty = false;
-            let _ = rev;
-            // The conversation resumes: one longer line, same key.
+            for (_, line) in flush_lines(&log, &mut st) {
+                append(&mut None, &path, &line).await.unwrap();
+            }
+            // The conversation resumes: a second line carries turn 2 alone.
             log.note(begin("carol#c1", 2, 9000));
             log.note(resp("carol#c1", 2, 9500));
-            let line2 = take_pending(&log.store, Duration::ZERO).remove(0).line;
-            append(&mut None, &path, &line2).await.unwrap();
+            let second = flush_lines(&log, &mut st);
+            assert_eq!(second[0].0.turns.len(), 1, "only the new turn is written");
+            assert_eq!(second[0].0.turns[0].rid, 2);
+            for (_, line) in second {
+                append(&mut None, &path, &line).await.unwrap();
+            }
             handle.abort();
         }
-        let lines = read_lines(&path);
-        assert_eq!(lines.len(), 2);
-        // The reader's rule: newest end_ms wins, and it holds both turns.
-        let newest = lines.into_iter().max_by_key(|c| c.end_ms).unwrap();
-        assert_eq!(newest.turns.len(), 2);
-        assert_eq!(newest.end_ms, 9500);
+        // The reader's rule: a key's lines fold oldest first into one
+        // conversation holding both turns.
+        let (convs, skipped) = load_conversations(&[path.clone().into()]).unwrap();
+        assert_eq!((convs.len(), skipped), (1, 0));
+        assert_eq!(convs[0].turns.iter().map(|t| t.rid).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!((convs[0].start_ms, convs[0].end_ms), (1000, 9500));
+        assert_eq!(convs[0].turns[1].msgs.len(), 1, "msgs survive their delta");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The point of v4: a session that resends its history stores each
+    /// message once, and every turn's body still reads back exactly — from
+    /// the file alone, through a fresh process, across a compaction that
+    /// broke the prefix.
+    #[tokio::test]
+    async fn request_deltas_store_each_message_once_and_rebuild_exactly() {
+        let path = tmp("delta.jsonl");
+        let sys = format!("{{\"role\":\"system\",\"content\":\"{}\"}}", "s".repeat(4000));
+        let mut msgs = vec![sys.clone()];
+        let mut bodies = Vec::new();
+        for i in 0..6u64 {
+            msgs.push(format!("{{\"role\":\"user\",\"content\":\"step {i} \\u00e9\"}}"));
+            if i == 4 {
+                // A compaction: the history is replaced by a summary.
+                msgs = vec![sys.clone(), "{\"role\":\"user\",\"content\":\"summary\"}".into()];
+            }
+            bodies.push(format!(
+                "{{\"model\":\"q\",\"messages\":[{}],\"stream\":true,\"tools\":[{{\"type\":\"function\",\"function\":{{\"name\":\"bash\"}}}}]}}",
+                msgs.join(",")
+            ));
+        }
+        {
+            let (log, handle) =
+                ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
+            let mut st = HashMap::new();
+            for (i, body) in bodies.iter().enumerate() {
+                let rid = 10 + i as u64;
+                let mut b = begin("dan#d1", rid, 1000 + rid);
+                if let Note::Begin(bx) = &mut b {
+                    bx.msgs = msg_meta(body);
+                }
+                log.note(b);
+                log.note(req_text("dan#d1", rid, body));
+                log.note(resp("dan#d1", rid, 1500 + rid));
+                // One line per turn, as an agent's pauses between turns make.
+                for (_, line) in flush_lines(&log, &mut st) {
+                    append(&mut None, &path, &line).await.unwrap();
+                }
+            }
+            handle.abort();
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.matches(&"s".repeat(4000)).count(), 1, "the system prompt is stored once");
+        assert_eq!(raw.matches("\"req_d\"").count(), 5, "every turn after the first is a delta");
+        assert!(raw.len() < bodies.iter().map(String::len).sum::<usize>() / 3);
+        // Read back from the file by a script…
+        let (convs, _) = load_conversations(&[path.clone().into()]).unwrap();
+        for (t, body) in convs[0].turns.iter().zip(&bodies) {
+            assert_eq!(t.content.as_ref().unwrap().req.as_deref().map(String::as_str), Some(body.as_str()));
+            assert_eq!(t.msgs, msg_meta(body), "msgs rebuilt from their deltas");
+        }
+        // …and by a fresh process's viewer.
+        let (log, handle) =
+            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
+        indexed(&log).await;
+        for (i, body) in bodies.iter().enumerate() {
+            let q = Find { key: Some("dan#d1"), rid: Some(10 + i as u64), ..Default::default() };
+            assert_eq!(log.content(&q, Dir::Req).as_deref(), Some(body.as_str()), "turn {i}");
+        }
+        let conv = log.index(&find_key("dan#d1")).unwrap();
+        assert_eq!(conv.turns.len(), 6);
+        assert_eq!(conv.turns[5].msgs, msg_meta(&bodies[5]));
+        handle.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A streamed reply is stored as the completion it amounts to; an errored
+    /// one keeps its stream as evidence.
+    #[tokio::test]
+    async fn streamed_replies_are_folded_unless_the_turn_failed() {
+        let path = tmp("sse.jsonl");
+        let (log, handle) =
+            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi \"}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"there\"},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: [DONE]\n\n";
+        for (rid, outcome) in [(1u64, "ok"), (2, "backend_error")] {
+            log.note(begin("eve#e1", rid, 1000 * rid));
+            if let Note::Resp(mut r) = resp("eve#e1", rid, 1000 * rid + 500) {
+                r.outcome = outcome.into();
+                log.note(Note::Resp(r));
+            }
+            log.note(Note::RespText {
+                key: "eve#e1".into(),
+                rid,
+                bytes: Some(sse.len() as u64),
+                text: Arc::new(sse.into()),
+            });
+        }
+        let (conv, _) = flush_lines(&log, &mut HashMap::new()).remove(0);
+        let folded = conv.turns[0].content.as_ref().unwrap().resp.as_deref().unwrap();
+        let v: serde_json::Value = serde_json::from_str(folded).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "hi there");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        let kept = conv.turns[1].content.as_ref().unwrap().resp.as_deref().unwrap();
+        assert_eq!(kept.as_str(), sse);
+        // The hot store still answers with the stream as captured.
+        let q = Find { key: Some("eve#e1"), rid: Some(1), ..Default::default() };
+        assert_eq!(log.content(&q, Dir::Resp).as_deref(), Some(sse));
+        handle.abort();
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2002,7 +2708,13 @@ mod tests {
         assert_eq!(sums.len(), 2, "superseded lines must not double-list");
         let ann = idx.find(&find_key("ann#k1")).expect("ann");
         assert_eq!(ann.summary.end_ms, 9_000, "the live file's newer line wins");
-        assert_eq!(ann.slot, 0);
+        assert_eq!(ann.locs.iter().map(|l| l.slot).collect::<Vec<_>>(), vec![1, 0], "oldest first");
+        let conv = idx.read(&ann).expect("ann reads back");
+        assert_eq!(
+            conv.turns[0].content.as_ref().unwrap().req.as_deref().map(String::as_str),
+            Some("new view"),
+            "the newer record of a turn wins the fold"
+        );
         // rid matching works off the index without reading the line back.
         let bob = idx
             .find(&Find {
@@ -2012,7 +2724,7 @@ mod tests {
                 rid: Some(42),
             })
             .expect("bob by rid+user");
-        assert_eq!(bob.slot, 1, "the only view sits in .0");
+        assert_eq!(bob.locs.iter().map(|l| l.slot).collect::<Vec<_>>(), vec![1], "the only view sits in .0");
         let conv = idx.read(&bob).expect("read back");
         assert_eq!(
             conv.turns[0].content.as_ref().unwrap().req.as_deref().map(String::as_str),
@@ -2022,9 +2734,11 @@ mod tests {
         // A rotation renames every file one slot older: entries follow; a
         // second rotation drops what moved past the chain's last slot.
         idx.shift_for_rotation();
-        assert_eq!(idx.find(&find_key("bob#k2")).unwrap().slot, 2);
+        assert_eq!(idx.find(&find_key("bob#k2")).unwrap().locs[0].slot, 2);
         idx.shift_for_rotation();
         assert!(idx.find(&find_key("bob#k2")).is_none());
+        // ann keeps the line that has not fallen off yet.
+        assert_eq!(idx.find(&find_key("ann#k1")).unwrap().locs.len(), 1);
         let _ = std::fs::remove_file(format!("{base}.0"));
     }
 
@@ -2051,7 +2765,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        assert_eq!(entry.slot, 0);
+        assert_eq!(entry.locs[0].slot, 0);
         assert_eq!(entry.summary.turns, 1);
         let conv = disk.read(&entry).expect("the flushed line reads back");
         assert_eq!(
@@ -2095,7 +2809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seeding_reads_back_the_newest_line_and_skips_old_format() {
+    async fn reopening_reads_history_back_and_skips_old_format() {
         let path = tmp("seed.jsonl");
         // A v1 line (old per-request format) must be ignored.
         std::fs::write(
@@ -2105,23 +2819,29 @@ mod tests {
         .unwrap();
         {
             let (log, handle) =
-            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
+                ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
             log.note(begin("dave#d1", 1, 1000));
             log.note(resp("dave#d1", 1, 2000));
-            let line = take_pending(&log.store, Duration::ZERO).remove(0).line;
-            append(&mut None, &path, &line).await.unwrap();
-            // Shorter/older view of the same key must not overwrite the newer one.
-            let (log2, h2) =
-                ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
-            let seeded = log2.index(&Find {
-                session: Some("d1"),
-                ..Default::default()
-            });
-            assert!(seeded.is_some(), "the v2 line must be read back");
-            assert_eq!(seeded.unwrap().turns.len(), 1);
-            h2.abort();
+            for (_, line) in flush_lines(&log, &mut HashMap::new()) {
+                append(&mut None, &path, &line).await.unwrap();
+            }
             handle.abort();
         }
+        let (log2, h2) =
+            ConvLogger::start(path.clone(), 1 << 20, 1, Duration::from_secs(3600)).unwrap();
+        indexed(&log2).await;
+        let back = log2.index(&Find { session: Some("d1"), ..Default::default() });
+        assert!(back.is_some(), "the line must be read back");
+        assert_eq!(back.unwrap().turns.len(), 1);
+        // The conversation resumes in the new process: the view is the
+        // history on disk plus the new turn, not the new turn alone.
+        log2.note(begin("dave#d1", 2, 5000));
+        let both = log2.index(&find_key("dave#d1")).unwrap();
+        assert_eq!(both.turns.iter().map(|t| t.rid).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(both.start_ms, 1000);
+        let row = log2.summaries(10).remove(0);
+        assert_eq!((row.turns, row.live), (2, true));
+        h2.abort();
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2150,11 +2870,13 @@ mod tests {
         // whole record inside the budget.
         let mut files = Vec::new();
         for _ in 0..200 {
-            let mut all = Vec::new();
-            for f in [&path, &format!("{path}.0"), &format!("{path}.1")] {
-                all.extend(read_lines(f));
+            let mut all = read_lines(&path);
+            for i in 0..2 {
+                if let Ok(data) = codec::read_slot_file(Path::new(&format!("{path}.{i}.zst"))) {
+                    all.extend(String::from_utf8(data).unwrap().lines().map(|l| serde_json::from_str::<Conv>(l).unwrap()));
+                }
             }
-            if !all.is_empty() && std::fs::metadata(format!("{path}.0")).is_ok() {
+            if !all.is_empty() && std::fs::metadata(format!("{path}.0.zst")).is_ok() {
                 files = all;
                 break;
             }
@@ -2162,14 +2884,32 @@ mod tests {
         }
         handle.abort();
         assert!(!files.is_empty(), "no conversation reached the file");
+        assert!(
+            std::fs::metadata(format!("{path}.0")).is_err(),
+            "the rotated slot is replaced by its compressed form"
+        );
         for c in &files {
             assert_eq!(c.v, SCHEMA_V);
             assert_eq!(c.turns.len(), 1);
         }
         let cur = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         assert!(cur <= 1200, "current file {cur}B exceeds the budget");
+        // A fresh process opens a turn that lives in a compressed slot.
+        let (log2, h2) = ConvLogger::start(path.clone(), 1200, 2, Duration::from_secs(3600)).unwrap();
+        indexed(&log2).await;
+        let in_zst = log2
+            .summaries(100)
+            .into_iter()
+            .find(|row| {
+                log2.disk.as_ref().unwrap().find(&find_key(&row.key)).unwrap().locs[0].slot > 0
+            })
+            .expect("a conversation sits in a rotated slot");
+        let q = Find { key: Some(&in_zst.key), ..Default::default() };
+        assert_eq!(log2.content(&q, Dir::Req).as_deref(), Some(body.as_str()));
+        h2.abort();
         for i in 0..3 {
             let _ = std::fs::remove_file(format!("{path}.{i}"));
+            let _ = std::fs::remove_file(format!("{path}.{i}.zst"));
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -2201,6 +2941,9 @@ mod tests {
                 redacted: false,
                 audit: Vec::new(),
                 content: None,
+                msgs_base: None,
+                msgs_keep: None,
+                rev: 0,
             });
         }
         assert_eq!(store.find(&Find { session: Some("s"), ..Default::default() }), Some("b#s"));
