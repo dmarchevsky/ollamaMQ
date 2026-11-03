@@ -24,9 +24,10 @@ since upstream `v0.5.0`.
   tail — exactly where a streamed tool call lives. The job now carries the full
   stored response (already bounded by `log_content_limit`) and the clamp happens
   after reconstruction, keeping the **tail** within the same 128 KiB budget. That
-  bound is also what the audit's memory is sized by: a held job costs up to
-  `log_content_limit`, so `(queue + concurrency) × log_content_limit` is the
-  worst case — about 66 MiB as shipped.
+  bound is also where the audit's memory sizing starts: a held job costs a reply
+  of up to `log_content_limit` **plus the request body it came with** (a second
+  buffer, bounded by `max_body_bytes`), so `(queue + concurrency) × (reply +
+  body)` is the worst case — roughly 66 MiB of replies as shipped, plus bodies.
 - **Every new user message is judged, and each one only once.** The audit read
   the *last* user message, which for a harness that appends its own boilerplate
   after the real instruction meant ignoring the instruction and re-flagging the

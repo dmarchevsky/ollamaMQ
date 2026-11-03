@@ -139,10 +139,12 @@ settings:
   #   concurrency: 2            # audit requests in flight against the backend
   #   queue: 64                 # turns held while the audit is busy; past it a
   #                             # turn is dropped and counted, never waited on.
-  #                             # Memory rides this too: a held job carries a
-  #                             # whole stored reply (up to log_content_limit,
-  #                             # default 1 MiB), so (queue + concurrency) x that
-  #                             # is the audit's worst case — ~66 MiB as shipped
+  #                             # Memory rides this too, and a job is more
+  #                             # than one buffer: it pins its reply (up to
+  #                             # log_content_limit) plus the request body it
+  #                             # came with (up to max_body_bytes), so the worst
+  #                             # case is (queue + concurrency) x (reply + body)
+  #                             # — ~66 MiB of replies as shipped, plus bodies.
   #   extra_watch_hosts: []     # domains that turn a transfer into an exfil flag
   #   guard_model: qwen3guard-gen-0.6b
   #   decision_model: d3-nano
