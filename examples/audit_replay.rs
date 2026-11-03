@@ -4,9 +4,11 @@
 //! cargo run --example audit_replay -- '/srv/logs/ollamamq-requests.jsonl*'
 //! ```
 //!
-//! Each line of that log is one conversation; each turn inside it is one
-//! `/v1/chat/completions` the proxy served, kept with its request body and its
-//! response as stored (`content.req`, `content.resp`). This walks them, rebuilds
+//! The chain is read the way the viewer reads it ([`convlog::load_conversations`]):
+//! every file, compressed slots included, folded into one record per
+//! conversation, each turn — one `/v1/chat/completions` the proxy served — with
+//! its request body rebuilt whole and its response as stored (`content.req`,
+//! `content.resp`; a streamed reply folded into one completion). This walks them, rebuilds
 //! what the audit is handed — the same `request_increment` + `reply_block` +
 //! `scan_turn` `judge` runs, over the same text, with the same rule that a user
 //! block is judged once per conversation — and prints what the rules see now.
@@ -33,12 +35,11 @@
 //! named or nothing named could be read.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use ollamamq::audit::{self, Flag};
+use ollamamq::convlog;
 use regex::Regex;
 
 fn main() {
@@ -54,9 +55,20 @@ fn main() {
         std::process::exit(2);
     }
     let mut replay = Replay { files: files.len(), ..Default::default() };
-    for file in &files {
-        if let Err(e) = replay_file(file, &mut replay) {
-            eprintln!("audit_replay: {}: {e}", file.display());
+    // A conversation's lines can sit in several rotated files, so the chain is
+    // folded as a whole before any turn is judged.
+    let (convs, unreadable) = match convlog::load_conversations(&files) {
+        Ok(read) => read,
+        Err(e) => {
+            eprintln!("audit_replay: cannot read the log: {e}");
+            std::process::exit(2);
+        }
+    };
+    replay.unreadable = unreadable;
+    for conv in &convs {
+        match serde_json::to_value(conv) {
+            Ok(record) => replay_record(&record, &mut replay),
+            Err(e) => eprintln!("audit_replay: {}: {e}", conv.key),
         }
     }
     replay.print();
@@ -133,35 +145,6 @@ fn glob_pattern(name: &str) -> Regex {
     Regex::new(&re).expect("a glob translated to a regex is always valid")
 }
 
-fn replay_file(path: &Path, out: &mut Replay) -> Result<(), String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    let mut number = 0usize;
-    loop {
-        line.clear();
-        number += 1;
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => return Err(format!("line {number}: {e}")),
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        // One record is one conversation with all of its turns in it; a record
-        // that will not parse is a torn line at the tail of a rotated file,
-        // counted and skipped rather than fatal.
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
-            eprintln!("{}: line {number} is not a record", path.display());
-            out.unreadable += 1;
-            continue;
-        };
-        replay_record(&record, out);
-    }
-    Ok(())
-}
-
 fn replay_record(record: &serde_json::Value, out: &mut Replay) {
     out.conversations += 1;
     let key = record
@@ -171,9 +154,7 @@ fn replay_record(record: &serde_json::Value, out: &mut Replay) {
         .to_string();
     // `judge` judges a user block once per conversation. Its ledger lives inside
     // `Audit` and is not exported, so the replay keeps its own for this record —
-    // which *is* the conversation. One conversation spread over two rotated files
-    // dedups per file: the same duplicate-flag cost an evicted ledger entry already
-    // accepts, for a tool that only prints.
+    // which *is* the conversation, folded across every file it was written to.
     let mut judged: HashSet<u64> = HashSet::new();
     let turns = record.get("turns").and_then(|t| t.as_array());
     for turn in turns.iter().flat_map(|list| list.iter()) {

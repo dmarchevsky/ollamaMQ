@@ -3,6 +3,39 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.28.0 — 2026-11-03
+
+### Changed
+
+- **The conversation log stores what a conversation added, not what it
+  repeated (schema v4).** A prod chain of 50 × 10 MB held 37 minutes of agent
+  traffic, and 88 % of it was superseded copies: every flush rewrote the whole
+  conversation (one 64-turn session was a 20 MB line written 35 times), every
+  turn stored its full resent history, and every streamed reply stored hundreds
+  of SSE frames. Now a flush appends only the turns that changed; a turn's
+  request keeps only the messages it added to an earlier turn's (`req_d`, and
+  `msgs_base`/`msgs_keep` for the roles), rebuilt byte-for-byte on read; a
+  successful streamed reply is stored as the one `chat.completion` it amounts
+  to (an errored one keeps its stream); and rotated files are zstd-compressed
+  (`.N.zst`). On that archive: 787 MiB → 3.5 MiB, 0.4 MiB compressed, every turn
+  verified. Every delta stays inside its own file, so rotating a file out never
+  breaks a newer one. Readers fold a key's lines oldest first; v2/v3 lines are
+  still read, so an upgrade keeps the history it finds.
+- **A conversation that resumes after a restart (or after the hot store
+  evicted it) appends to its history** instead of replacing it with a line
+  holding only the new turns: the hot store no longer re-seeds from the file's
+  tail, and every read folds the key's lines on disk with what memory holds.
+- **The retention warning compares uncompressed bytes**, the quantity
+  `request_log_max_bytes` caps, whatever the rotated files take on disk.
+
+### Added
+
+- **`convlog_tool` example**: `export` prints one line per conversation with
+  every request rebuilt whole (for `jq`, DuckDB, scripts), `compact` rewrites an
+  older chain in v4, and `check` proves on a real chain that every request,
+  reply and message list survives compaction. `audit_replay` reads the chain the
+  same way, compressed files and v4 deltas included.
+
 ## v0.27.0 — 2026-11-03
 
 ### Changed
