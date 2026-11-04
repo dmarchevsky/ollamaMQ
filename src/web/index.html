@@ -20,6 +20,7 @@
       <a href="#clients" data-page="clients"><span class="ico">⚿</span>Clients<span class="count" id="nav-clients"></span></a>
       <a href="#blocked" data-page="blocked"><span class="ico">⊘</span>Blocked<span class="count" id="nav-blocked"></span></a>
       <a href="#logs" data-page="logs"><span class="ico">≡</span>Logs<span class="count" id="nav-logs"></span></a>
+      <a href="#reviews" data-page="reviews"><span class="ico">✎</span>Reviews<span class="count" id="nav-reviews"></span></a>
       <a href="#settings" data-page="settings"><span class="ico">⚙</span>Settings<span class="count" id="nav-settings"></span></a>
     </nav>
     <div class="nav-foot">
@@ -153,6 +154,29 @@
       <div class="panel flush" id="logs"></div>
     </section>
 
+    <section class="page" id="page-reviews">
+      <div class="page-h">
+        <h1>Reviews</h1>
+        <div class="toolbar">
+          <input type="search" id="rv-filter" placeholder="Filter by conversation, client, prompt, model…" autocomplete="off">
+          <div class="seg" id="rv-show" role="radiogroup" aria-label="Reviews shown">
+            <label><input type="radio" name="rv-show" value="all" checked><span>All</span></label>
+            <label><input type="radio" name="rv-show" value="open"><span>Pending</span></label>
+            <label><input type="radio" name="rv-show" value="done"><span>Finished</span></label>
+          </div>
+          <button class="btn" data-action="rv-prompts" title="The prompts a review can start from">Prompts…</button>
+        </div>
+      </div>
+      <p class="hint">Send a conversation here with <b>✎ Review</b> in the conversation viewer. A review runs only on an idle
+        backend — one that has served no user for the quiet time set in <a href="#settings">Settings</a> — and never
+        holds a user request back.</p>
+      <div id="rv-banner"></div>
+      <div class="rv-split">
+        <div class="panel flush" id="rv-list"></div>
+        <div class="panel" id="rv-detail"></div>
+      </div>
+    </section>
+
     <section class="page" id="page-settings">
       <div class="page-h">
         <h1>Settings</h1>
@@ -268,6 +292,36 @@
   </form>
 </dialog>
 
+<dialog id="dlg-review">
+  <form method="dialog" data-form="review">
+    <h3>Send to review</h3>
+    <p data-conv></p>
+    <div class="rv-past" data-past></div>
+    <label>Prompt <select name="prompt_id" autofocus></select></label>
+    <label>Prompt text <textarea name="prompt" rows="9" spellcheck="false"></textarea></label>
+    <p class="field-hint" data-edited></p>
+    <label>Model <input name="model" list="dl-review-models" autocomplete="off" spellcheck="false" required placeholder="e.g. qwen3:32b"></label>
+    <datalist id="dl-review-models"></datalist>
+    <p class="field-hint" data-when></p>
+    <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary">Send to review</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-prompts">
+  <form method="dialog">
+    <h3>Review prompts</h3>
+    <p>The prompts a review starts from. Editing one changes future reviews only: each review keeps a copy of the text it was sent with.</p>
+    <div class="rp-list" data-list></div>
+    <div class="rp-edit" data-editor hidden>
+      <label>Name <input name="name" maxlength="80" autocomplete="off"></label>
+      <label>Text <textarea name="text" rows="12" spellcheck="false"></textarea></label>
+      <label class="check"><input type="checkbox" name="default"> The default for new reviews</label>
+      <div class="dlg-actions"><button type="button" class="btn" data-action="rp-cancel">Cancel</button><button type="button" class="btn primary" data-action="rp-save">Save prompt</button></div>
+    </div>
+    <div class="dlg-actions" data-foot><button type="button" class="btn" data-action="rp-new">+ New prompt</button><span style="flex:1"></span><button value="ok" class="btn primary">Done</button></div>
+  </form>
+</dialog>
+
 <dialog id="dlg-confirm">
   <form method="dialog">
     <h3 data-title>Are you sure?</h3>
@@ -283,6 +337,7 @@
       <label class="inc" title="incremental: each request shows only what it added; unchecked: the full prompt with re-sent messages dimmed"><input type="checkbox" id="lv-inc" data-action="lv-inc"> Incremental</label>
       <label class="inc" title="auto-refresh: check for new turns every few seconds — open blocks, folds and your scroll position are kept"><input type="checkbox" id="lv-auto" data-action="lv-auto"> Auto-refresh</label>
       <button class="btn sm" id="lv-dl" title="download the whole conversation as stored (one JSONL line)">⤓ Raw log</button>
+      <button class="btn sm" id="lv-review" title="send this conversation to an LLM review">✎ Review</button>
       <button class="btn sm danger lv-del" id="lv-del" title="delete this conversation from the log (asks to confirm)">Delete</button>
       <button class="btn sm" id="lv-jump" title="show the request tree">≣ Jump</button>
       <button class="btn sm" id="lv-reload" title="reload — pull in the newest turns">⟳</button>

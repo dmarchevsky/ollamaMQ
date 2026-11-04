@@ -45,6 +45,14 @@ pub const EDITABLE: &[(&str, bool)] = &[
     ("audit_flag_threshold", true),
     ("audit_scan_redacted", true),
     ("audit_backend", true),
+    // The review knobs, folded into `settings.review` the same way.
+    ("review_enabled", true),
+    ("review_model", true),
+    ("review_backend", true),
+    ("review_quiet_secs", true),
+    ("review_swap_idle_secs", true),
+    ("review_timeout_secs", true),
+    ("review_max_transcript_chars", true),
 ];
 
 /// Settings shown read-only: they are read once at startup.
@@ -94,6 +102,8 @@ pub fn defaults() -> Settings {
         web_ui: None,
         // The audit's own defaults live with the audit (see AuditSettings).
         audit: None,
+        // Likewise the review's (see ReviewSettings).
+        review: None,
     }
 }
 
@@ -255,6 +265,11 @@ pub fn apply(state: &AppState, eff: &Settings) {
     state
         .audit
         .apply(&eff.audit.clone().unwrap_or_default());
+    // Review settings are read by its worker on every tick; a change also wakes
+    // it, so a review held by "no model set" starts without waiting a tick.
+    state
+        .review
+        .apply(eff.review.clone().unwrap_or_default());
     *state.metrics_token.lock_or_recover() = eff.metrics_token.clone().filter(|t| !t.is_empty());
     state.set_model_aliases(eff.model_aliases.as_ref());
     // Capacity or aliases may have changed what can be dispatched.

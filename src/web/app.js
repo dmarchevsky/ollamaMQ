@@ -39,6 +39,12 @@ const S = {
   formShown: false,          // settings form drawn since entering the page
   revealToken: null,         // a generated metrics token, shown until saved
   me: null,                  // api/me: user and where the password comes from
+  reviews: [],               // api/reviews: every review, newest first (summaries)
+  reviewsEnabled: null,      // settings.review.enabled, as the list reports it
+  reviewCfg: null,           // api/review-prompts: default model, quiet time, library
+  reviewSel: null,           // the review shown in the detail pane
+  reviewFull: new Map(),     // review id -> its full record (answer, prompt text)
+  reviewLoading: null,       // the id being fetched, so a poll does not ask twice
   online: true,
 };
 
@@ -299,9 +305,10 @@ async function poll() {
     const needModels = S.page === 'models' || !S.modelPolicy;
     const needOverview = S.page === 'overview';
     const needSettings = S.page === 'settings' || S.page === 'backends';
+    const needReviews = S.page === 'reviews';
     // Capture state only changes on restart (the log path is opened at boot),
     // so ask once and keep the answer.
-    const [state, logs, clients, models, overview, settings, me, capture] = await Promise.all([
+    const [state, logs, clients, models, overview, settings, me, capture, reviews, reviewCfg] = await Promise.all([
       api('GET', 'state'),
       needLogs && !$('#log-pause').checked ? fetchLogs() : null,
       needClients ? api('GET', 'clients') : null,
@@ -310,6 +317,8 @@ async function poll() {
       needSettings ? api('GET', 'settings') : null,
       needSettings && !S.me ? api('GET', 'me') : null,
       needLogs && !S.capture ? api('GET', 'capture') : null,
+      needReviews ? api('GET', 'reviews') : null,
+      needReviews && !S.reviewCfg ? api('GET', 'review-prompts') : null,
     ]);
     S.state = state;
     if (logs) { S.logs = logs.events; S.logsMeta = logs; }
@@ -325,6 +334,8 @@ async function poll() {
     if (settings) S.settings = settings;
     if (me) S.me = me;
     if (capture) S.capture = capture;
+    if (reviews) { S.reviews = reviews.reviews; S.reviewsEnabled = reviews.enabled; }
+    if (reviewCfg) S.reviewCfg = reviewCfg;
     S.online = true;
   } catch (e) {
     S.online = false;
@@ -354,6 +365,7 @@ function render() {
     models: renderModels,
     blocked: renderBlocked,
     logs: renderLogs,
+    reviews: renderReviews,
     settings: renderSettings,
   })[S.page]?.(st);
 }
@@ -604,6 +616,7 @@ function renderNav(st) {
   $('#nav-models').textContent = hiddenModels ? `${hiddenModels} hidden` : '';
   const nb = st.blocked.users.length + st.blocked.ips.length + st.blocked.clients.length;
   $('#nav-blocked').textContent = nb || '';
+  $('#nav-reviews').textContent = st.reviews_active || '';
 }
 
 // --- Overview
@@ -2224,6 +2237,7 @@ async function openConv({ rid, session, user, key } = {}, { silent = false } = {
   $('#dlg-log [data-sub]').textContent = lvSubline(conv);
   $('#lv-inc').checked = S.lv.inc;
   $('#lv-auto').checked = S.lv.auto;
+  if (!resuming) lvReviewCount(conv.key);
   const dlg = $('#dlg-log');
   if (!dlg.open) dlg.showModal();
   await lvDraw({ scroll: true });
@@ -2286,6 +2300,7 @@ async function openSeq(seq, { silent = false } = {}) {
     turns: [{ rid: seq, at_ms: ev.at_ms, path: ev.info || 'event', tl: { end: ev.at_ms }, redacted: !!ev.redacted }],
   };
   LV.rid = seq;
+  lvReviewCount(LV.conv.key);
   LV.open = new Set([seq]);
   LV.closedRuns = new Set();
   LV.focusMsg = null;
@@ -3315,6 +3330,282 @@ function jsonTree(v, key, depth) {
   return `<details${depth < 1 ? ' open' : ''}><summary style="margin-left:${depth * 14}px">${label}${isArr ? `[${es.length}]` : `{${es.length}}`}</summary>${inner}</details>`;
 }
 
+// --- Reviews
+//
+// The list polls with the page (summaries only); the selected review's full
+// record — its answer and the prompt it was sent with — is fetched when it is
+// picked and again when its status moves. Nothing here is a live input, so a
+// poll may redraw both halves freely.
+
+const RV_STATUS = {
+  queued: ['q', 'queued'], running: ['accent', 'running'], done: ['ok', 'done'],
+  failed: ['bad', 'failed'], cancelled: ['', 'cancelled'],
+};
+
+function rvBadge(status) {
+  const [cls, text] = RV_STATUS[status] || ['', status];
+  return `<span class="badge ${cls}">${esc(text)}</span>`;
+}
+
+/** A conversation as a review names it: its label when it has one, else its tag. */
+function rvConvName(r) {
+  const tag = String(r.conv_key).split(/[#·]/)[1] || r.conv_key;
+  return r.label ? `${r.label}` : `#${tag}`;
+}
+
+function rvVisible() {
+  const q = ($('#rv-filter').value || '').trim().toLowerCase();
+  const show = $('#rv-show input:checked')?.value || 'all';
+  return S.reviews.filter(r => {
+    const open = r.status === 'queued' || r.status === 'running';
+    if (show === 'open' && !open) return false;
+    if (show === 'done' && open) return false;
+    if (!q) return true;
+    return [r.conv_key, r.label, r.user, r.prompt_name, r.model, r.backend, r.status]
+      .some(v => String(v ?? '').toLowerCase().includes(q));
+  });
+}
+
+/** One line under a row: what it is waiting for, how long it ran, or when. */
+function rvMeta(r) {
+  if (r.status === 'queued') return esc(r.wait_reason || 'waiting for an idle backend');
+  if (r.status === 'running') return `on ${esc(r.backend || '?')} · ${fmtDur((Date.now() - r.started_ms) / 1000)}`;
+  const took = r.started_ms && r.finished_ms ? ` · took ${fmtDur((r.finished_ms - r.started_ms) / 1000)}` : '';
+  return `${fmtAgo(r.finished_ms || r.created_ms)}${took}`;
+}
+
+function renderReviews() {
+  const cfg = S.reviewCfg;
+  let banner = '';
+  if (S.reviewsEnabled === false) {
+    banner = `<div class="note warn-note">Reviews are switched off in <a href="#settings">Settings</a>: queued reviews wait until they are on again.</div>`;
+  } else if (cfg && !cfg.model) {
+    banner = `<div class="note warn-note">No default review model is set. Set one in <a href="#settings">Settings → Conversation review</a>, or name a model when you send a review.</div>`;
+  }
+  setHTML($('#rv-banner'), banner);
+  const rows = rvVisible();
+  if (!rows.some(r => r.id === S.reviewSel) && !isPhone()) S.reviewSel = rows[0]?.id ?? null;
+  setHTML($('#rv-list'), rows.length
+    ? `<div class="rv-rows">${rows.map(r => `
+      <button type="button" class="rv-row${r.id === S.reviewSel ? ' sel' : ''}" data-action="rv-pick" data-id="${esc(r.id)}">
+        <span class="rv-top">${rvBadge(r.status)}<b>${esc(rvConvName(r))}</b><span class="dim">${esc(r.user)}</span></span>
+        <span class="rv-sub">${esc(r.prompt_name)} · <span class="mono">${esc(r.model)}</span></span>
+        <span class="rv-sub dim">${rvMeta(r)}</span>
+      </button>`).join('')}</div>`
+    : `<div class="empty">${S.reviews.length ? 'No review matches the filter.' : 'No reviews yet. Open a conversation from the Logs page and press <b>✎ Review</b>.'}</div>`);
+  renderReviewDetail(rows.find(r => r.id === S.reviewSel));
+}
+
+/** The selected review in full; fetched on pick and whenever its row moved. */
+function renderReviewDetail(row) {
+  const el = $('#rv-detail');
+  el.classList.toggle('rv-none', !row);
+  if (!row) { setHTML(el, `<div class="empty">Pick a review to read it.</div>`); return; }
+  const full = S.reviewFull.get(row.id);
+  const stale = !full || full.status !== row.status || full.finished_ms !== row.finished_ms;
+  if (stale && S.reviewLoading !== row.id) {
+    S.reviewLoading = row.id;
+    api('GET', `reviews/${encodeURIComponent(row.id)}`)
+      .then(j => { S.reviewFull.set(j.id, j); })
+      .catch(e => toast(e.message, false))
+      .finally(() => { S.reviewLoading = null; if (S.page === 'reviews') renderReviews(); });
+  }
+  const r = full && !stale ? { ...full, wait_reason: row.wait_reason } : { ...row };
+  const facts = [
+    `turns ${r.turns} <span class="dim">(requests ${r.rid_from}–${r.rid_to})</span>`,
+    `${esc(r.prompt_name)}${r.custom ? ' <span class="badge">edited</span>' : ''}`,
+    `<span class="mono">${esc(r.model)}</span>${r.backend ? ` on ${bkCell(r.backend)}` : ''}`,
+  ];
+  if (r.input_chars != null) facts.push(`${fmtNum(r.input_chars)} characters in${r.truncated ? ' <span class="badge warn" title="long messages or middle turns were cut to fit the budget">shortened</span>' : ''}`);
+  if (r.prompt_tokens != null) facts.push(`${fmtTok(r.prompt_tokens)} → ${fmtTok(r.completion_tokens ?? 0)} tokens`);
+  if (r.started_ms && r.finished_ms) facts.push(`took ${fmtDur((r.finished_ms - r.started_ms) / 1000)}`);
+  facts.push(`sent ${fmtAgo(r.created_ms)}`);
+  const open = r.status === 'queued' || r.status === 'running';
+  const tools = [
+    `<button class="btn sm" data-action="rv-open" data-key="${esc(r.conv_key)}">Open conversation</button>`,
+    open ? `<button class="btn sm" data-action="rv-cancel" data-id="${esc(r.id)}">Cancel</button>` : '',
+    r.status === 'done' ? `<button class="btn sm" data-action="rv-retry" data-id="${esc(r.id)}" title="review the conversation again, as it is now, with the same prompt and model">Re-run</button>` : '',
+    r.status === 'failed' || r.status === 'cancelled' ? `<button class="btn sm" data-action="rv-retry" data-id="${esc(r.id)}">Retry</button>` : '',
+    `<button class="btn sm danger" data-action="rv-delete" data-id="${esc(r.id)}">Delete</button>`,
+  ].join('');
+  let body;
+  if (r.status === 'done') body = full && !stale ? `<div class="md">${mdLite(r.result || '')}</div>` : `<div class="empty">Loading…</div>`;
+  else if (r.status === 'failed') body = `<div class="note bad-note">${esc(r.error || 'failed')}</div>`;
+  else if (r.status === 'cancelled') body = `<p class="dim">Cancelled before it finished. Retry queues it again.</p>`;
+  else if (r.status === 'running') body = `<p class="rv-wait"><span class="spin"></span>Running on ${bkCell(r.backend || '')} for ${fmtDur((Date.now() - r.started_ms) / 1000)}. A user request that arrives meanwhile is served at once, beside it.</p>`;
+  else body = `<p class="rv-wait">${esc(r.wait_reason || 'Waiting for an idle backend.')}</p>`;
+  const prompt = full && !stale ? `<details class="rv-prompt"><summary>Prompt used</summary><pre>${esc(full.prompt_text)}</pre></details>` : '';
+  setHTML(el, `
+    <div class="rv-head">
+      <div><h2>${rvBadge(r.status)} ${esc(rvConvName(r))} <span class="dim">· ${esc(r.user)}</span></h2>
+        <div class="rv-facts">${facts.map(f => `<span>${f}</span>`).join('')}</div></div>
+      <div class="btn-group rv-tools">${tools}</div>
+    </div>
+    ${body}${prompt}`);
+}
+
+/** A safe little Markdown: the text is escaped first, then headings, lists,
+ *  quotes, fenced code, `code`, **bold** and *emphasis* are drawn. Enough for
+ *  what a review model writes; anything else stays as the text it was. */
+function mdLite(src) {
+  const inline = s => s
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/(^|[\s(])\*([^*\s][^*]*)\*(?=[\s).,;:!?]|$)/g, '$1<i>$2</i>');
+  const out = [];
+  let list = null, para = [], code = null;
+  const flushPara = () => { if (para.length) { out.push(`<p>${para.map(inline).join('<br>')}</p>`); para = []; } };
+  const flushList = () => { if (list) { out.push(`<${list.tag}>${list.items.map(i => `<li>${inline(i)}</li>`).join('')}</${list.tag}>`); list = null; } };
+  for (const raw of esc(src).split('\n')) {
+    if (code) {
+      if (/^\s*```/.test(raw)) { out.push(`<pre><code>${code.join('\n')}</code></pre>`); code = null; } else code.push(raw);
+      continue;
+    }
+    if (/^\s*```/.test(raw)) { flushPara(); flushList(); code = []; continue; }
+    const h = raw.match(/^(#{1,6})\s+(.*)$/);
+    const li = raw.match(/^\s*(?:([-*+])|(\d+)[.)])\s+(.*)$/);
+    const q = raw.match(/^&gt;\s?(.*)$/);
+    if (h) { flushPara(); flushList(); const n = Math.min(4, h[1].length + 2); out.push(`<h${n}>${inline(h[2])}</h${n}>`); }
+    else if (li) {
+      flushPara();
+      const tag = li[2] ? 'ol' : 'ul';
+      if (list && list.tag !== tag) flushList();
+      if (!list) list = { tag, items: [] };
+      list.items.push(li[3]);
+    } else if (q) { flushPara(); flushList(); out.push(`<blockquote>${inline(q[1])}</blockquote>`); }
+    else if (!raw.trim()) { flushPara(); flushList(); }
+    else if (list && /^\s{2,}\S/.test(raw)) list.items[list.items.length - 1] += ' ' + raw.trim();
+    else { flushList(); para.push(raw); }
+  }
+  if (code) out.push(`<pre><code>${code.join('\n')}</code></pre>`);
+  flushPara(); flushList();
+  return out.join('');
+}
+
+/** Every model the backends list, for the model field's suggestions. */
+function knownModels() {
+  const all = new Set();
+  for (const b of S.state?.backends || []) for (const m of b.models_available || []) all.add(m);
+  return [...all].sort((a, b) => a.localeCompare(b));
+}
+
+/** The viewer's Review button says how many reviews its conversation has. */
+async function lvReviewCount(key) {
+  const btn = $('#lv-review');
+  btn.textContent = '✎ Review';
+  if (!key || String(key).startsWith('ctl:')) { btn.disabled = true; return; }
+  btn.disabled = false;
+  try {
+    const r = await api('GET', `reviews?conv=${encodeURIComponent(key)}`);
+    if (LV.conv?.key === key && r.reviews.length) btn.textContent = `✎ Review (${r.reviews.length})`;
+  } catch { /* the button works without its count */ }
+}
+
+let rvDlgPrompts = [];
+async function reviewDialog(conv) {
+  const dlg = $('#dlg-review');
+  const form = $('form', dlg);
+  let lib, past;
+  try {
+    [lib, past] = await Promise.all([api('GET', 'review-prompts'), api('GET', `reviews?conv=${encodeURIComponent(conv.key)}`)]);
+  } catch (e) { return toast(e.message, false); }
+  form.reset();
+  rvDlgPrompts = lib.prompts;
+  $('[data-conv]', dlg).innerHTML = `<b>${esc(conv.session_label || '#' + (conv.session || conv.key))}</b> · ${esc(conv.user)} · ${conv.turns.length} ${conv.turns.length === 1 ? 'request' : 'requests'} — all of them, as the conversation stands now.`;
+  $('[data-past]', dlg).innerHTML = past.reviews.length
+    ? `<div class="rv-past-h">Reviewed before</div>${past.reviews.slice(0, 4).map(r => `<a href="#reviews" data-action="rv-goto" data-id="${esc(r.id)}">${rvBadge(r.status)} ${esc(r.prompt_name)} · <span class="mono">${esc(r.model)}</span> · ${fmtAgo(r.created_ms)}</a>`).join('')}`
+    : '';
+  form.prompt_id.innerHTML = lib.prompts.map(p => `<option value="${esc(p.id)}" ${p.id === lib.default ? 'selected' : ''}>${esc(p.name)}${p.id === lib.default ? ' (default)' : ''}</option>`).join('');
+  form.prompt.value = (lib.prompts.find(p => p.id === lib.default) || lib.prompts[0])?.text || '';
+  $('[data-edited]', dlg).textContent = '';
+  form.model.value = lib.model || '';
+  $('#dl-review-models').innerHTML = knownModels().map(m => `<option value="${esc(m)}">`).join('');
+  const mins = Math.round((lib.quiet_secs ?? 300) / 60);
+  $('[data-when]', dlg).textContent = `It runs once a backend that has the model has served no user for ${mins} min${lib.enabled === false ? ' — reviews are switched off in Settings right now' : ''}.`;
+  const fd = await ask(dlg);
+  if (!fd) return;
+  const chosen = rvDlgPrompts.find(p => p.id === fd.get('prompt_id'));
+  const text = fd.get('prompt');
+  const body = { key: conv.key, prompt_id: fd.get('prompt_id') };
+  if (chosen && text.trim() !== chosen.text.trim()) body.prompt = text;
+  if (fd.get('model').trim() && fd.get('model').trim() !== lib.model) body.model = fd.get('model').trim();
+  const r = await act('POST', 'reviews', body, 'Sent to review — follow it on the Reviews page');
+  if (r) { S.reviewSel = r.id; lvReviewCount(conv.key); }
+}
+
+$('#dlg-review select[name="prompt_id"]').addEventListener('change', e => {
+  const p = rvDlgPrompts.find(x => x.id === e.target.value);
+  if (p) e.target.form.prompt.value = p.text;
+  $('#dlg-review [data-edited]').textContent = '';
+});
+$('#dlg-review textarea[name="prompt"]').addEventListener('input', e => {
+  const p = rvDlgPrompts.find(x => x.id === e.target.form.prompt_id.value);
+  $('#dlg-review [data-edited]').textContent = p && e.target.value.trim() !== p.text.trim()
+    ? 'Edited — sent with this review only; the library prompt stays as it is.' : '';
+});
+
+// The prompt library dialog: a list, and one editor that opens under it.
+const RP = { lib: null, editing: undefined };
+async function promptsDialog() {
+  try { RP.lib = await api('GET', 'review-prompts'); } catch (e) { return toast(e.message, false); }
+  RP.editing = undefined;
+  rpDraw();
+  await ask($('#dlg-prompts'));
+  S.reviewCfg = null; // re-read the default with the next poll
+}
+
+function rpDraw() {
+  const dlg = $('#dlg-prompts');
+  const lib = RP.lib;
+  $('[data-list]', dlg).innerHTML = lib.prompts.map(p => `
+    <div class="rp-row">
+      <div class="rp-main"><b>${esc(p.name)}</b>${p.id === lib.default ? ' <span class="badge ok">default</span>' : ''}
+        <div class="rp-preview">${esc(p.text.slice(0, 160))}${p.text.length > 160 ? '…' : ''}</div></div>
+      <span class="btn-group">
+        <button type="button" class="btn sm" data-action="rp-edit" data-id="${esc(p.id)}">Edit</button>
+        <button type="button" class="btn sm danger" data-action="rp-delete" data-id="${esc(p.id)}" ${lib.prompts.length < 2 ? 'disabled title="the last prompt stays"' : ''}>Delete</button>
+      </span>
+    </div>`).join('');
+  const ed = $('[data-editor]', dlg);
+  ed.hidden = RP.editing === undefined;
+  $('[data-foot]', dlg).hidden = !ed.hidden;
+  $('[data-list]', dlg).hidden = !ed.hidden;
+}
+
+function rpEdit(id) {
+  const form = $('#dlg-prompts form');
+  const p = id ? RP.lib.prompts.find(x => x.id === id) : null;
+  RP.editing = p ? p.id : null;
+  form.name.value = p ? p.name : '';
+  form.text.value = p ? p.text : '';
+  form.default.checked = p ? p.id === RP.lib.default : false;
+  rpDraw();
+  form.name.focus();
+}
+
+async function rpSave() {
+  const form = $('#dlg-prompts form');
+  const body = { name: form.name.value, text: form.text.value, default: form.default.checked };
+  if (RP.editing) body.id = RP.editing;
+  try {
+    RP.lib = await api('PUT', 'review-prompts', body);
+    toast(`Prompt ${body.name.trim()} saved`);
+    RP.editing = undefined;
+    rpDraw();
+  } catch (e) { toast(e.message, false); }
+}
+
+async function rpDelete(id) {
+  const p = RP.lib.prompts.find(x => x.id === id);
+  if (!p || !await confirmDlg('Delete prompt?', `<b>${esc(p.name)}</b> leaves the library. Reviews already sent with it keep their copy of the text.`, 'Delete')) return;
+  try { RP.lib = await api('DELETE', `review-prompts/${encodeURIComponent(id)}`); rpDraw(); }
+  catch (e) { toast(e.message, false); }
+}
+
+$('#rv-filter').addEventListener('input', () => renderReviews());
+$$('#rv-show input').forEach(r => r.addEventListener('change', () => renderReviews()));
+$('#lv-review').addEventListener('click', () => { if (LV.conv) reviewDialog(LV.conv); });
+
 // --- Settings
 //
 // The form is drawn only on demand (entering the page, save, undo, adding a
@@ -3343,6 +3634,13 @@ const FIELD_META = {
   audit_mode: { label: 'Audit mode', kind: 'seg', options: [['off', 'Off'], ['scanner', 'Scanner'], ['full', 'Full']], help: 'Scanner = local rules only. Full adds d3-nano + Qwen3Guard verdicts on the audit backend. The audit marks suspicious activity after the request is served — it never blocks, holds or changes a reply.' },
   audit_flag_threshold: { label: 'Flag threshold', kind: 'float', unit: '(0–1)', help: 'Probability at or above which a model verdict is confirmed (red badge) instead of watch (amber). Rule hits do not read it: a metadata probe or an injection phrase confirms on its own, every other rule is a watch unless a second hit in the same turn makes it a story — and the transfer in that story has to come from the model itself, not from an address someone named.' },
   audit_scan_redacted: { label: 'Scan redacted requests', kind: 'bool', help: 'X-Redact-Log traffic is judged in memory; verdicts and probabilities are stored, its text never is.' },
+  review_enabled: { label: 'Run reviews', kind: 'bool', help: 'Off holds every queued review where it is; nothing is lost.' },
+  review_model: { label: 'Default review model', kind: 'text', placeholder: 'e.g. qwen3:32b', list: 'dl-set-models', help: 'The model a review runs on unless it names its own. Any backend that lists it may run the review.' },
+  review_backend: { label: 'Review backend', kind: 'text', placeholder: 'any backend', help: 'Run reviews only here (URL or name). Empty: any backend that has the model.' },
+  review_quiet_secs: { label: 'Quiet time before a review', unit: 'min', scale: 60, min: 0, help: 'A review starts only on a backend that has served no user request for this long, so it never slips into the pause between an agent’s turns. A user request that arrives while a review runs is served at once, beside it.' },
+  review_swap_idle_secs: { label: 'Quiet time before loading its model', unit: 'min', scale: 60, min: 0, help: 'Below this a review runs only where its model is already loaded or nothing is: loading it would evict a model someone was using.' },
+  review_timeout_secs: { label: 'Review timeout', unit: 'min', scale: 60, min: 1, help: 'How long one review may take on the backend.' },
+  review_max_transcript_chars: { label: 'Transcript budget', unit: 'k chars', scale: 1000, min: 1, help: 'The conversation is cut to this from the middle (the start and the end are what a review needs most); each message is also cut to a few thousand characters.' },
   audit_backend: { label: 'Audit backend', kind: 'text', help: 'The server running <code>qwen3guard-gen</code> and <code>d3-nano</code>. Empty: the first enabled backend. While it is unreachable the scanner keeps working alone.' },
 };
 const SET_GROUPS = [
@@ -3350,6 +3648,7 @@ const SET_GROUPS = [
   ['Routing', ['model_aliases', 'ip_identity', 'sticky_routing', 'sticky_ttl', 'sticky_lag', 'sticky_max_entries', 'allow_all_routes']],
   ['Security', ['@password', 'metrics_token']],
   ['Security audit', ['audit_mode', 'audit_flag_threshold', 'audit_scan_redacted', 'audit_backend', '@auditstate']],
+  ['Conversation review', ['review_enabled', 'review_model', 'review_backend', 'review_quiet_secs', 'review_swap_idle_secs', 'review_timeout_secs', 'review_max_transcript_chars']],
   ['Logging & server', ['log_content_limit', '@startup']],
 ];
 const STARTUP_LABEL = {
@@ -3398,7 +3697,7 @@ function setControl(f) {
     return `<span class="num-in"><input type="number" id="set-${f.key}" data-key="${f.key}" value="${esc(v ?? '')}" min="0" max="1" step="0.05" ${dis}><span class="dim">${m.unit}</span></span>`;
   }
   if (m.kind === 'text') {
-    return `<input type="text" id="set-${f.key}" data-key="${f.key}" value="${esc(v ?? '')}" placeholder="auto-detect" ${dis} style="min-width:260px">`;
+    return `<input type="text" id="set-${f.key}" data-key="${f.key}" value="${esc(v ?? '')}" placeholder="${esc(m.placeholder ?? 'auto-detect')}" ${m.list ? `list="${m.list}"` : ''} autocomplete="off" spellcheck="false" ${dis} style="min-width:260px">`;
   }
   if (m.kind === 'secret') {
     const shown = S.revealToken && S.draft.get(f.key) === S.revealToken;
@@ -3756,6 +4055,34 @@ async function loadDialog(idx) {
 // ------------------------------------------------------------------ actions
 
 const actions = {
+  'rv-pick': el => {
+    S.reviewSel = el.dataset.id;
+    renderReviews();
+    if (isPhone()) $('#rv-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  },
+  'rv-open': el => openConv({ key: el.dataset.key }),
+  'rv-goto': el => {
+    S.reviewSel = el.dataset.id;
+    $('#dlg-review').close('cancel');
+    $('#dlg-log').close();
+    location.hash = '#reviews';
+  },
+  'rv-retry': el => act('POST', `reviews/${encodeURIComponent(el.dataset.id)}/retry`, undefined, r => {
+    S.reviewSel = r.id;
+    return r.id === el.dataset.id ? 'Queued again' : 'Sent again — the earlier answer stays';
+  }),
+  'rv-cancel': el => act('POST', `reviews/${encodeURIComponent(el.dataset.id)}/cancel`, undefined, 'Review cancelled'),
+  'rv-delete': async el => {
+    if (!await confirmDlg('Delete review?', 'The review and its answer are removed. The conversation itself stays in the log.', 'Delete')) return;
+    S.reviewFull.delete(el.dataset.id);
+    await act('DELETE', `reviews/${encodeURIComponent(el.dataset.id)}`, undefined, 'Review deleted');
+  },
+  'rv-prompts': () => promptsDialog(),
+  'rp-new': () => rpEdit(null),
+  'rp-edit': el => rpEdit(el.dataset.id),
+  'rp-cancel': () => { RP.editing = undefined; rpDraw(); },
+  'rp-save': () => rpSave(),
+  'rp-delete': el => rpDelete(el.dataset.id),
   'session-pri': async el => {
     const next = { normal: 'high', high: 'top', top: 'normal' }[el.dataset.pri] || 'high';
     // act() re-polls, so the new badge shows up on its own.
@@ -4123,6 +4450,8 @@ function route() {
   if (was !== S.page) S.hoverKey = null;
   // Coming back to Settings draws the form again (from the draft, if any).
   if (S.page === 'settings' && was !== 'settings') S.formShown = false;
+  // The default model and quiet time may have changed in Settings meanwhile.
+  if (S.page === 'reviews' && was !== 'reviews') S.reviewCfg = null;
   $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${S.page}`));
   $$('.nav nav a').forEach(a => a.classList.toggle('active', a.dataset.page === S.page));
   // The Filters scope covers the Overview panels and the Logs list, so the

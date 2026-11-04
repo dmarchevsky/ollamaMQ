@@ -1853,6 +1853,8 @@ mod tests {
             name: None,
             disabled: false,
             redact_log: false,
+            last_user_ms: 0,
+            review_running: false,
         }
     }
 

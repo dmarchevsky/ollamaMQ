@@ -248,6 +248,129 @@ pub struct Settings {
     /// what it saw and never touches the reply the client gets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit: Option<AuditSettings>,
+    /// LLM review of conversations the operator sends from the web UI (see
+    /// [`crate::review`]). Runs only on idle backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewSettings>,
+}
+
+/// `settings.review`: when and with what a conversation sent to review is
+/// judged. Reviews never compete with users: one starts only on a backend that
+/// has served no user request for `quiet_secs`, and a running review never
+/// holds a user request back.
+///
+/// ```yaml
+/// settings:
+///   review:
+///     model: qwen3:32b          # empty: Review stays off until one is set
+///     backend: ""               # empty: any backend that has the model
+///     quiet_secs: 300           # idle this long before a review starts
+///     swap_idle_secs: 600       # idle this long before a review may load its model
+///     timeout_secs: 1800
+///     max_transcript_chars: 200000
+///     max_message_chars: 4000
+///     concurrency: 1
+/// ```
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReviewSettings {
+    /// False holds every queued review where it is.
+    #[serde(default = "audit_yes", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// Default model a review runs on; each review may name its own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// Only this backend (URL or name) runs reviews. Empty: any of them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub backend: String,
+    /// Seconds a backend must have been free of user requests before a review
+    /// starts there.
+    #[serde(default = "review_default_quiet", skip_serializing_if = "is_default_review_quiet")]
+    pub quiet_secs: u64,
+    /// Seconds of quiet after which a review may evict the loaded model to load
+    /// its own. Below it a review runs only where its model is already loaded
+    /// or nothing is.
+    #[serde(default = "review_default_swap", skip_serializing_if = "is_default_review_swap")]
+    pub swap_idle_secs: u64,
+    /// How long one review may take on the backend.
+    #[serde(default = "review_default_timeout", skip_serializing_if = "is_default_review_timeout")]
+    pub timeout_secs: u64,
+    /// The transcript handed to the model is cut to this, from the middle.
+    #[serde(default = "review_default_transcript", skip_serializing_if = "is_default_review_transcript")]
+    pub max_transcript_chars: usize,
+    /// Each message or tool result is cut to this, keeping its head and tail.
+    #[serde(default = "review_default_message", skip_serializing_if = "is_default_review_message")]
+    pub max_message_chars: usize,
+    /// Reviews running at once across all backends (at most one per backend).
+    #[serde(default = "review_default_concurrency", skip_serializing_if = "is_default_review_concurrency")]
+    pub concurrency: u32,
+}
+
+impl Default for ReviewSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: String::new(),
+            backend: String::new(),
+            quiet_secs: review_default_quiet(),
+            swap_idle_secs: review_default_swap(),
+            timeout_secs: review_default_timeout(),
+            max_transcript_chars: review_default_transcript(),
+            max_message_chars: review_default_message(),
+            concurrency: review_default_concurrency(),
+        }
+    }
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+fn review_default_quiet() -> u64 {
+    300
+}
+
+fn review_default_swap() -> u64 {
+    600
+}
+
+fn review_default_timeout() -> u64 {
+    1800
+}
+
+fn review_default_transcript() -> usize {
+    200_000
+}
+
+fn review_default_message() -> usize {
+    4000
+}
+
+fn review_default_concurrency() -> u32 {
+    1
+}
+
+fn is_default_review_quiet(v: &u64) -> bool {
+    *v == review_default_quiet()
+}
+
+fn is_default_review_swap(v: &u64) -> bool {
+    *v == review_default_swap()
+}
+
+fn is_default_review_timeout(v: &u64) -> bool {
+    *v == review_default_timeout()
+}
+
+fn is_default_review_transcript(v: &usize) -> bool {
+    *v == review_default_transcript()
+}
+
+fn is_default_review_message(v: &usize) -> bool {
+    *v == review_default_message()
+}
+
+fn is_default_review_concurrency(v: &u32) -> bool {
+    *v == review_default_concurrency()
 }
 
 /// `settings.audit`: how hard the proxy looks at the traffic it already sees.
@@ -630,7 +753,7 @@ impl Settings {
             request_log_flush_secs, log_content_limit,
             history_hours, history_max_records,
             max_body_bytes, max_queued_bytes, clients_file, models_file,
-            metrics_token, web_ui, audit
+            metrics_token, web_ui, audit, review
         )
     }
 
@@ -681,6 +804,20 @@ impl Settings {
                 if host.trim().is_empty() {
                     return Err("audit.extra_watch_hosts holds host names, not blanks".into());
                 }
+            }
+        }
+        if let Some(review) = &self.review {
+            if review.timeout_secs < 10 {
+                return Err("review.timeout_secs must be at least 10".into());
+            }
+            if review.concurrency < 1 || review.concurrency > 8 {
+                return Err("review.concurrency is between 1 and 8".into());
+            }
+            if review.max_transcript_chars < 1000 {
+                return Err("review.max_transcript_chars must be at least 1000".into());
+            }
+            if review.max_message_chars < 200 {
+                return Err("review.max_message_chars must be at least 200".into());
             }
         }
         if self.load_keep_alive.is_some_and(|v| v < -1) {

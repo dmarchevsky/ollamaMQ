@@ -30,6 +30,7 @@ use crate::control::{self, ControlAction, LoadOptions};
 use crate::dispatcher::AppState;
 
 mod overview;
+mod reviews;
 mod settings;
 use crate::lock::LockExt;
 use crate::model_policy::{Action, Mode, Rule};
@@ -218,6 +219,11 @@ pub fn router_with_state(auth: Arc<AuthState>) -> Router<Arc<AppState>> {
         .route("/conv", get(get_conv).delete(delete_conv))
         .route("/conv/content", get(get_conv_content))
         .route("/conv/export", get(export_conv))
+        .route("/reviews", get(reviews::list).post(reviews::submit))
+        .route("/reviews/{id}", get(reviews::get).delete(reviews::delete))
+        .route("/reviews/{id}/{op}", post(reviews::action))
+        .route("/review-prompts", get(reviews::prompts).put(reviews::put_prompt))
+        .route("/review-prompts/{id}", axum::routing::delete(reviews::delete_prompt))
         .route("/users/{id}/{op}", post(user_action))
         .route("/sessions/{tag}/priority", post(session_priority))
         .route("/blocked/unblock", post(unblock))
@@ -441,6 +447,8 @@ struct StateView {
     blocked: BlockedView,
     /// Requests being served right now, oldest first.
     runs: Vec<RunView>,
+    /// Conversation reviews queued or running (the Reviews nav count).
+    reviews_active: usize,
 }
 
 #[derive(Serialize)]
@@ -503,6 +511,8 @@ struct BackendView {
     max: u32,
     /// `max` is the slot count the backend reports (else the configured cap).
     max_detected: bool,
+    /// A conversation review is running here (not counted in `active`).
+    reviewing: bool,
     processed: usize,
     current_model: Option<String>,
     models_available: Vec<String>,
@@ -579,6 +589,7 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
             active: b.active_requests,
             max: state.backend_capacity(b).0,
             max_detected: state.backend_capacity(b).1,
+            reviewing: b.review_running,
             processed: b.processed_count,
             current_model: b.current_model.clone(),
             models_available: sorted(&b.available_models),
@@ -639,6 +650,7 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateView> {
     ips.sort();
 
     Json(StateView {
+        reviews_active: state.review.active(),
         version: env!("CARGO_PKG_VERSION"),
         stats: Stats {
             queued: snap.users.iter().map(|u| u.queued).sum(),
@@ -2536,6 +2548,218 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND, "deleting twice is a 404");
+    }
+
+    #[tokio::test]
+    async fn reviews_are_sent_followed_cancelled_and_deleted() {
+        let state = test_state_with(test_convlog());
+        record_two_turns(&state);
+        let base = serve(state.clone()).await;
+        let c = http();
+        let api = |p: &str| format!("{base}/ui/api/{p}");
+        let send = |req: reqwest::RequestBuilder| req.basic_auth("admin", Some("pw")).header("X-OllamaMQ-UI", "1");
+
+        // No model anywhere: refused with the reason, nothing queued.
+        let res = send(c.post(api("reviews")).json(&json!({ "key": "alice#a3f19c" }))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        state.review.apply(crate::config::ReviewSettings { model: "qwen3:32b".into(), ..Default::default() });
+
+        let res = send(c.post(api("reviews")).json(&json!({ "key": "nobody#000000" }))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // The default prompt and model; the whole conversation as it is now.
+        let res = send(c.post(api("reviews")).json(&json!({ "key": "alice#a3f19c" }))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let job: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(job["status"], "queued");
+        assert_eq!(job["model"], "qwen3:32b");
+        assert_eq!(job["prompt_id"], "default");
+        assert_eq!((job["rid_from"].as_u64(), job["rid_to"].as_u64()), (Some(7), Some(8)));
+        let id = job["id"].as_str().unwrap().to_string();
+
+        // An override is kept verbatim and named as edited; a model override wins.
+        let res = send(c.post(api("reviews")).json(&json!({
+            "key": "alice#a3f19c", "prompt": "Only count the tool calls.", "model": "llama3:8b"
+        })))
+        .send()
+        .await
+        .unwrap();
+        let custom: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(custom["custom"], true);
+        assert_eq!(custom["model"], "llama3:8b");
+        let full: serde_json::Value = c
+            .get(api(&format!("reviews/{}", custom["id"].as_str().unwrap())))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(full["prompt_text"], "Only count the tool calls.");
+
+        let list: serde_json::Value = c
+            .get(api("reviews?conv=alice%23a3f19c"))
+            .basic_auth("admin", Some("pw"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let rows = list["reviews"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].get("prompt_text").is_none(), "the list leaves the long texts out");
+
+        let res = send(c.post(api(&format!("reviews/{id}/retry")))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "a queued review cannot be re-run");
+        let res = send(c.post(api(&format!("reviews/{id}/cancel")))).send().await.unwrap();
+        let cancelled: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        let res = send(c.post(api(&format!("reviews/{id}/retry")))).send().await.unwrap();
+        let again: serde_json::Value = res.json().await.unwrap();
+        assert_eq!((again["status"].as_str(), again["id"].as_str()), (Some("queued"), Some(id.as_str())));
+
+        let res = c.delete(api(&format!("reviews/{id}"))).basic_auth("admin", Some("pw")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "a delete needs the UI header");
+        let res = send(c.delete(api(&format!("reviews/{id}")))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = c.get(api(&format!("reviews/{id}"))).basic_auth("admin", Some("pw")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The worker end to end against a mock backend: it waits out the quiet
+    /// window, runs without taking a user slot, keeps the answer, and waits
+    /// again after a user shows up.
+    #[tokio::test]
+    async fn a_review_runs_only_on_a_quiet_backend_and_never_takes_a_user_slot() {
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let mock = {
+            let seen = seen.clone();
+            Router::new().route(
+                "/api/chat",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(body);
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        Json(json!({
+                            "message": { "role": "assistant", "content": "## Verdict\nsuccess" },
+                            "prompt_eval_count": 120, "eval_count": 4, "done": true
+                        }))
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+        let state = Arc::new(AppState::new(
+            vec![(mock_url, None)],
+            5,
+            86400,
+            1,
+            1,
+            std::env::temp_dir().join("omq-review-worker.yaml").to_string_lossy().into_owned(),
+            Vec::new(),
+            test_convlog(),
+            65_536,
+            512 * 1024 * 1024,
+        ));
+        record_two_turns(&state);
+        {
+            let mut b = state.backends.lock_or_recover();
+            b[0].available_models = Arc::new(["qwen3:32b".to_string()].into_iter().collect());
+            b[0].last_user_ms = crate::clients::now_ms(); // a user was just here
+        }
+        let cfg = crate::config::ReviewSettings { model: "qwen3:32b".into(), quiet_secs: 1, ..Default::default() };
+        state.review.apply(cfg.clone());
+        crate::review::start(&state);
+        let req = |key| crate::review::Request { key, prompt_id: None, prompt: None, model: None };
+        let job = state.review.submit(&state, req("alice#a3f19c")).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let j = state.review.get(&job.id).unwrap();
+        assert_eq!(j.status, crate::review::Status::Queued);
+        assert!(j.wait_reason.as_deref().unwrap_or("").contains("quiet"), "{:?}", j.wait_reason);
+
+        // Quiet now: a nudge starts it.
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        state.review.apply(cfg.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(state.review.get(&job.id).unwrap().status, crate::review::Status::Running);
+        {
+            let b = state.backends.lock_or_recover();
+            assert!(b[0].review_running);
+            assert_eq!(b[0].active_requests, 0, "a review never takes a user's slot");
+        }
+
+        let mut done = None;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let j = state.review.get(&job.id).unwrap();
+            if j.status == crate::review::Status::Done {
+                done = Some(j);
+                break;
+            }
+        }
+        let done = done.expect("the review finishes");
+        assert_eq!(done.result.as_deref(), Some("## Verdict\nsuccess"));
+        assert_eq!((done.prompt_tokens, done.completion_tokens), (Some(120), Some(4)));
+        assert!(!state.backends.lock_or_recover()[0].review_running);
+        let body = seen.lock().unwrap()[0].clone();
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["messages"][0]["role"], "system");
+        let user = body["messages"][1]["content"].as_str().unwrap();
+        assert!(user.contains("=== Turn 1") && user.contains("hello back"), "{user}");
+
+        // A user request touches the backend: the next review waits again.
+        state.backends.lock_or_recover()[0].last_user_ms = crate::clients::now_ms();
+        let next = state.review.submit(&state, req("alice#a3f19c")).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(state.review.get(&next.id).unwrap().status, crate::review::Status::Queued);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_prompt_library_is_edited_and_keeps_one_prompt() {
+        let state = test_state_with(test_convlog());
+        let base = serve(state).await;
+        let c = http();
+        let api = |p: &str| format!("{base}/ui/api/{p}");
+        let send = |req: reqwest::RequestBuilder| req.basic_auth("admin", Some("pw")).header("X-OllamaMQ-UI", "1");
+
+        let lib: serde_json::Value =
+            c.get(api("review-prompts")).basic_auth("admin", Some("pw")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(lib["default"], "default");
+        assert_eq!(lib["prompts"].as_array().unwrap().len(), 1);
+
+        let res = send(c.put(api("review-prompts")).json(&json!({ "name": "", "text": "x" }))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = send(c.put(api("review-prompts")).json(&json!({
+            "name": "Tool use", "text": "Judge the tool calls.", "default": true
+        })))
+        .send()
+        .await
+        .unwrap();
+        let lib: serde_json::Value = res.json().await.unwrap();
+        assert_eq!((lib["saved"].as_str(), lib["default"].as_str()), (Some("tool-use"), Some("tool-use")));
+
+        let res = send(c.put(api("review-prompts")).json(&json!({
+            "id": "tool-use", "name": "Tool use", "text": "Judge every tool call."
+        })))
+        .send()
+        .await
+        .unwrap();
+        let lib: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(lib["prompts"][1]["text"], "Judge every tool call.");
+
+        let res = send(c.delete(api("review-prompts/default"))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = send(c.delete(api("review-prompts/tool-use"))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "the last prompt stays");
     }
 
     async fn serve(state: Arc<AppState>) -> String {

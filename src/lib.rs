@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod model_policy;
 pub mod convlog;
 pub mod link;
+pub mod review;
 pub mod session;
 pub mod settings;
 pub mod snapshot;

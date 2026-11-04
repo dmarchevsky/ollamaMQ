@@ -3,6 +3,28 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.30.0 — 2026-11-03
+
+### Added
+
+- **Send a conversation to an LLM review**: **✎ Review** in the conversation viewer queues a
+  review of the conversation as it stands, with a prompt from a reusable library
+  (`review_prompts.yaml`, edited under **Reviews → Prompts…**) or one edited for that review
+  alone, on the default review model (`settings.review.model`) or another. The new **Reviews**
+  page lists every review with why a queued one waits, renders the answer as Markdown next to
+  the prompt it was sent with, and offers Re-run, Retry, Cancel and Delete. This is what
+  v0.29.0's whole-conversation files were for: a review reads a conversation from its first turn.
+- **Reviews never cost a user anything**: one starts only on a backend with no user request in
+  flight or queued for it and none finished for `review.quiet_secs` (5 min), and evicts a loaded
+  model only after `review.swap_idle_secs` (10 min) of quiet. A running review is not counted
+  against the backend's capacity, so a user request that arrives meanwhile is served at once
+  beside it — and the scheduler prefers a backend without one — rather than waiting for it.
+- **The transcript fits the model**: each turn shows only what it added, then its reply;
+  messages are cut head-and-tail and long conversations lose turns from the middle, marked, so
+  a review sees how a conversation started and how it ended.
+- Reviews are kept as files in `reviews/` beside `sessions/`, outside retention; a review running
+  at shutdown is queued again at start.
+
 ## v0.29.0 — 2026-11-03
 
 ### Changed
