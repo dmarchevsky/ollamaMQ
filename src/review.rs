@@ -19,6 +19,10 @@
 //!   The review finishes alongside; no new one starts there until the backend
 //!   is quiet again.
 //!
+//! The operator can override all of that with **Run now**: the review then
+//! starts on the first online backend that has its model and is not loading or
+//! unloading one, beside whatever users are doing there.
+//!
 //! The worker does not go through the user queue: reviews have their own, and
 //! their calls are not written to the conversation log or the metrics.
 
@@ -99,7 +103,8 @@ impl Wait {
 }
 
 /// May a review of `model` start on `b` now? `user_waiting`: a queued user
-/// request could be served by `b`.
+/// request could be served by `b`. `force` (Run now) skips everything but
+/// "the backend cannot run it at all".
 pub fn eligible(
     b: &BackendStatus,
     now: u64,
@@ -107,6 +112,7 @@ pub fn eligible(
     model: &str,
     control_busy: bool,
     user_waiting: bool,
+    force: bool,
 ) -> Result<(), Wait> {
     if b.disabled || !b.is_online {
         return Err(Wait::Offline);
@@ -119,6 +125,9 @@ pub fn eligible(
     }
     if control_busy {
         return Err(Wait::ControlOp);
+    }
+    if force {
+        return Ok(());
     }
     if b.review_running {
         return Err(Wait::ReviewRunning);
@@ -156,6 +165,8 @@ pub struct Request<'a> {
     /// Overrides the library prompt's text for this review only.
     pub prompt: Option<&'a str>,
     pub model: Option<&'a str>,
+    /// Start at once (see [`Review::run_now`]).
+    pub run_now: bool,
 }
 
 impl Review {
@@ -324,6 +335,7 @@ impl Review {
             prompt_tokens: None,
             completion_tokens: None,
             attempts: 0,
+            run_now: req.run_now,
         };
         self.persist(&job);
         {
@@ -370,6 +382,7 @@ impl Review {
                         j.started_ms = None;
                         j.finished_ms = None;
                         j.backend = None;
+                        j.run_now = false;
                     })
                     .ok_or_else(|| SubmitError::NotFound("no such review".into()))?;
                 self.wake.notify_one();
@@ -382,6 +395,7 @@ impl Review {
                     prompt_id: job.prompt_id.as_deref(),
                     prompt: Some(&job.prompt_text),
                     model: Some(&job.model),
+                    run_now: false,
                 },
             ),
             Status::Queued | Status::Running => Err(SubmitError::Invalid("the review has not finished".into())),
@@ -403,6 +417,23 @@ impl Review {
             j.wait_reason = None;
         })
         .ok_or_else(|| SubmitError::NotFound("no such review".into()))
+    }
+
+    /// Start a queued review now: it skips the quiet time, the swap wait, busy
+    /// backends, the concurrency limit and the off switch. It still needs an
+    /// online backend with its model; without one it stays queued, says why,
+    /// and starts as soon as one turns up.
+    pub fn run_now(&self, id: &str) -> Result<Job, SubmitError> {
+        let job = self.get(id).ok_or_else(|| SubmitError::NotFound("no such review".into()))?;
+        if job.status != Status::Queued {
+            return Err(SubmitError::Invalid("only a queued review can be started".into()));
+        }
+        let j = self
+            .update(id, |j| j.run_now = true)
+            .ok_or_else(|| SubmitError::NotFound("no such review".into()))?;
+        info!("review: {id} run now");
+        self.wake.notify_one();
+        Ok(j)
     }
 
     pub fn delete(&self, id: &str) -> bool {
@@ -438,11 +469,12 @@ pub fn start(state: &Arc<AppState>) {
 fn tick(state: &Arc<AppState>) {
     let review = &state.review;
     let cfg = review.settings();
-    let mut queued: Vec<(u64, String, String)> = {
+    // Run-now reviews first (`!run_now` sorts them ahead), then oldest first.
+    let mut queued: Vec<(bool, u64, String, String)> = {
         let jobs = review.jobs.lock_or_recover();
         jobs.values()
             .filter(|j| j.status == Status::Queued)
-            .map(|j| (j.created_ms, j.id.clone(), j.model.clone()))
+            .map(|j| (!j.run_now, j.created_ms, j.id.clone(), j.model.clone()))
             .collect()
     };
     if queued.is_empty() {
@@ -450,8 +482,12 @@ fn tick(state: &Arc<AppState>) {
     }
     queued.sort();
     if !cfg.enabled {
-        set_reasons(review, queued.iter().map(|q| (q.1.clone(), "reviews are switched off in Settings".into())));
-        return;
+        let (forced, held): (Vec<_>, Vec<_>) = queued.into_iter().partition(|q| !q.0);
+        set_reasons(review, held.into_iter().map(|q| (q.2, "reviews are switched off in Settings".into())));
+        if forced.is_empty() {
+            return;
+        }
+        queued = forced;
     }
     let mut running = review.aborts.lock_or_recover().len();
     // Snapshots of what users are doing, taken one lock at a time. A request
@@ -465,12 +501,13 @@ fn tick(state: &Arc<AppState>) {
         .collect();
     let control: HashSet<usize> = state.control_ops.lock_or_recover().keys().copied().collect();
     let mut reasons = Vec::new();
-    for (_, id, model) in queued {
-        if running >= cfg.concurrency as usize {
+    for (later, _, id, model) in queued {
+        let force = !later;
+        if !force && running >= cfg.concurrency as usize {
             reasons.push((id, "waiting for a running review to finish".into()));
             continue;
         }
-        match claim(state, &cfg, &model, &waiting_models, &control) {
+        match claim(state, &cfg, &model, &waiting_models, &control, force) {
             Ok((idx, label)) => {
                 running += 1;
                 launch(state, id, idx, label);
@@ -498,6 +535,7 @@ fn claim(
     model: &str,
     waiting_models: &[Option<String>],
     control: &HashSet<usize>,
+    force: bool,
 ) -> Result<(usize, String), Wait> {
     let now = now_ms();
     let mut backends = state.backends.lock_or_recover();
@@ -515,10 +553,12 @@ fn claim(
         let user_waiting = waiting_models
             .iter()
             .any(|m| m.as_deref().is_none_or(|m| crate::dispatcher::model_routable(m, &b.available_models)));
-        match eligible(b, now, cfg, model, control.contains(&idx), user_waiting) {
+        match eligible(b, now, cfg, model, control.contains(&idx), user_waiting, force) {
             Ok(()) => {
                 let loaded = crate::dispatcher::model_loaded_on(b, model);
-                if pick.is_none() || loaded {
+                // Forced: a backend without a review of its own beats one with.
+                let better = pick.is_none_or(|p| force && backends[p].review_running && !b.review_running);
+                if better || loaded {
                     pick = Some(idx);
                     if loaded {
                         break;
@@ -724,20 +764,20 @@ mod tests {
     fn a_review_waits_for_a_quiet_idle_backend() {
         let cfg = ReviewSettings::default();
         let mut b = backend();
-        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false), Ok(()));
-        assert_eq!(eligible(&b, NOW, &cfg, "missing", false, false), Err(Wait::NoModel));
-        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", true, false), Err(Wait::ControlOp));
-        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, true), Err(Wait::UserQueued));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false, false), Ok(()));
+        assert_eq!(eligible(&b, NOW, &cfg, "missing", false, false, false), Err(Wait::NoModel));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", true, false, false), Err(Wait::ControlOp));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, true, false), Err(Wait::UserQueued));
         b.active_requests = 1;
-        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false), Err(Wait::Busy));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false, false), Err(Wait::Busy));
         b.active_requests = 0;
         b.review_running = true;
-        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false), Err(Wait::ReviewRunning));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false, false), Err(Wait::ReviewRunning));
         b.review_running = false;
         b.last_user_ms = NOW - 60_000;
-        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false), Err(Wait::Quiet(240)));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false, false), Err(Wait::Quiet(240)));
         b.is_online = false;
-        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false), Err(Wait::Offline));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false, false), Err(Wait::Offline));
     }
 
     #[test]
@@ -746,15 +786,31 @@ mod tests {
         let mut b = backend();
         b.loaded_models = Arc::new(["llama3:8b".to_string()].into_iter().collect());
         b.last_user_ms = NOW - 400_000;
-        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false), Err(Wait::Swap(200)));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false, false), Err(Wait::Swap(200)));
         // Its own model loaded: no swap, so the short quiet is enough.
-        assert_eq!(eligible(&b, NOW, &cfg, "llama3:8b", false, false), Ok(()));
+        assert_eq!(eligible(&b, NOW, &cfg, "llama3:8b", false, false, false), Ok(()));
         b.last_user_ms = NOW - 700_000;
-        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false), Ok(()));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false, false), Ok(()));
         // Nothing loaded: nothing to evict.
         b.last_user_ms = NOW - 400_000;
         b.loaded_models = Arc::default();
-        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false), Ok(()));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false, false), Ok(()));
+    }
+
+    #[test]
+    fn run_now_skips_every_wait_but_an_unusable_backend() {
+        let cfg = ReviewSettings::default();
+        let mut b = backend();
+        b.active_requests = 2;
+        b.review_running = true;
+        b.last_user_ms = NOW - 1_000;
+        b.loaded_models = Arc::new(["llama3:8b".to_string()].into_iter().collect());
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, true, true), Ok(()));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, true, false), Err(Wait::ReviewRunning));
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", true, false, true), Err(Wait::ControlOp));
+        assert_eq!(eligible(&b, NOW, &cfg, "missing", false, false, true), Err(Wait::NoModel));
+        b.is_online = false;
+        assert_eq!(eligible(&b, NOW, &cfg, "qwen3:32b", false, false, true), Err(Wait::Offline));
     }
 
     #[test]

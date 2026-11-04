@@ -263,6 +263,14 @@ impl Turn {
     }
 }
 
+/// One turn's captured text, as [`ConvLogger::contents`] hands it out.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TurnText {
+    pub rid: u64,
+    pub req: Option<String>,
+    pub resp: Option<String>,
+}
+
 /// One conversation: the turns of one client session, oldest turn first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conv {
@@ -1275,6 +1283,30 @@ impl ConvLogger {
         let legacy = self.legacy.as_ref().is_some_and(|l| l.forget(key));
         let files = sessions.delete(key, upto, legacy);
         hot || legacy || files || conv.is_some()
+    }
+
+    /// Captured text of many turns of conversation `key` at once — every turn,
+    /// or those in `rids` — oldest first, as `(rid, request, response)`. The
+    /// conversation is read and folded once and the request deltas are rebuilt
+    /// with one shared memo, where [`Self::content`] per turn would redo both
+    /// for every call: what a viewer wants when it opens a long conversation.
+    pub fn contents(&self, key: &str, rids: Option<&[u64]>) -> Option<Vec<TurnText>> {
+        let conv = self.assemble(&Find { key: Some(key), ..Default::default() })?;
+        let mut memo = HashMap::new();
+        let mut out = Vec::new();
+        for t in conv.turns.iter().filter(|t| rids.is_none_or(|r| r.contains(&t.rid))) {
+            let c = t.content.as_ref();
+            let req = match c {
+                Some(c) if c.req.is_some() => c.req.as_deref().map(|s| s.to_string()),
+                Some(c) if c.req_d.is_some() => {
+                    req_parts(&conv, t.rid, &mut memo, 0).and_then(|p| codec::render_body(&p.1, &p.0))
+                }
+                _ => None,
+            };
+            let resp = c.and_then(|c| c.resp.as_deref()).map(|s| s.to_string());
+            out.push(TurnText { rid: t.rid, req, resp });
+        }
+        Some(out)
     }
 
     /// Captured text of one turn (`rid` defaults to the newest turn). Falls
@@ -3072,6 +3104,16 @@ mod tests {
             let q = Find { key: Some("dan#d1"), rid: Some(10 + i as u64), ..Default::default() };
             assert_eq!(log.content(&q, Dir::Req).as_deref(), Some(body.as_str()), "turn {i}");
         }
+        // The batch read rebuilds the same bodies in one pass, and keeps to `rids`.
+        let all = log.contents("dan#d1", None).unwrap();
+        assert_eq!(all.len(), 6);
+        for (t, body) in all.iter().zip(&bodies) {
+            assert_eq!(t.req.as_deref(), Some(body.as_str()), "batch turn {}", t.rid);
+        }
+        let some = log.contents("dan#d1", Some(&[15, 12])).unwrap();
+        assert_eq!(some.iter().map(|t| t.rid).collect::<Vec<_>>(), vec![12, 15]);
+        assert_eq!(some[1].req.as_deref(), Some(bodies[5].as_str()));
+        assert!(log.contents("nobody#x", None).is_none());
         let conv = log.index(&find_key("dan#d1")).unwrap();
         assert_eq!(conv.turns.len(), 6);
         assert_eq!(conv.turns[5].msgs, msg_meta(&bodies[5]));

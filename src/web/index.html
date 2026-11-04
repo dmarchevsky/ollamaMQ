@@ -303,7 +303,8 @@
     <label>Model <input name="model" list="dl-review-models" autocomplete="off" spellcheck="false" required placeholder="e.g. qwen3:32b"></label>
     <datalist id="dl-review-models"></datalist>
     <p class="field-hint" data-when></p>
-    <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary">Send to review</button></div>
+    <input type="hidden" name="run_now" value="">
+    <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn" data-run-now title="start at once on any backend with the model, beside users' requests">Send &amp; run now</button><button value="ok" class="btn primary">Send to review</button></div>
   </form>
 </dialog>
 

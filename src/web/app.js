@@ -2098,7 +2098,7 @@ S.lv = storedLv();
  *  run ordinals folded shut; whether a request shows only its increment or the
  *  whole re-sent prompt is the one global `S.lv.inc` switch, not per-request. */
 const LV = { conv: null, rid: null, open: new Set(), closedRuns: new Set(), focusMsg: null, content: new Map(),
-  msgFold: new Map() };
+  loading: new Map(), msgFold: new Map() };
 let lvToken = 0;
 
 const tryJson = s => { try { return JSON.parse(s); } catch { return undefined; } };
@@ -2210,16 +2210,32 @@ async function openConv({ rid, session, user, key } = {}, { silent = false } = {
   if (key) q.set('key', key);
   if (session) q.set('session', session);
   if (user) q.set('user', user);
+  // A large conversation takes a while to read back from disk: open the viewer
+  // at once with a spinner, so the click visibly did something. A viewer that
+  // already shows a conversation keeps it until the new one arrives.
+  const dlg = $('#dlg-log');
+  const fresh = !dlg.open;
+  if (fresh) {
+    lvToken++;              // a draw still in flight must not land on the spinner
+    lvPrefetchKey = null;   // nor a prefetch of the last conversation
+    $('#dlg-log [data-title]').textContent = 'Loading…';
+    $('#dlg-log [data-sub]').textContent = '';
+    setHTML($('#dlg-log [data-content]'), '<div class="lv-loading"><span class="spin"></span>Loading conversation…</div>');
+    dlg.showModal();
+  }
   let conv;
   try {
     conv = await api('GET', 'conv?' + q.toString());
   } catch (e) {
+    if (fresh) dlg.close();
     // `silent` is the deep link falling through rid -> conv -> seq: a miss
     // there is a next try, not an error to announce.
     if (!silent) toast(e.message, false);
     if (silent) throw e;
     return;
   }
+  // Closed while it loaded: the operator changed their mind.
+  if (fresh && !dlg.open) return false;
   const resuming = LV.conv && LV.conv.key === conv.key;
   // A log opened from the Overview shows up where it belongs: the Logs page.
   // (replaceState, not a jump, when the viewer is already open — a step must
@@ -2231,6 +2247,7 @@ async function openConv({ rid, session, user, key } = {}, { silent = false } = {
   LV.closedRuns = new Set();
   LV.focusMsg = null;
   LV.content = new Map();
+  LV.loading = new Map();
   LV.msgFold = new Map();
   $('#dlg-log [data-title]').textContent =
     `${conv.model || 'traffic'} · ${conv.user}${conv.backend ? ` → ${bkName(conv.backend)}` : ''}`;
@@ -2238,7 +2255,6 @@ async function openConv({ rid, session, user, key } = {}, { silent = false } = {
   $('#lv-inc').checked = S.lv.inc;
   $('#lv-auto').checked = S.lv.auto;
   if (!resuming) lvReviewCount(conv.key);
-  const dlg = $('#dlg-log');
   if (!dlg.open) dlg.showModal();
   await lvDraw({ scroll: true });
   lvPrefetch();
@@ -2261,8 +2277,9 @@ function lvSubline(conv) {
 
 /** The collapsed lines want a word from every turn's text (and the run lines
  *  want every finish), so all turn texts are fetched in the background after
- *  the first paint — newest first, a few in flight, repaints throttled. A
- *  redacted turn has no text to fetch. */
+ *  the first paint — newest first, LV_BATCH turns per call, two calls in
+ *  flight, repaints throttled. A redacted turn has no text to fetch. */
+const LV_BATCH = 8;
 let lvPrefetchKey = null;
 async function lvPrefetch() {
   if (!LV.conv) return;
@@ -2275,15 +2292,16 @@ async function lvPrefetch() {
     clearTimeout(timer);
     timer = setTimeout(() => { if (lvPrefetchKey === key) lvDraw({ scroll: false }); }, 250);
   };
-  const worker = async list => {
-    for (const t of list) {
+  const chunks = [];
+  for (let i = 0; i < todo.length; i += LV_BATCH) chunks.push(todo.slice(i, i + LV_BATCH).map(t => t.rid));
+  const worker = async () => {
+    while (chunks.length) {
       if (lvPrefetchKey !== key) return;
-      await lvLoad(t.rid);
+      await lvLoadMany(chunks.shift());
       paint();
     }
   };
-  const N = Math.min(6, todo.length);
-  await Promise.all(Array.from({ length: N }, (_, w) => worker(todo.filter((_, i) => i % N === w))));
+  await Promise.all([worker(), worker()]);
 }
 
 /** A log event with no proxied request behind it (a control action): the same
@@ -2305,6 +2323,7 @@ async function openSeq(seq, { silent = false } = {}) {
   LV.closedRuns = new Set();
   LV.focusMsg = null;
   LV.content = new Map([[seq, { req: null, resp: ev.content ?? null, reqObj: null }]]);
+  LV.loading = new Map();
   $('#dlg-log [data-title]').textContent = `control \u00b7 ${ev.user}`;
   $('#dlg-log [data-sub]').textContent = `${fmtTime(ev.at_ms)} \u00b7 ${ev.info}`;
   const dlg = $('#dlg-log');
@@ -2314,18 +2333,33 @@ async function openSeq(seq, { silent = false } = {}) {
   return true;
 }
 
-/** Captured text of one turn, fetched once and kept for the session. */
-async function lvLoad(rid) {
-  if (LV.content.has(rid)) return LV.content.get(rid);
-  const one = async dir => {
-    try { return (await api('GET', `conv/content?rid=${rid}&dir=${dir}`)).content ?? null; }
-    catch { return null; }
-  };
-  const c = { req: await one('in'), resp: await one('out') };
-  c.reqObj = c.req ? tryJson(c.req) || salvageChat(c.req) : null;
-  LV.content.set(rid, c);
-  return c;
+/** Captured text of turns, fetched once and kept for the session. Many go in
+ *  one call — `conv/contents` reads the conversation once for all of them,
+ *  where a call per turn would read it again every time. A fetch in flight is
+ *  shared, so redraws while it loads do not ask again. */
+function lvLoadMany(rids) {
+  const content = LV.content, loading = LV.loading, key = LV.conv?.key;
+  const todo = rids.filter(r => !content.has(r) && !loading.has(r));
+  if (todo.length && key) {
+    const batch = api('GET', `conv/contents?key=${encodeURIComponent(key)}&rids=${todo.join(',')}`)
+      .then(r => new Map(r.turns.map(t => [t.rid, t])))
+      .catch(() => new Map());
+    for (const rid of todo) {
+      loading.set(rid, batch.then(m => {
+        const t = m.get(rid);
+        const c = { req: t?.req ?? null, resp: t?.resp ?? null };
+        c.reqObj = c.req ? tryJson(c.req) || salvageChat(c.req) : null;
+        content.set(rid, c);
+        loading.delete(rid);
+        return c;
+      }));
+    }
+  }
+  const none = { req: null, resp: null, reqObj: null };
+  return Promise.all(rids.map(r => content.get(r) ?? loading.get(r) ?? none));
 }
+
+const lvLoad = rid => lvLoadMany([rid]).then(cs => cs[0]);
 
 /** The turn's own measured timeline, in the same words Details uses. */
 function lvStages(t) {
@@ -2605,7 +2639,16 @@ async function lvDraw({ scroll = false } = {}) {
     } else parts.push(gap);
     if (rk !== -1 && LV.closedRuns.has(rk)) continue; // folded run: its header says it all
     let sec = lvTurnHead(t, i);
-    if (LV.open.has(t.rid)) sec += lvAuditBlock(t) + await lvTurnInner(t);
+    if (LV.open.has(t.rid)) {
+      // Text not fetched yet: draw the turn now with a spinner where the text
+      // goes, and draw again when it lands (lvToken drops a superseded draw).
+      if (t.redacted || LV.content.has(t.rid)) sec += lvAuditBlock(t) + await lvTurnInner(t);
+      else {
+        sec += lvAuditBlock(t) + '<div class="lv-loading sm"><span class="spin"></span>Loading request and response…</div>';
+        const key = LV.conv.key;
+        lvLoad(t.rid).then(() => { if (LV.conv?.key === key && $('#dlg-log').open) lvDraw(); });
+      }
+    }
     parts.push(sec + '</section>');
   }
   if (openRun) parts.push('</div>');
@@ -2717,6 +2760,7 @@ async function lvFocusSec(rid, side) {
   LV.focusMsg = null;
   LV.open.add(rid);
   LV.closedRuns.delete(lvRunOf(lvRuns(), lvIdxOf(rid)));
+  await lvLoad(rid); // the section to land on is part of the turn's text
   await lvDraw({ scroll: false });
   const el = document.getElementById(`lv-${side}-${rid}`);
   if (!el) { lvScroll(); lvDrawRail(); return; }
@@ -2795,7 +2839,7 @@ async function lvFocusMsg(rid, idx) {
   LV.rid = tgt.rid;
   LV.open.add(tgt.rid);
   LV.focusMsg = [tgt.rid, tgt.idx];
-  if (needed) await lvDraw({ scroll: false });
+  if (needed) { await lvLoad(tgt.rid); await lvDraw({ scroll: false }); }
   const el = document.getElementById(`lv-m-${tgt.rid}-${tgt.idx}`);
   if (!el) { lvScroll(); lvDrawRail(); return; }
   for (const d of [el.closest('details'), ...el.querySelectorAll('details')]) if (d) d.open = true;
@@ -2840,9 +2884,12 @@ async function lvReload({ quiet = false } = {}) {
   const top = b ? b.scrollTop : 0;
   LV.conv = conv;
   LV.content = new Map();
+  LV.loading = new Map();
   LV.open = new Set(open.filter(keep));
   LV.closedRuns = new Set(shut);
   $('#dlg-log [data-sub]').textContent = lvSubline(conv);
+  // The open turns' text first, so a refresh redraws in place, not via a spinner.
+  await lvLoadMany(conv.turns.filter(t => LV.open.has(t.rid) && !t.redacted).map(t => t.rid));
   await lvDraw({ scroll: false });
   if (b) b.scrollTop = top;
   lvPrefetch();
@@ -3367,8 +3414,14 @@ function rvVisible() {
 }
 
 /** One line under a row: what it is waiting for, how long it ran, or when. */
+/** What a queued review is waiting for; a Run-now one says it was pressed. */
+function rvWhy(r) {
+  const why = r.wait_reason || (r.run_now ? 'starting…' : 'waiting for an idle backend');
+  return r.run_now ? `Run now requested — ${why}` : why;
+}
+
 function rvMeta(r) {
-  if (r.status === 'queued') return esc(r.wait_reason || 'waiting for an idle backend');
+  if (r.status === 'queued') return esc(rvWhy(r));
   if (r.status === 'running') return `on ${esc(r.backend || '?')} · ${fmtDur((Date.now() - r.started_ms) / 1000)}`;
   const took = r.started_ms && r.finished_ms ? ` · took ${fmtDur((r.finished_ms - r.started_ms) / 1000)}` : '';
   return `${fmtAgo(r.finished_ms || r.created_ms)}${took}`;
@@ -3410,7 +3463,7 @@ function renderReviewDetail(row) {
       .catch(e => toast(e.message, false))
       .finally(() => { S.reviewLoading = null; if (S.page === 'reviews') renderReviews(); });
   }
-  const r = full && !stale ? { ...full, wait_reason: row.wait_reason } : { ...row };
+  const r = full && !stale ? { ...full, wait_reason: row.wait_reason, run_now: row.run_now } : { ...row };
   const facts = [
     `turns ${r.turns} <span class="dim">(requests ${r.rid_from}–${r.rid_to})</span>`,
     `${esc(r.prompt_name)}${r.custom ? ' <span class="badge">edited</span>' : ''}`,
@@ -3423,6 +3476,7 @@ function renderReviewDetail(row) {
   const open = r.status === 'queued' || r.status === 'running';
   const tools = [
     `<button class="btn sm" data-action="rv-open" data-key="${esc(r.conv_key)}">Open conversation</button>`,
+    r.status === 'queued' ? `<button class="btn sm primary" data-action="rv-run" data-id="${esc(r.id)}" title="start now on any backend with the model, beside users' requests — skips the quiet time"${r.run_now ? ' disabled' : ''}>▶ Run now</button>` : '',
     open ? `<button class="btn sm" data-action="rv-cancel" data-id="${esc(r.id)}">Cancel</button>` : '',
     r.status === 'done' ? `<button class="btn sm" data-action="rv-retry" data-id="${esc(r.id)}" title="review the conversation again, as it is now, with the same prompt and model">Re-run</button>` : '',
     r.status === 'failed' || r.status === 'cancelled' ? `<button class="btn sm" data-action="rv-retry" data-id="${esc(r.id)}">Retry</button>` : '',
@@ -3433,7 +3487,7 @@ function renderReviewDetail(row) {
   else if (r.status === 'failed') body = `<div class="note bad-note">${esc(r.error || 'failed')}</div>`;
   else if (r.status === 'cancelled') body = `<p class="dim">Cancelled before it finished. Retry queues it again.</p>`;
   else if (r.status === 'running') body = `<p class="rv-wait"><span class="spin"></span>Running on ${bkCell(r.backend || '')} for ${fmtDur((Date.now() - r.started_ms) / 1000)}. A user request that arrives meanwhile is served at once, beside it.</p>`;
-  else body = `<p class="rv-wait">${esc(r.wait_reason || 'Waiting for an idle backend.')}</p>`;
+  else body = `<p class="rv-wait">${r.run_now ? '<span class="spin"></span>' : ''}${esc(rvWhy(r))}</p>`;
   const prompt = full && !stale ? `<details class="rv-prompt"><summary>Prompt used</summary><pre>${esc(full.prompt_text)}</pre></details>` : '';
   setHTML(el, `
     <div class="rv-head">
@@ -3444,41 +3498,90 @@ function renderReviewDetail(row) {
     ${body}${prompt}`);
 }
 
-/** A safe little Markdown: the text is escaped first, then headings, lists,
- *  quotes, fenced code, `code`, **bold** and *emphasis* are drawn. Enough for
- *  what a review model writes; anything else stays as the text it was. */
+/** A safe little Markdown: the text is escaped first, then headings, lists
+ *  (nested by indent), tables, quotes, rules, fenced code, `code`, links,
+ *  **bold**, *emphasis* and ~~strike~~ are drawn. Enough for what a review
+ *  model writes; anything else stays as the text it was. Links go out only to
+ *  http(s), and every attribute value is already escaped text. */
 function mdLite(src) {
-  const inline = s => s
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
+  const link = (u, t) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>`;
+  const marks = s => s
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, u) => link(u, t))
+    .replace(/(^|[\s(])(https?:\/\/[^\s<]*[^\s<.,;:!?)])/g, (_, p, u) => p + link(u, u))
+    .replace(/\*\*\*([^*]+)\*\*\*/g, '<b><i>$1</i></b>')
     .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
-    .replace(/(^|[\s(])\*([^*\s][^*]*)\*(?=[\s).,;:!?]|$)/g, '$1<i>$2</i>');
+    .replace(/(^|[^\w])__([^_]+)__(?=[^\w]|$)/g, '$1<b>$2</b>')
+    .replace(/~~([^~]+)~~/g, '<del>$1</del>')
+    .replace(/(^|[\s(])\*([^*\s][^*]*)\*(?=[\s).,;:!?]|$)/g, '$1<i>$2</i>')
+    .replace(/(^|[\s(])_([^_\s][^_]*)_(?=[\s).,;:!?]|$)/g, '$1<i>$2</i>');
+  // Code spans are cut out first: nothing inside them is marked up.
+  const inline = s => s.split(/(`[^`]+`)/).map((p, i) => i % 2 ? `<code>${p.slice(1, -1)}</code>` : marks(p)).join('');
+  const cells = row => row.trim().replace(/^\|/, '').replace(/\|$/, '').replace(/\\\|/g, '\u0000')
+    .split('|').map(c => c.trim().replace(/\u0000/g, '|'));
+  const isSep = l => /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(l) && l.includes('-');
+
   const out = [];
-  let list = null, para = [], code = null;
+  let para = [], quote = [], code = null;
+  /** Open lists, outermost first: { tag, indent, start, items: [html] }. */
+  const lists = [];
+  const closeList = () => {
+    const l = lists.pop();
+    const html = `<${l.tag}${l.start > 1 ? ` start="${l.start}"` : ''}>${l.items.map(i => `<li>${i}</li>`).join('')}</${l.tag}>`;
+    if (lists.length) lists[lists.length - 1].items[lists[lists.length - 1].items.length - 1] += html;
+    else out.push(html);
+  };
   const flushPara = () => { if (para.length) { out.push(`<p>${para.map(inline).join('<br>')}</p>`); para = []; } };
-  const flushList = () => { if (list) { out.push(`<${list.tag}>${list.items.map(i => `<li>${inline(i)}</li>`).join('')}</${list.tag}>`); list = null; } };
-  for (const raw of esc(src).split('\n')) {
+  const flushQuote = () => { if (quote.length) { out.push(`<blockquote>${quote.map(inline).join('<br>')}</blockquote>`); quote = []; } };
+  const flushList = () => { while (lists.length) closeList(); };
+  const flush = () => { flushPara(); flushQuote(); flushList(); };
+
+  const lines = esc(src).split('\n');
+  for (let n = 0; n < lines.length; n++) {
+    const raw = lines[n];
     if (code) {
       if (/^\s*```/.test(raw)) { out.push(`<pre><code>${code.join('\n')}</code></pre>`); code = null; } else code.push(raw);
       continue;
     }
-    if (/^\s*```/.test(raw)) { flushPara(); flushList(); code = []; continue; }
-    const h = raw.match(/^(#{1,6})\s+(.*)$/);
-    const li = raw.match(/^\s*(?:([-*+])|(\d+)[.)])\s+(.*)$/);
-    const q = raw.match(/^&gt;\s?(.*)$/);
-    if (h) { flushPara(); flushList(); const n = Math.min(4, h[1].length + 2); out.push(`<h${n}>${inline(h[2])}</h${n}>`); }
+    if (/^\s*```/.test(raw)) { flush(); code = []; continue; }
+    if (raw.includes('|') && n + 1 < lines.length && isSep(lines[n + 1])) {
+      flush();
+      const head = cells(raw);
+      const align = cells(lines[n + 1]).map(c => c.startsWith(':') && c.endsWith(':') ? 'center' : c.endsWith(':') ? 'right' : '');
+      const td = (tag, c, i) => `<${tag}${align[i] ? ` style="text-align:${align[i]}"` : ''}>${inline(c)}</${tag}>`;
+      const body = [];
+      for (n += 2; n < lines.length && lines[n].includes('|') && lines[n].trim(); n++) {
+        const r = cells(lines[n]);
+        body.push(`<tr>${head.map((_, i) => td('td', r[i] ?? '', i)).join('')}</tr>`);
+      }
+      n--;
+      out.push(`<div class="md-table"><table><thead><tr>${head.map((c, i) => td('th', c, i)).join('')}</tr></thead><tbody>${body.join('')}</tbody></table></div>`);
+      continue;
+    }
+    const h = raw.match(/^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/);
+    const hr = /^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(raw);
+    const li = raw.match(/^(\s*)(?:([-*+])|(\d+)[.)])\s+(.*)$/);
+    const q = raw.match(/^\s{0,3}&gt;\s?(.*)$/);
+    if (h) { flush(); const k = Math.min(4, h[1].length + 2); out.push(`<h${k}>${inline(h[2])}</h${k}>`); }
+    else if (hr) { flush(); out.push('<hr>'); }
     else if (li) {
-      flushPara();
-      const tag = li[2] ? 'ol' : 'ul';
-      if (list && list.tag !== tag) flushList();
-      if (!list) list = { tag, items: [] };
-      list.items.push(li[3]);
-    } else if (q) { flushPara(); flushList(); out.push(`<blockquote>${inline(q[1])}</blockquote>`); }
-    else if (!raw.trim()) { flushPara(); flushList(); }
-    else if (list && /^\s{2,}\S/.test(raw)) list.items[list.items.length - 1] += ' ' + raw.trim();
-    else { flushList(); para.push(raw); }
+      flushPara(); flushQuote();
+      const indent = li[1].replace(/\t/g, '    ').length;
+      const tag = li[3] ? 'ol' : 'ul';
+      while (lists.length > 1 && indent < lists[lists.length - 1].indent) closeList();
+      let top = lists[lists.length - 1];
+      if (top && indent >= top.indent + 2) top = null; // deeper: a list inside the last item
+      else if (top && top.tag !== tag) { closeList(); top = lists[lists.length - 1]; if (top && indent >= top.indent + 2) top = null; }
+      if (top && top.tag === tag && indent < top.indent + 2) top.items.push(inline(li[4]));
+      else lists.push({ tag, indent, start: li[3] ? +li[3] : 1, items: [inline(li[4])] });
+    } else if (q) { flushPara(); flushList(); quote.push(q[1]); }
+    else if (!raw.trim()) flush();
+    else if (lists.length && /^\s{2,}\S/.test(raw)) {
+      const top = lists[lists.length - 1];
+      top.items[top.items.length - 1] += ' ' + inline(raw.trim());
+    } else { flushQuote(); flushList(); para.push(raw); }
   }
   if (code) out.push(`<pre><code>${code.join('\n')}</code></pre>`);
-  flushPara(); flushList();
+  flush();
   return out.join('');
 }
 
@@ -3522,6 +3625,7 @@ async function reviewDialog(conv) {
   $('#dl-review-models').innerHTML = knownModels().map(m => `<option value="${esc(m)}">`).join('');
   const mins = Math.round((lib.quiet_secs ?? 300) / 60);
   $('[data-when]', dlg).textContent = `It runs once a backend that has the model has served no user for ${mins} min${lib.enabled === false ? ' — reviews are switched off in Settings right now' : ''}.`;
+  form.run_now.value = '';
   const fd = await ask(dlg);
   if (!fd) return;
   const chosen = rvDlgPrompts.find(p => p.id === fd.get('prompt_id'));
@@ -3529,10 +3633,16 @@ async function reviewDialog(conv) {
   const body = { key: conv.key, prompt_id: fd.get('prompt_id') };
   if (chosen && text.trim() !== chosen.text.trim()) body.prompt = text;
   if (fd.get('model').trim() && fd.get('model').trim() !== lib.model) body.model = fd.get('model').trim();
-  const r = await act('POST', 'reviews', body, 'Sent to review — follow it on the Reviews page');
+  if (fd.get('run_now')) body.run_now = true;
+  const r = await act('POST', 'reviews', body, body.run_now ? 'Sent — starting it now; follow it on the Reviews page' : 'Sent to review — follow it on the Reviews page');
   if (r) { S.reviewSel = r.id; lvReviewCount(conv.key); }
 }
 
+// method=dialog sends no submitter, so the button marks the form itself.
+$('#dlg-review').addEventListener('click', e => {
+  const b = e.target.closest('button[value="ok"]');
+  if (b) $('#dlg-review form').run_now.value = b.hasAttribute('data-run-now') ? '1' : '';
+});
 $('#dlg-review select[name="prompt_id"]').addEventListener('change', e => {
   const p = rvDlgPrompts.find(x => x.id === e.target.value);
   if (p) e.target.form.prompt.value = p.text;
@@ -4071,6 +4181,7 @@ const actions = {
     S.reviewSel = r.id;
     return r.id === el.dataset.id ? 'Queued again' : 'Sent again — the earlier answer stays';
   }),
+  'rv-run': el => act('POST', `reviews/${encodeURIComponent(el.dataset.id)}/run`, undefined, 'Starting the review now'),
   'rv-cancel': el => act('POST', `reviews/${encodeURIComponent(el.dataset.id)}/cancel`, undefined, 'Review cancelled'),
   'rv-delete': async el => {
     if (!await confirmDlg('Delete review?', 'The review and its answer are removed. The conversation itself stays in the log.', 'Delete')) return;

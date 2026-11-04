@@ -218,6 +218,7 @@ pub fn router_with_state(auth: Arc<AuthState>) -> Router<Arc<AppState>> {
         .route("/convs", get(list_convs))
         .route("/conv", get(get_conv).delete(delete_conv))
         .route("/conv/content", get(get_conv_content))
+        .route("/conv/contents", get(get_conv_contents))
         .route("/conv/export", get(export_conv))
         .route("/reviews", get(reviews::list).post(reviews::submit))
         .route("/reviews/{id}", get(reviews::get).delete(reviews::delete))
@@ -1119,6 +1120,16 @@ async fn audit_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
     Json(state.audit.status(&state))
 }
 
+/// Run a conversation-log read on the blocking pool. Opening a conversation
+/// reads and decompresses its files and rebuilds requests from their deltas —
+/// seconds for a long one — and on a runtime worker that would stall the
+/// proxy's own request handling while a viewer loads.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("reading the log failed: {e}")))
+}
+
 async fn get_conv(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ConvQuery>,
@@ -1131,9 +1142,8 @@ async fn get_conv(
         "no such conversation: retention removed it — raise request_log_max_total_bytes \
          (or request_log_max_days) to keep more"
     };
-    state
-        .convlog
-        .index(&find_of(&q))
+    blocking(move || state.convlog.index(&find_of(&q)))
+        .await?
         .map(Json)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, missing))
 }
@@ -1146,11 +1156,9 @@ async fn export_conv(
 ) -> ApiResult<crate::convlog::Conv> {
     let key = q
         .key
-        .as_deref()
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "key is required"))?;
-    state
-        .convlog
-        .load_session(key)
+    blocking(move || state.convlog.load_session(&key))
+        .await?
         .map(Json)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no such conversation in the log"))
 }
@@ -1163,9 +1171,9 @@ async fn delete_conv(
 ) -> ApiResult<serde_json::Value> {
     let key = q
         .key
-        .as_deref()
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "key is required"))?;
-    if !state.convlog.delete(key) {
+    let (st, k) = (state.clone(), key.clone());
+    if !blocking(move || st.convlog.delete(&k)).await? {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "no such conversation in the log"));
     }
     info!("web: conversation {key} deleted from the log");
@@ -1180,11 +1188,41 @@ async fn get_conv_content(
         Some("out") => crate::convlog::Dir::Resp,
         _ => crate::convlog::Dir::Req,
     };
-    let content = state
-        .convlog
-        .content(&find_of(&q), dir)
+    let content = blocking(move || state.convlog.content(&find_of(&q), dir))
+        .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no captured text for this request"))?;
     Ok(Json(json!({ "content": content })))
+}
+
+#[derive(Deserialize)]
+struct ContentsQuery {
+    /// Conversation key verbatim (`client#session`).
+    key: String,
+    /// Comma-separated request ids; absent or empty: every turn.
+    rids: Option<String>,
+}
+
+/// `GET /conv/contents?key=…&rids=12,15`: the captured text of many turns in
+/// one call — the conversation is read once for all of them. Turns without
+/// stored text come back with `null`s; ids that are not in the conversation
+/// are left out.
+async fn get_conv_contents(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ContentsQuery>,
+) -> ApiResult<serde_json::Value> {
+    let rids = match q.rids.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(list) => Some(
+            list.split(',')
+                .map(|r| r.trim().parse::<u64>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "rids must be comma-separated request ids"))?,
+        ),
+    };
+    let turns = blocking(move || state.convlog.contents(&q.key, rids.as_deref()))
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no such conversation in the log"))?;
+    Ok(Json(json!({ "turns": turns })))
 }
 
 // ------------------------------------------------------- users & blocking
@@ -2032,6 +2070,20 @@ mod tests {
             .unwrap();
         assert!(req["content"].as_str().unwrap().starts_with("{\"messages\""));
 
+        // Many turns' text in one call, in turn order; a turn without text is nulls.
+        let get = |q: &str| c.get(format!("{base}/ui/api/conv/contents?{q}")).basic_auth("admin", Some("pw")).send();
+        let all: serde_json::Value = get("key=alice%23a3f19c").await.unwrap().json().await.unwrap();
+        let turns = all["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!((turns[0]["rid"].as_u64(), turns[0]["resp"].as_str()), (Some(7), Some("hello back")));
+        assert!(turns[0]["req"].as_str().unwrap().starts_with("{\"messages\""));
+        assert!(turns[1]["resp"].is_null());
+        let one: serde_json::Value = get("key=alice%23a3f19c&rids=8").await.unwrap().json().await.unwrap();
+        assert_eq!(one["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(one["turns"][0]["rid"], 8);
+        assert_eq!(get("key=alice%23a3f19c&rids=x").await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(get("key=alice%23nope").await.unwrap().status(), StatusCode::NOT_FOUND);
+
         // Unknown conversation and a turn without text are 404, not empty 200s.
         assert_eq!(
             c.get(format!("{base}/ui/api/conv?session=deadbe"))
@@ -2677,7 +2729,7 @@ mod tests {
         let cfg = crate::config::ReviewSettings { model: "qwen3:32b".into(), quiet_secs: 1, ..Default::default() };
         state.review.apply(cfg.clone());
         crate::review::start(&state);
-        let req = |key| crate::review::Request { key, prompt_id: None, prompt: None, model: None };
+        let req = |key| crate::review::Request { key, prompt_id: None, prompt: None, model: None, run_now: false };
         let job = state.review.submit(&state, req("alice#a3f19c")).unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2721,6 +2773,19 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(state.review.get(&next.id).unwrap().status, crate::review::Status::Queued);
         assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // Run now: it starts at once, though the backend is not quiet.
+        state.review.run_now(&next.id).unwrap();
+        let mut ran = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if state.review.get(&next.id).unwrap().status != crate::review::Status::Queued {
+                ran = true;
+                break;
+            }
+        }
+        assert!(ran, "run now starts a review on a backend that is not quiet");
+        assert!(state.review.run_now(&next.id).is_err(), "only a queued review can be started");
     }
 
     #[tokio::test]

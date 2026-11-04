@@ -74,6 +74,10 @@ pub struct Job {
     pub completion_tokens: Option<u64>,
     #[serde(default)]
     pub attempts: u32,
+    /// The operator pressed Run now: the review starts on the first backend
+    /// that has its model, without waiting for quiet (see [`crate::review::eligible`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub run_now: bool,
 }
 
 impl Job {
@@ -361,6 +365,7 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             attempts: 1,
+            run_now: false,
         }
     }
 
