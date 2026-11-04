@@ -2478,7 +2478,32 @@ function lvAnswerSig(t) {
   if (!c || c.resp == null) return '';
   if (c.ansSig != null) return c.ansSig;
   const st = streamState(c.resp) || lvPlainResp(c.resp);
+  c.ansTools = ((st && st.tools) || []).map(x => x.name).filter(Boolean).join(',');
   return (c.ansSig = lvWords((st && st.text) || ''));
+}
+
+/** The index of the message in request i that re-sends turn i-1's answer — the
+ *  assistant message right after the re-sent prefix — or -1. That answer is
+ *  already drawn as turn i-1's Response, so it is not something request i
+ *  added. When both bodies are at hand they must agree: on the tools called
+ *  when either called any (a client may fold its reasoning into the text it
+ *  re-sends), else on the opening words. Without them the position decides —
+ *  an agent appends the answer first, then the results. */
+function lvEcho(i) {
+  const turns = lvTurns();
+  const k = lvHidden(i), t = turns[i], prev = turns[i - 1];
+  if (!k || !prev || (prev.status == null && !prev.resp)) return -1;
+  const msgs = LV.content.get(t.rid)?.reqObj?.messages;
+  const m = msgs ? msgs[k] : (t.msgs || [])[k];
+  if (!m || m.role !== 'assistant') return -1;
+  const pc = LV.content.get(prev.rid);
+  if (msgs && pc && pc.resp != null) {
+    const words = lvAnswerSig(prev), tools = pc.ansTools || '';
+    const mTools = (m.tool_calls || []).map(tc => tc.function?.name ?? tc.name).filter(Boolean).join(',');
+    if (tools || mTools ? tools !== mTools
+      : words && lvWords(msgText(m.content)) && words !== lvWords(msgText(m.content))) return -1;
+  }
+  return k;
 }
 
 /** Runs in index ranges: the requests from the previous final answer up to the
@@ -2559,9 +2584,13 @@ function lvMsgsHtml(obj, i, rid) {
   // Incremental mode renders the re-sent prefix not at all; full mode renders
   // it dimmed. The strip says which rows the request actually added.
   const from = carry && S.lv.inc ? carry.hidden : 0;
+  // The previous answer re-sent as a message is that turn's Response, already
+  // on screen above: incremental mode skips it, full mode dims it as held.
+  const echo = lvEcho(i);
   const mid = (k) => (rid != null ? `lv-m-${rid}-${k}` : undefined);
-  const cls = k => !carry ? '' : (from + k < carry.hidden ? ' m-held' : ' m-new');
-  const body = msgs.slice(from).map((m, k) => msgBlock(m, toolNames, mid(from + k), cls(k))).join('');
+  const cls = k => !carry ? '' : (k < carry.hidden || k === echo ? ' m-held' : ' m-new');
+  const body = msgs.map((m, k) => k < from || (S.lv.inc && k === echo) ? ''
+    : msgBlock(m, toolNames, mid(k), cls(k))).join('');
   return body || (from ? '' : '<div class="empty">No messages in this request.</div>');
 }
 
@@ -2611,7 +2640,8 @@ async function lvTurnInner(t) {
   const respSize = t.resp?.bytes != null ? fmtBytes(t.resp.bytes) : null;
   const carry = lvCarry(i);
   const reqTip = [c.reqObj ? reqMeta(c.reqObj) : null,
-    carry ? `${(c.reqObj?.messages || []).length - carry.hidden} new · ${lvCarryTip(carry)}` : null
+    carry ? `${(c.reqObj?.messages || []).length - carry.hidden - (lvEcho(i) < 0 ? 0 : 1)} new · ${lvCarryTip(carry)}`
+      + (lvEcho(i) < 0 ? '' : ` · the previous answer re-sent`) : null
   ].filter(Boolean).join(' · ');
   return lvSec({ cls: 'req', title: 'Request', info: [t.method, t.path, reqSize].filter(Boolean).join(' '),
     tip: reqTip || null, id: `lv-q-${t.rid}` }, lvReqHtml(t, c, i))
@@ -3098,15 +3128,13 @@ function lvDrawRail() {
     // The messages this request re-sent stay out of the tree while incremental
     // mode is on — they are drawn under the request that first sent them.
     const hid = lvHidden(i);
-    // The answer this turn gave re-enters the next request as a message —
-    // the RESP head under its own turn already speaks it, so the increment
-    // below does not repeat it (it read as a duplicated assistant).
-    const prevAns = i ? lvAnswerSig(turns[i - 1]) : '';
+    // The answer the previous turn gave re-enters this request as a message —
+    // the RESP head under that turn already speaks it, so the increment below
+    // does not repeat it (it read as a duplicated assistant).
+    const echo = lvEcho(i);
     const msgs = [];
     for (const [mi, m] of ((c?.reqObj && c.reqObj.messages) || []).entries()) {
-      if (S.lv.inc && mi < hid) continue;
-      if (S.lv.inc && m.role === 'assistant' && prevAns
-        && lvWords(msgText(m.content, m.images)) === prevAns) continue;
+      if (S.lv.inc && (mi < hid || mi === echo)) continue;
       const w = lvMsgWhen(lvIdxOf(t.rid), mi)
         || { when: '', tip: 'older than this log \u2014 the request that produced it was never captured' };
       msgs.push(lvNode({ level: subLevel + 1, rid: t.rid, idx: mi, when: w.when, tip: w.tip,
