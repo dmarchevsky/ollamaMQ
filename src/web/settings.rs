@@ -96,9 +96,10 @@ pub fn view(state: &AppState) -> SettingsView {
     };
     let fields = EDITABLE
         .iter()
-        .filter(|(k, _)| !k.starts_with("audit_"))
+        .filter(|(k, _)| !k.starts_with("audit_") && !k.starts_with("review_"))
         .map(|(k, live)| make(k, *live))
         .chain(audit_fields(&full, &layers))
+        .chain(review_fields(&full, &layers))
         .collect();
     // Store files: where they were actually found, not the bare name.
     let startup = STARTUP_ONLY
@@ -230,6 +231,63 @@ fn fold_audit_key(settings: &mut Map<String, Value>, key: &str, value: Value) {
     settings.insert("audit".to_string(), Value::Object(audit));
 }
 
+/// The review's rows on the Settings page: flat names over the `review:`
+/// section, as with the audit's.
+fn review_fields(full: &Settings, layers: &settings::Layers) -> Vec<FieldView> {
+    let eff = full.review.clone().unwrap_or_default();
+    let fallback = crate::config::ReviewSettings::default();
+    let source = if layers.file.settings.review.is_some() {
+        "file"
+    } else {
+        "default"
+    };
+    let make = |key: &'static str, value: Value, fallback: Value| FieldView {
+        key,
+        value,
+        source,
+        locked_by: None,
+        live: true,
+        fallback,
+        fallback_source: "default",
+    };
+    let num = |v: u64| Value::from(v);
+    vec![
+        make("review_enabled", Value::Bool(eff.enabled), Value::Bool(fallback.enabled)),
+        make("review_model", Value::String(eff.model), Value::String(fallback.model)),
+        make("review_backend", Value::String(eff.backend), Value::String(fallback.backend)),
+        make("review_quiet_secs", num(eff.quiet_secs), num(fallback.quiet_secs)),
+        make("review_swap_idle_secs", num(eff.swap_idle_secs), num(fallback.swap_idle_secs)),
+        make("review_timeout_secs", num(eff.timeout_secs), num(fallback.timeout_secs)),
+        make(
+            "review_max_transcript_chars",
+            num(eff.max_transcript_chars as u64),
+            num(fallback.max_transcript_chars as u64),
+        ),
+    ]
+}
+
+/// Fold a flat `review_*` key into the `review:` object the file keeps. `null`
+/// drops the sub-key, so the built-in default applies again.
+fn fold_review_key(settings: &mut Map<String, Value>, key: &str, value: Value) {
+    let Some(sub) = key.strip_prefix("review_") else {
+        return;
+    };
+    let mut review = match settings.get("review") {
+        Some(Value::Object(map)) => map.clone(),
+        _ => Map::new(),
+    };
+    if value.is_null() {
+        review.remove(sub);
+    } else {
+        review.insert(sub.to_string(), value);
+    }
+    if review.is_empty() {
+        settings.remove("review");
+    } else {
+        settings.insert("review".to_string(), Value::Object(review));
+    }
+}
+
 pub async fn get_settings(State(state): State<Arc<AppState>>) -> Json<SettingsView> {
     Json(view(&state))
 }
@@ -289,6 +347,7 @@ pub async fn put_settings(
                 ));
             }
             match value {
+                v if key.starts_with("review_") => fold_review_key(&mut settings, &key, v),
                 Value::Null => {
                     settings.remove(&key);
                 }

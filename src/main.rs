@@ -478,6 +478,23 @@ async fn main() {
             if backend.is_empty() { "none configured yet" } else { &backend }
         );
     }
+    // Conversation reviews: jobs next to the conversation log (they outlive the
+    // conversations they reviewed), the prompt library next to appconf.yaml.
+    // Without a log folder they run in memory, and say nothing survives a
+    // restart by having nothing to load.
+    {
+        let reviews_dir = state
+            .convlog
+            .path()
+            .map(|p| std::path::Path::new(p).with_file_name("reviews"));
+        let (prompts, _) = settings::store_path(
+            ollamamq::review::store::DEFAULT_PROMPTS_FILE,
+            &config_dir,
+            std::path::Path::new(""),
+        );
+        state.review.attach(reviews_dir, Some(prompts));
+        ollamamq::review::start(&state);
+    }
     // Activity journal: replay the records that survived the restart into the
     // Overview history and start appending new ones, next to the conversation
     // log (same folder decision, same fallback). Capture off means no journal:

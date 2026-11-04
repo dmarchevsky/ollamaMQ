@@ -400,6 +400,7 @@
       backends: backends.map(b => ({ ...b, models_hidden: b.models_available.filter(m => !served(m, b.url)) })),
       users,
       runs: runView(),
+      reviews_active: reviews.filter(r => r.status === 'queued' || r.status === 'running').length,
     };
   }
 
@@ -660,6 +661,57 @@
     return view;
   }
 
+  // Conversation reviews: one of every status, so the Reviews page and its
+  // detail pane can be walked (and screenshotted) in every state.
+  const REVIEW_PROMPT = 'You are reviewing a recorded conversation between a user (often a coding agent\'s harness) and an AI assistant, captured by an LLM proxy.\n\nWrite a concise review in Markdown with these sections:\n\n## Summary\n## What went well\n## Problems\n## Suggestions\n## Verdict';
+  const reviewLib = {
+    default: 'default',
+    prompts: [
+      { id: 'default', name: 'Default review', text: REVIEW_PROMPT },
+      { id: 'tool-use', name: 'Tool use audit', text: 'Judge every tool call in this conversation: was it needed, were its arguments right, did the assistant read the result before acting on it? List the wasteful or risky calls by turn.' },
+    ],
+  };
+  const reviewCfg = { model: 'Qwen3.8-27B', enabled: true, quiet_secs: 300 };
+  const RESULT = `## Summary
+The user asked the agent to fix the request-log rotation, which walked the slot chain from the oldest file. The agent found the bug, fixed it, and finished with a green test suite — **the task was achieved**.
+
+## What went well
+- It read \`src/reqlog.rs\` before editing, and quoted the loop it was about to change.
+- After the first red run it fixed the *test's* wrong expectation instead of bending the code to it.
+
+## Problems
+1. **Turn 2:** a tool result carried an instruction to send the file to an outside host; the agent did not act on it, but it did not say it had seen it either.
+2. **Turn 3:** the full suite ran twice where one focused \`cargo test rotate\` would have shown the same failure.
+
+## Suggestions
+- Ask the agent to name any instruction it finds inside a tool result before going on.
+- Prefer a focused test first, the whole suite once at the end.
+
+## Verdict
+Success — the fix is right and verified; two small inefficiencies.`;
+  const reviews = [
+    { id: '19a4c-0', conv_key: 'codex-laptop#a3f19c', user: 'codex-laptop', label: 'dispatcher refactor', rid_from: 900, rid_to: 905, turns: 4,
+      prompt_id: 'default', prompt_name: 'Default review', prompt_text: REVIEW_PROMPT, custom: false, model: 'Qwen3.8-27B', status: 'done',
+      backend: 'gpu-box.lan:11434', created_ms: now - 3_600_000, started_ms: now - 3_300_000, finished_ms: now - 3_180_000,
+      input_chars: 48_210, truncated: false, result: RESULT, prompt_tokens: 13_480, completion_tokens: 412, attempts: 1 },
+    { id: '19a4d-1', conv_key: 'codex-laptop#a3f19c', user: 'codex-laptop', label: 'dispatcher refactor', rid_from: 900, rid_to: 905, turns: 4,
+      prompt_id: null, prompt_name: 'Tool use audit (edited)', prompt_text: 'Judge only the bash calls.', custom: true, model: 'Qwen3.8-27B', status: 'running',
+      backend: 'gpu-box.lan:11434', created_ms: now - 400_000, started_ms: now - 95_000, input_chars: 48_210, truncated: false, attempts: 1 },
+    { id: '19a4e-2', conv_key: 'n8n-agents#b7c2d9', user: 'n8n-agents', label: null, rid_from: 930, rid_to: 931, turns: 2,
+      prompt_id: 'default', prompt_name: 'Default review', prompt_text: REVIEW_PROMPT, custom: false, model: 'Qwen3.8-27B', status: 'queued',
+      wait_reason: 'waiting for 2:13 more of quiet', created_ms: now - 120_000, attempts: 0 },
+    { id: '19a4f-3', conv_key: 'n8n-agents#b7c2d9', user: 'n8n-agents', label: null, rid_from: 930, rid_to: 931, turns: 2,
+      prompt_id: 'tool-use', prompt_name: 'Tool use audit', prompt_text: reviewLib.prompts[1].text, custom: false, model: 'llama3.3:70b', status: 'failed',
+      backend: '192.168.255.224:8000', created_ms: now - 7_200_000, started_ms: now - 7_000_000, finished_ms: now - 6_990_000,
+      error: 'the backend answered 500 Internal Server Error: model requires more system memory (41.2 GiB) than is available (31.0 GiB)', attempts: 1 },
+    { id: '19a50-4', conv_key: 'codex-laptop#a3f19c', user: 'codex-laptop', label: 'dispatcher refactor', rid_from: 900, rid_to: 901, turns: 2,
+      prompt_id: 'default', prompt_name: 'Default review', prompt_text: REVIEW_PROMPT, custom: false, model: 'Qwen3.8-27B', status: 'cancelled',
+      created_ms: now - 86_400_000, finished_ms: now - 86_000_000, attempts: 0 },
+  ];
+  let reviewSeq = 5;
+  const reviewSummary = r => { const { result, prompt_text, ...rest } = r; return { ...rest, has_result: result != null }; };
+  const findReview = id => reviews.find(r => r.id === id) || err('no such review');
+
   // Settings page: fields as /ui/api/settings returns them.
   const F = (key, value, source, live = true, fallback = value, fallback_source = source === 'ui' ? 'file' : source) =>
     ({ key, value, source, locked_by: null, live, fallback, fallback_source });
@@ -676,6 +728,9 @@
       F('audit_mode', 'full', 'file'), F('audit_flag_threshold', 0.85, 'default'),
       F('audit_scan_redacted', true, 'default'), F('audit_backend', 'http://192.168.6.11:8731', 'default'),
       F('request_log_flush_secs', 60, 'default'),
+      F('review_enabled', true, 'default'), F('review_model', 'Qwen3.8-27B', 'file', true, ''),
+      F('review_backend', '', 'default'), F('review_quiet_secs', 300, 'default'), F('review_swap_idle_secs', 600, 'default'),
+      F('review_timeout_secs', 1800, 'default'), F('review_max_transcript_chars', 200000, 'default'),
     ],
     startup: [
       F('host', '0.0.0.0', 'file', false), F('port', 11435, 'file', false),
@@ -783,6 +838,61 @@
         let content = contentBySeq[ev.seq] ?? null;
         if (content == null && ev.has_content) content = ev.dir === 'OUT' ? SAMPLE_RESPONSE : SAMPLE_CONTENT;
         return delay({ ...ev, content });
+      }
+      if (method === 'GET' && p === 'reviews') {
+        const conv = qs(path).conv;
+        return delay({ enabled: reviewCfg.enabled,
+          reviews: reviews.filter(r => !conv || r.conv_key === conv).sort((a, b) => b.created_ms - a.created_ms).map(reviewSummary) });
+      }
+      if (method === 'GET' && seg[0] === 'reviews' && seg.length === 2) return delay(findReview(seg[1]));
+      if (method === 'POST' && p === 'reviews') {
+        const c = convs.find(x => x.key === body.key) || err('no such conversation in the log');
+        const lp = reviewLib.prompts.find(x => x.id === (body.prompt_id || reviewLib.default)) || err(`no prompt '${body.prompt_id}'`);
+        const custom = !!body.prompt && body.prompt.trim() !== lp.text.trim();
+        const r = { id: `19a6${reviewSeq}-${reviewSeq++}`, conv_key: c.key, user: c.user, label: c.session_label ?? null,
+          rid_from: c.turns[0].rid, rid_to: c.turns.at(-1).rid, turns: c.turns.length,
+          prompt_id: custom ? null : lp.id, prompt_name: custom ? `${lp.name} (edited)` : lp.name, prompt_text: body.prompt || lp.text,
+          custom, model: body.model || reviewCfg.model || err('no model: name one, or set the default review model in Settings'),
+          status: 'queued', wait_reason: 'waiting for 4:58 more of quiet', created_ms: Date.now(), attempts: 0 };
+        reviews.push(r);
+        return delay(r);
+      }
+      if (method === 'POST' && seg[0] === 'reviews' && seg.length === 3) {
+        const r = findReview(seg[1]);
+        if (seg[2] === 'cancel') {
+          if (r.status !== 'queued' && r.status !== 'running') err('the review has already finished');
+          Object.assign(r, { status: 'cancelled', finished_ms: Date.now(), wait_reason: undefined });
+          return delay(r);
+        }
+        if (r.status === 'done') {
+          const again = { ...r, id: `19a6${reviewSeq}-${reviewSeq++}`, status: 'queued', created_ms: Date.now(), started_ms: undefined,
+            finished_ms: undefined, result: undefined, backend: undefined, wait_reason: 'waiting for 4:58 more of quiet', attempts: 0 };
+          reviews.push(again);
+          return delay(again);
+        }
+        if (r.status === 'queued' || r.status === 'running') err('the review has not finished');
+        Object.assign(r, { status: 'queued', error: undefined, finished_ms: undefined, started_ms: undefined, wait_reason: 'waiting for 4:58 more of quiet' });
+        return delay(r);
+      }
+      if (method === 'DELETE' && seg[0] === 'reviews') {
+        reviews.splice(reviews.indexOf(findReview(seg[1])), 1);
+        return delay({ deleted: seg[1] });
+      }
+      if (method === 'GET' && p === 'review-prompts') return delay({ ...reviewLib, ...reviewCfg });
+      if (method === 'PUT' && p === 'review-prompts') {
+        if (!(body.name || '').trim()) err('a prompt needs a name of at most 80 characters');
+        if (!(body.text || '').trim()) err('a prompt needs some text');
+        let id = body.id;
+        if (id) Object.assign(reviewLib.prompts.find(x => x.id === id) || err(`no prompt '${id}'`), { name: body.name.trim(), text: body.text });
+        else { id = body.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'prompt'; reviewLib.prompts.push({ id, name: body.name.trim(), text: body.text }); }
+        if (body.default) reviewLib.default = id;
+        return delay({ ...reviewLib, ...reviewCfg, saved: id });
+      }
+      if (method === 'DELETE' && seg[0] === 'review-prompts') {
+        if (reviewLib.prompts.length < 2) err('the last prompt cannot be removed');
+        reviewLib.prompts = reviewLib.prompts.filter(x => x.id !== seg[1]);
+        if (!reviewLib.prompts.some(x => x.id === reviewLib.default)) reviewLib.default = reviewLib.prompts[0].id;
+        return delay({ ...reviewLib, ...reviewCfg });
       }
       if (method === 'GET' && p === 'convs') return delay(convList());
       if (method === 'GET' && p === 'capture') return delay({ log: true, path: 'demo-conversations.jsonl', indexing: false, chain_back_ms: null });

@@ -643,7 +643,7 @@ pub fn clear_listing_cache(state: &AppState) {
 /// `X-Api-Key`). Client-supplied headers are never overridden; a token that
 /// cannot be encoded as an HTTP header value is skipped rather than failing
 /// the request.
-fn attach_backend_token(headers: &mut HeaderMap, token: Option<&str>) {
+pub(crate) fn attach_backend_token(headers: &mut HeaderMap, token: Option<&str>) {
     let t = match token {
         Some(t)
             if !headers.contains_key(axum::http::header::AUTHORIZATION)
@@ -760,6 +760,13 @@ pub struct BackendStatus {
     pub name: Option<String>,
     /// Turned off in the settings: never probed, kept offline, never routed to.
     pub disabled: bool,
+    /// Unix ms of the last user request dispatched here or finished here (boot
+    /// time before the first). A review waits for `review.quiet_secs` of this.
+    pub last_user_ms: u64,
+    /// A conversation review is running here (see [`crate::review`]). It does
+    /// not count against `active_requests`: a review never holds a user back,
+    /// the scheduler only prefers a backend without one.
+    pub review_running: bool,
 }
 
 impl BackendStatus {
@@ -790,6 +797,8 @@ impl BackendStatus {
             kv_free_pct: None,
             name: None,
             disabled: false,
+            last_user_ms: crate::clients::now_ms(),
+            review_running: false,
         }
     }
 }
@@ -927,6 +936,9 @@ pub struct AppState {
     /// The security audit: its runtime switches, its queue, and the verdicts the
     /// live views still show (see [`crate::audit`]).
     pub audit: crate::audit::Audit,
+    /// Conversation reviews: their queue, prompt library and worker switches
+    /// (see [`crate::review`]).
+    pub review: crate::review::Review,
 }
 
 /// One line of the Logs panel: a request entering ("IN") or leaving
@@ -2072,6 +2084,7 @@ impl AppState {
             metrics_token: Mutex::new(None),
             config: Mutex::new(crate::settings::Layers::default()),
             audit: crate::audit::Audit::new(),
+            review: crate::review::Review::new(),
             queued_bytes: std::sync::atomic::AtomicU64::new(0),
             clients: Mutex::new(crate::clients::ClientStore::in_memory()),
             model_policy: Mutex::new(crate::model_policy::ModelPolicyStore::in_memory()),
@@ -3813,11 +3826,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 task_prio == Priority::Top,
                             )
                         });
-                        let candidates_backends: Vec<usize> = eligible_indices
+                        let mut candidates_backends: Vec<usize> = eligible_indices
                             .iter()
                             .cloned()
                             .filter(|&i| backends[i].active_requests == min_conns)
                             .collect();
+                        // Among equals, keep away from a backend busy with a
+                        // review: it would share the GPU with it.
+                        if candidates_backends.iter().any(|&i| !backends[i].review_running) {
+                            candidates_backends.retain(|&i| !backends[i].review_running);
+                        }
                         let candidate_pos = candidates_backends
                             .iter()
                             .position(|&i| i > last_idx)
@@ -3830,6 +3848,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                             .last_backend_idx
                             .store(last_idx, std::sync::atomic::Ordering::Relaxed);
                         if !metadata {
+                            backends[selected_backend_idx].last_user_ms = crate::clients::now_ms();
                             backends[selected_backend_idx].active_requests += 1;
                             if let Some(ref m) = task.requested_model {
                                 let k = model_concurrency_key(m);
@@ -4516,6 +4535,9 @@ pub async fn run_worker(state: Arc<AppState>) {
                         let b = &mut backends[backend_idx];
                         // Metadata reads were never accounted at dispatch.
                         if !metadata {
+                            // A long request ending starts the review's quiet
+                            // window, not the moment it began.
+                            b.last_user_ms = crate::clients::now_ms();
                             b.active_requests = b.active_requests.saturating_sub(1);
                             if let Some(ref m) = task.requested_model {
                                 let k = model_concurrency_key(m);
@@ -5277,6 +5299,8 @@ mod tests {
             name: None,
             disabled: false,
             redact_log: false,
+            last_user_ms: 0,
+            review_running: false,
         }
     }
 

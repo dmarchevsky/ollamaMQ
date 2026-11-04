@@ -151,6 +151,27 @@ settings:
   #                             # a watchlist entry is a watch, nothing more
   #   guard_model: qwen3guard-gen-0.6b
   #   decision_model: d3-nano
+  # --- Conversation review ---------------------------------------------------
+  # Conversations you send from the web UI (✎ Review in the conversation
+  # viewer) are judged by an LLM with a prompt from the library in
+  # review_prompts.yaml (next to this file) or one written for that review.
+  # Reviews are the lowest-priority work: one starts only on a backend that has
+  # served no user request for quiet_secs, and a running review never holds a
+  # user request back. See the README's Conversation Review section.
+  # review:
+  #   model: qwen3:32b          # default review model; empty = Review is off
+  #                             # until a review names one
+  #   backend: ""               # only this backend (URL or name); empty = any
+  #                             # backend that has the model
+  #   quiet_secs: 300           # idle this long (no user request in flight or
+  #                             # just finished) before a review starts
+  #   swap_idle_secs: 600       # idle this long before a review may evict a
+  #                             # loaded model to load its own
+  #   timeout_secs: 1800        # one review's call to the backend
+  #   max_transcript_chars: 200000  # the transcript is cut from the middle
+  #   max_message_chars: 4000   # each message / tool result, head and tail kept
+  #   concurrency: 1            # reviews at once (at most one per backend)
+  #   enabled: true             # false holds every queued review where it is
   # Files the web UI writes. A relative path is resolved from the folder
   # holding this file, so by default they sit next to it (logs above stay
   # relative to the working directory). Defaults shown.
