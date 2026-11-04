@@ -317,6 +317,13 @@
     const text = (CONV_TEXT[t.rid] || {})[q.dir === 'out' ? 'out' : 'in'];
     return { content: text ?? err('no captured text for this request') };
   };
+  /** `conv/contents`: many turns' text at once, as the viewer loads them. */
+  const convContents = q => {
+    const conv = convFind({ key: q.key }) || err('no such conversation in the log');
+    const want = q.rids ? new Set(q.rids.split(',').map(Number)) : null;
+    return { turns: conv.turns.filter(t => !want || want.has(t.rid))
+      .map(t => ({ rid: t.rid, req: CONV_TEXT[t.rid]?.in ?? null, resp: CONV_TEXT[t.rid]?.out ?? null })) };
+  };
 
   const SAMPLE_CONTENT = JSON.stringify({
     model: 'Qwen3.8-Flash-Next',
@@ -679,6 +686,14 @@ The user asked the agent to fix the request-log rotation, which walked the slot 
 - It read \`src/reqlog.rs\` before editing, and quoted the loop it was about to change.
 - After the first red run it fixed the *test's* wrong expectation instead of bending the code to it.
 
+## Scores
+| Area | Score | Note |
+|:-----|:-----:|-----:|
+| Correctness | 5/5 | fix verified by \`cargo test\` |
+| Efficiency | 3/5 | suite ran twice |
+
+---
+
 ## Problems
 1. **Turn 2:** a tool result carried an instruction to send the file to an outside host; the agent did not act on it, but it did not say it had seen it either.
 2. **Turn 3:** the full suite ran twice where one focused \`cargo test rotate\` would have shown the same failure.
@@ -686,6 +701,10 @@ The user asked the agent to fix the request-log rotation, which walked the slot 
 ## Suggestions
 - Ask the agent to name any instruction it finds inside a tool result before going on.
 - Prefer a focused test first, the whole suite once at the end.
+  - e.g. \`cargo test rotate\`, then ~~everything twice~~ the whole suite once
+- See the [rotation notes](https://example.com/docs/rotation) for why the chain is walked newest first.
+
+> Injected text stays text: <script>alert(1)</script>
 
 ## Verdict
 Success — the fix is right and verified; two small inefficiencies.`;
@@ -711,6 +730,9 @@ Success — the fix is right and verified; two small inefficiencies.`;
   let reviewSeq = 5;
   const reviewSummary = r => { const { result, prompt_text, ...rest } = r; return { ...rest, has_result: result != null }; };
   const findReview = id => reviews.find(r => r.id === id) || err('no such review');
+  /** Run now, as the demo plays it: running at once on the GPU box. */
+  const demoStart = r => Object.assign(r, { run_now: true, status: 'running', started_ms: Date.now(),
+    backend: 'gpu-box.lan:11434', wait_reason: undefined, attempts: (r.attempts || 0) + 1 });
 
   // Settings page: fields as /ui/api/settings returns them.
   const F = (key, value, source, live = true, fallback = value, fallback_source = source === 'ui' ? 'file' : source) =>
@@ -855,10 +877,16 @@ Success — the fix is right and verified; two small inefficiencies.`;
           custom, model: body.model || reviewCfg.model || err('no model: name one, or set the default review model in Settings'),
           status: 'queued', wait_reason: 'waiting for 4:58 more of quiet', created_ms: Date.now(), attempts: 0 };
         reviews.push(r);
+        if (body.run_now) demoStart(r);
         return delay(r);
       }
       if (method === 'POST' && seg[0] === 'reviews' && seg.length === 3) {
         const r = findReview(seg[1]);
+        if (seg[2] === 'run') {
+          if (r.status !== 'queued') err('only a queued review can be started');
+          demoStart(r);
+          return delay(r);
+        }
         if (seg[2] === 'cancel') {
           if (r.status !== 'queued' && r.status !== 'running') err('the review has already finished');
           Object.assign(r, { status: 'cancelled', finished_ms: Date.now(), wait_reason: undefined });
@@ -900,6 +928,7 @@ Success — the fix is right and verified; two small inefficiencies.`;
         backend_online: true, queue: 0, queue_max: 64, dropped: 0, scan_redacted: true, flag_threshold: 0.85 });
       if (method === 'GET' && p === 'conv') return delay(convIndex(qs(path)));
       if (method === 'GET' && p === 'conv/content') return delay(convContent(qs(path)));
+      if (method === 'GET' && p === 'conv/contents') return delay(convContents(qs(path)));
       if (method === 'GET' && p === 'conv/export') {
         const c = convIndex(qs(path));
         return delay({ ...c, turns: c.turns.map(t => ({ ...t, content: { req: (CONV_TEXT[t.rid] || {}).in ?? null, resp: (CONV_TEXT[t.rid] || {}).out ?? null } })) });

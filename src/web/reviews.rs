@@ -52,6 +52,9 @@ pub struct SubmitBody {
     prompt_id: Option<String>,
     prompt: Option<String>,
     model: Option<String>,
+    /// Start it at once instead of waiting for a quiet backend.
+    #[serde(default)]
+    run_now: bool,
 }
 
 pub async fn submit(
@@ -65,12 +68,13 @@ pub async fn submit(
             prompt_id: b.prompt_id.as_deref(),
             prompt: b.prompt.as_deref(),
             model: b.model.as_deref(),
+            run_now: b.run_now,
         },
     )?;
     Ok(Json(job))
 }
 
-/// `POST /reviews/{id}/{op}`: `retry` or `cancel`.
+/// `POST /reviews/{id}/{op}`: `retry`, `cancel` or `run` (start a queued one now).
 pub async fn action(
     State(state): State<Arc<AppState>>,
     Path((id, op)): Path<(String, String)>,
@@ -78,6 +82,7 @@ pub async fn action(
     let job = match op.as_str() {
         "retry" => state.review.retry(&state, &id)?,
         "cancel" => state.review.cancel(&id)?,
+        "run" => state.review.run_now(&id)?,
         _ => return Err(ApiError::new(StatusCode::NOT_FOUND, "no such review action")),
     };
     Ok(Json(job))

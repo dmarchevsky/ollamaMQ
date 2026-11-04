@@ -3,6 +3,33 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.30.1 — 2026-11-04
+
+### Added
+
+- **Run a queued review now**: **▶ Run now** on a queued review (and **Send & run now** in the
+  review dialog) starts it at once on any online backend that has its model and is not loading
+  or unloading one — skipping the quiet time, the swap wait, busy backends, the concurrency
+  limit and the off switch. Without such a backend it stays queued and says why.
+  `POST /ui/api/reviews/{id}/run`; `POST /ui/api/reviews` takes `run_now`.
+
+### Changed
+
+- **Review answers render fuller Markdown**: tables (with column alignment), nested lists,
+  `---` rules, multi-line quotes, links (http/https only), `~~strike~~`, `***bold italic***`
+  and `__bold__` — and emphasis no longer reaches inside `code`.
+- **The conversation viewer opens at once**: a click shows the viewer with a spinner while the
+  conversation is read from disk, and the turn list appears before the open turn's text.
+  Previously nothing happened on screen for the seconds a large conversation took to load.
+- **A long conversation loads with a handful of reads, not hundreds**: the viewer fetches turn
+  text through the new `GET /ui/api/conv/contents?key=…&rids=…`, which reads and folds the
+  conversation once for up to eight turns and rebuilds their requests from the deltas with one
+  shared memo. Before, every turn cost two calls that each read the whole conversation back from
+  disk — about 120 full reads to open a 60-turn conversation.
+- **Viewer reads no longer block the proxy**: opening, exporting or deleting a conversation reads
+  the disk on the blocking thread pool instead of a runtime worker, so a viewer loading a large
+  conversation cannot slow request handling.
+
 ## v0.30.0 — 2026-11-03
 
 ### Added
