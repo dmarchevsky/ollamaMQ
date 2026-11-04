@@ -114,6 +114,18 @@ addEventListener('load', () => {
         A('incremental-striped', document.querySelectorAll(`#lv-t-${rid2} .msg.m-new`).length > 0
           && !document.querySelector(`#lv-t-${rid2} .msg.m-held`),
           `${inc()} messages in request 2, the new ones stripped`);
+        // The previous answer re-sent at the head of the increment is turn 1's
+        // Response, already on screen: request 2 does not draw it a second time.
+        const echoed = [];
+        for (const [i, t2] of lvTurns().entries()) {
+          await lvLoad(t2.rid); if (i) await lvLoad(lvTurns()[i - 1].rid);
+          if (lvEcho(i) >= 0) echoed.push([t2.rid, lvEcho(i)]);
+        }
+        for (const [r] of echoed) LV.open.add(r);
+        await lvDraw();
+        const drawn = echoed.filter(([r, k]) => document.getElementById(`lv-m-${r}-${k}`));
+        A('echo-not-repeated', echoed.length > 0 && !drawn.length,
+          `${echoed.length} re-sent answers found, ${drawn.length} drawn again`);
         // Capture turned off reads as a decision, in the tree and in the turn.
         const off = document.querySelector('.turn-h [title*="text not stored"]');
         A('redacted-labelled', !!off || !LV.conv.redacted, 'capture-off turns are labelled');

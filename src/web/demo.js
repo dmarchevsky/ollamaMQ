@@ -223,13 +223,15 @@
   ];
   const convC = convB.concat(moreMsgs.slice(0, 2));
   const convD = convB.concat(moreMsgs.slice(0, 5));
+  // 904 answers the red test run with the test fix — the very reply 905 sends
+  // back as a message, so the viewer has a re-sent answer to keep out of 905.
   const out904 = sse(
     [{ role: 'assistant', content: '' },
-     { reasoning: 'The edit landed; the right move now is a focused test run before anything else.' },
-     ...'Running the suite to verify the rotation fix.'
+     { reasoning: 'The failure is the test itself: it asserts the oldest-slot order, but the fix deliberately walks the other way.' },
+     ...'The rotation test still expects the old ordering — updating its expectation to match the new chain.'
        .match(/.{1,14}/g).map(s => ({ content: s })),
-     { tool_calls: [{ index: 0, id: 'c20', function: { name: 'bash', arguments: '{"command":' } }] },
-     { tool_calls: [{ index: 0, function: { arguments: '"cargo test rotate"}' } }] }],
+     { tool_calls: [{ index: 0, id: 'c21', function: { name: 'edit', arguments: '{"path":' } }] },
+     { tool_calls: [{ index: 0, function: { arguments: '"src/reqlog.rs"}' } }] }],
     { prompt_tokens: 1310, completion_tokens: 210 }, 'tool_calls');
   const out905 = sse(    [{ role: 'assistant', content: '' },
      { reasoning: 'The suite is green with the corrected expectation — this answers the original request.' },

@@ -3,6 +3,17 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.30.2 — 2026-11-04
+
+### Fixed
+
+- **The log viewer no longer shows an answer twice**: an agent sends the model's previous answer
+  back as the first new message of its next request, so that answer appeared under one request's
+  Response and again at the top of the next request. With **Show incremental** on, a request now
+  shows only what it added (usually the tool results). With it off, the re-sent answer is dimmed
+  like the rest of the re-sent history. The conversation tree now also drops a re-sent answer
+  made only of tool calls; before, it recognized a re-sent answer only by its text.
+
 ## v0.30.1 — 2026-11-04
 
 ### Added
