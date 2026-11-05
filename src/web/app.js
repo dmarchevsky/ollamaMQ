@@ -780,11 +780,18 @@ function renderCapacity(st, ov) {
   const sharedRow = shared.length ? row(
     '<span class="cap-shared" title="Several backends can serve these models, or none lists them">any backend</span>',
     `<div class="q2-bar"><div class="q-track">${shared.map(w => waitSeg(w, 'flex:1 1 26px')).join('')}</div></div>`, '') : '';
-  // Legend of the board: the conversations on it right now, not the window
-  // history — same identity (client, or client+label) the rows are coloured by.
-  // Capacity names only what Capacity draws; the stage chips are keyed under
+  // Legend of the board's colours: everyone Activity shows in the window under
+  // the current filters (reqRows is what Activity draws from, so the two never
+  // disagree), plus whoever is on the bar now — the bar draws the whole queue,
+  // which the priority filter would otherwise leave unkeyed. Same identity
+  // (client, or client:keylabel) the rows and segments are coloured by, sorted
+  // by name so a poll never reshuffles it. The stage chips are keyed under
   // Activity, where they are drawn.
-  const ids = [...new Set([...(st.runs || []).map(fmtWho), ...ov.queue.map(fmtWho)])]
+  const ids = [...new Set([
+    ...reqRows(st, ov, true).rows.map(r => fmtWho(r.o)),
+    ...(st.runs || []).map(fmtWho), ...ov.queue.map(fmtWho),
+  ])]
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
     .map(id => `<span>${swatch(id)}${esc(id)}</span>`);
   const legend = legendRow([...ids, swItem('free', 'free'), swItem('loading', 'loading a model'),
     '<span class="dim">waiting rows share the bar’s token scale</span>']);

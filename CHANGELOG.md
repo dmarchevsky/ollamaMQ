@@ -3,6 +3,16 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.30.4 — 2026-11-05
+
+### Fixed
+
+- **The Capacity legend names everyone Activity shows**: the legend under the Overview's Capacity
+  panel listed only the clients running or waiting at that moment, so when the board was idle
+  it named no one, even with Activity full of coloured rows. It now lists every client shown in
+  Activity under the current filters (client and key label in key mode), plus anyone on the bar,
+  sorted by name.
+
 ## v0.30.3 — 2026-11-04
 
 ### Fixed
