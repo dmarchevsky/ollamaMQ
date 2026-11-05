@@ -3,6 +3,28 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.30.3 — 2026-11-04
+
+### Fixed
+
+- **Activity shows whole conversations**: the Overview's Activity panel received only the newest
+  100 finished requests, so a long-running conversation was cut off and looked shorter than it
+  does on the Logs page. The limit now counts conversations (the newest 30, at most 1,500
+  requests in total), and a conversation is either shown whole within the window or not at all.
+- **A renamed conversation shows the same name everywhere**: when a client changes a conversation's
+  name partway through, the Logs list, the log viewer and the Activity panel all show the newest
+  name. Before, the conversation log kept the first name and Activity showed the newest.
+
+### Changed
+
+- **Logs list shows Start time and End time**: the By conversation view has both in place of the
+  single Time column. End time is marked `+1d` when a conversation crosses midnight, and both show
+  the full date on hover.
+- **⏮ ‹ › ⏭ in the log viewer bring the request into view in both panes**: the request is scrolled
+  to and briefly highlighted in the log, and the Jump panel scrolls to the same entry. Before,
+  the Jump panel stayed where it was. Jumping to a message or a response from the Jump panel now
+  scrolls that panel too.
+
 ## v0.30.2 — 2026-11-04
 
 ### Fixed

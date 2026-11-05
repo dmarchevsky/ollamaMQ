@@ -21,8 +21,54 @@ use crate::stats::{self, Agg, SPARK_BUCKETS, Summary, buckets, group_by};
 const MAX_CLIENTS: usize = 50;
 const MAX_MARKERS: usize = 100;
 const MAX_QUEUE: usize = 100;
-/// Rows of the Requests table's finished list.
-const MAX_RECENT: usize = 100;
+/// Conversations the Requests table's finished list carries, newest first.
+/// The cap is on conversations, not requests: a request cap cut a busy
+/// conversation at whichever request happened to be the hundredth, so the
+/// Activity panel showed a fragment of what the Logs page showed whole.
+const MAX_RECENT_CONVS: usize = 30;
+/// Row budget for that list (it is polled every second). A conversation that
+/// would overflow it is left out whole rather than cut; the newest one is
+/// always sent whole.
+const MAX_RECENT_ROWS: usize = 1500;
+
+/// The finished requests the Requests table shows, newest first: every row of
+/// the newest conversations (by latest activity) in the window. A conversation
+/// is one client + session tag; a request without a tag stands alone.
+fn pick_recent(finished: &[stats::Finished]) -> Vec<&stats::Finished> {
+    let conv = |i: usize| -> (&str, Option<&str>, usize) {
+        let f = &finished[i];
+        match f.session.as_deref() {
+            Some(s) => (f.client.as_str(), Some(s), 0),
+            None => (f.client.as_str(), None, i),
+        }
+    };
+    let mut sizes: HashMap<(&str, Option<&str>, usize), usize> = HashMap::new();
+    for i in 0..finished.len() {
+        *sizes.entry(conv(i)).or_default() += 1;
+    }
+    let mut admitted: HashSet<(&str, Option<&str>, usize)> = HashSet::new();
+    let mut rows = 0;
+    for i in (0..finished.len()).rev() {
+        if admitted.len() >= MAX_RECENT_CONVS {
+            break;
+        }
+        let k = conv(i);
+        if admitted.contains(&k) {
+            continue;
+        }
+        let n = sizes[&k];
+        if !admitted.is_empty() && rows + n > MAX_RECENT_ROWS {
+            break;
+        }
+        rows += n;
+        admitted.insert(k);
+    }
+    (0..finished.len())
+        .rev()
+        .filter(|&i| admitted.contains(&conv(i)))
+        .map(|i| &finished[i])
+        .collect()
+}
 /// Fixed lane bucket widths, chosen so the bar count stays ~30–60 and edges
 /// land on round multiples: 5 min→10 s, 15 min→30 s, 1 h→60 s; longer
 /// windows widen the bucket to keep the count near 30.
@@ -719,10 +765,8 @@ pub async fn get_overview(
         .collect();
 
     // --- requests: recently finished, newest first
-    let recent: Vec<Recent> = finished
-        .iter()
-        .rev()
-        .take(MAX_RECENT)
+    let recent: Vec<Recent> = pick_recent(&finished)
+        .into_iter()
         .map(|f| Recent {
             at_ms: f.at_ms,
             error: f.is_error(),
@@ -1017,6 +1061,63 @@ mod tests {
     }
 
     /// One backend, one finished request per client, all inside the window.
+    fn fin(at_ms: u64, client: &str, session: Option<&str>) -> crate::stats::Finished {
+        crate::stats::Finished {
+            session_key: None,
+            kind: None,
+            link: None,
+            at_ms,
+            client: client.to_string(),
+            key: "none".into(),
+            model: "m".into(),
+            backend: None,
+            outcome: "ok",
+            session: session.map(str::to_string),
+            session_label: None,
+            priority: "normal",
+            rid: None,
+            queue_wait: None,
+            tools: vec![],
+            stage: Default::default(),
+            timing: Default::default(),
+        }
+    }
+
+    #[test]
+    fn recent_keeps_whole_conversations() {
+        // A long conversation whose start is far older than 100 requests ago,
+        // interleaved with two short ones that ran later.
+        let mut f: Vec<_> = (0..250).map(|i| fin(i, "dm", Some("long"))).collect();
+        f.extend((250..290).map(|i| fin(i, "dm", Some(if i % 2 == 0 { "a" } else { "b" }))));
+        let got = pick_recent(&f);
+        assert_eq!(got.len(), 290, "no conversation is cut");
+        assert!(got.windows(2).all(|w| w[0].at_ms >= w[1].at_ms), "newest first");
+        assert_eq!(got.iter().filter(|x| x.session.as_deref() == Some("long")).count(), 250);
+    }
+
+    #[test]
+    fn recent_caps_conversations_not_requests() {
+        // Untagged requests are a conversation each.
+        let f: Vec<_> = (0..(MAX_RECENT_CONVS as u64 + 10)).map(|i| fin(i, "x", None)).collect();
+        let got = pick_recent(&f);
+        assert_eq!(got.len(), MAX_RECENT_CONVS);
+        assert_eq!(got[0].at_ms, MAX_RECENT_CONVS as u64 + 9);
+        // Same tag under another client is another conversation.
+        let f = vec![fin(0, "a", Some("s")), fin(1, "b", Some("s"))];
+        assert_eq!(pick_recent(&f).len(), 2);
+    }
+
+    #[test]
+    fn recent_row_budget_drops_whole_conversations() {
+        // The newest conversation goes whole even past the budget; the next
+        // one, which would overflow it, is left out rather than cut.
+        let mut f: Vec<_> = (0..10).map(|i| fin(i, "dm", Some("old"))).collect();
+        f.extend((10..10 + MAX_RECENT_ROWS as u64 + 5).map(|i| fin(i, "dm", Some("big"))));
+        let got = pick_recent(&f);
+        assert_eq!(got.len(), MAX_RECENT_ROWS + 5);
+        assert!(got.iter().all(|x| x.session.as_deref() == Some("big")));
+    }
+
     fn state_with(clients: &[&str]) -> Arc<AppState> {
         let conf = std::env::temp_dir().join(format!("omq-overview-{}.yaml", std::process::id()));
         let url = "http://127.0.0.1:9";
