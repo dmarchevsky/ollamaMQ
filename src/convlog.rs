@@ -1065,7 +1065,9 @@ impl ConvLogger {
                     store.dropped.fetch_add(1, Ordering::Relaxed);
                 }
                 let e = store.entry(&b.key, &b.user);
-                if e.conv.session_label.is_none() {
+                // The newest label wins: a renamed conversation is named as
+                // it is now, as the Activity panel names it.
+                if b.session_label.is_some() {
                     e.conv.session_label = b.session_label;
                 }
                 if b.model.is_some() {
@@ -1386,15 +1388,19 @@ fn parse_line(raw: &[u8]) -> Option<Conv> {
 }
 
 /// Fold a newer header into what is known of a conversation: the clock only
-/// widens, the newest model and backend win, the first label sticks and the
-/// priority only rises.
+/// widens, the newest model and backend win, the newest label wins (a client
+/// may rename a conversation mid-way, and every view names it as it is now)
+/// and the priority only rises.
 fn fold_head(acc: &mut Conv, line: &Conv) {
     acc.v = acc.v.max(line.v);
     if line.start_ms > 0 && (acc.start_ms == 0 || line.start_ms < acc.start_ms) {
         acc.start_ms = line.start_ms;
     }
+    // Decided before the clock widens: whichever line ends last names it,
+    // whatever order the lines are folded in.
+    let newer = line.end_ms >= acc.end_ms;
     acc.end_ms = acc.end_ms.max(line.end_ms);
-    if acc.session_label.is_none() {
+    if line.session_label.is_some() && (newer || acc.session_label.is_none()) {
         acc.session_label = line.session_label.clone();
     }
     if line.model.is_some() {
@@ -2322,6 +2328,37 @@ mod tests {
     use super::*;
     use sessions::{SessionStore, Tombs};
 
+    /// A conversation renamed mid-way is named by its newest line, whichever
+    /// order the lines are folded in; a line without a label never clears one.
+    #[test]
+    fn fold_head_takes_the_newest_label() {
+        let line = |end_ms: u64, label: Option<&str>| Conv {
+            v: 4,
+            key: "dm#a6399e".into(),
+            user: "dm".into(),
+            session: Some("a6399e".into()),
+            session_label: label.map(str::to_string),
+            model: None,
+            backend: None,
+            priority: None,
+            redacted: false,
+            start_ms: 100,
+            end_ms,
+            dropped_turns: 0,
+            turns: Vec::new(),
+        };
+        let old = line(200, Some("review-how-telegram-integration"));
+        let new = line(900, Some("telegram-settings"));
+        for order in [[&old, &new], [&new, &old]] {
+            let mut acc = order[0].clone();
+            fold_head(&mut acc, order[1]);
+            assert_eq!(acc.session_label.as_deref(), Some("telegram-settings"));
+        }
+        let mut acc = new.clone();
+        fold_head(&mut acc, &line(1000, None));
+        assert_eq!(acc.session_label.as_deref(), Some("telegram-settings"));
+    }
+
     /// The boot retention warning's rule, without a disk: the log's own
     /// growth decides whether its budget can span `history_hours`.
     #[test]
@@ -2912,6 +2949,32 @@ mod tests {
         // The hot store still answers with the stream as captured.
         let q = Find { key: Some("eve#e1"), rid: Some(1), ..Default::default() };
         assert_eq!(log.content(&q, Dir::Resp).as_deref(), Some(sse));
+        handle.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A client that renames its conversation mid-way: the line written after
+    /// the rename carries the new name, so every view reading the log agrees
+    /// with the Activity panel.
+    #[tokio::test]
+    async fn renamed_conversation_carries_the_new_label() {
+        let path = tmp("renamed.jsonl");
+        let (log, handle) =
+            ConvLogger::start(path.clone(), Retention::default(), Duration::from_secs(3600)).unwrap();
+        let named = |rid: u64, at: u64, label: &str| match begin("dm#a6", rid, at) {
+            Note::Begin(mut b) => {
+                b.session_label = Some(label.into());
+                Note::Begin(b)
+            }
+            _ => unreachable!(),
+        };
+        log.note(named(1, 1000, "review-how-telegram-integration"));
+        log.note(resp("dm#a6", 1, 2000));
+        log.note(named(2, 3000, "telegram-settings"));
+        log.note(resp("dm#a6", 2, 4000));
+        let lines = flush_lines(&log, &mut HashMap::new());
+        let conv: Conv = serde_json::from_str(&lines[0].1).unwrap();
+        assert_eq!(conv.session_label.as_deref(), Some("telegram-settings"));
         handle.abort();
         let _ = std::fs::remove_file(&path);
     }

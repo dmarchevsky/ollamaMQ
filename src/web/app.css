@@ -513,6 +513,12 @@ pre.content {
   .panel table.logs td:nth-child(4), .panel table.logs td:nth-child(5) { grid-column: span 3; font-size: 12.5px; }
   .panel table.logs td:nth-child(4) { color: var(--text); }
   .panel table.logs td.none { display: none; }
+  /* By conversation: start, end and the name share the first line; model,
+     backend and activity each take a line under it. */
+  .panel table.logs.conv td:nth-child(2) { font-weight: 400; overflow: visible; }
+  .panel table.logs.conv td:nth-child(3) { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .panel table.logs.conv td:nth-child(n+4) { grid-column: span 3; font-size: 12.5px; color: inherit; }
+  .panel table.logs.conv td:nth-child(5) { color: var(--text); }
 }
 
 /* Clients page: filter + action row, three-column Blocked page. */

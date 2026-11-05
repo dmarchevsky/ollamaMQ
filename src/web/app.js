@@ -1885,7 +1885,13 @@ function logConvs(rounds) {
     }
     if (!e.hist || e.has_content) g.open = true;
     g.first = Math.min(g.first, e.at_ms);
-    if (e.at_ms >= g.at) { g.at = e.at_ms; if (e.rid != null) g.rid = e.rid; }
+    // The newest event names the row: a renamed conversation reads as it is
+    // now, the way the Activity panel names it.
+    if (e.at_ms >= g.at) {
+      g.at = e.at_ms;
+      if (e.rid != null) g.rid = e.rid;
+      if (e.session_label) g.label = e.session_label;
+    }
     if (e.model) g.models.add(e.model);
     if (e.backend) g.backends.add(e.backend);
     if (e.redacted) g.redacted = true;
@@ -1935,6 +1941,14 @@ function convSegs(g) {
  *  keys on — the label is what makes one row per conversation recognisable. */
 const sessTag = g => `<span class="sess" title="session tag ${esc(g.session)} — this is what the log keys on">#${esc(g.label || g.session)}</span>`;
 
+/** ` +1d` when `to` falls on a later calendar day than `from` — a time of day
+ *  alone would read as earlier than the start across midnight. */
+const dayShift = (from, to) => {
+  const day = ms => { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime(); };
+  const n = Math.round((day(to) - day(from)) / 86400000);
+  return n > 0 ? `<span class="dim"> +${n}d</span>` : '';
+};
+
 function convTable(rounds) {
   const items = logConvs(rounds);
   if (!items.length) return '<div class="empty">No matching log events</div>';
@@ -1943,6 +1957,7 @@ function convTable(rounds) {
       const e = it.r.in || it.r.out || it.r.solo;
       return `<tr class="clickable" data-action="log-detail" data-seq="${e.seq}">
         <td class="time">${fmtTime(e.at_ms)}</td>
+        <td class="time">${it.r.in && !it.r.out ? '\u2014' : fmtTime(e.at_ms)}</td>
         <td><span class="mono">${esc(e.user)}</span> <span class="dim">\u00b7 no session</span></td>
         <td class="trunc none">\u2014</td><td class="dim none">\u2014</td>
         <td class="round"><div class="rline">${roundSegs(it.r)}${roundFlags(it.r).length ? ' ' + flagBadges(roundFlags(it.r)) : ''}</div></td></tr>`;
@@ -1952,14 +1967,15 @@ function convTable(rounds) {
     return `<tr class="${g.open ? 'clickable' : ''}" ${g.open
         ? `data-action="conv-open" data-session="${esc(g.session)}" data-user="${esc(g.user)}"${g.rid != null ? ` data-rid="${g.rid}"` : ''} title="${esc(span)}"`
         : `title="${deadWhy()}"`}>
-      <td class="time">${fmtTime(g.at)}</td>
+      <td class="time" title="${fmtDate(g.first)} ${fmtTime(g.first)}">${fmtTime(g.first)}</td>
+      <td class="time" title="${fmtDate(g.at)} ${fmtTime(g.at)}">${g.waiting && g.at === g.first ? '\u2014' : fmtTime(g.at) + dayShift(g.first, g.at)}</td>
       <td><span class="mono">${esc(g.user)}</span>${sessTag(g)}</td>
       <td class="trunc ${model ? '' : 'none'}">${model ?? '—'}</td>
       <td class="dim ${bk ? '' : 'none'}">${bk ?? '—'}</td>
       <td class="round"><div class="rline">${convSegs(g)}</div></td></tr>`;
   }).join('');
-  return `<table class="logs">
-    <tr><th>Time</th><th>Conversation</th><th>Model</th><th>Backend</th><th>Activity</th></tr>${rows}</table>`;
+  return `<table class="logs conv">
+    <tr><th>Start time</th><th>End time</th><th>Conversation</th><th>Model</th><th>Backend</th><th>Activity</th></tr>${rows}</table>`;
 }
 
 // When the log file could not be opened at boot nothing is captured, so a row
@@ -2768,7 +2784,27 @@ function lvScroll() {
   if (el) el.scrollIntoView({ block: 'start' });
 }
 
-/** Focus one request: expand it (leaving the others as they were), scroll to it. */
+/** Light one rail row and bring it into the rail's own view (centred). Only
+ *  the rail scrolls — `scrollIntoView` would drag the dialog along with it.
+ *  Jumps call this themselves: their scroll holds `lvTrackLock`, so the
+ *  tracker would otherwise leave the rail wherever it was (at #1, while the
+ *  log shows #168). */
+function lvRevealRail(sel) {
+  const rail = $('#lv-rail');
+  if (!S.lv.rail || !rail || rail.hidden) return;
+  const node = rail.querySelector(sel);
+  if (!node) return;
+  rail.querySelectorAll('.lv-node.on').forEach(n => { if (n !== node) n.classList.remove('on'); });
+  node.classList.add('on');
+  const rr = node.getBoundingClientRect(), pr = rail.getBoundingClientRect();
+  if (rr.top < pr.top || rr.bottom > pr.bottom)
+    rail.scrollTop += rr.top - pr.top - (pr.height - rr.height) / 2;
+}
+const lvRailTurn = rid => `.lv-node.turn[data-rid="${rid}"]`;
+
+/** Focus one request: expand it (leaving the others as they were), scroll the
+ *  log to it and flash it, and bring its row into view in the Jump rail —
+ *  what ⏮ ‹ › ⏭ and a rail click do. */
 async function lvFocus(rid) {
   if (rid == null || lvIdxOf(rid) < 0) return;
   lvTrackLock = Date.now() + 700; // its own scroll lands the highlight it drew
@@ -2776,7 +2812,17 @@ async function lvFocus(rid) {
   LV.focusMsg = null;
   LV.open.add(rid);
   LV.closedRuns.delete(lvRunOf(lvRuns(), lvIdxOf(rid)));
+  // The turn's text first: drawn without it, the block grows under the
+  // scroll once it arrives and the target slides out of place.
+  await lvLoad(rid);
   await lvDraw({ scroll: true });
+  if (LV.rid !== rid) return; // a newer jump took over while this one loaded
+  const head = document.querySelector(`#lv-t-${rid} > .turn-h`);
+  if (head) {
+    head.classList.add('flash');
+    setTimeout(() => head.classList.remove('flash'), 1300);
+  }
+  lvRevealRail(lvRailTurn(rid));
   lvHashWrite();
 }
 
@@ -2793,11 +2839,12 @@ async function lvFocusSec(rid, side) {
   await lvLoad(rid); // the section to land on is part of the turn's text
   await lvDraw({ scroll: false });
   const el = document.getElementById(`lv-${side}-${rid}`);
-  if (!el) { lvScroll(); lvDrawRail(); return; }
+  if (!el) { lvScroll(); lvDrawRail(); lvRevealRail(lvRailTurn(rid)); return; }
   el.scrollIntoView({ block: 'start' });
   el.classList.add('flash');
   setTimeout(() => el.classList.remove('flash'), 1300);
   lvDrawRail();
+  lvRevealRail(`.lv-node.resph[data-rid="${rid}"]`);
 }
 
 /** The rail is where you are, not just what you click: whatever block sits at
@@ -2871,12 +2918,13 @@ async function lvFocusMsg(rid, idx) {
   LV.focusMsg = [tgt.rid, tgt.idx];
   if (needed) { await lvLoad(tgt.rid); await lvDraw({ scroll: false }); }
   const el = document.getElementById(`lv-m-${tgt.rid}-${tgt.idx}`);
-  if (!el) { lvScroll(); lvDrawRail(); return; }
+  if (!el) { lvScroll(); lvDrawRail(); lvRevealRail(lvRailTurn(tgt.rid)); return; }
   for (const d of [el.closest('details'), ...el.querySelectorAll('details')]) if (d) d.open = true;
   el.scrollIntoView({ block: 'start' });
   el.classList.add('flash');
   setTimeout(() => el.classList.remove('flash'), 1300);
   lvDrawRail();
+  lvRevealRail(`.lv-node.sub[data-rid="${tgt.rid}"][data-idx="${tgt.idx}"]`);
 }
 
 async function lvStep(delta) {
