@@ -534,7 +534,7 @@ since upstream `v0.5.0`.
   because the marker is read from the body in memory and nothing new is stored. The summarization
   call is no longer charged as cache waste: its cold prefill is the client rewriting its own
   history, not the backend losing it.
-  [README](README.md#-context-compaction)
+  [Context compaction](docs/scheduling.md#context-compaction)
 
 ## v0.21.0 — 2026-10-26
 
@@ -565,7 +565,7 @@ since upstream `v0.5.0`.
   exactly as with the per-client/key/backend `redact_log` rules. The flag is one-way: a request
   can hide its own text, but can never force text to be stored that a client, key or backend has
   switched off. Like its sibling headers it reaches the backend forwarded unchanged
-  (see README [Request logging](README.md#request-logging)).
+  (see [Request log](docs/request-log.md)).
 
 ### Changed
 
