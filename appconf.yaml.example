@@ -121,7 +121,7 @@ settings:
   # holds or rewrites a reply. The rule scanner is free and local; the model
   # layer is opt-in because it copies judged text to the audit backend and
   # spends its NPU (bounded: `concurrency` in flight, queue of `queue`,
-  # overflow dropped and counted). See the README's Security Audit section.
+  # overflow dropped and counted). See docs/security-audit.md.
   # audit:
   #   enabled: scanner          # off | scanner (local rules only) | full (+ models)
   #   backend: ""               # verdict-model host; empty = first enabled backend
@@ -157,7 +157,7 @@ settings:
   # review_prompts.yaml (next to this file) or one written for that review.
   # Reviews are the lowest-priority work: one starts only on a backend that has
   # served no user request for quiet_secs, and a running review never holds a
-  # user request back. See the README's Conversation Review section.
+  # user request back. See docs/review.md.
   # review:
   #   model: qwen3:32b          # default review model; empty = Review is off
   #                             # until a review names one
