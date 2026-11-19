@@ -42,8 +42,29 @@ use crate::clients::now_ms;
 use crate::config::ReviewSettings;
 use crate::dispatcher::{ApiFamily, AppState, BackendStatus};
 use crate::lock::LockExt;
-pub use store::{Job, Prompt, Status};
+pub use store::{ConvRef, Job, Prompt, Status};
 use store::AutoRule;
+
+mod auto;
+
+/// A conversation the sweep found finished and matching, waiting for its rule
+/// to send it (a batch may hold it a few minutes).
+#[derive(Clone, Debug)]
+pub struct Due {
+    pub key: String,
+    pub due_ms: u64,
+}
+
+/// What an automatic review is sent with: the rule's prompt and model as they
+/// stand now, or, for a re-run after the rule is gone, what the review stored.
+pub struct AutoSpec {
+    pub rule_id: Option<String>,
+    pub rule_name: Option<String>,
+    pub prompt_id: Option<String>,
+    pub prompt_name: String,
+    pub prompt_text: String,
+    pub model: String,
+}
 
 /// How often the worker looks again without being woken. The quiet windows it
 /// waits for are minutes long; this only bounds how late a countdown ends.
@@ -63,6 +84,13 @@ pub struct Review {
     wake: Notify,
     started: AtomicBool,
     seq: AtomicU64,
+    /// When the auto-review sweep last ran (unix ms).
+    auto_clock: AtomicU64,
+    /// Conversations due for a rule, waiting for their batch: rule id → queue.
+    auto_pending: Mutex<std::collections::HashMap<String, Vec<Due>>>,
+    /// What the sweep has already complained about, so a broken rule warns
+    /// once and not every minute.
+    auto_warned: Mutex<std::collections::HashSet<String>>,
 }
 
 
@@ -160,6 +188,14 @@ pub enum SubmitError {
     Invalid(String),
 }
 
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitError::NotFound(e) | SubmitError::Invalid(e) => f.write_str(e),
+        }
+    }
+}
+
 /// What the operator sends.
 pub struct Request<'a> {
     pub key: &'a str,
@@ -183,6 +219,9 @@ impl Review {
             wake: Notify::new(),
             started: AtomicBool::new(false),
             seq: AtomicU64::new(0),
+            auto_clock: AtomicU64::new(0),
+            auto_pending: Mutex::new(std::collections::HashMap::new()),
+            auto_warned: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -383,6 +422,113 @@ impl Review {
         Ok(job)
     }
 
+    /// Queue a review a standing rule sends: one review over `keys` as they
+    /// stand in the log now — one conversation, or a batch of several. Conversations
+    /// that went away or were redacted meanwhile drop out; a batch that emptied
+    /// is an error the sweep will stop hearing about via its warned set.
+    fn send_auto(&self, state: &AppState, spec: &AutoSpec, keys: &[String]) -> Result<Job, SubmitError> {
+        if spec.model.is_empty() {
+            return Err(SubmitError::Invalid(
+                "no model: name one on the rule, or set the default review model in Settings".into(),
+            ));
+        }
+        if spec.prompt_text.chars().count() > 32_000 {
+            return Err(SubmitError::Invalid("the prompt is longer than 32000 characters".into()));
+        }
+        let mut parts: Vec<ConvRef> = Vec::with_capacity(keys.len());
+        let mut turns = 0usize;
+        let mut user = String::new();
+        let mut label: Option<String> = None;
+        let mut rid_from = 0u64;
+        for k in keys {
+            let find = crate::convlog::Find { key: Some(k.as_str()), ..Default::default() };
+            let Some(conv) = state.convlog.index(&find) else { continue };
+            let Some(last) = conv.turns.last() else { continue };
+            if conv.turns.iter().all(|t| t.redacted) {
+                continue;
+            }
+            if parts.is_empty() {
+                user = conv.user.clone();
+                label = conv.session_label.clone();
+                rid_from = conv.turns.first().map_or(0, |t| t.rid);
+            }
+            turns += conv.turns.len();
+            parts.push(ConvRef { key: conv.key.clone(), rid_to: last.rid });
+        }
+        if parts.is_empty() {
+            return Err(SubmitError::NotFound("none of the conversations is still reviewable".into()));
+        }
+        let multi = parts.len() > 1;
+        let now = now_ms();
+        let job = Job {
+            id: format!("{:x}-{}", now, self.seq.fetch_add(1, Relaxed) % 1000),
+            conv_key: parts[0].key.clone(),
+            user,
+            label,
+            rid_from,
+            rid_to: parts[0].rid_to,
+            turns,
+            prompt_id: spec.prompt_id.clone(),
+            prompt_name: spec.prompt_name.clone(),
+            prompt_text: spec.prompt_text.clone(),
+            custom: false,
+            model: spec.model.clone(),
+            status: Status::Queued,
+            wait_reason: None,
+            backend: None,
+            created_ms: now,
+            started_ms: None,
+            finished_ms: None,
+            input_chars: None,
+            truncated: false,
+            result: None,
+            error: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            attempts: 0,
+            run_now: false,
+            auto: true,
+            rule_id: spec.rule_id.clone(),
+            rule_name: spec.rule_name.clone(),
+            attention: None,
+            attention_note: None,
+            // A one-conversation auto review is the classic shape: conv_key alone.
+            parts: if multi { parts } else { vec![] },
+        };
+        self.persist(&job);
+        {
+            let mut jobs = self.jobs.lock_or_recover();
+            jobs.insert(job.id.clone(), job.clone());
+            self.trim(&mut jobs);
+        }
+        self.wake.notify_one();
+        Ok(job)
+    }
+
+    /// Re-run an automatic review: with the rule still there it takes the
+    /// rule's current prompt and model; without it the review's own stored
+    /// ones. The conversations as they are now, like a manual Re-run.
+    fn retry_auto(&self, state: &AppState, job: &Job) -> Result<Job, SubmitError> {
+        let keys: Vec<String> = if job.parts.is_empty() {
+            vec![job.conv_key.clone()]
+        } else {
+            job.parts.iter().map(|p| p.key.clone()).collect()
+        };
+        let rule = job.rule_id.as_deref().and_then(|id| self.rules.lock_or_recover().get(id).cloned());
+        let spec = match &rule {
+            Some(rule) => auto::spec_for(self, rule, &self.settings().model).map_err(SubmitError::Invalid)?,
+            None => AutoSpec {
+                rule_id: job.rule_id.clone(),
+                rule_name: job.rule_name.clone(),
+                prompt_id: job.prompt_id.clone(),
+                prompt_name: job.prompt_name.clone(),
+                prompt_text: job.prompt_text.clone(),
+                model: job.model.clone(),
+            },
+        };
+        self.send_auto(state, &spec, &keys)
+    }
+
     /// Past [`MAX_JOBS`], drop the oldest finished reviews.
     fn trim(&self, jobs: &mut BTreeMap<String, Job>) {
         if jobs.len() <= MAX_JOBS {
@@ -423,16 +569,21 @@ impl Review {
                 self.wake.notify_one();
                 Ok(j)
             }
-            Status::Done => self.submit(
-                state,
-                Request {
-                    key: &job.conv_key,
-                    prompt_id: job.prompt_id.as_deref(),
-                    prompt: Some(&job.prompt_text),
-                    model: Some(&job.model),
-                    run_now: false,
-                },
-            ),
+            Status::Done => {
+                if job.auto {
+                    return self.retry_auto(state, &job);
+                }
+                self.submit(
+                    state,
+                    Request {
+                        key: &job.conv_key,
+                        prompt_id: job.prompt_id.as_deref(),
+                        prompt: Some(&job.prompt_text),
+                        model: Some(&job.model),
+                        run_now: false,
+                    },
+                )
+            }
             Status::Queued | Status::Running => Err(SubmitError::Invalid("the review has not finished".into())),
         }
     }
@@ -503,6 +654,7 @@ pub fn start(state: &Arc<AppState>) {
 /// Start what can start; say why the rest waits.
 fn tick(state: &Arc<AppState>) {
     let review = &state.review;
+    auto::sweep(state);
     let cfg = review.settings();
     // Run-now reviews first (`!run_now` sorts them ahead), then oldest first.
     let mut queued: Vec<(bool, u64, String, String)> = {
@@ -668,6 +820,14 @@ fn launch(state: &Arc<AppState>, id: String, idx: usize, label: String) {
             match outcome {
                 Ok(out) => {
                     j.status = Status::Done;
+                    // An auto review was asked for a verdict line; read it
+                    // before the answer is filed. No line, no badge.
+                    if j.auto
+                        && let Some((yes, note)) = auto::parse_attention(&out.text)
+                    {
+                        j.attention = Some(yes);
+                        j.attention_note = Some(note);
+                    }
                     j.result = Some(out.text);
                     j.prompt_tokens = out.prompt_tokens;
                     j.completion_tokens = out.completion_tokens;
@@ -697,18 +857,51 @@ struct Outcome {
 async fn run(state: &Arc<AppState>, job: &Job, idx: usize) -> Result<Outcome, String> {
     let cfg = state.review.settings();
     let st = state.clone();
-    let key = job.conv_key.clone();
-    let conv = tokio::task::spawn_blocking(move || st.convlog.load_session(&key))
-        .await
-        .map_err(|e| format!("reading the conversation failed: {e}"))?
-        .ok_or("the conversation is no longer in the log")?;
-    let t = transcript::build(&conv, job.rid_to, cfg.max_transcript_chars, cfg.max_message_chars);
-    if t.text.trim().is_empty() {
-        return Err("the conversation has no recorded text to review".into());
+    let parts: Vec<ConvRef> = if job.parts.is_empty() {
+        vec![ConvRef { key: job.conv_key.clone(), rid_to: job.rid_to }]
+    } else {
+        job.parts.clone()
+    };
+    let n_parts = parts.len();
+    let loaded = tokio::task::spawn_blocking(move || {
+        parts
+            .iter()
+            .map(|p| (p.key.clone(), p.rid_to, st.convlog.load_session(&p.key)))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("reading the conversation failed: {e}"))?;
+    // A batch shares one call, so it also shares one transcript budget.
+    let budget = (cfg.max_transcript_chars / loaded.len().max(1)).max(4_000);
+    let mut text = String::new();
+    let mut turns = 0usize;
+    let mut truncated = false;
+    let mut gone = 0usize;
+    for (i, (key, rid_to, conv)) in loaded.iter().enumerate() {
+        let Some(conv) = conv else {
+            gone += 1;
+            continue;
+        };
+        let t = transcript::build(conv, *rid_to, budget, cfg.max_message_chars);
+        turns += t.turns;
+        truncated |= t.truncated;
+        if n_parts > 1 {
+            let label = conv.session_label.as_deref().map(|l| format!(" ({l})")).unwrap_or_default();
+            text.push_str(&format!("## Conversation {} — `{key}`{label}\n\n", i + 1));
+        }
+        text.push_str(&t.text);
+        text.push('\n');
+    }
+    if text.trim().is_empty() {
+        return Err(if gone > 0 {
+            "the conversations are no longer in the log".into()
+        } else {
+            "the conversation has no recorded text to review".into()
+        });
     }
     state.review.update(&job.id, |j| {
-        j.input_chars = Some(t.text.chars().count());
-        j.truncated = t.truncated;
+        j.input_chars = Some(text.chars().count());
+        j.truncated = truncated;
     });
     let (url, token, ollama, model) = {
         let backends = state.backends.lock_or_recover();
@@ -717,15 +910,31 @@ async fn run(state: &Arc<AppState>, job: &Job, idx: usize) -> Result<Outcome, St
         let model = crate::control::resolve_model_name(b, &job.model).unwrap_or_else(|| job.model.clone());
         (b.url.clone(), b.token.clone(), ollama, model)
     };
-    let messages = json!([
-        { "role": "system", "content": job.prompt_text },
-        { "role": "user", "content": format!(
-            "Conversation `{}` ({} turns{}):\n\n{}",
+    let head = if n_parts > 1 {
+        let gone_note = if gone > 0 { format!(", {gone} no longer in the log") } else { String::new() };
+        format!(
+            "A batch of {} conversations ({} turns{}{}):\n\n",
+            loaded.len(),
+            turns,
+            if truncated { ", shortened to fit" } else { "" },
+            gone_note
+        )
+    } else {
+        format!(
+            "Conversation `{}` ({} turns{}):\n\n",
             job.conv_key,
-            t.turns,
-            if t.truncated { ", shortened to fit" } else { "" },
-            t.text
-        ) },
+            turns,
+            if truncated { ", shortened to fit" } else { "" }
+        )
+    };
+    let system = if job.auto {
+        format!("{}{}", job.prompt_text, auto::ATTENTION_INSTRUCTION)
+    } else {
+        job.prompt_text.clone()
+    };
+    let messages = json!([
+        { "role": "system", "content": system },
+        { "role": "user", "content": format!("{head}{text}") },
     ]);
     let (path, body) = if ollama {
         ("/api/chat", json!({ "model": model, "messages": messages, "stream": false }))
