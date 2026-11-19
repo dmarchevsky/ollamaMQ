@@ -43,6 +43,7 @@ use crate::config::ReviewSettings;
 use crate::dispatcher::{ApiFamily, AppState, BackendStatus};
 use crate::lock::LockExt;
 pub use store::{Job, Prompt, Status};
+use store::AutoRule;
 
 /// How often the worker looks again without being woken. The quiet windows it
 /// waits for are minutes long; this only bounds how late a countdown ends.
@@ -55,6 +56,7 @@ pub struct Review {
     jobs: Mutex<BTreeMap<String, Job>>,
     dir: Mutex<Option<PathBuf>>,
     prompts: Mutex<store::Prompts>,
+    rules: Mutex<store::Rules>,
     cfg: Mutex<ReviewSettings>,
     /// Running reviews' tasks, so Cancel can stop one.
     aborts: Mutex<HashMap<String, tokio::task::AbortHandle>>,
@@ -175,6 +177,7 @@ impl Review {
             jobs: Mutex::new(BTreeMap::new()),
             dir: Mutex::new(None),
             prompts: Mutex::new(store::Prompts::in_memory()),
+            rules: Mutex::new(store::Rules::in_memory()),
             cfg: Mutex::new(ReviewSettings::default()),
             aborts: Mutex::new(HashMap::new()),
             wake: Notify::new(),
@@ -184,8 +187,9 @@ impl Review {
     }
 
     /// Give the reviews a home on disk: past jobs are loaded from `dir`, the
-    /// prompt library from `prompts`. Without them everything stays in memory.
-    pub fn attach(&self, dir: Option<PathBuf>, prompts: Option<PathBuf>) {
+    /// prompt library from `prompts`, the standing auto-review rules from
+    /// `rules`. Without them everything stays in memory.
+    pub fn attach(&self, dir: Option<PathBuf>, prompts: Option<PathBuf>, rules: Option<PathBuf>) {
         if let Some(d) = &dir {
             match std::fs::create_dir_all(d) {
                 Ok(()) => {
@@ -202,6 +206,9 @@ impl Review {
         *self.dir.lock_or_recover() = dir;
         if let Some(p) = prompts {
             *self.prompts.lock_or_recover() = store::Prompts::load(p);
+        }
+        if let Some(r) = rules {
+            *self.rules.lock_or_recover() = store::Rules::load(r);
         }
     }
 
@@ -232,10 +239,14 @@ impl Review {
         Some(job)
     }
 
-    /// Every review, newest first; `conv` keeps one conversation's.
+    /// Every review, newest first; `conv` keeps one conversation's — a review
+    /// counts for every conversation it covers, batch included.
     pub fn list(&self, conv: Option<&str>) -> Vec<Value> {
         let jobs = self.jobs.lock_or_recover();
-        let mut out: Vec<&Job> = jobs.values().filter(|j| conv.is_none_or(|k| j.conv_key == k)).collect();
+        let mut out: Vec<&Job> = jobs
+            .values()
+            .filter(|j| conv.is_none_or(|k| j.conv_key == k || j.parts.iter().any(|p| p.key == k)))
+            .collect();
         out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then(b.id.cmp(&a.id)));
         out.into_iter().map(Job::summary).collect()
     }
@@ -271,6 +282,24 @@ impl Review {
 
     pub fn remove_prompt(&self, id: &str) -> Result<(), String> {
         self.prompts.lock_or_recover().remove(id)
+    }
+
+    /// The standing auto-review rules, in creation order.
+    pub fn rules(&self) -> Vec<AutoRule> {
+        self.rules.lock_or_recover().file.rules.clone()
+    }
+
+    /// Add or change a rule. A named prompt must still exist; the id is
+    /// assigned when the rule is new.
+    pub fn upsert_rule(&self, rule: AutoRule) -> Result<String, String> {
+        if !rule.prompt_id.is_empty() && self.prompts.lock_or_recover().get(&rule.prompt_id).is_none() {
+            return Err(format!("no prompt '{}'", rule.prompt_id));
+        }
+        self.rules.lock_or_recover().upsert(rule)
+    }
+
+    pub fn remove_rule(&self, id: &str) -> Result<(), String> {
+        self.rules.lock_or_recover().remove(id)
     }
 
     /// Queue a review of the conversation `req.key` as it stands now.
@@ -336,6 +365,12 @@ impl Review {
             completion_tokens: None,
             attempts: 0,
             run_now: req.run_now,
+            auto: false,
+            rule_id: None,
+            rule_name: None,
+            attention: None,
+            attention_note: None,
+            parts: vec![],
         };
         self.persist(&job);
         {

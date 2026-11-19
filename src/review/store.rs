@@ -78,6 +78,33 @@ pub struct Job {
     /// that has its model, without waiting for quiet (see [`crate::review::eligible`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub run_now: bool,
+    /// Sent by a standing rule rather than by hand.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// Kept for display: the rule may be gone while its reviews are not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_name: Option<String>,
+    /// What the finished review said about needing attention: parsed from the
+    /// verdict line an auto-review asks for. `None` when there was no verdict
+    /// line to read — no badge rather than a guessed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_note: Option<String>,
+    /// The conversations this review covers with their turn bounds. Empty on
+    /// manual reviews, which cover `conv_key` alone as before; an automatic
+    /// one always lists its parts, a batch as several.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<ConvRef>,
+}
+
+/// One conversation inside a review, and the turn it was reviewed up to.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConvRef {
+    pub key: String,
+    pub rid_to: u64,
 }
 
 impl Job {
@@ -313,24 +340,181 @@ impl Prompts {
 
     /// A slug of the name, unique in the library.
     fn fresh_id(&self, name: &str) -> String {
-        let mut base: String = name
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect::<String>()
-            .split('-')
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("-");
-        base.truncate(40);
-        if base.is_empty() {
-            base = "prompt".into();
-        }
         let taken: BTreeMap<&str, ()> = self.file.prompts.iter().map(|p| (p.id.as_str(), ())).collect();
-        if !taken.contains_key(base.as_str()) {
-            return base;
+        fresh_id(name, "prompt", |id| taken.contains_key(id))
+    }
+}
+
+/// A slug of the name used as a file-safe id, `fallback` when nothing remains
+/// of it, and `n` appended until unique. `taken` says which ids are.
+fn fresh_id(name: &str, fallback: &str, taken: impl Fn(&str) -> bool) -> String {
+    let mut base: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    base.truncate(40);
+    if base.is_empty() {
+        base = fallback.into();
+    }
+    if !taken(&base) {
+        return base;
+    }
+    (2..).map(|n| format!("{base}-{n}")).find(|c| !taken(c)).unwrap_or(base)
+}
+
+// ---------------------------------------------------------- auto-review rules
+
+/// Where the standing rules live, next to the prompt library.
+pub const DEFAULT_RULES_FILE: &str = "review_rules.yaml";
+
+/// Default quiet a conversation must have seen before a rule reviews it: past
+/// the pauses an agent session makes, so a rule reviews a live session whole,
+/// once.
+pub const DEFAULT_COOLDOWN_MINS: u64 = 30;
+
+fn cooldown_default() -> u64 {
+    DEFAULT_COOLDOWN_MINS
+}
+
+/// A standing rule: which conversations to review, with what, once they have
+/// gone quiet. An empty filter field means "any".
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutoRule {
+    /// Slug of the name, assigned on create.
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default = "yes_bool")]
+    pub enabled: bool,
+    /// The backend that served the conversation (its label), case-insensitive.
+    #[serde(default)]
+    pub backend: String,
+    /// The client that owns the conversation, exact name.
+    #[serde(default)]
+    pub client: String,
+    /// Glob (`*`, `?`) over the conversation label; an unlabeled conversation
+    /// never matches a set pattern.
+    #[serde(default)]
+    pub label: String,
+    /// Library prompt to start from; empty means the library's default.
+    #[serde(default)]
+    pub prompt_id: String,
+    /// Review model; empty means `review.model` from Settings.
+    #[serde(default)]
+    pub model: String,
+    /// Quiet after the conversation's last turn before it is due.
+    #[serde(default = "cooldown_default")]
+    pub cooldown_mins: u64,
+    /// Due conversations reviewed together in one call; 1 is one review each.
+    #[serde(default)]
+    pub batch: u32,
+}
+
+fn yes_bool() -> bool {
+    true
+}
+
+impl AutoRule {
+    /// Clean the fields into their stored shape and reject what cannot work.
+    pub fn validate(&mut self) -> Result<(), String> {
+        self.name = self.name.trim().to_string();
+        self.backend = self.backend.trim().to_string();
+        self.client = self.client.trim().to_string();
+        self.label = self.label.trim().to_string();
+        self.model = self.model.trim().to_string();
+        if self.name.is_empty() || self.name.chars().count() > 80 {
+            return Err("a rule needs a name of at most 80 characters".into());
         }
-        (2..).map(|n| format!("{base}-{n}")).find(|c| !taken.contains_key(c.as_str())).unwrap_or(base)
+        if !(5..=1440).contains(&self.cooldown_mins) {
+            return Err("the cooldown must be between 5 and 1440 minutes".into());
+        }
+        if !(1..=10).contains(&self.batch) {
+            return Err("the batch size must be between 1 and 10".into());
+        }
+        Ok(())
+    }
+
+    /// A human line of what the rule watches, for the UI.
+    pub fn watches(&self) -> String {
+        let backend = if self.backend.is_empty() { "any backend" } else { &self.backend };
+        let client = if self.client.is_empty() { "any client" } else { &self.client };
+        let label = if self.label.is_empty() { "any label" } else { &self.label };
+        format!("{backend} · {client} · {label}")
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RuleFile {
+    #[serde(default)]
+    pub rules: Vec<AutoRule>,
+}
+
+/// The standing rules: in memory, written back on every change when they have
+/// a file. Like the prompt library, an unreadable file is left as it is and
+/// the rules run in memory, so a typo never costs the operator their rules.
+pub struct Rules {
+    path: Option<PathBuf>,
+    pub file: RuleFile,
+}
+
+impl Rules {
+    pub fn in_memory() -> Self {
+        Self { path: None, file: RuleFile::default() }
+    }
+
+    pub fn load(path: PathBuf) -> Self {
+        match crate::clients::read_store_or_migrate::<RuleFile>(&path) {
+            Ok(Some(file)) => Self { path: Some(path), file },
+            Ok(None) => Self { path: Some(path), file: RuleFile::default() },
+            Err(e) => {
+                warn!("review: {e}; the auto-review rules run in memory until it is fixed");
+                Self::in_memory()
+            }
+        }
+    }
+
+    fn save(&self) {
+        if let Some(path) = &self.path
+            && let Err(e) = crate::clients::write_store_atomic(path, &self.file)
+        {
+            warn!("review: could not save {}: {e}", path.display());
+        }
+    }
+
+    pub fn get(&self, id: &str) -> Option<&AutoRule> {
+        self.file.rules.iter().find(|r| r.id == id)
+    }
+
+    /// Add a rule (empty `id`) or change one. Returns its id.
+    pub fn upsert(&mut self, mut rule: AutoRule) -> Result<String, String> {
+        rule.validate()?;
+        if rule.id.is_empty() {
+            rule.id = fresh_id(&rule.name, "rule", |id| self.get(id).is_some());
+        } else if self.get(&rule.id).is_none() {
+            return Err(format!("no rule '{}'", rule.id));
+        }
+        let file = &mut self.file.rules;
+        match file.iter_mut().find(|r| r.id == rule.id) {
+            Some(slot) => *slot = rule.clone(),
+            None => file.push(rule.clone()),
+        }
+        self.save();
+        Ok(rule.id)
+    }
+
+    pub fn remove(&mut self, id: &str) -> Result<(), String> {
+        let before = self.file.rules.len();
+        self.file.rules.retain(|r| r.id != id);
+        if self.file.rules.len() == before {
+            return Err(format!("no rule '{id}'"));
+        }
+        self.save();
+        Ok(())
     }
 }
 
@@ -366,6 +550,12 @@ mod tests {
             completion_tokens: None,
             attempts: 1,
             run_now: false,
+            auto: false,
+            rule_id: None,
+            rule_name: None,
+            attention: None,
+            attention_note: None,
+            parts: vec![],
         }
     }
 
@@ -411,6 +601,58 @@ mod tests {
         p.remove("security-pass").unwrap();
         assert_eq!(p.default_prompt().id, "security-pass-2", "a removed default falls to the first left");
         assert!(p.remove("security-pass-2").is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn rule(name: &str) -> AutoRule {
+        AutoRule {
+            id: String::new(),
+            name: name.into(),
+            enabled: true,
+            backend: String::new(),
+            client: "alice".into(),
+            label: String::new(),
+            prompt_id: "default".into(),
+            model: String::new(),
+            cooldown_mins: DEFAULT_COOLDOWN_MINS,
+            batch: 1,
+        }
+    }
+
+    #[test]
+    fn rules_round_trip_and_validate() {
+        let d = tmpdir("rules");
+        let path = d.join(DEFAULT_RULES_FILE);
+        let mut r = Rules::load(path.clone());
+        assert!(r.file.rules.is_empty(), "a fresh file has no rules");
+        let id = r.upsert(rule("Agent sessions nightly")).unwrap();
+        assert_eq!(id, "agent-sessions-nightly");
+        assert_eq!(r.upsert(rule("Agent sessions nightly")).unwrap(), "agent-sessions-nightly-2");
+        let mut off = rule("Agent sessions nightly");
+        off.id = id.clone();
+        off.enabled = false;
+        off.batch = 4;
+        assert_eq!(r.upsert(off).unwrap(), id);
+        assert!(!r.get(&id).unwrap().enabled, "an update changes the rule in place");
+        assert_eq!(Rules::load(path).get(&id).unwrap().batch, 4);
+
+        let mut bad = rule("x");
+        bad.name = String::new();
+        assert!(r.upsert(bad).is_err());
+        let mut bad = rule("x");
+        bad.cooldown_mins = 1;
+        assert!(r.upsert(bad).is_err());
+        let mut bad = rule("x");
+        bad.batch = 11;
+        assert!(r.upsert(bad).is_err());
+        assert!(r.upsert({
+            let mut bad = rule("x");
+            bad.id = "ghost".into();
+            bad
+        })
+        .is_err());
+        r.remove(&id).unwrap();
+        assert!(r.remove(&id).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -492,7 +492,12 @@ async fn main() {
             &config_dir,
             std::path::Path::new(""),
         );
-        state.review.attach(reviews_dir, Some(prompts));
+        let (rules, _) = settings::store_path(
+            ollamamq::review::store::DEFAULT_RULES_FILE,
+            &config_dir,
+            std::path::Path::new(""),
+        );
+        state.review.attach(reviews_dir, Some(prompts), Some(rules));
         ollamamq::review::start(&state);
     }
     // Activity journal: replay the records that survived the restart into the
