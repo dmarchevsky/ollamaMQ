@@ -381,6 +381,10 @@ fn cooldown_default() -> u64 {
     DEFAULT_COOLDOWN_MINS
 }
 
+fn batch_default() -> u32 {
+    1
+}
+
 /// A standing rule: which conversations to review, with what, once they have
 /// gone quiet. An empty filter field means "any".
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -411,7 +415,7 @@ pub struct AutoRule {
     #[serde(default = "cooldown_default")]
     pub cooldown_mins: u64,
     /// Due conversations reviewed together in one call; 1 is one review each.
-    #[serde(default)]
+    #[serde(default = "batch_default")]
     pub batch: u32,
 }
 

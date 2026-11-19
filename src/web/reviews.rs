@@ -129,3 +129,24 @@ pub async fn delete_prompt(State(state): State<Arc<AppState>>, Path(id): Path<St
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(state.review.prompts()))
 }
+
+pub async fn rules(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({ "rules": state.review.rules() }))
+}
+
+/// Create (no `id`) or change one standing rule; the body is the rule itself.
+pub async fn put_rule(State(state): State<Arc<AppState>>, Json(rule): Json<crate::review::store::AutoRule>) -> ApiResult<Value> {
+    let id = state
+        .review
+        .upsert_rule(rule)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(json!({ "saved": id, "rules": state.review.rules() })))
+}
+
+pub async fn delete_rule(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<Value> {
+    state
+        .review
+        .remove_rule(&id)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(json!({ "rules": state.review.rules() })))
+}

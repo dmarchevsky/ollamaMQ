@@ -225,6 +225,8 @@ pub fn router_with_state(auth: Arc<AuthState>) -> Router<Arc<AppState>> {
         .route("/reviews/{id}/{op}", post(reviews::action))
         .route("/review-prompts", get(reviews::prompts).put(reviews::put_prompt))
         .route("/review-prompts/{id}", axum::routing::delete(reviews::delete_prompt))
+        .route("/review-rules", get(reviews::rules).put(reviews::put_rule))
+        .route("/review-rules/{id}", axum::routing::delete(reviews::delete_rule))
         .route("/users/{id}/{op}", post(user_action))
         .route("/sessions/{tag}/priority", post(session_priority))
         .route("/blocked/unblock", post(unblock))
@@ -2683,6 +2685,113 @@ mod tests {
     /// The worker end to end against a mock backend: it waits out the quiet
     /// window, runs without taking a user slot, keeps the answer, and waits
     /// again after a user shows up.
+    /// The rule API is the rule store's front door: create, validate, change,
+    /// delete — and the sweep turns a matching finished conversation into one
+    /// automatic review, once, after its cooldown.
+    #[tokio::test]
+    async fn auto_review_rules_are_managed_and_the_sweep_uses_them() {
+        let state = test_state_with(test_convlog());
+        // A conversation that just ended: the sweep only watches the last day,
+        // and the shared fixture's turns are from 1970 on purpose.
+        {
+            use crate::convlog::{Begin, MsgMeta, Note, Resp};
+            let key = "alice#fresh".to_string();
+            let now = crate::clients::now_ms();
+            state.convlog.note(Note::Begin(Box::new(Begin {
+                kind: None,
+                link: None,
+                key: key.clone(),
+                rid: 21,
+                user: "alice".into(),
+                session_label: Some("nightly".into()),
+                model: Some("qwen".into()),
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                bytes: Some(10),
+                priority: "normal".into(),
+                at_ms: now - 60_000,
+                queue_ms: Some(now - 59_000),
+                redacted: false,
+                msgs: vec![MsgMeta { role: "user".into(), chars: 4, name: None, calls: vec![] }],
+            })));
+            state.convlog.note(Note::ReqText {
+                key: key.clone(),
+                rid: 21,
+                bytes: Some(10),
+                text: std::sync::Arc::new("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}".into()),
+            });
+            state.convlog.note(Note::Resp(Box::new(Resp {
+                key: key.clone(),
+                rid: 21,
+                end_ms: now,
+                first_token: Some(now - 500),
+                status: Some(200),
+                resp_bytes: Some(5),
+                backend: Some("gpu:11434".into()),
+                outcome: "ok".into(),
+                prompt_tokens: Some(3),
+                completion_tokens: Some(2),
+                waste_secs: None,
+                redacted: false,
+            })));
+            state.convlog.note(Note::RespText {
+                key: key.clone(),
+                rid: 21,
+                bytes: Some(5),
+                text: std::sync::Arc::new("hello back".into()),
+            });
+        }
+        state
+            .review
+            .apply(crate::config::ReviewSettings { model: "qwen3:32b".into(), ..Default::default() });
+        let base = serve(state.clone()).await;
+        let c = http();
+        let api = |p: &str| format!("{base}/ui/api/{p}");
+        let send = |req: reqwest::RequestBuilder| req.basic_auth("admin", Some("pw")).header("X-OllamaMQ-UI", "1");
+
+        let res = send(c.get(api("review-rules"))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.json::<serde_json::Value>().await.unwrap()["rules"].as_array().unwrap().len(), 0);
+        let res = c.get(api("review-rules")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "rules are admin-facing like the rest");
+
+        let res = send(
+            c.put(api("review-rules")).json(&json!({
+                "name": "Alice nightly", "client": "alice", "prompt_id": "default", "cooldown_mins": 5
+            })),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let id = res.json::<serde_json::Value>().await.unwrap()["saved"].as_str().unwrap().to_string();
+        assert_eq!(id, "alice-nightly");
+
+        let res = send(c.put(api("review-rules")).json(&json!({ "name": "too wide", "batch": 11 }))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = send(c.put(api("review-rules")).json(&json!({ "name": "gone prompt", "prompt_id": "nope" }))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "a rule must point at a prompt that exists");
+
+        // The conversation was just recorded, so the sweep leaves it in its
+        // cooldown; moving the clock past the cooldown sends exactly one
+        // automatic review, and the next sweep claims the conversation no more.
+        crate::review::auto::sweep_now(&state, crate::clients::now_ms());
+        assert!(state.review.list(None).is_empty(), "no review before the cooldown has passed");
+        crate::review::auto::sweep_now(&state, crate::clients::now_ms() + 6 * 60 * 1000);
+        let jobs = state.review.list(None);
+        assert_eq!(jobs.len(), 1, "only the fresh conversation is inside the lookback");
+        assert_eq!(jobs[0]["auto"], true);
+        assert_eq!(jobs[0]["rule_id"], id.as_str());
+        assert_eq!(jobs[0]["conv_key"], "alice#fresh");
+        assert_eq!(jobs[0]["model"], "qwen3:32b", "the rule without a model uses the Settings default");
+        crate::review::auto::sweep_now(&state, crate::clients::now_ms() + 7 * 60 * 1000);
+        assert_eq!(state.review.list(None).len(), 1, "a rule reviews a conversation once");
+
+        let res = send(c.delete(api(&format!("review-rules/{id}")))).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.json::<serde_json::Value>().await.unwrap()["rules"].as_array().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_review_runs_only_on_a_quiet_backend_and_never_takes_a_user_slot() {
         let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();

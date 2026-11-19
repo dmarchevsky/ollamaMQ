@@ -163,6 +163,17 @@ pub fn sweep(state: &Arc<AppState>) {
         return;
     }
     review.auto_clock.store(now, Relaxed);
+    run(state, now);
+}
+
+/// One sweep, at the current time: for the worker's tests and the app tests.
+#[cfg(test)]
+pub(crate) fn sweep_now(state: &Arc<AppState>, now: u64) {
+    run(state, now);
+}
+
+fn run(state: &Arc<AppState>, now: u64) {
+    let review = &state.review;
     let rules: Vec<AutoRule> = review.rules().into_iter().filter(|r| r.enabled).collect();
     if rules.is_empty() {
         return;

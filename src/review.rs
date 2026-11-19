@@ -28,6 +28,7 @@
 
 pub mod store;
 pub mod transcript;
+pub(crate) mod auto;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -44,8 +45,6 @@ use crate::dispatcher::{ApiFamily, AppState, BackendStatus};
 use crate::lock::LockExt;
 pub use store::{ConvRef, Job, Prompt, Status};
 use store::AutoRule;
-
-mod auto;
 
 /// A conversation the sweep found finished and matching, waiting for its rule
 /// to send it (a batch may hold it a few minutes).
