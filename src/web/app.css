@@ -1259,11 +1259,11 @@ dialog label:not(.check) textarea { display: block; width: 100%; margin-top: 5px
 .ar-sub { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ar-off .ar-main b { color: var(--muted); }
 
-/* Automatic reviews: the rule chip row, and the verdict around the answer. */
+/* Automatic reviews: the rule chip row, and the verdict line above the answer. */
 .rv-row .rv-auto { margin-top: 2px; white-space: normal; }
 .rv-verdict { margin: 14px 0 0; }
-.rv-rule { margin: 10px 0 0; }
-.rv-clear { margin: 12px 0 0; }
+.rv-rule { margin: 8px 0 0; }
+.rv-clear { margin: 14px 0 0; }
 #dlg-prompts { width: min(720px, calc(100vw - 32px)); }
 #dlg-prompts textarea { min-height: 220px; max-height: 50vh; }
 .rp-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; max-height: 50vh; overflow-y: auto; }

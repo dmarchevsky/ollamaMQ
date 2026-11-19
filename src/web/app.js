@@ -3560,17 +3560,15 @@ function renderReviews() {
  *  and the line naming the rule under it. Empty for a manual review, which
  *  reads exactly as it always did. */
 function rvAutoNotes(r) {
-  if (!r.auto) return { before: '', after: '' };
+  if (!r.auto) return '';
   const done = r.status === 'done';
-  const before = done && r.attention === true
-    ? `<div class="note warn-note rv-verdict">⚠ ${esc(r.attention_note || 'flagged by the review')}</div>`
-    : done && r.attention === false
-      ? `<p class="hint rv-clear">Nothing was flagged.${r.attention_note ? ` ${esc(r.attention_note)}` : ''}</p>`
-      : '';
   // The cooldown is the rule's, not the job's: gone once the rule is deleted.
   const quiet = S.autoRules?.find(x => x.id === r.rule_id)?.cooldown_mins;
-  const after = `<p class="hint rv-rule">auto · <b>${esc(r.rule_name || '?')}</b> — reviewed ${r.parts?.length > 1 ? 'the batch' : 'the conversation'} whole${quiet ? ` after ${quiet} min of quiet` : ''}.</p>`;
-  return { before, after };
+  const rule = `<p class="hint rv-rule">auto · <b>${esc(r.rule_name || '?')}</b> — reviewed ${r.parts?.length > 1 ? 'the batch' : 'the conversation'} whole${quiet ? ` after ${quiet} min of quiet` : ''}.</p>`;
+  if (!done) return rule;
+  if (r.attention === true) return `<div class="note warn-note rv-verdict">⚠ ${esc(r.attention_note || 'flagged by the review')}</div>${rule}`;
+  if (r.attention === false) return `<p class="hint rv-clear">Nothing was flagged.${r.attention_note ? ` ${esc(r.attention_note)}` : ''}</p>${rule}`;
+  return rule;
 }
 
 /** The selected review in full; fetched on pick and whenever its row moved. */
@@ -3620,7 +3618,7 @@ function renderReviewDetail(row) {
         <div class="rv-facts">${facts.map(f => `<span>${f}</span>`).join('')}</div></div>
       <div class="btn-group rv-tools">${tools}</div>
     </div>
-    ${auto.before}${body}${auto.after}${prompt}`);
+    ${auto}${body}${prompt}`);
 }
 
 /** A safe little Markdown: the text is escaped first, then headings, lists
