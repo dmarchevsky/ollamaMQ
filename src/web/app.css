@@ -1248,6 +1248,22 @@ dialog label:not(.check) textarea { display: block; width: 100%; margin-top: 5px
 .rv-past-h { font-size: 12.5px; font-weight: 600; color: var(--muted); }
 .rv-past a { font-size: 12.5px; color: var(--text); text-decoration: none; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .rv-past a:hover { color: var(--accent); }
+
+/* Auto-review rules: the dialog list — switch, name, what it watches, and the
+   edit row. A dimmed name says the rule is switched off. */
+.ar-list { display: flex; flex-direction: column; }
+.ar-row { display: flex; align-items: center; gap: 12px; padding: 10px 2px; border-bottom: 1px solid var(--border); }
+.ar-row:last-child { border-bottom: 0; }
+.ar-main { flex: 1; min-width: 0; }
+.ar-main b { display: block; }
+.ar-sub { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ar-off .ar-main b { color: var(--muted); }
+
+/* Automatic reviews: the rule chip row, and the verdict around the answer. */
+.rv-row .rv-auto { margin-top: 2px; white-space: normal; }
+.rv-verdict { margin: 14px 0 0; }
+.rv-rule { margin: 10px 0 0; }
+.rv-clear { margin: 12px 0 0; }
 #dlg-prompts { width: min(720px, calc(100vw - 32px)); }
 #dlg-prompts textarea { min-height: 220px; max-height: 50vh; }
 .rp-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; max-height: 50vh; overflow-y: auto; }

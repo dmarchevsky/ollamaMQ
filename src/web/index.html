@@ -163,8 +163,10 @@
             <label><input type="radio" name="rv-show" value="all" checked><span>All</span></label>
             <label><input type="radio" name="rv-show" value="open"><span>Pending</span></label>
             <label><input type="radio" name="rv-show" value="done"><span>Finished</span></label>
+            <label><input type="radio" name="rv-show" value="attention"><span>Attention</span></label>
           </div>
           <button class="btn" data-action="rv-prompts" title="The prompts a review can start from">Prompts…</button>
+          <button class="btn" data-action="rv-autorules" title="Rules that review finished conversations on their own">Auto-reviews…</button>
         </div>
       </div>
       <p class="hint">Send a conversation here with <b>✎ Review</b> in the conversation viewer. A review runs only on an idle
@@ -320,6 +322,36 @@
       <div class="dlg-actions"><button type="button" class="btn" data-action="rp-cancel">Cancel</button><button type="button" class="btn primary" data-action="rp-save">Save prompt</button></div>
     </div>
     <div class="dlg-actions" data-foot><button type="button" class="btn" data-action="rp-new">+ New prompt</button><span style="flex:1"></span><button value="ok" class="btn primary">Done</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-autorules">
+  <form method="dialog">
+    <h3>Auto-reviews</h3>
+    <p>Rules that send finished conversations to review on their own. A conversation joins a rule once, after its
+      cooldown of quiet; each review runs only when a backend is quiet.</p>
+    <div class="ar-list" data-list></div>
+    <div class="dlg-actions"><button type="button" class="btn" data-action="ar-new">+ New rule</button><span style="flex:1"></span><button value="ok" class="btn primary">Done</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-autorule">
+  <form method="dialog" data-form="autorule">
+    <h3 data-title>New auto-review rule</h3>
+    <label>Name <input name="name" maxlength="80" autocomplete="off"></label>
+    <label>Backend <select name="backend" data-any="Any backend"></select></label>
+    <label>Client <select name="client" data-any="Any client"></select></label>
+    <label>Label pattern <input name="label" spellcheck="false" autocomplete="off" placeholder="e.g. ci-* — matched against the conversation label"></label>
+    <p class="field-hint"><code>*</code> matches anything, <code>?</code> one character; case-insensitive. A conversation without a label never matches a pattern.</p>
+    <label>Prompt <select name="prompt_id"></select></label>
+    <label>Model <input name="model" list="dl-ar-models" autocomplete="off" spellcheck="false" placeholder="e.g. qwen3:32b — empty: the default review model"></label>
+    <datalist id="dl-ar-models"></datalist>
+    <label>Cooldown, minutes <input name="cooldown" type="number" value="30" min="5" max="1440" required></label>
+    <p class="field-hint">A conversation waits this long after its last turn before the rule reviews it — long enough that a session with pauses is reviewed whole, once.</p>
+    <label>Batch size <input name="batch" type="number" value="1" min="1" max="10" required></label>
+    <p class="field-hint">Above 1, up to this many conversations due for the rule are reviewed together in one call (a digest), closing the batch five minutes after the first one is due.</p>
+    <input type="hidden" name="id" value="">
+    <div class="dlg-actions"><button value="cancel" class="btn" formnovalidate>Cancel</button><button value="ok" class="btn primary" data-submit>Add rule</button></div>
   </form>
 </dialog>
 
