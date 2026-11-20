@@ -2144,19 +2144,25 @@ function lvHidden(i) {
 /** --- The log's address ---------------------------------------------------
  *
  * While a log is open the address bar names it, so sharing a log is copying the
- * URL — there is no copy button and no clipboard code. `#logs?rid=<focus>&conv=<key>`
- * for a request's conversation, `#logs?seq=<seq>` for a control event. Steps
- * rewrite it with replaceState so Back leaves the viewer instead of walking
- * every request, and closing restores the plain `#logs` — a bar copied after
- * the close cannot name a log that is no longer on screen. A pasted link is
- * read in priority order rid -> conv -> seq, each form falling through when the
- * server cannot resolve it (a conversation whose key aged out may still hold
- * the request the link names, and the other way round). */
+ * URL — there is no copy button and no clipboard code. `#<page>?rid=<focus>&conv=<key>`
+ * for a request's conversation, `#<page>?seq=<seq>` for a control event, where
+ * `<page>` is the page showing underneath: a log opened from the Overview is
+ * addressed as `#overview?rid=…`, and the page stays the Overview while it is on
+ * screen — naming the log is a replaceState, never a jump, so the viewer no
+ * longer pulls the page out from under itself. A link pasted into a fresh tab
+ * lands on the page it names. A step rewrites the address with replaceState, so
+ * Back leaves the viewer instead of walking every request, and closing restores
+ * the plain page address — a bar copied after the close cannot name a log that
+ * is no longer on screen. A pasted link is read in priority order rid -> conv ->
+ * seq, each form falling through when the server cannot resolve it (a
+ * conversation whose key aged out may still hold the request the link names,
+ * and the other way round). */
 let deepPending = null, deepSeen = null, deepBusy = false;
 const deepArgs = () => {
   const h = location.hash.slice(1);
-  if (!h.startsWith('logs?')) return null;
-  const q = new URLSearchParams(h.slice('logs?'.length));
+  const m = /^[^?]+\?(.*)$/.exec(h);
+  if (!m) return null;
+  const q = new URLSearchParams(m[1]);
   const out = {};
   for (const k of ['rid', 'conv', 'seq']) if (q.get(k)) out[k] = q.get(k);
   return Object.keys(out).length ? out : null;
@@ -2169,17 +2175,19 @@ const lvHashWrite = () => {
   if (!LV.conv || !$('#dlg-log').open) return;
   const ctl = String(LV.conv.key || '').startsWith('ctl:');
   const key = LV.conv.key && !ctl ? `&conv=${encodeURIComponent(LV.conv.key)}` : '';
-  const h = `#logs?${ctl ? 'seq' : 'rid'}=${LV.rid ?? ''}${key}`;
+  const h = `#${S.page}?${ctl ? 'seq' : 'rid'}=${LV.rid ?? ''}${key}`;
   deepSeen = h;              // our own write is not a link to follow
   history.replaceState(null, '', h);
 };
 const lvHashClear = () => {
   deepSeen = null;
   deepPending = null;
-  // Replace, never assign: an assigned `#logs` is a history ENTRY, and Back
+  // Any page can carry an open log's address now, so an address with a query is
+  // the viewer's own write and is taken back on the close.
+  // Replace, never assign: an assigned page address is a history ENTRY, and Back
   // would land on the deep link we just cleared and reopen the viewer the
   // operator closed. Same reason the open itself uses replaceState.
-  if (location.hash.startsWith('#logs?')) history.replaceState(null, '', '#logs');
+  if (location.hash.includes('?')) history.replaceState(null, '', `#${S.page}`);
 };
 /** Open what the address names: rid -> conv -> seq, each form falling through
  *  when the server cannot resolve it. openConv reports its own success. If
@@ -2260,10 +2268,6 @@ async function openConv({ rid, session, user, key } = {}, { silent = false } = {
   // Closed while it loaded: the operator changed their mind.
   if (fresh && !dlg.open) return false;
   const resuming = LV.conv && LV.conv.key === conv.key;
-  // A log opened from the Overview shows up where it belongs: the Logs page.
-  // (replaceState, not a jump, when the viewer is already open — a step must
-  // not add a history entry per request.)
-  if (S.page !== 'logs' && !resuming) location.hash = '#logs';
   LV.conv = conv;
   LV.rid = rid || (resuming && LV.rid) || conv.turns.at(-1)?.rid || null;
   LV.open = new Set(LV.rid != null ? [LV.rid] : []);
@@ -4498,8 +4502,16 @@ document.addEventListener('keydown', e => {
 
 // Click on a dialog's backdrop closes it.
 $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close('cancel'); }));
-// A closed viewer must leave no poller behind.
-$('#dlg-log').addEventListener('close', () => { lvAutoStop(); lvHashClear(); });
+// A closed viewer stops polling and returns to the page it was opened from
+// (the restore itself is lvHashClear, which is where the address is unwritten).
+$('#dlg-log').addEventListener('close', () => {
+  // The close lands as a queued task: if a log is open again by then, the operator
+  // reopened in the same beat, and this close is not theirs to undo — neither its
+  // quiet polling nor its address.
+  if ($('#dlg-log').open) return;
+  lvAutoStop();
+  lvHashClear();
+});
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
 $$('#log-flag input').forEach(r => r.addEventListener('change', () => {
@@ -4632,12 +4644,12 @@ $('#model-list').addEventListener('change', e => {
 // ------------------------------------------------------------------- routing
 
 function route() {
+  const was = S.page;
   let page = (location.hash.slice(1) || 'overview').split('?')[0];
   if (page === 'users') page = 'clients';  // Users merged into Clients
-  // A pasted or edited `#logs?…` address is a log to open, once the page's own
+  // A pasted or edited `#<page>?…` address is a log to open, once the page's own
   // data has arrived (maybeOpenDeepLink runs at the end of every poll).
   deepPending = deepArgs();
-  const was = S.page;
   S.page = $(`#page-${page}`) ? page : 'overview';
   // A conversation left under the pointer keeps no mark behind: the next Overview
   // draw would otherwise light it with nothing under the mouse.
@@ -4647,6 +4659,12 @@ function route() {
   // The default model and quiet time may have changed in Settings meanwhile.
   if (S.page === 'reviews' && was !== 'reviews') S.reviewCfg = null;
   $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${S.page}`));
+  // A page change under an open log is the operator moving on — Back, a nav link,
+  // a dialog's own "go to ..." — and the log goes with them: its address is
+  // rewritten to name the page now underneath, so the address bar never names a
+  // page that is not on screen. An address that itself names a log is not a move,
+  // it is a request to open that log, so it is left for maybeOpenDeepLink.
+  if (was !== S.page && !deepPending && $('#dlg-log').open) lvHashWrite();
   $$('.nav nav a').forEach(a => a.classList.toggle('active', a.dataset.page === S.page));
   // The Filters scope covers the Overview panels and the Logs list, so the
   // button is on the top bar wherever the scope it carries applies.
