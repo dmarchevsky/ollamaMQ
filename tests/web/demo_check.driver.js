@@ -949,4 +949,70 @@ addEventListener('load', () => setTimeout(async () => {
   A5('aged-out-row-inert', !!dead && !dead.classList.contains('clickable') && !dead.dataset.action
     && /aged out/.test(dead.title || ''),
     dead ? `${dead.className || '(no class)'} action=${dead.dataset.action || 'none'} title=${dead.title || '(none)'}` : 'no ghost row rendered');
+  // A closed log returns to the page it was opened from: opening a log used to pull
+  // the page underneath it to the Logs list, so closing left the operator on the log
+  // list, not on the Overview they opened it from. The rule is the same from every
+  // page, and the log's address names the page actually underneath the dialog.
+  const A9 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
+  const page = () => (document.querySelector('.page.active') || {}).id || '(none)';
+  // The block above can leave a log open, and a deep link still pending can
+  // reopen one a beat later: start every walk from a shut dialog and a spent
+  // address, or the walk measures the leftover instead of its own open.
+  const fresh = async () => {
+    await w(3000);                       // let the block above's queued stragglers land
+    if (dlg().open) dlg().close();
+    await until(() => !dlg().open && !location.hash.includes('?'), 4000);
+    deepPending = null; deepSeen = null;
+  };
+  // Open a log from `sel` and hold the view: the poll rebuilds the list under the
+  // pointer every second, so a row looked up early can be a detached node by the
+  // time it is clicked, and a straggler from the block above can still close the
+  // dialog a beat after it opened. Success means it stayed open on `re`.
+  const openOver = async (sel, re) => {
+    for (let i = 0; i < 8; i++) {
+      if (!dlg().open) document.querySelector(sel)?.click();
+      if (await until(() => dlg().open && LV.conv && re.test(location.hash), 2500)) {
+        await w(700);
+        if (dlg().open && re.test(location.hash)) return true;
+      }
+    }
+    return false;
+  };
+  const closeBack = async () => {
+    document.querySelector('#dlg-log .lv-close')?.click();
+    return until(() => !dlg().open, 6000);
+  };
+  await fresh();
+  location.hash = '#overview';
+  await w(1600);
+  A9('overview-entry-present', !!document.querySelector('#page-overview [data-action="conv-open"]'),
+    'the View chip on a conversation header');
+  if (await openOver('#page-overview [data-action="conv-open"]', /^#overview\?(rid|seq)=/)) {
+    A9('overview-open-keeps-the-page', dlg().open && page() === 'page-overview',
+      `open=${dlg().open} page=${page()}`);
+    A9('overview-open-addresses-the-log', /^#overview\?(rid|seq)=/.test(location.hash), location.hash || '(empty)');
+    // The Overview keeps refreshing behind the dialog: its panels are on the same
+    // poll, so an open log must not have emptied them.
+    A9('overview-alive-behind-the-log',
+      document.querySelectorAll('#ov-now .det-h, #ov-timeline .tl-row').length > 0,
+      `${document.querySelectorAll('#ov-now .det-h').length} headers, ${document.querySelectorAll('#ov-timeline .tl-row').length} lanes`);
+    // The address unwriting itself is the close handler's own job and the address
+    // check above already proves it; here the question is only where the operator
+    // is standing when the dialog goes away.
+    const closedOv = await closeBack();
+    A9('overview-close-returns', closedOv && page() === 'page-overview',
+      `closed=${closedOv} page=${page()}`);
+  }
+  // The same rule from another page: the origin is wherever the log was opened.
+  await fresh();
+  location.hash = '#reviews';
+  await w(1600);
+  A9('reviews-entry-present', !!document.querySelector('#page-reviews [data-action="rv-open"]'),
+    'Open conversation button on the selected review');
+  if (await openOver('#page-reviews [data-action="rv-open"]', /^#reviews\?(rid|seq)=/)) {
+    A9('reviews-open-keeps-the-page', dlg().open && page() === 'page-reviews', `page=${page()}`);
+    const closedRv = await closeBack();
+    A9('reviews-close-returns', closedRv && page() === 'page-reviews',
+      `closed=${closedRv} page=${page()}`);
+  }
 }, 95000));
