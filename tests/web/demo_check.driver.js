@@ -867,7 +867,11 @@ addEventListener('load', () => setTimeout(async () => {
   const until = async (fn, ms) => { for (let i = 0; i < Math.ceil(ms / 120); i++) { if (fn()) return true; await w(120); } return false; };
   const closeIt = async () => {
     document.querySelector('#dlg-log .lv-close')?.click();
-    return until(() => !dlg().open && location.hash === '#logs', 6000);
+    // The address goes back in the close event, a task the shell queues behind the
+    // waiters that check it: a tight poll starves the very task it waits for, so
+    // idle in long beats and let it land.
+    for (let i = 0; i < 8 && (dlg().open || location.hash.includes('?')); i++) await w(1200);
+    return !dlg().open && location.hash === '#logs';
   };
   let cleared = await closeIt();
   if (!cleared && !dlg().open) {
