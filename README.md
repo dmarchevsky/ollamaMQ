@@ -24,7 +24,7 @@ A few machines with GPUs, several people and a handful of coding agents all poin
 - **Warm caches** — sticky sessions keep a conversation on the backend that holds its context, and cache-aware scheduling stops agents from evicting each other on every turn.
 - **Live dashboard** — see each backend's capacity, every conversation's waiting, prefill and decode on a timeline, and open any conversation as a readable transcript.
 - **Clients and keys** — hand out API keys per client, block or prioritise them, hide models, load and unload models, all from the web UI.
-- **Conversation log and review** — a compact per-conversation log, with optional redaction, and one-click LLM review of any conversation that runs only when the hardware is idle.
+- **Conversation log and review** — a compact per-conversation log, with optional redaction, one-click LLM review of any conversation that runs only when the hardware is idle, and standing auto-review rules that watch finished conversations and flag what needs attention.
 - **Security audit** — flags prompt injection, exfiltration and similar patterns in agent traffic. It only marks them and never blocks anything.
 - **Prometheus metrics** — requests, tokens, latency, queue depth and cache waste, per client and per model.
 

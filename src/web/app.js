@@ -42,6 +42,7 @@ const S = {
   reviews: [],               // api/reviews: every review, newest first (summaries)
   reviewsEnabled: null,      // settings.review.enabled, as the list reports it
   reviewCfg: null,           // api/review-prompts: default model, quiet time, library
+  autoRules: null,           // api/review-rules: the standing auto-review rules
   reviewSel: null,           // the review shown in the detail pane
   reviewFull: new Map(),     // review id -> its full record (answer, prompt text)
   reviewLoading: null,       // the id being fetched, so a poll does not ask twice
@@ -308,7 +309,7 @@ async function poll() {
     const needReviews = S.page === 'reviews';
     // Capture state only changes on restart (the log path is opened at boot),
     // so ask once and keep the answer.
-    const [state, logs, clients, models, overview, settings, me, capture, reviews, reviewCfg] = await Promise.all([
+    const [state, logs, clients, models, overview, settings, me, capture, reviews, reviewCfg, autoRules] = await Promise.all([
       api('GET', 'state'),
       needLogs && !$('#log-pause').checked ? fetchLogs() : null,
       needClients ? api('GET', 'clients') : null,
@@ -319,6 +320,7 @@ async function poll() {
       needLogs && !S.capture ? api('GET', 'capture') : null,
       needReviews ? api('GET', 'reviews') : null,
       needReviews && !S.reviewCfg ? api('GET', 'review-prompts') : null,
+      needReviews && !S.autoRules ? api('GET', 'review-rules') : null,
     ]);
     S.state = state;
     if (logs) { S.logs = logs.events; S.logsMeta = logs; }
@@ -336,6 +338,7 @@ async function poll() {
     if (capture) S.capture = capture;
     if (reviews) { S.reviews = reviews.reviews; S.reviewsEnabled = reviews.enabled; }
     if (reviewCfg) S.reviewCfg = reviewCfg;
+    if (autoRules) S.autoRules = autoRules.rules;
     S.online = true;
   } catch (e) {
     S.online = false;
@@ -3494,10 +3497,29 @@ function rvVisible() {
     const open = r.status === 'queued' || r.status === 'running';
     if (show === 'open' && !open) return false;
     if (show === 'done' && open) return false;
+    // Attention: what the standing rules say is worth reading. A manual review
+    // has no verdict, so it never shows up here.
+    if (show === 'attention' && !(r.auto && r.status === 'done' && r.attention === true)) return false;
     if (!q) return true;
-    return [r.conv_key, r.label, r.user, r.prompt_name, r.model, r.backend, r.status]
+    return [r.conv_key, r.label, r.user, r.prompt_name, r.model, r.backend, r.status, r.rule_name]
       .some(v => String(v ?? '').toLowerCase().includes(q));
   });
+}
+
+/** The line a rule's review carries: what rule sent it, and — once it is
+ *  finished — what it said about needing attention. No badge for a review whose
+ *  model wrote no verdict line, rather than a guessed one. */
+function rvAutoBadges(r) {
+  if (!r.auto) return '';
+  const bits = [`<span class="badge accent">auto · ${esc(r.rule_name || '?')}</span>`];
+  if (r.status === 'done' && r.attention === true) bits.push('<span class="badge warn">⚠ needs attention</span>');
+  if (r.status === 'done' && r.attention === false) bits.push('<span class="badge ok">✓ nothing flagged</span>');
+  return bits.join(' ');
+}
+
+/** "9 turns", or — a batch reviewed more than one conversation. */
+function rvScope(r) {
+  return r.parts?.length > 1 ? `${r.parts.length} conversations` : `${r.turns} ${r.turns === 1 ? 'turn' : 'turns'}`;
 }
 
 /** One line under a row: what it is waiting for, how long it ran, or when. */
@@ -3529,11 +3551,28 @@ function renderReviews() {
     ? `<div class="rv-rows">${rows.map(r => `
       <button type="button" class="rv-row${r.id === S.reviewSel ? ' sel' : ''}" data-action="rv-pick" data-id="${esc(r.id)}">
         <span class="rv-top">${rvBadge(r.status)}<b>${esc(rvConvName(r))}</b><span class="dim">${esc(r.user)}</span></span>
-        <span class="rv-sub">${esc(r.prompt_name)} · <span class="mono">${esc(r.model)}</span></span>
+        <span class="rv-sub">${esc(r.prompt_name)} · <span class="mono">${esc(r.model)}</span>${r.auto ? ` · ${rvScope(r)}` : ''}</span>
+        ${rvAutoBadges(r) ? `<span class="rv-sub rv-auto">${rvAutoBadges(r)}</span>` : ''}
         <span class="rv-sub dim">${rvMeta(r)}</span>
       </button>`).join('')}</div>`
     : `<div class="empty">${S.reviews.length ? 'No review matches the filter.' : 'No reviews yet. Open a conversation from the Logs page and press <b>✎ Review</b>.'}</div>`);
   renderReviewDetail(rows.find(r => r.id === S.reviewSel));
+}
+
+/** What a rule's review says about itself, around the answer: the verdict in
+ *  front of the text (what to look at, or the plain word that nothing does),
+ *  and the line naming the rule under it. Empty for a manual review, which
+ *  reads exactly as it always did. */
+function rvAutoNotes(r) {
+  if (!r.auto) return '';
+  const done = r.status === 'done';
+  // The cooldown is the rule's, not the job's: gone once the rule is deleted.
+  const quiet = S.autoRules?.find(x => x.id === r.rule_id)?.cooldown_mins;
+  const rule = `<p class="hint rv-rule">auto · <b>${esc(r.rule_name || '?')}</b> — reviewed ${r.parts?.length > 1 ? 'the batch' : 'the conversation'} whole${quiet ? ` after ${quiet} min of quiet` : ''}.</p>`;
+  if (!done) return rule;
+  if (r.attention === true) return `<div class="note warn-note rv-verdict">⚠ ${esc(r.attention_note || 'flagged by the review')}</div>${rule}`;
+  if (r.attention === false) return `<p class="hint rv-clear">Nothing was flagged.${r.attention_note ? ` ${esc(r.attention_note)}` : ''}</p>${rule}`;
+  return rule;
 }
 
 /** The selected review in full; fetched on pick and whenever its row moved. */
@@ -3552,7 +3591,7 @@ function renderReviewDetail(row) {
   }
   const r = full && !stale ? { ...full, wait_reason: row.wait_reason, run_now: row.run_now } : { ...row };
   const facts = [
-    `turns ${r.turns} <span class="dim">(requests ${r.rid_from}–${r.rid_to})</span>`,
+    r.parts?.length > 1 ? `${r.parts.length} conversations` : `turns ${r.turns} <span class="dim">(requests ${r.rid_from}–${r.rid_to})</span>`,
     `${esc(r.prompt_name)}${r.custom ? ' <span class="badge">edited</span>' : ''}`,
     `<span class="mono">${esc(r.model)}</span>${r.backend ? ` on ${bkCell(r.backend)}` : ''}`,
   ];
@@ -3576,13 +3615,14 @@ function renderReviewDetail(row) {
   else if (r.status === 'running') body = `<p class="rv-wait"><span class="spin"></span>Running on ${bkCell(r.backend || '')} for ${fmtDur((Date.now() - r.started_ms) / 1000)}. A user request that arrives meanwhile is served at once, beside it.</p>`;
   else body = `<p class="rv-wait">${r.run_now ? '<span class="spin"></span>' : ''}${esc(rvWhy(r))}</p>`;
   const prompt = full && !stale ? `<details class="rv-prompt"><summary>Prompt used</summary><pre>${esc(full.prompt_text)}</pre></details>` : '';
+  const auto = rvAutoNotes(r);
   setHTML(el, `
     <div class="rv-head">
       <div><h2>${rvBadge(r.status)} ${esc(rvConvName(r))} <span class="dim">· ${esc(r.user)}</span></h2>
         <div class="rv-facts">${facts.map(f => `<span>${f}</span>`).join('')}</div></div>
       <div class="btn-group rv-tools">${tools}</div>
     </div>
-    ${body}${prompt}`);
+    ${auto}${body}${prompt}`);
 }
 
 /** A safe little Markdown: the text is escaped first, then headings, lists
@@ -3798,6 +3838,117 @@ async function rpDelete(id) {
   try { RP.lib = await api('DELETE', `review-prompts/${encodeURIComponent(id)}`); rpDraw(); }
   catch (e) { toast(e.message, false); }
 }
+
+// The standing auto-review rules: a list, and one form that opens under it.
+// The list keeps its own copy (like the prompt library), so a poll never redraws
+// a rule out from under the operator while they are reading the dialog.
+const AR = { list: [] };
+
+async function autoRulesDialog() {
+  try {
+    AR.list = (await api('GET', 'review-rules')).rules;
+    // The form's Client select wants the names; the Clients page may never
+    // have been opened in this visit.
+    if (!S.clients.length) S.clients = await api('GET', 'clients').catch(() => S.clients);
+  } catch (e) { return toast(e.message, false); }
+  arDraw();
+  await ask($('#dlg-autorules'));
+  S.autoRules = null; // whatever the dialog changed comes back with the next poll
+}
+
+/** The row's small line: what the rule watches, then how it reviews. */
+function arLine(r) {
+  const lib = S.reviewCfg || {};
+  const prompt = (lib.prompts || []).find(p => p.id === (r.prompt_id || lib.default))?.name || 'default prompt';
+  const quiet = r.cooldown_mins >= 120 && r.cooldown_mins % 60 === 0 ? `${r.cooldown_mins / 60} h` : `${r.cooldown_mins} min`;
+  return [
+    r.backend ? esc(r.backend) : 'any backend',
+    r.client ? esc(r.client) : 'any client',
+    r.label ? `label <code>${esc(r.label)}</code>` : 'any label',
+    esc(prompt),
+    r.model ? `<span class="mono">${esc(r.model)}</span>` : 'default model',
+    `${quiet} quiet`,
+    `batch ${r.batch}`,
+  ].join(' · ');
+}
+
+function arDraw() {
+  const dlg = $('#dlg-autorules');
+  setHTML($('[data-list]', dlg), AR.list.map(r => `
+    <div class="ar-row${r.enabled ? '' : ' ar-off'}">
+      <label class="switch" title="${r.enabled ? 'On — matching conversations get reviewed' : 'Off — the rule matches nothing new'}">
+        <input type="checkbox" data-id="${esc(r.id)}"${r.enabled ? ' checked' : ''}><span></span></label>
+      <div class="ar-main"><b>${esc(r.name)}</b><div class="ar-sub">${arLine(r)}</div></div>
+      <span class="btn-group">
+        <button type="button" class="btn sm" data-action="ar-edit" data-id="${esc(r.id)}">Edit</button>
+        <button type="button" class="btn sm danger" data-action="ar-delete" data-id="${esc(r.id)}">Delete</button>
+      </span>
+    </div>`).join('')
+    || '<div class="empty">No rules yet. A rule reviews the conversations that match it, once they have gone quiet.</div>');
+}
+
+/** One rule-form select: "Any" first, then the names the proxy knows, then the
+ *  saved value when nothing knows it any more (a backend can be gone). */
+function arFillSelect(sel, items, value, anyText) {
+  const all = !value || items.some(([v]) => v === value) ? items : [[value, value], ...items];
+  setHTML(sel, `<option value="">${anyText}</option>`
+    + all.map(([v, t]) => `<option value="${esc(v)}"${v === value ? ' selected' : ''}>${esc(t)}</option>`).join(''));
+}
+
+async function arEdit(id) {
+  const dlg = $('#dlg-autorule');
+  const form = $('form', dlg);
+  const lib = S.reviewCfg || {};
+  const r = id ? AR.list.find(x => x.id === id) : null;
+  form.reset();
+  $('[data-title]', dlg).textContent = r ? `Edit ${r.name}` : 'New auto-review rule';
+  $('[data-submit]', dlg).textContent = r ? 'Save rule' : 'Add rule';
+  form.id.value = r?.id || '';
+  form.name.value = r?.name || '';
+  arFillSelect(form.backend, (S.state?.backends || []).map(b => [hostOf(b.url), bkName(b.url)]), r?.backend || '', form.backend.dataset.any);
+  arFillSelect(form.client, S.clients.map(c => [c.name, c.name]), r?.client || '', form.client.dataset.any);
+  form.label.value = r?.label || '';
+  setHTML(form.prompt_id, (lib.prompts || []).map(p => `<option value="${esc(p.id)}">${esc(p.name)}${p.id === lib.default ? ' (default)' : ''}</option>`).join(''));
+  form.prompt_id.value = (lib.prompts || []).some(p => p.id === r?.prompt_id) ? r.prompt_id : lib.default || '';
+  form.model.value = r?.model || '';
+  setHTML($('#dl-ar-models'), knownModels().map(m => `<option value="${esc(m)}">`).join(''));
+  form.cooldown.value = r?.cooldown_mins ?? 30;
+  form.batch.value = r?.batch ?? 1;
+  const fd = await ask(dlg);
+  if (!fd) return;
+  const body = {
+    name: fd.get('name').trim(), backend: fd.get('backend'), client: fd.get('client'),
+    label: fd.get('label').trim(), prompt_id: fd.get('prompt_id'), model: fd.get('model').trim(),
+    cooldown_mins: Number(fd.get('cooldown')) || 30, batch: Number(fd.get('batch')) || 1,
+    enabled: r ? r.enabled : true,
+  };
+  if (r) body.id = r.id;
+  try {
+    AR.list = (await api('PUT', 'review-rules', body)).rules;
+    arDraw();
+    toast(`Rule ${body.name} ${r ? 'saved' : 'added'}`);
+  } catch (e) { toast(e.message, false); }
+}
+
+async function arDelete(id) {
+  const r = AR.list.find(x => x.id === id);
+  if (!r || !await confirmDlg('Delete rule?', `<b>${esc(r.name)}</b> stops reviewing conversations. The reviews it already sent stay on the list, and keep its name.`, 'Delete')) return;
+  try { AR.list = (await api('DELETE', `review-rules/${encodeURIComponent(id)}`)).rules; arDraw(); }
+  catch (e) { toast(e.message, false); }
+}
+
+// A rule's switch, PUT straight from the row; a failure redraws the list so the
+// switch goes back to what the server has.
+$('#dlg-autorules').addEventListener('change', async ev => {
+  const cb = ev.target.closest('input[data-id]');
+  if (!cb) return;
+  const r = AR.list.find(x => x.id === cb.dataset.id);
+  if (!r) return;
+  try {
+    AR.list = (await api('PUT', 'review-rules', { ...r, enabled: cb.checked })).rules;
+    arDraw();
+  } catch (e) { arDraw(); toast(e.message, false); }
+});
 
 $('#rv-filter').addEventListener('input', () => renderReviews());
 $$('#rv-show input').forEach(r => r.addEventListener('change', () => renderReviews()));
@@ -4276,6 +4427,10 @@ const actions = {
     await act('DELETE', `reviews/${encodeURIComponent(el.dataset.id)}`, undefined, 'Review deleted');
   },
   'rv-prompts': () => promptsDialog(),
+  'rv-autorules': () => autoRulesDialog(),
+  'ar-new': () => arEdit(null),
+  'ar-edit': el => arEdit(el.dataset.id),
+  'ar-delete': el => arDelete(el.dataset.id),
   'rp-new': () => rpEdit(null),
   'rp-edit': el => rpEdit(el.dataset.id),
   'rp-cancel': () => { RP.editing = undefined; rpDraw(); },

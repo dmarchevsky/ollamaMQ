@@ -714,7 +714,9 @@ Success — the fix is right and verified; two small inefficiencies.`;
     { id: '19a4c-0', conv_key: 'codex-laptop#a3f19c', user: 'codex-laptop', label: 'dispatcher refactor', rid_from: 900, rid_to: 905, turns: 4,
       prompt_id: 'default', prompt_name: 'Default review', prompt_text: REVIEW_PROMPT, custom: false, model: 'Qwen3.8-27B', status: 'done',
       backend: 'gpu-box.lan:11434', created_ms: now - 3_600_000, started_ms: now - 3_300_000, finished_ms: now - 3_180_000,
-      input_chars: 48_210, truncated: false, result: RESULT, prompt_tokens: 13_480, completion_tokens: 412, attempts: 1 },
+      input_chars: 48_210, truncated: false, result: RESULT, prompt_tokens: 13_480, completion_tokens: 412, attempts: 1,
+      auto: true, rule_id: 'agent-sessions-nightly', rule_name: 'Agent sessions nightly',
+      attention: true, attention_note: 'the agent ran the failing suite twice, then changed the test to match the bug' },
     { id: '19a4d-1', conv_key: 'codex-laptop#a3f19c', user: 'codex-laptop', label: 'dispatcher refactor', rid_from: 900, rid_to: 905, turns: 4,
       prompt_id: null, prompt_name: 'Tool use audit (edited)', prompt_text: 'Judge only the bash calls.', custom: true, model: 'Qwen3.8-27B', status: 'running',
       backend: 'gpu-box.lan:11434', created_ms: now - 400_000, started_ms: now - 95_000, input_chars: 48_210, truncated: false, attempts: 1 },
@@ -728,8 +730,22 @@ Success — the fix is right and verified; two small inefficiencies.`;
     { id: '19a50-4', conv_key: 'codex-laptop#a3f19c', user: 'codex-laptop', label: 'dispatcher refactor', rid_from: 900, rid_to: 901, turns: 2,
       prompt_id: 'default', prompt_name: 'Default review', prompt_text: REVIEW_PROMPT, custom: false, model: 'Qwen3.8-27B', status: 'cancelled',
       created_ms: now - 86_400_000, finished_ms: now - 86_000_000, attempts: 0 },
+    { id: '19a51-5', conv_key: 'n8n-agents#d41f00', user: 'n8n-agents', label: null, rid_from: 940, rid_to: 944, turns: 9,
+      parts: [{ key: 'n8n-agents#d41f00', rid_to: 944 }, { key: 'n8n-agents#e50b11', rid_to: 912 }, { key: 'n8n-agents#f61c22', rid_to: 908 }],
+      prompt_id: 'default', prompt_name: 'Default review', prompt_text: REVIEW_PROMPT, custom: false, model: 'Qwen3.8-27B', status: 'done',
+      backend: 'gpu-box.lan:11434', created_ms: now - 2 * 3_600_000, started_ms: now - 2 * 3_600_000 + 60_000, finished_ms: now - 3_600_000,
+      input_chars: 91_400, truncated: true, result: RESULT, prompt_tokens: 24_100, completion_tokens: 860, attempts: 1,
+      auto: true, rule_id: 'agent-sessions-nightly', rule_name: 'Agent sessions nightly',
+      attention: false, attention_note: 'three routine sessions, nothing to revisit' },
   ];
-  let reviewSeq = 5;
+  let reviewSeq = 6;
+  // The standing auto-review rules, as the Auto-reviews dialog lists them.
+  const autoRules = [
+    { id: 'agent-sessions-nightly', name: 'Agent sessions nightly', enabled: true, backend: '', client: 'codex-laptop', label: '',
+      prompt_id: 'default', model: '', cooldown_mins: 30, batch: 4 },
+    { id: 'security-pass-work', name: 'Security pass on work', enabled: false, backend: 'gpu-box.lan:11434', client: 'n8n-agents', label: 'ci-*',
+      prompt_id: 'tool-use', model: 'llama3.3:70b', cooldown_mins: 120, batch: 1 },
+  ];
   const reviewSummary = r => { const { result, prompt_text, ...rest } = r; return { ...rest, has_result: result != null }; };
   const findReview = id => reviews.find(r => r.id === id) || err('no such review');
   /** Run now, as the demo plays it: running at once on the GPU box. */
@@ -907,6 +923,27 @@ Success — the fix is right and verified; two small inefficiencies.`;
       if (method === 'DELETE' && seg[0] === 'reviews') {
         reviews.splice(reviews.indexOf(findReview(seg[1])), 1);
         return delay({ deleted: seg[1] });
+      }
+      if (method === 'GET' && p === 'review-rules') return delay({ rules: autoRules });
+      if (method === 'PUT' && p === 'review-rules') {
+        if (!(body.name || '').trim()) err('a rule needs a name of at most 80 characters');
+        if (!(body.batch >= 1 && body.batch <= 10)) err('the batch size must be between 1 and 10');
+        if (!(body.cooldown_mins >= 5 && body.cooldown_mins <= 1440)) err('the cooldown must be between 5 and 1440 minutes');
+        if (body.prompt_id && !reviewLib.prompts.some(x => x.id === body.prompt_id)) err(`no prompt '${body.prompt_id}'`);
+        const known = { enabled: true, backend: '', client: '', label: '', prompt_id: '', model: '', cooldown_mins: 30, batch: 1 };
+        let r = body.id ? autoRules.find(x => x.id === body.id) || err(`no rule '${body.id}'`) : null;
+        if (r) Object.assign(r, known, body);
+        else {
+          const id = body.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `rule-${autoRules.length + 1}`;
+          r = { ...known, ...body, id };
+          autoRules.push(r);
+        }
+        return delay({ saved: r.id, rules: autoRules });
+      }
+      if (method === 'DELETE' && seg[0] === 'review-rules') {
+        autoRules.find(x => x.id === seg[1]) || err(`no rule '${seg[1]}'`);
+        autoRules.splice(autoRules.findIndex(x => x.id === seg[1]), 1);
+        return delay({ rules: autoRules });
       }
       if (method === 'GET' && p === 'review-prompts') return delay({ ...reviewLib, ...reviewCfg });
       if (method === 'PUT' && p === 'review-prompts') {
