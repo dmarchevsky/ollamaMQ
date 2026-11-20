@@ -17,6 +17,19 @@ since upstream `v0.5.0`.
   pane shows why, and an **Attention** filter finds the flagged ones. Rules live in
   `review_rules.yaml`; `GET|PUT /ui/api/review-rules`, `DELETE /ui/api/review-rules/{id}`.
 
+## v0.30.5 — 2026-11-19
+
+### Fixed
+
+- **Closing a log leaves you on the page you opened it from**: opening a conversation from the
+  Overview — or from Reviews, or Clients — pulled the page underneath the viewer to the Logs list,
+  so closing it left you on the log list instead of where you came from. The viewer now sits over
+  whatever page is showing, and the close finds you there. The address bar names that page and the
+  log on it (`#overview?rid=…` where it used to say `#logs?rid=…`); a link left over from before
+  still opens, on the Logs page. Moving to another page while a log is open — Back, a nav link, a
+  dialog's `Go to review` — now takes the log with you and rewrites its address to the new page,
+  instead of pulling you back to the log list when you close it.
+
 ## v0.30.4 — 2026-11-05
 
 ### Fixed
