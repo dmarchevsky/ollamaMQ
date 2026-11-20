@@ -6,10 +6,10 @@
 //! over at `cooldown` after its last turn: agent sessions pause for minutes at
 //! a time, and reviewing a live session reviews it half.
 //!
-//! Each rule reviews each conversation once. A review that failed or was
-//! cancelled does not count as covered — the operator can Re-run it — but the
-//! sweep never re-submits it on its own, so a rule that cannot run (a deleted
-//! model, say) fails once instead of retrying forever.
+//! Each rule reviews each conversation once, for good: even a review that
+//! failed or was cancelled keeps its conversation claimed, so a rule that
+//! cannot run (a deleted model, say) fails once instead of retrying forever —
+//! the operator's Re-run is the one way back in.
 //!
 //! The sweep runs inside the review worker's loop, at most once a minute, and
 //! only looks at conversations that ended within the last day: auto-reviews
@@ -29,10 +29,13 @@ use crate::lock::LockExt;
 use crate::model_policy::glob_match;
 
 use super::store::AutoRule;
-use super::{AutoSpec, Due, Job, Status};
+use super::{AutoSpec, Due, Job};
 
 /// How often the sweep may run.
 pub const SWEEP_SECS: u64 = 60;
+/// A rule never sends more than this per sweep: a rule created after a busy
+/// day digests its backlog over a few minutes instead of burying the queue.
+pub const MAX_SENDS_PER_SWEEP: usize = 10;
 /// A batch closes this long after its first conversation fell due, even if it
 /// never filled up — a digest should not wait forever for company.
 pub const BATCH_WINDOW_SECS: u64 = 300;
@@ -81,15 +84,14 @@ pub fn is_finished(rule: &AutoRule, s: &ConvSummary, now: u64) -> bool {
     quiet >= rule.cooldown_mins * 60_000 && quiet <= LOOKBACK_HOURS * 3_600_000
 }
 
-/// The conversations each rule already has a claim on: every auto review that
-/// is not failed or cancelled covers its conversations for its rule, for good.
+/// The conversations each rule already has a claim on: any auto review of a
+/// rule covers its conversations for good — a failed one included, so the
+/// sweep never re-sends what failed; the operator's Re-run is the one escape
+/// (it re-queues the job itself, which keeps the claim).
 pub fn covered(jobs: &BTreeMap<String, Job>) -> HashMap<String, HashSet<String>> {
     let mut out: HashMap<String, HashSet<String>> = HashMap::new();
     for j in jobs.values() {
         if !j.auto {
-            continue;
-        }
-        if matches!(j.status, Status::Failed | Status::Cancelled) {
             continue;
         }
         let Some(rule) = &j.rule_id else { continue };
@@ -103,17 +105,19 @@ pub fn covered(jobs: &BTreeMap<String, Job>) -> HashMap<String, HashSet<String>>
 }
 
 /// Take the conversations a batch job should go out with: filled batches at
-/// once, everything that has waited past the window as one late batch.
-pub fn drain(pending: &mut Vec<Due>, batch: u32, now: u64) -> Vec<Vec<Due>> {
+/// once, everything that has waited past the window as one late batch — and
+/// never more than `cap` groups, so a backlog drains in paced bites.
+pub fn drain(pending: &mut Vec<Due>, batch: u32, now: u64, cap: usize) -> Vec<Vec<Due>> {
     let mut out = Vec::new();
     if batch <= 1 {
-        out.extend(pending.drain(..).map(|d| vec![d]));
+        let n = pending.len().min(cap);
+        out.extend(pending.drain(..n).map(|d| vec![d]));
         return out;
     }
-    while pending.len() >= batch as usize {
+    while out.len() < cap && pending.len() >= batch as usize {
         out.push(pending.drain(..batch as usize).collect());
     }
-    if !pending.is_empty() && now.saturating_sub(pending[0].due_ms) >= BATCH_WINDOW_SECS * 1000 {
+    if out.len() < cap && !pending.is_empty() && now.saturating_sub(pending[0].due_ms) >= BATCH_WINDOW_SECS * 1000 {
         out.push(std::mem::take(pending));
     }
     out
@@ -174,6 +178,12 @@ pub(crate) fn sweep_now(state: &Arc<AppState>, now: u64) {
 
 fn run(state: &Arc<AppState>, now: u64) {
     let review = &state.review;
+    // While reviews are switched off, auto-reviews collect nothing: what the
+    // rules would send waits for the switch to flip back, it does not
+    // pre-queue a flood that then fires the moment it does.
+    if !review.settings().enabled {
+        return;
+    }
     let rules: Vec<AutoRule> = review.rules().into_iter().filter(|r| r.enabled).collect();
     if rules.is_empty() {
         return;
@@ -212,7 +222,7 @@ fn run(state: &Arc<AppState>, now: u64) {
             pending.push(Due { key: s.key.clone(), due_ms: now });
         }
         let mut backs = Vec::new();
-        for group in drain(&mut pending, rule.batch, now) {
+        for group in drain(&mut pending, rule.batch, now, MAX_SENDS_PER_SWEEP) {
             // The send re-reads the log: turn bounds are as they are at send
             // time, and a conversation deleted or redacted meanwhile drops out.
             let keys: Vec<String> = group.iter().map(|d| d.key.clone()).collect();
@@ -277,7 +287,7 @@ pub(super) fn spec_for(review: &super::Review, rule: &AutoRule, cfg_model: &str)
 mod tests {
     use super::*;
     use crate::convlog::ConvSummary;
-    use crate::review::ConvRef;
+    use crate::review::{ConvRef, Status};
 
     const MIN: u64 = 60_000;
 
@@ -358,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_keeps_its_claim_except_over_failures() {
+    fn a_rule_keeps_every_claim_it_ever_made() {
         let mut jobs = BTreeMap::new();
         let mut job = |id: &str, status: Status, parts: Vec<&str>| {
             let j = Job {
@@ -403,7 +413,10 @@ mod tests {
         let covered = covered(&jobs);
         let mine = covered.get("r").unwrap();
         assert!(mine.contains("alice#a1") && mine.contains("alice#a3") && mine.contains("alice#a4"));
-        assert!(!mine.contains("alice#a2"), "a failed review leaves the door open for a re-run");
+        assert!(
+            mine.contains("alice#a2"),
+            "a failed review still claims its conversation: the sweep never re-sends what failed — Re-run is the escape"
+        );
     }
 
     fn due(key: &str, due_ms: u64) -> Due {
@@ -413,18 +426,23 @@ mod tests {
     #[test]
     fn batches_close_when_full_or_when_the_window_passes() {
         let mut p = vec![due("a", 0), due("b", 10), due("c", 20)];
-        let out = drain(&mut p, 2, 10_000);
+        let out = drain(&mut p, 2, 10_000, 10);
         assert_eq!(out.len(), 1, "one filled batch");
         assert_eq!(out[0].len(), 2);
         assert_eq!(p.len(), 1, "the third waits for company");
-        let late = drain(&mut p, 2, 20 + BATCH_WINDOW_SECS * 1000);
+        let late = drain(&mut p, 2, 20 + BATCH_WINDOW_SECS * 1000, 10);
         assert_eq!(late[0].len(), 1, "the window sends the leftover alone");
         assert!(p.is_empty());
 
         let mut p = vec![due("a", 0), due("b", 0), due("c", 0)];
-        let out = drain(&mut p, 1, 0);
+        let out = drain(&mut p, 1, 0, 10);
         assert_eq!(out.len(), 3, "batch 1 sends each conversation as its own review");
         assert!(p.is_empty());
+
+        let mut p: Vec<Due> = (0..12).map(|i| due(&format!("c{i}"), 0)).collect();
+        let out = drain(&mut p, 1, 0, 10);
+        assert_eq!(out.len(), 10, "a busy rule sends a capped bite per sweep");
+        assert_eq!(p.len(), 2, "the rest waits for the next sweep");
     }
 
     #[test]

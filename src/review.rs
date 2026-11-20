@@ -337,7 +337,14 @@ impl Review {
     }
 
     pub fn remove_rule(&self, id: &str) -> Result<(), String> {
-        self.rules.lock_or_recover().remove(id)
+        self.rules.lock_or_recover().remove(id)?;
+        // A deleted rule leaves no sweep state behind: ids are reused by slug,
+        // and a new rule of the same name must not inherit the old queue or
+        // the old warnings.
+        self.auto_pending.lock_or_recover().remove(id);
+        let prefix = format!("{id}\u{0}");
+        self.auto_warned.lock_or_recover().retain(|k| !k.starts_with(&prefix));
+        Ok(())
     }
 
     /// Queue a review of the conversation `req.key` as it stands now.
@@ -870,8 +877,9 @@ async fn run(state: &Arc<AppState>, job: &Job, idx: usize) -> Result<Outcome, St
     })
     .await
     .map_err(|e| format!("reading the conversation failed: {e}"))?;
-    // A batch shares one call, so it also shares one transcript budget.
-    let budget = (cfg.max_transcript_chars / loaded.len().max(1)).max(4_000);
+    // A batch shares one call, so it also shares one transcript budget; the
+    // floor only keeps a pathological count from dividing it to nothing.
+    let budget = (cfg.max_transcript_chars / loaded.len().max(1)).max(1_000);
     let mut text = String::new();
     let mut turns = 0usize;
     let mut truncated = false;

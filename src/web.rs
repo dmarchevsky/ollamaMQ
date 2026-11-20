@@ -1843,6 +1843,74 @@ mod tests {
         .0
     }
 
+    /// One finished conversation with fresh timestamps — what the auto-review
+    /// sweep watches (the shared fixture is from 1970 on purpose).
+    fn record_fresh(state: &AppState, key: &str, user: &str) {
+        use crate::convlog::{Begin, MsgMeta, Note, Resp};
+        let key = key.to_string();
+        let now = crate::clients::now_ms();
+        state.convlog.note(Note::Begin(Box::new(Begin {
+            kind: None,
+            link: None,
+            key: key.clone(),
+            rid: 21,
+            user: user.into(),
+            session_label: None,
+            model: Some("qwen".into()),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            bytes: Some(10),
+            priority: "normal".into(),
+            at_ms: now - 60_000,
+            queue_ms: Some(now - 59_000),
+            redacted: false,
+            msgs: vec![MsgMeta { role: "user".into(), chars: 4, name: None, calls: vec![] }],
+        })));
+        state.convlog.note(Note::ReqText {
+            key: key.clone(),
+            rid: 21,
+            bytes: Some(10),
+            text: std::sync::Arc::new("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}".into()),
+        });
+        state.convlog.note(Note::Resp(Box::new(Resp {
+            key: key.clone(),
+            rid: 21,
+            end_ms: now,
+            first_token: Some(now - 500),
+            status: Some(200),
+            resp_bytes: Some(5),
+            backend: Some("gpu:11434".into()),
+            outcome: "ok".into(),
+            prompt_tokens: Some(3),
+            completion_tokens: Some(2),
+            waste_secs: None,
+            redacted: false,
+        })));
+        state.convlog.note(Note::RespText {
+            key,
+            rid: 21,
+            bytes: Some(5),
+            text: std::sync::Arc::new("hello back".into()),
+        });
+    }
+
+    fn rule(name: &str, f: impl FnOnce(&mut crate::review::store::AutoRule)) -> crate::review::store::AutoRule {
+        let mut r = crate::review::store::AutoRule {
+            id: String::new(),
+            name: name.into(),
+            enabled: true,
+            backend: String::new(),
+            client: String::new(),
+            label: String::new(),
+            prompt_id: String::new(),
+            model: String::new(),
+            cooldown_mins: 5,
+            batch: 1,
+        };
+        f(&mut r);
+        r
+    }
+
     /// Two turns of one agent conversation, as the request path would record it.
     fn record_two_turns(state: &AppState) {
         use crate::convlog::{Begin, MsgMeta, Note, Resp};
@@ -2691,56 +2759,7 @@ mod tests {
     #[tokio::test]
     async fn auto_review_rules_are_managed_and_the_sweep_uses_them() {
         let state = test_state_with(test_convlog());
-        // A conversation that just ended: the sweep only watches the last day,
-        // and the shared fixture's turns are from 1970 on purpose.
-        {
-            use crate::convlog::{Begin, MsgMeta, Note, Resp};
-            let key = "alice#fresh".to_string();
-            let now = crate::clients::now_ms();
-            state.convlog.note(Note::Begin(Box::new(Begin {
-                kind: None,
-                link: None,
-                key: key.clone(),
-                rid: 21,
-                user: "alice".into(),
-                session_label: Some("nightly".into()),
-                model: Some("qwen".into()),
-                method: "POST".into(),
-                path: "/v1/chat/completions".into(),
-                bytes: Some(10),
-                priority: "normal".into(),
-                at_ms: now - 60_000,
-                queue_ms: Some(now - 59_000),
-                redacted: false,
-                msgs: vec![MsgMeta { role: "user".into(), chars: 4, name: None, calls: vec![] }],
-            })));
-            state.convlog.note(Note::ReqText {
-                key: key.clone(),
-                rid: 21,
-                bytes: Some(10),
-                text: std::sync::Arc::new("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}".into()),
-            });
-            state.convlog.note(Note::Resp(Box::new(Resp {
-                key: key.clone(),
-                rid: 21,
-                end_ms: now,
-                first_token: Some(now - 500),
-                status: Some(200),
-                resp_bytes: Some(5),
-                backend: Some("gpu:11434".into()),
-                outcome: "ok".into(),
-                prompt_tokens: Some(3),
-                completion_tokens: Some(2),
-                waste_secs: None,
-                redacted: false,
-            })));
-            state.convlog.note(Note::RespText {
-                key: key.clone(),
-                rid: 21,
-                bytes: Some(5),
-                text: std::sync::Arc::new("hello back".into()),
-            });
-        }
+        record_fresh(&state, "alice#fresh", "alice");
         state
             .review
             .apply(crate::config::ReviewSettings { model: "qwen3:32b".into(), ..Default::default() });
@@ -2790,6 +2809,93 @@ mod tests {
         let res = send(c.delete(api(&format!("review-rules/{id}")))).send().await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert!(res.json::<serde_json::Value>().await.unwrap()["rules"].as_array().unwrap().is_empty());
+    }
+
+    /// A batch rule reviews the conversations due for it together, in one
+    /// job — the window closes the batch when it never fills up.
+    #[tokio::test]
+    async fn a_batch_rule_sends_one_review_over_several_conversations() {
+        let state = test_state_with(test_convlog());
+        record_fresh(&state, "alice#b1", "alice");
+        record_fresh(&state, "alice#b2", "alice");
+        state
+            .review
+            .apply(crate::config::ReviewSettings { model: "m".into(), ..Default::default() });
+        state.review.upsert_rule(rule("digest", |r| { r.client = "alice".into(); r.batch = 3; })).unwrap();
+        let now = crate::clients::now_ms();
+        crate::review::auto::sweep_now(&state, now + 6 * 60 * 1000);
+        assert!(state.review.list(None).is_empty(), "the batch still waits for its third company");
+        crate::review::auto::sweep_now(&state, now + 11 * 60 * 1000);
+        let jobs = state.review.list(None);
+        assert_eq!(jobs.len(), 1, "the window sends both together");
+        let keys: Vec<&str> = jobs[0]["parts"].as_array().unwrap().iter().map(|p| p["key"].as_str().unwrap()).collect();
+        assert!(keys.contains(&"alice#b1") && keys.contains(&"alice#b2"), "both conversations are inside the one job");
+        assert_eq!(jobs[0]["turns"], 2, "the job counts the turns of every part");
+        assert_eq!(jobs[0]["auto"], true);
+    }
+
+    /// A rule created after a busy day digests its backlog a capped bite per
+    /// sweep — the queue is never buried in one minute.
+    #[tokio::test]
+    async fn a_new_rule_digests_its_backlog_in_capped_sweeps() {
+        let state = test_state_with(test_convlog());
+        for i in 0..12 {
+            record_fresh(&state, &format!("flood#f{i}"), "flood");
+        }
+        state
+            .review
+            .apply(crate::config::ReviewSettings { model: "m".into(), ..Default::default() });
+        state.review.upsert_rule(rule("flood", |r| { r.client = "flood".into(); })).unwrap();
+        let now = crate::clients::now_ms();
+        crate::review::auto::sweep_now(&state, now + 6 * 60 * 1000);
+        assert_eq!(state.review.list(None).len(), crate::review::auto::MAX_SENDS_PER_SWEEP);
+        crate::review::auto::sweep_now(&state, now + 7 * 60 * 1000);
+        assert_eq!(state.review.list(None).len(), 12, "the next sweep sends the rest");
+        crate::review::auto::sweep_now(&state, now + 8 * 60 * 1000);
+        assert_eq!(state.review.list(None).len(), 12, "and a conversation is never reviewed twice");
+    }
+
+    /// Re-running an automatic review sends a new job that still carries the
+    /// rule, even after the rule itself is gone — the stored prompt takes over.
+    #[tokio::test]
+    async fn re_running_an_auto_review_keeps_the_rule() {
+        let state = test_state_with(test_convlog());
+        record_two_turns(&state);
+        state
+            .review
+            .apply(crate::config::ReviewSettings { model: "m".into(), ..Default::default() });
+        let dir = std::env::temp_dir().join(format!("omq-retry-{}", crate::clients::random_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("777-1.json"),
+            json!({
+                "id": "777-1", "conv_key": "alice#a3f19c", "user": "alice",
+                "rid_from": 7, "rid_to": 8, "turns": 2,
+                "prompt_name": "Default review", "prompt_text": "t", "custom": false,
+                "model": "m", "status": "done", "created_ms": 1,
+                "auto": true, "rule_id": "ghost-rule", "rule_name": "Ghost",
+                "attention": true, "attention_note": "x"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        state.review.attach(Some(dir.clone()), None, None);
+        let base = serve(state.clone()).await;
+        let c = http();
+        let res = c
+            .post(format!("{base}/ui/api/reviews/777-1/retry"))
+            .basic_auth("admin", Some("pw"))
+            .header("X-OllamaMQ-UI", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let job: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(job["auto"], true);
+        assert_eq!(job["rule_id"], "ghost-rule", "the re-run is still an automatic review of its rule");
+        assert_eq!(job["conv_key"], "alice#a3f19c");
+        assert_eq!(job["prompt_text"], "t", "with the prompt the review stored");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
