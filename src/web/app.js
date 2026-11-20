@@ -2121,11 +2121,7 @@ S.lv = storedLv();
  *  run ordinals folded shut; whether a request shows only its increment or the
  *  whole re-sent prompt is the one global `S.lv.inc` switch, not per-request. */
 const LV = { conv: null, rid: null, open: new Set(), closedRuns: new Set(), focusMsg: null, content: new Map(),
-  loading: new Map(), msgFold: new Map(),
-  // The page the viewer was opened over, so closing it returns there instead of
-  // wherever the log's own address happens to name. Stepping between requests
-  // never changes it — the page you came from is the page you get back.
-  origin: null };
+  loading: new Map(), msgFold: new Map() };
 let lvToken = 0;
 
 const tryJson = s => { try { return JSON.parse(s); } catch { return undefined; } };
@@ -2186,7 +2182,6 @@ const lvHashWrite = () => {
 const lvHashClear = () => {
   deepSeen = null;
   deepPending = null;
-  LV.origin = null;
   // Any page can carry an open log's address now, so an address with a query is
   // the viewer's own write and is taken back on the close.
   // Replace, never assign: an assigned page address is a history ENTRY, and Back
@@ -2252,7 +2247,6 @@ async function openConv({ rid, session, user, key } = {}, { silent = false } = {
   const dlg = $('#dlg-log');
   const fresh = !dlg.open;
   if (fresh) {
-    LV.origin = S.page;     // where the close goes back to
     lvToken++;              // a draw still in flight must not land on the spinner
     lvPrefetchKey = null;   // nor a prefetch of the last conversation
     $('#dlg-log [data-title]').textContent = 'Loading…';
@@ -2264,7 +2258,7 @@ async function openConv({ rid, session, user, key } = {}, { silent = false } = {
   try {
     conv = await api('GET', 'conv?' + q.toString());
   } catch (e) {
-    if (fresh) { LV.origin = null; dlg.close(); }
+    if (fresh) dlg.close();
     // `silent` is the deep link falling through rid -> conv -> seq: a miss
     // there is a next try, not an error to announce.
     if (!silent) toast(e.message, false);
@@ -2272,7 +2266,7 @@ async function openConv({ rid, session, user, key } = {}, { silent = false } = {
     return;
   }
   // Closed while it loaded: the operator changed their mind.
-  if (fresh && !dlg.open) { LV.origin = null; return false; }
+  if (fresh && !dlg.open) return false;
   const resuming = LV.conv && LV.conv.key === conv.key;
   LV.conv = conv;
   LV.rid = rid || (resuming && LV.rid) || conv.turns.at(-1)?.rid || null;
@@ -2340,15 +2334,11 @@ async function lvPrefetch() {
 /** A log event with no proxied request behind it (a control action): the same
  *  dialog with a single turn, its text taken from the event ring. */
 async function openSeq(seq, { silent = false } = {}) {
-  const dlg = $('#dlg-log');
-  const fresh = !dlg.open;
-  const origin = S.page;    // read now: a nav away during the fetch re-routes the close
   let ev;
   // Silent mode is the deep-link path: a seq that no longer resolves must not
   // toast its own raw message and count as opened — the caller owns the verdict.
   try { ev = await api('GET', `logs/${seq}`); }
   catch (e) { if (silent) throw e; return toast(e.message, false); }
-  if (fresh) LV.origin = origin;
   LV.conv = {
     key: 'ctl:' + seq, user: ev.user || '\u2014', model: 'control', session: null,
     start_ms: ev.at_ms, end_ms: ev.at_ms,
@@ -2363,6 +2353,7 @@ async function openSeq(seq, { silent = false } = {}) {
   LV.loading = new Map();
   $('#dlg-log [data-title]').textContent = `control \u00b7 ${ev.user}`;
   $('#dlg-log [data-sub]').textContent = `${fmtTime(ev.at_ms)} \u00b7 ${ev.info}`;
+  const dlg = $('#dlg-log');
   if (!dlg.open) dlg.showModal();
   await lvDraw({ scroll: true });
   lvHashWrite();
@@ -4514,10 +4505,12 @@ $$('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d)
 // A closed viewer stops polling and returns to the page it was opened from
 // (the restore itself is lvHashClear, which is where the address is unwritten).
 $('#dlg-log').addEventListener('close', () => {
+  // The close lands as a queued task: if a log is open again by then, the operator
+  // reopened in the same beat, and this close is not theirs to undo — neither its
+  // quiet polling nor its address.
+  if ($('#dlg-log').open) return;
   lvAutoStop();
-  // The close lands as a queued task: if another log is already open by then,
-  // the operator reopened in the same beat, and this close is not theirs to clear.
-  if (!$('#dlg-log').open) lvHashClear();
+  lvHashClear();
 });
 
 ['#log-filter', '#log-dir'].forEach(s => $(s).addEventListener('input', () => renderLogs()));
@@ -4667,10 +4660,11 @@ function route() {
   if (S.page === 'reviews' && was !== 'reviews') S.reviewCfg = null;
   $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${S.page}`));
   // A page change under an open log is the operator moving on — Back, a nav link,
-  // a dialog's own "go to ...". The log goes with them: that page becomes the one
-  // the close returns to, and its address is rewritten to name it, so the address
-  // bar always shows the page actually underneath the dialog.
-  if (was !== S.page && $('#dlg-log').open) { LV.origin = S.page; lvHashWrite(); }
+  // a dialog's own "go to ..." — and the log goes with them: its address is
+  // rewritten to name the page now underneath, so the address bar never names a
+  // page that is not on screen. An address that itself names a log is not a move,
+  // it is a request to open that log, so it is left for maybeOpenDeepLink.
+  if (was !== S.page && !deepPending && $('#dlg-log').open) lvHashWrite();
   $$('.nav nav a').forEach(a => a.classList.toggle('active', a.dataset.page === S.page));
   // The Filters scope covers the Overview panels and the Logs list, so the
   // button is on the top bar wherever the scope it carries applies.

@@ -955,26 +955,29 @@ addEventListener('load', () => setTimeout(async () => {
   // page, and the log's address names the page actually underneath the dialog.
   const A9 = (name, ok, extra) => console.log(`ASSERT ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ' — ' + extra : ''}`);
   const page = () => (document.querySelector('.page.active') || {}).id || '(none)';
-  // The block above can leave a log open, and a deep link still pending can
-  // reopen one a beat later: start every walk from a shut dialog and a spent
-  // address, or the walk measures the leftover instead of its own open.
+  // The block above can leave a log open, and a deep link still pending can reopen one
+  // a beat later: start every walk from a shut dialog and a spent address, or the walk
+  // measures the leftover instead of its own open.
   const fresh = async () => {
-    await w(3000);                       // let the block above's queued stragglers land
+    await w(2500);
     if (dlg().open) dlg().close();
-    await until(() => !dlg().open && !location.hash.includes('?'), 4000);
+    await until(() => !dlg().open, 4000);
     deepPending = null; deepSeen = null;
   };
-  // Open a log from `sel` and hold the view: the poll rebuilds the list under the
-  // pointer every second, so a row looked up early can be a detached node by the
-  // time it is clicked, and a straggler from the block above can still close the
-  // dialog a beat after it opened. Success means it stayed open on `re`.
-  const openOver = async (sel, re) => {
-    for (let i = 0; i < 8; i++) {
-      if (!dlg().open) document.querySelector(sel)?.click();
-      if (await until(() => dlg().open && LV.conv && re.test(location.hash), 2500)) {
+  // Open a log over the page showing, from one of the first few entry points: the poll
+  // rebuilds the list under the pointer every second, so a row can be a detached node
+  // by the time it is clicked, and one conversation may be outside what the log can
+  // read. Each attempt says out loud whether a log came up — a walk that never opened
+  // one must fail, not skip its own assertions.
+  const openOver = async (sel) => {
+    const n = Math.min(4, document.querySelectorAll(sel).length);
+    for (let i = 0; i < n; i++) {
+      document.querySelectorAll(sel)[i]?.click();
+      if (await until(() => dlg().open && LV.conv, 2000)) {
         await w(700);
-        if (dlg().open && re.test(location.hash)) return true;
+        if (dlg().open) return true;
       }
+      if (dlg().open) { dlg().close(); await until(() => !dlg().open, 3000); }
     }
     return false;
   };
@@ -985,34 +988,36 @@ addEventListener('load', () => setTimeout(async () => {
   await fresh();
   location.hash = '#overview';
   await w(1600);
-  A9('overview-entry-present', !!document.querySelector('#page-overview [data-action="conv-open"]'),
-    'the View chip on a conversation header');
-  if (await openOver('#page-overview [data-action="conv-open"]', /^#overview\?(rid|seq)=/)) {
-    A9('overview-open-keeps-the-page', dlg().open && page() === 'page-overview',
-      `open=${dlg().open} page=${page()}`);
-    A9('overview-open-addresses-the-log', /^#overview\?(rid|seq)=/.test(location.hash), location.hash || '(empty)');
-    // The Overview keeps refreshing behind the dialog: its panels are on the same
-    // poll, so an open log must not have emptied them.
-    A9('overview-alive-behind-the-log',
-      document.querySelectorAll('#ov-now .det-h, #ov-timeline .tl-row').length > 0,
-      `${document.querySelectorAll('#ov-now .det-h').length} headers, ${document.querySelectorAll('#ov-timeline .tl-row').length} lanes`);
-    // The address unwriting itself is the close handler's own job and the address
-    // check above already proves it; here the question is only where the operator
-    // is standing when the dialog goes away.
-    const closedOv = await closeBack();
-    A9('overview-close-returns', closedOv && page() === 'page-overview',
-      `closed=${closedOv} page=${page()}`);
-  }
-  // The same rule from another page: the origin is wherever the log was opened.
+  const ovOpened = await openOver('#page-overview [data-action="conv-open"]');
+  A9('overview-walk-opened', ovOpened, ovOpened ? `${LV.conv.key} over ${page()}` : 'no Overview entry would open a log');
+  A9('overview-open-keeps-the-page', ovOpened && dlg().open && page() === 'page-overview',
+    `open=${dlg().open} page=${page()}`);
+  A9('overview-open-addresses-the-log', ovOpened && /^#overview\?(rid|seq)=/.test(location.hash),
+    location.hash || '(empty)');
+  // The Overview keeps refreshing behind the dialog: its panels are on the same poll,
+  // so a log opened here must not have stopped them, nor emptied them.
+  const ovNow0 = S.overview && S.overview.now_ms;
+  await w(3200);
+  A9('overview-polls-behind-the-log', ovOpened && dlg().open
+      && S.overview && S.overview.now_ms > ovNow0
+      && document.querySelectorAll('#ov-now .det-h, #ov-timeline .tl-row').length > 0,
+    `now_ms ${ovNow0} -> ${S.overview && S.overview.now_ms}, open=${dlg().open}`);
+  // Where the operator is standing when the dialog goes away is the whole rule; the
+  // address going back with it is the close handler's own job, asserted above.
+  const ovBack = await closeBack();
+  A9('overview-close-on-the-page-it-opened-from', ovBack && page() === 'page-overview',
+    `closed=${ovBack} page=${page()}`);
+  // The same rule from another page, so the rule is the page and not the Overview.
   await fresh();
   location.hash = '#reviews';
   await w(1600);
-  A9('reviews-entry-present', !!document.querySelector('#page-reviews [data-action="rv-open"]'),
-    'Open conversation button on the selected review');
-  if (await openOver('#page-reviews [data-action="rv-open"]', /^#reviews\?(rid|seq)=/)) {
-    A9('reviews-open-keeps-the-page', dlg().open && page() === 'page-reviews', `page=${page()}`);
-    const closedRv = await closeBack();
-    A9('reviews-close-returns', closedRv && page() === 'page-reviews',
-      `closed=${closedRv} page=${page()}`);
-  }
+  const rvOpened = await openOver('#page-reviews [data-action="rv-open"]');
+  A9('reviews-walk-opened', rvOpened, rvOpened ? `${LV.conv.key} over ${page()}` : 'no Reviews entry would open a log');
+  A9('reviews-open-keeps-the-page', rvOpened && dlg().open && page() === 'page-reviews',
+    `open=${dlg().open} page=${page()}`);
+  A9('reviews-open-addresses-the-log', rvOpened && /^#reviews\?(rid|seq)=/.test(location.hash),
+    location.hash || '(empty)');
+  const rvBack = await closeBack();
+  A9('reviews-close-on-the-page-it-opened-from', rvBack && page() === 'page-reviews',
+    `closed=${rvBack} page=${page()}`);
 }, 95000));
