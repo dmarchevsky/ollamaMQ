@@ -24,7 +24,7 @@ The dashboard covers:
 - **Models** — every model the backends list, with a switch per model and filter rules (below)
 - **Blocked** — disabled clients, blocked ids and blocked IPs
 - **Logs** — the request log, by conversation or by request, and the conversation viewer — see [Logs and the conversation viewer](#logs-and-the-conversation-viewer)
-- **Reviews** — conversations sent to an LLM review (**✎ Review** in the conversation viewer): each one's status — queued with the reason it waits, running and where, done, failed with the backend's answer — and the review itself, with the prompt it was sent with; **Run now**, **Re-run**, **Retry**, **Cancel**, **Delete**, and the prompt library under **Prompts…** (see [Conversation Review](review.md))
+- **Reviews** — conversations sent to an LLM review (**✎ Review** in the conversation viewer): each one's status — queued with the reason it waits, running and where, done, failed with the backend's answer — and the review itself, with the prompt it was sent with; **Run now**, **Re-run**, **Retry**, **Cancel**, **Delete**, the prompt library under **Prompts…**, and standing **auto-review rules** under **Auto-reviews…** that review finished conversations on their own and badge what needs attention (see [Conversation Review](review.md))
 - **Settings** — limits, model aliases, metrics token, the admin password, and the version you are running (see below)
 - **Reload config** — re-read `appconf.yaml`
 

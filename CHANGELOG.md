@@ -3,6 +3,20 @@
 All notable changes to this fork of [ollamaMQ](https://github.com/Chleba/ollamaMQ)
 since upstream `v0.5.0`.
 
+## v0.31.0 — 2026-11-20
+
+### Added
+
+- **Auto-reviews**: Reviews → **Auto-reviews…** keeps standing rules that send finished
+  conversations to review on their own. A rule watches conversations by backend, client and
+  label pattern, reviews each one **once** after it has been quiet for a cooldown (default
+  30 min, so a session with pauses is reviewed whole), optionally batching up to 10 due
+  conversations into one call. Everything the quiet-backend discipline guarantees still holds:
+  an automatic review never runs ahead of, over or instead of a user. Finished ones carry a
+  verdict — the Reviews list badges **⚠ needs attention** or **✓ nothing flagged**, the detail
+  pane shows why, and an **Attention** filter finds the flagged ones. Rules live in
+  `review_rules.yaml`; `GET|PUT /ui/api/review-rules`, `DELETE /ui/api/review-rules/{id}`.
+
 ## v0.30.4 — 2026-11-05
 
 ### Fixed
